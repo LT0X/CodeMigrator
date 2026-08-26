@@ -1,0 +1,198 @@
+{
+  "success": true,
+  "outcome": "passed",
+  "repairable": true,
+  "terminalViolations": [],
+  "terminalBlockingSummary": null,
+  "skillProvenance": {
+    "name": "solo-design",
+    "version": "2026.08.06.19.15.08",
+    "version_source": "skill-release-manifest.json",
+    "runtime_skill_dir": "c:\\Users\\EDY\\.trae-cn\\builtin\\design\\default\\skills\\solo-design",
+    "recorded_at": null,
+    "expected_version": "2026.08.06.19.15.08",
+    "status": "manifest_fallback",
+    "read_status": "ok",
+    "reason": "runtime-orchestration-summary.json missing skillProvenance; used skill-release-manifest.json"
+  },
+  "operatingMode": "free-explore",
+  "renderBlockingErrorCount": 0,
+  "softWarningCount": 17,
+  "renderBlockingErrors": [],
+  "errorSignatures": [],
+  "softWarnings": [
+    "[html-head-style] run-workspace-v4.html: found 13 custom <style> block(s) in <head>. The <head> is owned by apply-html-head-contract.mjs; move custom styles before </body> or re-run apply-html-head-contract.mjs <css-path> <html-file> --replace-head to relocate them.",
+    "[html-head-style] run-workspace-v9.html: found 1 custom <style> block(s) in <head>. The <head> is owned by apply-html-head-contract.mjs; move custom styles before </body> or re-run apply-html-head-contract.mjs <css-path> <html-file> --replace-head to relocate them.",
+    "[orchestration-summary] runtime-orchestration-summary.json is missing skillProvenance.name/version/version_source. Version provenance will be reported as observed_unknown by external evaluators.",
+    "[repair-ledger] validationRepairLedger[0].repairActions[] is missing",
+    "[repair-ledger] validationRepairLedger[0].revalidationReportPath is missing",
+    "[repair-ledger] validationRepairLedger[0].revalidationReportHash is missing",
+    "[repair-ledger] validationRepairLedger[0].revalidationSuccess should be a boolean",
+    "[repair-ledger] validationRepairLedger[1].repairActions[] is missing",
+    "[repair-ledger] validationRepairLedger[1].revalidationReportPath is missing",
+    "[repair-ledger] validationRepairLedger[1].revalidationReportHash is missing",
+    "[repair-ledger] validationRepairLedger[1].revalidationSuccess should be a boolean",
+    "[html-quality] colors_and_type.css: ordinary/static shadow tokens must keep every shadow alpha <= 0.05; deeper shadows are allowed only for floating-layer tokens such as modal/popover/dropdown/drawer/overlay (--cm-shadow-2: 0 8px 24px -8px rgba(15,23,42,.18)).",
+    "[html-quality] run-workspace-v14.html: hardcoded colors are forbidden outside <style id=\"theme-vars\">. Use brand CSS variables from the token reference.",
+    "[html-quality] run-workspace-v2.html: hardcoded colors are forbidden outside <style id=\"theme-vars\">. Use brand CSS variables from the token reference.",
+    "[html-quality] run-workspace-v3.html: hardcoded colors are forbidden outside <style id=\"theme-vars\">. Use brand CSS variables from the token reference.",
+    "[html-quality] run-workspace-v4.html: hardcoded colors are forbidden outside <style id=\"theme-vars\">. Use brand CSS variables from the token reference.",
+    "[html-quality] run-workspace-v4.html: free-explore pages must not use secondary/accent brand variables. Use the single primary hue, neutral tints, or --state-success/warning/error/info for real semantic states."
+  ],
+  "repairPlanHints": [
+    {
+      "errorClass": "hardcoded-color-in-body",
+      "owner": "sub-agent",
+      "repairScope": "targeted-token-replace",
+      "strategy": "targeted_token_replace_once",
+      "affectedFiles": [
+        "run-workspace-v14.html"
+      ],
+      "repairReportPath": null,
+      "repairAlreadyAttempted": false,
+      "allowSourceRead": "no-full-html-read",
+      "maxValidationRuns": 2
+    },
+    {
+      "errorClass": "hardcoded-color-in-body",
+      "owner": "sub-agent",
+      "repairScope": "targeted-token-replace",
+      "strategy": "targeted_token_replace_once",
+      "affectedFiles": [
+        "run-workspace-v2.html"
+      ],
+      "repairReportPath": null,
+      "repairAlreadyAttempted": false,
+      "allowSourceRead": "no-full-html-read",
+      "maxValidationRuns": 2
+    },
+    {
+      "errorClass": "hardcoded-color-in-body",
+      "owner": "sub-agent",
+      "repairScope": "targeted-token-replace",
+      "strategy": "targeted_token_replace_once",
+      "affectedFiles": [
+        "run-workspace-v3.html"
+      ],
+      "repairReportPath": null,
+      "repairAlreadyAttempted": false,
+      "allowSourceRead": "no-full-html-read",
+      "maxValidationRuns": 2
+    },
+    {
+      "errorClass": "hardcoded-color-in-body",
+      "owner": "sub-agent",
+      "repairScope": "targeted-token-replace",
+      "strategy": "targeted_token_replace_once",
+      "affectedFiles": [
+        "run-workspace-v4.html"
+      ],
+      "repairReportPath": null,
+      "repairAlreadyAttempted": false,
+      "allowSourceRead": "no-full-html-read",
+      "maxValidationRuns": 2
+    }
+  ],
+  "repairActionTable": [],
+  "errorCount": 0,
+  "warningCount": 17,
+  "errors": [],
+  "warnings": [
+    "[html-head-style] run-workspace-v4.html: found 13 custom <style> block(s) in <head>. The <head> is owned by apply-html-head-contract.mjs; move custom styles before </body> or re-run apply-html-head-contract.mjs <css-path> <html-file> --replace-head to relocate them.",
+    "[html-head-style] run-workspace-v9.html: found 1 custom <style> block(s) in <head>. The <head> is owned by apply-html-head-contract.mjs; move custom styles before </body> or re-run apply-html-head-contract.mjs <css-path> <html-file> --replace-head to relocate them.",
+    "[orchestration-summary] runtime-orchestration-summary.json is missing skillProvenance.name/version/version_source. Version provenance will be reported as observed_unknown by external evaluators.",
+    "[repair-ledger] validationRepairLedger[0].repairActions[] is missing",
+    "[repair-ledger] validationRepairLedger[0].revalidationReportPath is missing",
+    "[repair-ledger] validationRepairLedger[0].revalidationReportHash is missing",
+    "[repair-ledger] validationRepairLedger[0].revalidationSuccess should be a boolean",
+    "[repair-ledger] validationRepairLedger[1].repairActions[] is missing",
+    "[repair-ledger] validationRepairLedger[1].revalidationReportPath is missing",
+    "[repair-ledger] validationRepairLedger[1].revalidationReportHash is missing",
+    "[repair-ledger] validationRepairLedger[1].revalidationSuccess should be a boolean",
+    "[html-quality] colors_and_type.css: ordinary/static shadow tokens must keep every shadow alpha <= 0.05; deeper shadows are allowed only for floating-layer tokens such as modal/popover/dropdown/drawer/overlay (--cm-shadow-2: 0 8px 24px -8px rgba(15,23,42,.18)).",
+    "[html-quality] run-workspace-v14.html: hardcoded colors are forbidden outside <style id=\"theme-vars\">. Use brand CSS variables from the token reference.",
+    "[html-quality] run-workspace-v2.html: hardcoded colors are forbidden outside <style id=\"theme-vars\">. Use brand CSS variables from the token reference.",
+    "[html-quality] run-workspace-v3.html: hardcoded colors are forbidden outside <style id=\"theme-vars\">. Use brand CSS variables from the token reference.",
+    "[html-quality] run-workspace-v4.html: hardcoded colors are forbidden outside <style id=\"theme-vars\">. Use brand CSS variables from the token reference.",
+    "[html-quality] run-workspace-v4.html: free-explore pages must not use secondary/accent brand variables. Use the single primary hue, neutral tints, or --state-success/warning/error/info for real semantic states."
+  ],
+  "validationRunDisciplineStatus": {
+    "declared": true,
+    "restoreMode": false,
+    "maxFullValidationRuns": 2,
+    "validationHistoryCount": 2,
+    "repairLedgerCount": 2,
+    "softWarningsTriggerRepair": false,
+    "terminalState": null,
+    "nextAction": null,
+    "violations": [],
+    "success": true
+  },
+  "terminalState": null,
+  "nextCheck": {
+    "type": "finish-readiness",
+    "command": "node \"c:\\Users\\EDY\\.trae-cn\\builtin\\design\\default\\skills\\solo-design\\shared-runtime\\deterministic-tooling\\validate-finish-readiness.mjs\" \"d:\\work\\temp_project_work\\codemigrator-web-prototype\" --check=all",
+    "fullValidationAllowed": false,
+    "reason": "workspace validation passed; run complete finish readiness before final delivery"
+  },
+  "repairBatch": [],
+  "repairContextPacket": {
+    "schema_version": "1.0",
+    "purpose": "small-context repair packet; read this before full validation-report.json",
+    "success": true,
+    "terminalState": null,
+    "skillProvenance": {
+      "name": "solo-design",
+      "version": "2026.08.06.19.15.08",
+      "version_source": "skill-release-manifest.json",
+      "runtime_skill_dir": "c:\\Users\\EDY\\.trae-cn\\builtin\\design\\default\\skills\\solo-design",
+      "recorded_at": null,
+      "expected_version": "2026.08.06.19.15.08",
+      "status": "manifest_fallback",
+      "read_status": "ok",
+      "reason": "runtime-orchestration-summary.json missing skillProvenance; used skill-release-manifest.json"
+    },
+    "renderBlockingErrorCount": 0,
+    "softWarningCount": 17,
+    "renderBlockingErrors": [],
+    "repairActionTable": [],
+    "nextCheck": {
+      "type": "finish-readiness",
+      "command": "node \"c:\\Users\\EDY\\.trae-cn\\builtin\\design\\default\\skills\\solo-design\\shared-runtime\\deterministic-tooling\\validate-finish-readiness.mjs\" \"d:\\work\\temp_project_work\\codemigrator-web-prototype\" --check=all",
+      "fullValidationAllowed": false,
+      "reason": "workspace validation passed; run complete finish readiness before final delivery"
+    },
+    "forbidden": [
+      "do not read validator source",
+      "do not rerun full validation when nextCheck.fullValidationAllowed=false",
+      "do not start preview/browser unless user explicitly asks",
+      "do not hand-edit repair ledger fields"
+    ]
+  },
+  "projectFileHashes": {
+    "codemigrator-web-prototype.design": "6017993fff72018ea035cd5d9c59131f7ae591a2c8690b8e6009ef8dd6c60af9",
+    "colors_and_type.css": "4f2650cfe2aa8d1d7b64fa6df6d277060d020b97689ce14e305c11c1c7409060",
+    "runtime-orchestration-summary.json": "332026c1075901083e7a9e0884f223169ca55785c2d8aaaedc1d11962eddf96f",
+    "pages/run-workspace-v10.html": "c833acbd507baafa6afa136d45e01b9d13b9382eee2b9692e3cee919814eca85",
+    "pages/run-workspace-v11.html": "a9b2a98969177a2bdb04c819afd2f5d5304d17165f76034cdb589fed511040c5",
+    "pages/run-workspace-v12.html": "fadabfecc1f746667df33582423128bf27abddb7477373c4feadf92572cdc13b",
+    "pages/run-workspace-v13.html": "e9c8af800af1f369b1ef71331b594a99a1f13f31b8121626e9761ddb47162d4a",
+    "pages/run-workspace-v14.html": "0331585379ad864b12d60f9da329ed36cc59ae9f743b1d35eeab5d34e82b796a",
+    "pages/run-workspace-v2.html": "610e6612b25a62992c51bb0cb1850203585d156a461080f3bdabdd98c525d317",
+    "pages/run-workspace-v3.html": "345ce6010d2b8cd3e65695838965fa12ef40271c57d7e7cbcb119e30df3280af",
+    "pages/run-workspace-v4.html": "0fefa867dbc8214d065bb2b3980903eb1e42701f735d5787b1398df7fb7f5413",
+    "pages/run-workspace-v5.html": "7c69b0bb672d3b60afb761a4d22c771d978e3689b9ecae3d0dbe74bcebeebba5",
+    "pages/run-workspace-v6.html": "1bc335136cd2b3263c288a6afb4199ab5dfa218948d353412dafa28d14b5554b",
+    "pages/run-workspace-v7.html": "fa91ae1d12360c1a94f504191258a30ef6baeb6a9aaf14205c9d3357023a6069",
+    "pages/run-workspace-v8.html": "c44ba4d1a6278483c0605a84eec883ff302015e8f907673fdb27e5a238ee1179",
+    "pages/run-workspace-v9.html": "784d3d9fab2776d7699fc7c6793f1e28babfe59e656c0277b0aed3cf58216e53",
+    "pages/run-workspace.html": "244b86418295c3123b20f2250d5da849f5ff0a1900da915066c8d5f252a86c41",
+    "assets/raccoon-failed.jpg": "c07773157f2fc90e02b2064459b2912cf870517a82d96f234515ce5d05762f6a",
+    "assets/raccoon-verified.jpg": "672a6fee314e4a988bd605b3b1cfd8520e00d55db5a0194c73c76fb20274e723",
+    "assets/raccoon-working.jpg": "3d87e1cd8c03a82a322a030f28036c27e8fc53e5bc050a81417fc813dd49b823"
+  },
+  "designDir": "d:\\work\\temp_project_work\\codemigrator-web-prototype",
+  "expectedPages": null,
+  "requireInteractions": null,
+  "checkedAt": "2026-08-15T08:40:54.674Z"
+}

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Preflight</title>
+    <style id="theme-vars">
+/* ============================================================
+   CodeMigrator Web Workbench — Design Tokens
+   浅色优先视觉基线：暖白画布 + 语义状态色系
+   ============================================================ */
+
+:root {
+  /* ---- Surface (warm white + light fog gray canvas) ---- */
+  --cm-background: #FAF9F7;
+  --cm-foreground: #1A1B1E;
+  --cm-card: #FFFFFF;
+  --cm-card-foreground: #1A1B1E;
+  --cm-popover: #FFFFFF;
+  --cm-popover-foreground: #1A1B1E;
+  --cm-muted: #F1F0ED;
+  --cm-muted-foreground: #6B6E76;
+  --cm-border: #E4E2DD;
+  --cm-input: #E4E2DD;
+  --cm-ring: #4F46E5;
+
+  /* ---- Primary (紫蓝: candidate & generation) ---- */
+  --cm-primary: #4F46E5;
+  --cm-primary-foreground: #FFFFFF;
+
+  /* ---- State Colors (semantic, not brand) ---- */
+  --cm-state-verified: #0D9488;       /* 青绿色: verified spine */
+  --cm-state-verified-soft: #CCFBF1;
+  --cm-state-agent: #2563EB;          /* 电光蓝: Agent activity & internal verify */
+  --cm-state-agent-soft: #DBEAFE;
+  --cm-state-waiting: #D97706;        /* 琥珀色: waiting / recoverable conflict */
+  --cm-state-waiting-soft: #FEF3C7;
+  --cm-state-failure: #E11D48;       /* 珊瑚红: terminal failure & safety reject */
+  --cm-state-failure-soft: #FFE4E6;
+  --cm-state-info: #2563EB;
+  --cm-state-info-soft: #DBEAFE;
+
+  /* ---- Radius ---- */
+  --cm-radius-sm: 4px;
+  --cm-radius-md: 8px;
+  --cm-radius-lg: 12px;
+  --cm-radius-pill: 999px;
+
+  /* ---- Shadows ---- */
+  --cm-shadow-1: 0 1px 2px rgba(15,23,42,.05), 0 1px 1px rgba(15,23,42,.03);
+  --cm-shadow-2: 0 8px 24px -8px rgba(15,23,42,.18);
+
+  /* ---- Spacing (8pt grid) ---- */
+  --cm-s-1: 4px;
+  --cm-s-2: 8px;
+  --cm-s-3: 12px;
+  --cm-s-4: 16px;
+  --cm-s-5: 24px;
+  --cm-s-6: 32px;
+
+  /* ---- Typography ---- */
+  --cm-font-sans: "Inter", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --cm-font-mono: "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code", Consolas, monospace;
+}
+
+/* ---- Semantic alias mapping for apply-html-head-contract.mjs ---- */
+:root {
+  --background: var(--cm-background);
+  --foreground: var(--cm-foreground);
+  --card: var(--cm-card);
+  --card-foreground: var(--cm-card-foreground);
+  --popover: var(--cm-popover);
+  --popover-foreground: var(--cm-popover-foreground);
+  --primary: var(--cm-primary);
+  --primary-foreground: var(--cm-primary-foreground);
+  --muted: var(--cm-muted);
+  --muted-foreground: var(--cm-muted-foreground);
+  --border: var(--cm-border);
+  --input: var(--cm-input);
+  --ring: var(--cm-ring);
+  --radius-sm: var(--cm-radius-sm);
+  --radius-md: var(--cm-radius-md);
+  --radius-lg: var(--cm-radius-lg);
+}
+
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.3.1/dist/index.global.js"></script>
+    <script src="https://unpkg.com/lucide@1.8.0/dist/umd/lucide.min.js"></script>
+    <style type="text/tailwindcss">
+  @theme inline {
+    --color-background: var(--cm-background);
+    --color-foreground: var(--cm-foreground);
+    --color-card: var(--cm-card);
+    --color-card-foreground: var(--cm-card-foreground);
+    --color-popover: var(--cm-popover);
+    --color-popover-foreground: var(--cm-popover-foreground);
+    --color-primary: var(--cm-primary);
+    --color-primary-foreground: var(--cm-primary-foreground);
+    --color-muted: var(--cm-muted);
+    --color-muted-foreground: var(--cm-muted-foreground);
+    --color-border: var(--cm-border);
+    --color-input: var(--cm-input);
+    --color-ring: var(--cm-ring);
+    --radius-sm: var(--cm-radius-sm);
+    --radius-md: var(--cm-radius-md);
+    --radius-lg: var(--cm-radius-lg);
+  }
+  @layer base {
+    body { background: var(--cm-background); color: var(--cm-foreground); }
+    td, th { @apply break-words; word-break: break-all; word-break: auto-phrase; }
+    th { @apply whitespace-nowrap; }
+  }
+    </style>
+    <style id="semantic-token-fallback">
+      .bg-background { background-color: var(--cm-background); }
+      .text-background { color: var(--cm-background); }
+      .border-background { border-color: var(--cm-background); }
+      .ring-background { --tw-ring-color: var(--cm-background); }
+      .bg-foreground { background-color: var(--cm-foreground); }
+      .text-foreground { color: var(--cm-foreground); }
+      .border-foreground { border-color: var(--cm-foreground); }
+      .ring-foreground { --tw-ring-color: var(--cm-foreground); }
+      .bg-card { background-color: var(--cm-card); }
+      .text-card { color: var(--cm-card); }
+      .border-card { border-color: var(--cm-card); }
+      .ring-card { --tw-ring-color: var(--cm-card); }
+      .bg-card-foreground { background-color: var(--cm-card-foreground); }
+      .text-card-foreground { color: var(--cm-card-foreground); }
+      .border-card-foreground { border-color: var(--cm-card-foreground); }
+      .ring-card-foreground { --tw-ring-color: var(--cm-card-foreground); }
+      .bg-popover { background-color: var(--cm-popover); }
+      .text-popover { color: var(--cm-popover); }
+      .border-popover { border-color: var(--cm-popover); }
+      .ring-popover { --tw-ring-color: var(--cm-popover); }
+      .bg-popover-foreground { background-color: var(--cm-popover-foreground); }
+      .text-popover-foreground { color: var(--cm-popover-foreground); }
+      .border-popover-foreground { border-color: var(--cm-popover-foreground); }
+      .ring-popover-foreground { --tw-ring-color: var(--cm-popover-foreground); }
+      .bg-primary { background-color: var(--cm-primary); }
+      .text-primary { color: var(--cm-primary); }
+      .border-primary { border-color: var(--cm-primary); }
+      .ring-primary { --tw-ring-color: var(--cm-primary); }
+      .bg-primary-foreground { background-color: var(--cm-primary-foreground); }
+      .text-primary-foreground { color: var(--cm-primary-foreground); }
+      .border-primary-foreground { border-color: var(--cm-primary-foreground); }
+      .ring-primary-foreground { --tw-ring-color: var(--cm-primary-foreground); }
+      .bg-muted { background-color: var(--cm-muted); }
+      .text-muted { color: var(--cm-muted); }
+      .border-muted { border-color: var(--cm-muted); }
+      .ring-muted { --tw-ring-color: var(--cm-muted); }
+      .bg-muted-foreground { background-color: var(--cm-muted-foreground); }
+      .text-muted-foreground { color: var(--cm-muted-foreground); }
+      .border-muted-foreground { border-color: var(--cm-muted-foreground); }
+      .ring-muted-foreground { --tw-ring-color: var(--cm-muted-foreground); }
+      .bg-border { background-color: var(--cm-border); }
+      .text-border { color: var(--cm-border); }
+      .border-border { border-color: var(--cm-border); }
+      .ring-border { --tw-ring-color: var(--cm-border); }
+      .bg-input { background-color: var(--cm-input); }
+      .text-input { color: var(--cm-input); }
+      .border-input { border-color: var(--cm-input); }
+      .ring-input { --tw-ring-color: var(--cm-input); }
+      .bg-ring { background-color: var(--cm-ring); }
+      .text-ring { color: var(--cm-ring); }
+      .border-ring { border-color: var(--cm-ring); }
+      .ring-ring { --tw-ring-color: var(--cm-ring); }
+    </style>
+    <style>
+      .no-scrollbar::-webkit-scrollbar { display: none; }
+      .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+      [data-icon] {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        -webkit-mask-size: contain;
+        mask-size: contain;
+        -webkit-mask-repeat: no-repeat;
+        mask-repeat: no-repeat;
+        -webkit-mask-position: center;
+        mask-position: center;
+        background-color: currentColor;
+      }
+    </style>
+</head>
+<body class="min-h-screen font-sans antialiased">
+    <main>
+    </main>
+    <script>lucide.createIcons();</script>
+</body>
+</html>

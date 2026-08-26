@@ -1,0 +1,77 @@
+/* ============================================================
+   CodeMigrator Web Workbench — Design Tokens
+   浅色优先视觉基线：暖白画布 + 语义状态色系
+   ============================================================ */
+
+:root {
+  /* ---- Surface (warm white + light fog gray canvas) ---- */
+  --cm-background: #FAF9F7;
+  --cm-foreground: #1A1B1E;
+  --cm-card: #FFFFFF;
+  --cm-card-foreground: #1A1B1E;
+  --cm-popover: #FFFFFF;
+  --cm-popover-foreground: #1A1B1E;
+  --cm-muted: #F1F0ED;
+  --cm-muted-foreground: #6B6E76;
+  --cm-border: #E4E2DD;
+  --cm-input: #E4E2DD;
+  --cm-ring: #4F46E5;
+
+  /* ---- Primary (紫蓝: candidate & generation) ---- */
+  --cm-primary: #4F46E5;
+  --cm-primary-foreground: #FFFFFF;
+
+  /* ---- State Colors (semantic, not brand) ---- */
+  --cm-state-verified: #0D9488;       /* 青绿色: verified spine */
+  --cm-state-verified-soft: #CCFBF1;
+  --cm-state-agent: #2563EB;          /* 电光蓝: Agent activity & internal verify */
+  --cm-state-agent-soft: #DBEAFE;
+  --cm-state-waiting: #D97706;        /* 琥珀色: waiting / recoverable conflict */
+  --cm-state-waiting-soft: #FEF3C7;
+  --cm-state-failure: #E11D48;       /* 珊瑚红: terminal failure & safety reject */
+  --cm-state-failure-soft: #FFE4E6;
+  --cm-state-info: #2563EB;
+  --cm-state-info-soft: #DBEAFE;
+
+  /* ---- Radius ---- */
+  --cm-radius-sm: 4px;
+  --cm-radius-md: 8px;
+  --cm-radius-lg: 12px;
+  --cm-radius-pill: 999px;
+
+  /* ---- Shadows ---- */
+  --cm-shadow-1: 0 1px 2px rgba(15,23,42,.05), 0 1px 1px rgba(15,23,42,.03);
+  --cm-shadow-2: 0 8px 24px -8px rgba(15,23,42,.18);
+
+  /* ---- Spacing (8pt grid) ---- */
+  --cm-s-1: 4px;
+  --cm-s-2: 8px;
+  --cm-s-3: 12px;
+  --cm-s-4: 16px;
+  --cm-s-5: 24px;
+  --cm-s-6: 32px;
+
+  /* ---- Typography ---- */
+  --cm-font-sans: "Inter", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --cm-font-mono: "JetBrains Mono", "Fira Code", "SF Mono", "Cascadia Code", Consolas, monospace;
+}
+
+/* ---- Semantic alias mapping for apply-html-head-contract.mjs ---- */
+:root {
+  --background: var(--cm-background);
+  --foreground: var(--cm-foreground);
+  --card: var(--cm-card);
+  --card-foreground: var(--cm-card-foreground);
+  --popover: var(--cm-popover);
+  --popover-foreground: var(--cm-popover-foreground);
+  --primary: var(--cm-primary);
+  --primary-foreground: var(--cm-primary-foreground);
+  --muted: var(--cm-muted);
+  --muted-foreground: var(--cm-muted-foreground);
+  --border: var(--cm-border);
+  --input: var(--cm-input);
+  --ring: var(--cm-ring);
+  --radius-sm: var(--cm-radius-sm);
+  --radius-md: var(--cm-radius-md);
+  --radius-lg: var(--cm-radius-lg);
+}
