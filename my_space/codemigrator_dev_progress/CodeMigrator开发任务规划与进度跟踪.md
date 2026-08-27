@@ -385,9 +385,9 @@ flowchart TD
 
 | 任务ID | 任务描述 | 状态 | 开始日期 | 实际完成日期 | 备注 |
 |---|---|---|---|---|---|
-| CM-CORE-001 | 实现公共契约（codemigrator-core，M-00）：状态机、枚举、稳定错误码、phase 授权矩阵、公共 ID/限额、保留策略 | 未开始 | — | — | Wave 0；全部任务的上游 |
-| CM-INFRA-001 | 建立工程骨架（M-01）：Cargo workspace 8 crate + descriptors/ 资源目录 + compose.yaml 三服务基线 | 未开始 | — | — | Wave 0；依赖 CM-CORE-001 |
-| CM-API-001 | 实现系统后端（api + 控制面，M-02）：REST/SSE 投影、run_events 同事务、幂等边界 | 未开始 | — | — | Wave 1 |
+| CM-CORE-001 | 实现公共契约（codemigrator-core，M-00）：状态机、枚举、稳定错误码、phase 授权矩阵、公共 ID/限额、保留策略 | 未开始 | — | — | Wave 0；全部任务的上游 ；已对齐：my_space/code_alignment_record/core/CM-CORE-001-对齐记录.md |
+| CM-INFRA-001 | 建立工程骨架（M-01）：Cargo workspace 8 crate + descriptors/ 资源目录 + compose.yaml 三服务基线 | 未开始 | — | — | Wave 0；依赖 CM-CORE-001 ；已对齐：my_space/code_alignment_record/infra/CM-INFRA-001-对齐记录.md（布局专项：project/CM-PROJECT-001-对齐记录.md） |
+| CM-API-001 | 实现系统后端（api + 控制面，M-02）：REST/SSE 投影、run_events 同事务、幂等边界 | 未开始 | — | — | Wave 1 ；已对齐：my_space/code_alignment_record/api/CM-API-001-对齐记录.md |
 | CM-RUNTIME-001 | 实现 Harness（runtime，M-03）：Run actor 单写者、调度与集成协调、接管与恢复 | 未开始 | — | — | Wave 3；无编号条款，以 10 条运行性质为验收 |
 | CM-LOOP-001 | 实现 Agent Loop（M-04）：五阶段编排、EXECUTE 调用循环、会话失效 | 未开始 | — | — | Wave 3；与 CM-RUNTIME-001 协同 |
 | CM-SPEC-001 | 实现 Migration Spec（M-05）：四道门、canonical 规范化、不可变留存 | 未开始 | — | — | Wave 1 |
