@@ -1,7 +1,7 @@
 # CodeMigrator Agent Loop：阶段编排与工具箱调用循环
 
-> 文档状态：V4 当前架构基线；本篇是五阶段模型会话编排、EXECUTE 模型↔工具箱调用循环与会话隔离边界的唯一 owner。  
-> 技术范围：阶段与模型档绑定、EXECUTE 六工具调用循环（L1-L4 四层）、Shell 会话自检与 Exec 编排、四类 Slice 会话上下文构成、Spec 起草会话、重生成历史注入、P-05 数据边界、失败传播与会话失效。  
+> 文档状态：V6 方向对齐版；本篇是五阶段模型会话编排、EXECUTE 模型↔工具箱调用循环、常驻协调会话、修复会话与会话隔离边界的唯一 owner。  
+> 技术范围：阶段与模型档绑定、EXECUTE 六工具调用循环（L1-L4 四层）、Shell 会话自检与 Exec 编排、四类 Slice 会话上下文构成、Spec 起草会话、常驻协调会话类型、修复会话与重生升级包、重生成历史注入、P-05 数据边界、失败传播与会话失效。  
 > 契约真相：Phase、RunStatus、ModelProfile、Phase 工具授权矩阵、WriteScope、稳定错误码与预算语义以 [M-00 垂类设计原则与架构哲学](CodeMigrator_垂类设计原则与架构哲学.md) 为准；本篇只定义它们在循环中的使用边界。  
 > 关联文档：[Harness 总体设计](CodeMigrator_Harness总体设计.md)、[Migration Spec](CodeMigrator_Migration_Spec抽象层.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[工具系统与 Hook](CodeMigrator_工具系统与Hook.md)、[记忆与上下文管理](CodeMigrator_记忆与上下文管理.md)、[验证引擎](CodeMigrator_验证引擎.md)、[会话与运行时修正编排](CodeMigrator_会话与运行时修正编排.md)
 
@@ -11,35 +11,47 @@ P-01 在本篇的落点是"Agent 直写、Harness 编排"：EXECUTE 的 Agent �
 
 Loop 不自由扩大工具权限，不把模型的自然语言解释当作代码、计划或验证事实。不同 Slice 会话彼此隔离：每个会话只能读自己的 Context Pack、写自己的候选工作区，不能触达 Git ref、PostgreSQL、其他 Slice 的候选工作区或 sandbox 控制面。Web 只消费 actor 已持久化的活动投影（M-15），不能从 UI 反向控制 Loop、工具或模型调用。本篇不定义工具 frame 明细与拒绝码清单（M-12）、Context Pack 装配与逐出策略（M-14）、checkpoint 事务与候选工作区生命周期（M-08/M-11），只定义它们在循环中的使用边界。
 
+## V5 当前对齐
+
+起草阶段先消费预索引知识图谱并按模块/目录域扇出只读探索会话；子会话不直接互发消息，只提交带 file:range 锚点、覆盖度和置信度理由的结构化探索报告。主会话合并报告并处理显式冲突，产出并供用户一次确认四件工件：MigrationSpec、UnderstandingDossier、TargetProjectBlueprint、MigrationRulebook。PLAN 阶段由 LLM Planner 依据四件冻结输入提案，机器校验后自动冻结，不逐 Slice 请求用户确认。EXECUTE 仍使用六工具与长期 Slice 沙箱卷；VERIFY 仍由确定性 Oracle 裁决。
+
+## V6 方向对齐（演进说明，V5 对齐段留存追溯）
+
+V6 在 V5 的方向对齐基础上补充两类会话形态；V5 的阶段编排、六工具循环与数据边界保持不动，V5 对齐段如上留存仅供追溯，不因本次演进作废：
+
+- **常驻协调会话类型**：新增两类常驻会话——起草期的探索协调者（由主会话升级）与执行期的 EXECUTE Supervisor（被动唤醒）。二者落在既有六工具与阶段编排之上，以"建议而非直写"承载 Agent Loop 判断层，均计入模型会话池并受独立预算档。
+- **修复会话 / 重生升级包**：新增"修复会话"会话类型承担全局修复决策的专门会话（身份 `(run_id, repair_decision_id)`）；并说明简单场景下原 Slice 重生会话可获"升级包"（全境读视野 + 修复简报）。
+
+本章节标题沿用惯例命名，编号与后续章节顺序保持既有；本节点明 V6 相对 V5 的增量，其余章节文字保留原样，保证追溯一致。
+
 ## 五阶段的职责边界
 
-阶段不是五个模型产品。Run 创建时冻结两档 `ModelProfile { Reasoning, Code }` 到五个阶段的绑定（M-00：ANALYZE→Reasoning、PLAN→Reasoning、EXECUTE→Code；VERIFY 不开模型会话、REPORT 正文由确定性模板从 verified facts 拼装——两者均无模型档位），缺失绑定在 CreateRun 前拒绝。分工基线（fb8 对齐后口径）是**信息分层**（M-00 信息分层原则）：机械完备层产候选事实，语义正确性由理解会话（本体＝起草会话深潜阶段）消解并经用户确认入闸，PLAN 从三件冻结输入机械派生；模型在 EXECUTE 担任执行主体，在 ANALYZE 担任机械层↔档案校验主体，PLAN 承担计划解释，VERIFY/REPORT 无模型会话。
+阶段不是五个模型产品。Run 创建时冻结两档 `ModelProfile { Reasoning, Code }` 到五个阶段的绑定（M-00：ANALYZE→Reasoning、PLAN→Reasoning、EXECUTE→Code；VERIFY 不开模型会话、REPORT 正文由确定性模板从 verified facts 拼装——两者均无模型档位），缺失绑定在 CreateRun 前拒绝。分工基线是信息分层：机械完备层产候选事实，起草期多会话探索与主会话合并产出四件工件并经用户确认入闸，PLAN 由 LLM Planner 提案再经机器校验；模型在 EXECUTE 担任执行主体，VERIFY/REPORT 无模型会话。
 
 | 阶段 | 进入状态 | 主要输入 | 可产生的结果 | 确定性管线与模型的边界 |
 |---|---|---|---|---|
-| ANALYZE | `ANALYZING` | 冻结源快照 OID、M-06 机械完备层产物（候选事实：文件清单/import 候选/测试清单/构建清单/PSF 锚点索引）、**已冻结 UnderstandingDossier**（起草会话深潜产出、用户确认后随 CreateRun 冻结的第三件输入） | 机械层↔档案一致性校验结论（偏差记入分析投影，不回写档案） | 机械完备层由 M-06 确定性管线执行（枚举保底不漏）；Reasoning 会话消费已冻结档案做交叉校验，不再承担语义消解产出（产制点归一起草期，见信息分层原则） |
-| PLAN | `PLANNING` | import 图、测试覆盖图、Spec 分解策略、**已确认 UnderstandingDossier** | 无（Loop 只消费计划投影） | Planner（M-07）从三件冻结输入确定性生成四类 Slice DAG、write scope 与集成序；语义模块=分组依据、档案依赖判定=边依据（替代大部分 Unknown 盲猜）；同输入必同计划 |
+| ANALYZE | `ANALYZING` | 冻结源快照 OID、M-06 机械完备层产物与四件冻结工件 | 机械层↔冻结档案一致性校验结论（偏差记入分析投影，不回写工件） | M-06 负责机械枚举；本阶段不重新生成语义档案 |
+| PLAN | `PLANNING` | M-06 事实与关系图、四件冻结工件、Spec 分解原则 | 无（Loop 只消费计划投影） | Planner（M-07）生成 PlanProposal；机器校验四项门禁后自动冻结 Slice、DAG、write scope 与 integration_rank |
 | EXECUTE | `EXECUTING` | 本 Slice generation 的冻结 Context Pack（含档案相关摘录） | 候选工作区中的目标代码文件 | 模型与工具箱的循环是执行主体；Harness 不逐键介入文件内容，只做 write scope 校验、checkpoint 与验证 |
 | VERIFY | `VERIFYING` | 冻结最终 verified head、最终验证 receipt | 无（Loop 只消费 receipt 投影） | 零工具、零模型副作用；最终检查由 Run actor 经 InternalVerificationDispatch 派发（M-09/M-10） |
 | REPORT | `REPORTING` | verified facts、检查与交付事实 | 语义等价证据页与报告正文（确定性模板拼装） | 无模型会话：正文由确定性模板从 verified facts 拼装（挡位收敛定案，更可审计）；不访问未验证候选 |
 
 ```mermaid
 flowchart LR
-  A["ANALYZE 分析\n机械完备层管线 + 消费已冻结理解档案校验\n（档案产制＝起草会话深潜 → 用户确认冻结）"] --> P["PLAN 规划\nPlanner 从 快照+Spec+档案 三件冻结输入\n确定性派生 DAG"]
-  P --> W1["EXECUTE 契约层 契约会话\n目标骨架 + 构建文件 + ContractArtifact"]
-  W1 --> W2["EXECUTE 实现层 实现/测试翻译/测试生成会话\n依赖闭包就绪即启动 pack 含档案摘录"]
-  W2 --> V["VERIFY 最终验证\n零工具 只消费 receipt"]
+  A["ANALYZE 分析\n机械完备层管线 + 消费已冻结理解档案校验\n（档案产制＝起草会话深潜 → 用户确认冻结）"] --> P["PLAN 规划\nPlanner 消费四件冻结工件 + M-06 事实\n提案 → 机器校验 → 冻结 DAG"]
+  P --> X["EXECUTE Planner 选择的 Slice 会话\nDAG 依赖闭包 + 三池资源许可即启动"]
+  X --> V["VERIFY 最终验证\n零工具 只消费 receipt"]
   V --> R["REPORT 报告\n确定性模板从 verified facts 拼装正文"]
   R --> T["Terminal projection 终态投影"]
 ```
 
 ANALYZE 的边界：import 图、模块清单、测试清单与构建清单是 PLAN 与四类会话上下文的公共输入，必须可由冻结快照 OID 确定性重建（M-06）。分析期模型摘要只服务于人类可读投影，省略它不改变任何下游输入；辅助核验的工具面与授权矩阵中 ANALYZE 的只读子集一致（ReadFile/QuerySourceAst），不引入新的信任面。
 
-PLAN 的边界：依赖边、write scope 与集成序是并发安全与结果确定性的载体（P-03），全部由 Planner 从源 import 图、测试覆盖图与**已确认理解档案**确定性派生——语义模块=分组依据，档案中判定为真实依赖的动态 import 显式进边（替代大部分 Unknown 盲猜保守化）。同快照+同 Spec+同已确认档案必得同计划。PLAN 阶段的 Reasoning 模型可读取事实并向会话解释计划，不设独立建议通道——语义消解已在起草期深潜（理解会话本体）完成并经用户确认入闸（M-00 信息分层原则）；运行中的计划调整一律经 M-16 的 PlanRevision 由 actor 冻结后再生效——模型在任何时点都不可直接写 DAG 边、write scope 或集成序。
+PLAN 的边界：依赖边、write scope 与集成序是并发安全与结果确定性的载体（P-03）。Planner 从 M-06 事实、关系图和四件冻结工件提出方案；机器校验四项门禁后，actor 冻结计划。运行中的计划调整一律经 M-16 的 PlanRevision 由 actor 冻结后再生效；模型在任何时点都不可直接写已冻结 DAG 边、write scope 或 integration_rank。
 
 VERIFY 与 REPORT 保持零工具且均无模型会话：最终验证的裁决必须完全确定——冻结 verified head、冻结检查集、typed receipt 与 verification fingerprint（M-10），任何模型介入都会破坏 fingerprint 的可复算性。REPORT 的报告正文与语义等价证据页素材（通过率、失败清单、覆盖映射、等价信心分级）全部来自 verified facts 与检查结果，由确定性模板拼装——模板输出不含任何未验证叙述，比生成式组织更可审计（挡位收敛定案）。
 
-EXECUTE 内部分为契约层与实现层两个拓扑层标注（非全局屏障）：契约层执行全部契约 Slice（目标项目骨架、构建文件、模块接口契约），实现层执行实现、测试翻译与测试生成 Slice——每个 Slice 的就绪条件是依赖闭包就绪，即其全部依赖契约 Slice 集成后即可进入 `RUNNING`，不等全仓库契约 Slice 清空集成队列（对齐 M-00 V-M00-V4-001）；分层只由 SliceKind 与 Requires 边表达，Loop 不为分层增加状态或工具。任一时刻的并行会话数等于"DAG ready 且 write scope 互斥"的实现/测试翻译/测试生成 Slice 数——这也是 M-15 作业区卡片数量的投影来源，会话开启与关闭即卡片的入场与退场事件。分组粒度质量纪律：语义模块的分组粒度需与并行度目标匹配——大项目避免过粗分组压低扇出（计划侧落点见 M-07）。
+EXECUTE 不再把 Slice 固定为契约层/实现层两波；Planner 提案中的 DAG 和依赖闭包决定就绪条件，依赖闭包就绪即启动。Loop 只消费冻结的 write scope、integration_rank、Context Pack 和六工具授权；任一时刻的并行会话数由 DAG ready、范围互斥和三池资源许可共同决定。以往的分层名称只作为兼容展示标签。
 
 Loop 在每个阶段入口检查 phase/status 配对、Run 取消标记、冻结 binding 与预算门；EXECUTE 会话另须匹配 Slice、active generation 与创建时 candidate OID。任一检查失败时模型请求、工具调用和 outcome 发布均为零。Run version 只用于外部 API 的 `If-Match`，不进入每次模型调用。
 
@@ -77,11 +89,11 @@ stateDiagram-v2
 
 会话身份失效即会话作废：重生成创建新 generation、candidate ref 被推进或 Run 取消后，旧会话不再接纳模型调用与工具请求，迟到结果只产生丢弃审计事件。不存在"会话复活"；对同一 Slice 的后续修改只能经由新 generation 会话或集成层归因触发。
 
-按 generation 切会话服务于两条 V4 不变量：P-07 要求每个 generation 拥有独立候选工作区、上下文与 Artifact 命名空间，会话边界即上下文与副作用的边界；generation `0..=2` 的定向重生成要求旧会话可整体作废而不留下半开状态。会话不跨 generation 复用，也不跨 Slice 复用——并行 Slice 的会话之间没有任何共享可变状态，唯一共享的输入是只读源快照与已集成契约。
+按 generation 切会话服务于两条 V4 不变量：P-07 要求每个 generation 拥有独立候选工作区、上下文与 Artifact 命名空间，会话边界即上下文与副作用的边界；generation `0`~`2` 的定向重生成要求旧会话可整体作废而不留下半开状态。会话不跨 generation 复用，也不跨 Slice 复用——并行 Slice 的会话之间没有任何共享可变状态，唯一共享的输入是只读源快照与已集成契约。
 
 ### 六工具的授权与边界
 
-工具授权的唯一真相源是 M-00 的 Phase 工具授权矩阵（`core://phase-tool-policy/v2` 编译时资源）；Loop 不缓存、镜像或重新表述该 policy，只把模型工具请求连同 Run、Phase、会话身份交给 ToolGateway，由 Gateway 加载 policy 裁决。本表描述六工具可触达的资源与边界，完整 frame 规则与拒绝码清单归 M-12。
+工具授权的唯一真相源是 M-00 的 Phase 工具授权矩阵（`core://phase-tool-policy/v2` 包内静态资源）；Loop 不缓存、镜像或重新表述该 policy，只把模型工具请求连同 Run、Phase、会话身份交给 ToolGateway，由 Gateway 加载 policy 裁决。本表描述六工具可触达的资源与边界，完整 frame 规则与拒绝码清单归 M-12。
 
 | 工具 | 可触达资源 | 边界与拒绝 |
 |---|---|---|
@@ -93,7 +105,7 @@ stateDiagram-v2
 
 **消费边界例：**VERIFY 阶段若模型请求查看一个报错文件，Gateway 按 M-00 policy 返回 `TOOL_PHASE_DENIED`，不降级为 ReadFile，也不从源快照取正文；该阶段只能消费 M-10 生成的诊断与 receipt 引用。
 
-分层工具面是 V4 安全模型的根基：Agent 能做的最坏事情被限制在"向本 Slice 白名单写文件、读冻结快照、在该 Slice 专属长驻沙箱卷内执行命令"之内——结构化通道（L1/L2）的越权尝试表现为一次类型化拒绝而不是一次被拦截的副作用；`Shell`（L3）的自由执行被沙箱物理边界限定，宿主零触碰，写效果由 checkpoint 批量校验兜底；`Exec`（L4）零环境权威，唯一出口是工具桥。网络出口受控（依赖安装外联语义归 M-09），对控制面（Git ref、PostgreSQL、sandbox 控制面）没有任何句柄。安全边界因此可审计、可测试。
+分层工具面是现行四层安全模型的根基：Agent 能做的最坏事情被限制在"向本 Slice 白名单写文件、读冻结快照、在该 Slice 专属长驻沙箱卷内执行命令"之内——结构化通道（L1/L2）的越权尝试表现为一次类型化拒绝而不是一次被拦截的副作用；`Shell`（L3）的自由执行被沙箱物理边界限定，宿主零触碰，写效果由 checkpoint 批量校验兜底；`Exec`（L4）零环境权威，唯一出口是工具桥。网络出口受控（依赖安装外联语义归 M-09），对控制面（Git ref、PostgreSQL、sandbox 控制面）没有任何句柄。安全边界因此可审计、可测试。
 
 ### 调用循环
 
@@ -142,7 +154,7 @@ sequenceDiagram
 
 自检给 Agent 一个会话内的反馈闭环：写完目标代码即可在长驻沙箱内跑构建、类型检查或 lint，读原始输出就地自纠，而不必等 Harness 局部验证失败后返工。自检并入 `Shell`——自由命令、自由参数，直接在该 Slice 专属长驻沙箱卷内执行，构建缓存与已装依赖跨命令驻留复用，同会话重复构建/测试不重复下载与冷编译。`CheckRunner` 作为 Agent 工具已退役：模型工具注册表移出该变体，请求该工具名返回 `TOOL_NOT_FOUND`（退役语义归 M-12）；描述符冻结的检查命令模板只服务裁决层 `InternalVerificationDispatch` 与 Scaffold 基线初始化，模型工具面与描述符命令面不再有交集。
 
-会话内自检与验证层裁决的关系是明文边界：会话内 Shell 自检是反馈——不写 `CheckResult` 账本、不推进任何 ref、不进入验证 fingerprint；验证层测试是裁决事实——由 Run actor 经裁决层 `InternalVerificationDispatch`（非模型工具）以冻结检查集 + tested_commit overlay 独立做出（M-09/M-10）。Agent 自检通过不等于局部验证通过：提交 checkpoint 后 Run actor 仍按冻结检查集独立派发局部验证；验证独立性不依赖自检同面——无论模型在会话内执行了什么命令，fingerprint 的计算输入不受任何影响（P-02）。工具调用受 M-12 frame 规则与 M-00 资源上限约束（模型工具档超时、输出流上限）；超时或超限归约为该次调用的失败结果回上下文，模型可据此收缩检查范围或修正代码，不终止会话。
+会话内自检与验证层裁决的关系是明文边界：会话内 Shell 自检是反馈——不写 `CheckResult` 账本、不推进任何 ref、不进入验证 fingerprint；验证层测试是裁决事实——由 Run actor 经裁决层 `InternalVerificationDispatch`（非模型工具）以冻结检查集 + 从 tested commit 临时物化的独立目录做出（M-09/M-10）。Agent 自检通过不等于局部验证通过：提交 checkpoint 后 Run actor 仍按冻结检查集独立派发局部验证；验证独立性不依赖自检同面——无论模型在会话内执行了什么命令，fingerprint 的计算输入不受任何影响（P-02）。工具调用受 M-12 frame 规则与 M-00 资源上限约束（模型工具档超时、输出流上限）；超时或超限归约为该次调用的失败结果回上下文，模型可据此收缩检查范围或修正代码，不终止会话。
 
 | 反馈/裁决来源 | 发起方 | 检查内容 | 结果去向 |
 |---|---|---|---|
@@ -166,11 +178,11 @@ sequenceDiagram
 
 ## 四类会话的上下文构成
 
-四类 Slice 开启四类会话，对应 EXECUTE 的两个拓扑层：契约会话构成契约层，实现、测试翻译与测试生成会话在各自依赖闭包（全部依赖契约 Slice 集成）就绪后构成实现层。四类 Context Pack 构成互不混用：
+四类 Slice（其中 Contract 可为 0）按 Planner 冻结的 SliceKind 开启相应会话，不再绑定 EXECUTE 的两个固定拓扑层：若存在契约 Slice，下游会话按各自依赖闭包就绪；实现、测试翻译与测试生成会话不因全仓库契约未清空而等待。四类 Context Pack 构成互不混用：
 
 | 会话 | SliceKind | 拓扑层 | 上下文构成 | 初始工作区 |
 |---|---|---|---|---|
-| 契约会话 | Contract | 契约层 | 源项目结构与模块清单（M-06 分析事实）、源构建摘要（清单、依赖、脚本）、目标端工具链约定（包管理器、脚手架/构建/测试命令、目录与命名约定）、Spec 语言对约束 | 空 |
+| 契约会话（若存在） | Contract | 兼容展示标签 | 源项目结构与模块清单（M-06 分析事实）、源构建摘要（清单、依赖、脚本）、目标端工具链约定（包管理器、脚手架/构建/测试命令、目录与命名约定）、Spec 语言对约束 | 空 |
 | 实现会话 | Implementation | 实现层 | 所分配源模块代码、依赖模块的 ContractArtifact（目标路径、公开签名、types_hash）、目标端约定 | 空 |
 | 测试翻译会话 | TestTranslation | 实现层 | 源测试文件、覆盖模块归属的契约签名（ContractArtifact）、目标测试框架约定 | 空 |
 | 测试生成会话 | TestGeneration | 实现层 | 源模块正文（被测模块代码语义）、契约签名（ContractArtifact 目标路径、公开签名、types_hash）、生成指引（目标测试框架约定与生成规则） | 空 |
@@ -187,14 +199,24 @@ sequenceDiagram
 
 **规则条目提案出口**（fb8 续对齐，Anthropic 迁移实践吸收）：重生成会话的归因诊断揭示**系统性**误译模式（同一规则缺失跨文件重复致错）时，owning 会话除修正代码外可附《规则条目提案》——条目带归因引用与理由，经 Harness 记入 `run_events` 审计后写入 MigrationRulebook 并递增版本（M-00 契约）；新版本即时生效于**后续派发**会话的 Context Pack 规则书章节，已集成成果零追溯。提案是会话产出的可选组成，不构成写通道——采纳与入账由 Harness 完成，模型不能直接修改任何其他 Slice 或已冻结工件。
 
+**会话类型扩展的上下文构成补充**：上述四类 Slice 会话的测试类**信息防火墙保持不变**——测试翻译/测试生成会话仍不注入被测实现的目标语言正文（已集成与否均然），被测行为事实仅经契约签名进入上下文。新增的常驻协调会话与修复会话的上下文构成标注如下：
+
+| 会话 | 上下文构成 | 备注 |
+|---|---|---|
+| 探索协调者 / EXECUTE Supervisor（常驻协调会话） | 机器态势快照（不入上下文）+ 触发时定向事件投影注入 + 滚动摘要（历史唤醒有界窗口） | 只出建议（Advice）、零直写；输入经 Harness 注入，不带自由跨会话记忆 |
+| 修复会话 | 修复简报（必要输入）+ 全 Run verified 树 / 源快照 / 失败测试 / PSF-2 调用链（导航索引式按需 `ReadFile`） | 身份 `(run_id, repair_decision_id)`，不占原 Slice generation 0-2 |
+| 原 Slice 重生会话（升级包场景） | 常规重生成 Context Pack（含前代失败诊断与前代 diff 摘要）+ 全境读视野 + 修复简报 | 仍占用原 Slice generation，验证走 checkpoint→局部→集成 |
+
+修复简报为修复会话与重生升级包会话的**必要输入**；其余读路径（verified 树、源快照、调用链细部）采用导航索引式按需 `ReadFile`，超限细节的装配与预算治理归 M-14（字段 schema 与装配规则为实施期开放项，在 M-14/M-16 定案前不臆造）。
+
 ## 理解会话：语义消解本体＝起草会话深潜（产制点归一）
 
-产制点归一定案：**理解会话的本体是 Spec 起草会话的深潜阶段**——《项目理解档案》在起草期产出并经用户确认，CreateRun 时作为三件冻结输入之一已齐备；ANALYZE 阶段不再承担语义消解产出，只做机械完备层管线执行＋消费已冻结档案的一致性校验（偏差记入分析投影供 PLAN 与证据页引用）。理解会话以 Reasoning 档运行（fb8 对齐：从辅助摘要升为语义消解主体；X1 归一后其位置在起草期深潜）。输入是 M-06 机械完备层的候选事实（文件清单、import 候选全集、PSF 锚点索引——枚举保底不漏）与用户迁移需求上下文；产出是《项目理解档案》UnderstandingDossier 草稿（M-00 公共契约）。
+产制点归一定案：理解会话的本体是 Spec 起草会话的深潜阶段。主会话按模块/目录域扇出只读探索子会话，合并带 file:range 锚点和置信度理由的结构化报告，产出 Spec、UnderstandingDossier、TargetProjectBlueprint、MigrationRulebook 四件工件。用户确认后四者一起哈希冻结为 Run 输入；ANALYZE 不重新生成语义档案，只做机械完备层管线与一致性校验。
 
 - **探索策略**：入口文件 → 依赖闭包定向展开 → 代表性文件抽查；批量结构查询用 `Exec` 编排只读工具（一次调用多步探索），深度由预算档约束（`Shallow/Deep`，M-14 数值实施期基准；小项目可浅档甚至跳过深潜）。
 - **工具面**：`ReadFile`/`QuerySourceAst`/`Exec`（编排只读三件），无任何写权限；档案草稿经会话通道持久化（TaskDraft 体系，M-16），不经 WriteFile。
 - **档案质量纪律**：全条目 file:range 锚点必填且可解析到冻结快照内真实位置；无法锚定的叙述显式标记 `advisory`；覆盖率自述如实声明触达与未读区域；不引入概率置信度——判定附文字理由。
-- **确认门**：档案草稿随 Spec 草稿一并交用户多轮审阅（流程 owner M-16），显式确认后以内容 hash 冻结为 Run 的第三件输入（PLAN 消费）；未确认的档案零 Run 副作用。PlanRevision 时档案随修订走重确认通道（M-16/M-07）。
+ - **确认门**：四件工件草稿随起草会话一并交用户审阅，显式确认后分别记录版本和 hash 并冻结为 Run 输入；未确认的工件零 Run 副作用。PlanRevision 时仅对发生语义变化的工件走 M-16 重确认通道。
 - **执行继承**：各 EXECUTE 会话 Context Pack 按 source_modules 关联注入档案摘录（惯用法/风险提示/依赖叙事，M-14 装配规则），替代执行期盲探。
 
 ## Spec 起草会话：ANALYZE 前的交互阶段
@@ -204,6 +226,36 @@ Spec 起草会话是四类 Slice 会话之外的一类模型会话，发生在 A
 流程：用户选定源项目路径 → 以自然语言输入迁移需求 → Agent 只读探索源项目（ReadFile/QuerySourceAst，ANALYZE 级授权）→ 起草 Spec 草稿（语言对、翻译范围、工件策略、测试策略的建议值）→ 经 AskUser 补齐关键决策 → 用户审阅草稿全文（支持多轮修改与再对齐）→ 用户显式确认后 Spec 才生效进入 CreateRun。
 
 边界：Agent 只起草、不提交——草稿生效的确认权在用户，未经确认的草稿不产生任何 Run 副作用；起草会话工具面为只读探索 + AskUser，无写权限（无 WriteFile/EditFile/Shell/Exec），Spec 草稿的持久化走会话通道（TaskDraftRevision 账本，M-16）而非 WriteFile；探索对象为用户选定项目的只读事实，不触达任何候选工作区或托管输出。AskUser 属于会话 Agent 通道而非 phase 工具面（见"会话 Agent 与迁移 Agent 的隔离"）。
+
+## 常驻协调会话类型（判断层落地于 Agent Loop）
+
+两类常驻协调会话把判断层落地在 Agent Loop，二者均**只出建议（Advice）、零直写权**，计入模型会话池并受独立预算档（预算档位由 M-14 差异化配置）；VERIFY/REPORT 零模型硬边界不破——常驻协调会话同样不进入 VERIFY 裁决面。
+
+### 探索协调者（起草期）
+
+探索协调者是起草期主会话的升级形态，在深潜理解阶段承担只读探索子会话的调度协调。它持有**切域调整建议权**：围绕 Harness 产出的机器骨架，可建议对探索域做合并/拆分/重点标注，并为每名探索员下发展 `focus brief`。这些建议经 Harness 机器校验（覆盖恰好一次、扇出与预算上限）后才派发；需要时探索员可按需改派。探索协调者仅持有只读探索工具面（ReadFile/QuerySourceAst/Exec 编排只读三件），**无任何写权限**——WriteFile/EditFile/Shell 零接纳，与 Spec 起草会话同源的行为限制（草稿与档案经会话通道持久化，不经 WriteFile）。
+
+### EXECUTE Supervisor（执行期）
+
+EXECUTE Supervisor 是被动唤醒式常驻会话，在 Slice 会话运行期常驻但默认静默，仅承担两个职责：
+
+1. 归因多义/双错 → 全局修复决策；
+2. Slice 会话失败停止 → 异常语义路由建议。
+
+其观察模型是**态势快照**：态势由机器算入、不导入模型上下文以控制 token 占用；仅当被触发时做**定向事件投影注入**（把相关事件事实投影注入上下文），并配**滚动摘要**——历史唤醒保持有界窗口。Supervisor 只输出建议（Advice）、零直写权：全局修复经"修复会话"落地（见下节），异常语义路由建议仅供 Harness/M-10 参考，模型不经 Supervisor 直接修改任何 Slice 候选。
+
+两者均计入模型会话池、受独立预算档，其工具面沿既有六工具 L1-L4 分层的只读子集，不新增信任面。（探索协调者切域调整的机器校验门禁、Supervisor 唤醒阈值、滚动摘要的有界窗口/预算数值为实施期开放项，归 M-14/M-16 定案前不臆造。）
+
+## 修复会话：全局修复的专门会话
+
+修复会话是 EXECUTE Supervisor（或 M-10 归因逻辑）在归因多义/双错需全局决策时派发的专门会话类型，身份为 `(run_id, repair_decision_id)`，**不属于原 Slice**，**不占用原 Slice 的 generation 0-2 余额**。
+
+- **读**：全 Run verified 树 + 源快照 + 失败测试 + PSF-2 调用链 + 修复简报。
+- **写**：修复集联合域——并集内路径无在途并行写者的条件下构成**条件安全联合域**；写范围由 Harness 基于在途并行写入状态在派发时冻结。
+- **验证**：走 `checkpoint → 局部 → 集成` 的既有裁决链。
+- **简单场景**：当失败清晰归因于单个 Slice 且无需跨域协调时，由原 Slice 的**重生会话**承担修复；重生会话获"**升级包**"——全境读视野 + 修复简报，作为其 Context Pack 的补充输入（仍占用原 Slice generation，验证亦走 checkpoint→局部→集成）。
+
+修复简报是修复会话与重生升级包会话的**必要输入**（含归因结论、失败测试、影响范围）；其余读路径（verified 树、源快照、调用链细部）采用**导航索引式按需 ReadFile**——超限细节的装配与预算治理归 M-14。（修复集联合域的在途并行写者判定语义、修复简报字段 schema 为实施期开放项，在 M-14/M-16 定案前不臆造。）
 
 ## P-05 落地：源码是数据不是指令
 
@@ -254,15 +306,15 @@ provider 的可重试基础设施错误只在 Run 未取消、当前 generation/
 
 ## 会话 Agent 与迁移 Agent 的隔离
 
-[M-16](CodeMigrator_会话与运行时修正编排.md) 的会话 Agent 负责 Spec 起草、TaskDraft、AskUser 与运行时修正（PlanRevision、CorrectionIntent）；本篇的迁移 Agent 只消费 actor 已冻结的 PlanRevision、Spec、锁定知识目录与最小上下文。运行中的自然语言不会直接进入正在执行的模型调用；AskUser 不在 Phase 工具授权矩阵内。Spec 起草会话由会话 Agent 承担，其只读探索+AskUser 工具面不经 phase policy 扩权——起草产物只能经用户确认进入 CreateRun，不能直接进入任何迁移 Agent 会话。
+[M-16](CodeMigrator_会话与运行时修正编排.md) 的会话 Agent 负责 Spec 起草、TaskDraft、AskUser 与运行时修正（PlanRevision、CorrectionIntent）；本篇的迁移 Agent 只消费 actor 已冻结的 PlanRevision、四件工件、锁定知识目录与最小上下文。运行中的自然语言不会直接进入正在执行的模型调用；AskUser 不在 Phase 工具授权矩阵内。Spec 起草会话由会话 Agent 承担，其只读探索+AskUser 工具面不经 phase policy 扩权——起草产物只能经用户确认进入 CreateRun，不能直接进入任何迁移 Agent 会话。
 
 锁定知识（Skill 目录）只作为上下文选择输入参与各阶段；其中嵌入的工具、shell、script、hook 与 model/effort 指令一律忽略并记录提示——模型不能借知识条目扩权、弱化检查或触碰冻结计划。修正被接纳并触发重生成后，受影响 Slice 的旧 candidate 会话与上下文失效，只有新 generation 的冻结输入允许再次推理。
 
 隔离的判定标准很简单：会话 Agent 的输出只能改变"将要迁移什么"，迁移 Agent 的输出只能改变"候选工作区里有什么"；两条输出通道在 actor 处汇合、互不直连，任何一侧都不能冒充另一侧产生事实。
 
-## 贯穿场景：一次实现 Slice 会话与一次越界拒绝
+## 贯穿示例：一次实现 Slice 会话与一次越界拒绝
 
-TS→Python Run 中实现 Slice A 负责 `models` 模块，依赖契约 Slice C 已集成的 models 契约：
+以下假设 Planner 选择了 Contract Slice C，仅用于说明一种合法 DAG；若没有 Contract Slice，A 按提案中的实际前驱与上下文启动：
 
 1. 前置：Run 能力门已预检双工具链描述符与镜像摘要（M-00）；A 的 Context Pack 在 dispatch 时冻结——契约取自当前 verified、源模块取自冻结快照，此后会话内一切补读都以冻结 OID 为准，而非可变工作副本。
 2. A 的依赖契约已集成、write scope 与并行 Slice 不相交，Harness 创建 A 的候选工作区与 generation 0 会话，注入实现会话上下文（models 源模块、ContractArtifact、目标端约定）。
@@ -270,13 +322,21 @@ TS→Python Run 中实现 Slice A 负责 `models` 模块，依赖契约 Slice C 
 4. 模型 WriteFile `src/models/user.py`（本 Slice 白名单内）。
 5. 模型经 Shell 在长驻沙箱内跑 typecheck 自检，输出返回某函数签名与契约不符（file:line）。
 6. 模型 EditFile 修正签名，再次自检通过。
-7. 模型声明完成；Harness 对工作区文件集做 checkpoint commit（提交时校验 Git diff 全落冻结 write scope，覆盖 Shell 写效果），以 expected old OID 推进 candidate ref，随后进入局部验证（语法 + 对契约的类型检查，M-10）。同组的测试翻译 Slice T 在 A 集成后才获得含 A 已集成实现的测试会话上下文。
+7. 模型声明完成；Harness 对工作区文件集做 checkpoint commit（提交时校验 Git diff 全落冻结 write scope，覆盖 Shell 写效果），以 expected old OID 推进 candidate ref，随后进入局部验证（语法 + 对可用契约事实的类型检查，M-10）。测试翻译 Slice T 的上下文仍以源测试与可用契约签名为硬输入，不注入被测实现的目标正文；其验证保序由 M-10 在场门控承担。
 
 同会话中若模型尝试 WriteFile `src/api/client.py`（属实现 Slice B 的白名单）：ToolGateway 返回 `WRITE_SCOPE_VIOLATION`，文件写入、candidate ref 推进与 checkpoint 均为零；模型收到类型化拒绝后可继续在自身白名单内工作，该次尝试进入工具调用审计。
 
 两个场景合起来覆盖了循环的关键边界：正路径上，模型的全部动作（读契约、读源码、写目标、自检、修正）都发生在工具箱内，Harness 只在两端出现——dispatch 注入冻结上下文与完成后 checkpoint；错误路径上，越权不是被事后回滚，而是在 Gateway 处被类型化拒绝，零副作用发生。
 
-## 可证伪施工验收
+## V5 可验收增量
+
+- [ ] 起草会话可按模块/目录域扇出只读探索，子会话零直连；主会话合并带 file:range、覆盖率和置信度理由的报告，并显式保留冲突。
+- [ ] 用户一次确认 Spec、UnderstandingDossier、TargetProjectBlueprint、MigrationRulebook 四件工件；Planner 自动提案并经机器校验冻结，不逐 Slice 询问用户。
+- [ ] EXECUTE 会话只消费 Planner 冻结的 Slice、DAG、write scope、integration_rank 与六工具授权；Contract Slice 可为 0，依赖闭包就绪即启动。
+- [ ] 测试翻译与测试生成会话不接收被测实现目标正文；生成测试产出全链路携带 GENERATED，VERIFY/REPORT 不开启模型会话。
+- [ ] 运行期结构变化只经 M-16 安全点与 ImpactPreview 确认后重规划未集成部分，已验证主线不被会话直接改写。
+
+## V4 历史验收基线（追溯，非当前 V5 契约）
 
 - [ ] V-M04-V4-001：EXECUTE 会话的可调用工具面恰为 `ReadFile/WriteFile/EditFile/QuerySourceAst/Shell/Exec` 六工具（L1-L4 四层）；ANALYZE/PLAN 会话恰为 `ReadFile` 与 `QuerySourceAst`；VERIFY/REPORT 为空集；运行期不存在第七工具的注册路径，请求 `CheckRunner` 工具名返回 `TOOL_NOT_FOUND`
 - [ ] V-M04-V4-002：写路径不属于本 Slice 冻结 write scope 的 WriteFile/EditFile 请求返回 `WRITE_SCOPE_VIOLATION`，且文件写入、candidate ref 推进与 checkpoint receipt 均为 0

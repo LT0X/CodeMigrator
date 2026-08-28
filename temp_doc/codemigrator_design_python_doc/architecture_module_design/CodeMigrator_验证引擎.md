@@ -1,13 +1,17 @@
 # CodeMigrator 验证引擎：三层验证、测试移植主证与诊断归因
 
-> 文档状态：V4 当前架构基线。  
+> 文档状态：V5 方向对齐版。  
 > 技术范围：三层检查集实例化、描述符命令面、执行事实归一、P-09 符号级诊断归因与守恒信号辅助归因、测试移植验证侧（flaky 重跑/超时/部分完成）、生成测试验证语义（TestGeneration 同执行面、GENERATED 标注与信心分级双档）、行为 parity 场景对比（无测试模块的黑盒补充取证）、Test 空集预派发跳过、目标侧结构守恒计算、Oracle 派生与反向自检、验证边界声明、语义 fingerprint 与非确定性检测。  
 > 契约真相：`CheckResult`、`VerificationSubject`、`VerificationOutcome`、`verification_fingerprint`、`DerivedVerificationGuard`、`CheckCommandTemplate`、`CheckStatus` 与 `DiagnosticMapping` 由 [M-00：设计原则、系统地图与公共契约](CodeMigrator_垂类设计原则与架构哲学.md) 唯一定义；write scope 查表基础与 required checks 冻结由 [M-07：迁移计划生成器](CodeMigrator_迁移计划生成器.md) 拥有；F3 覆盖映射、F2 import 图与 PSF-2 项目索引（符号级覆盖边）由 [M-06：代码分析与 AST 引擎](CodeMigrator_代码分析与AST引擎.md) 拥有；`Shell` 会话自检通道（自检=反馈不裁决）与工具面边界由 [M-12：工具系统与 Hook](CodeMigrator_工具系统与Hook.md) 拥有；本篇拥有三层检查集合实例化、Test 空集预派发跳过语义、生成测试验证语义（同执行面与 GENERATED 标注）、目标侧结构守恒计算、守恒信号辅助归因、验证边界声明、Oracle 派生、失败归因与 generation 失败归约。  
 > 关联文档：[公共契约](CodeMigrator_垂类设计原则与架构哲学.md)、[Harness 总体设计](CodeMigrator_Harness总体设计.md)、[代码分析与 AST 引擎](CodeMigrator_代码分析与AST引擎.md)、[迁移计划生成器](CodeMigrator_迁移计划生成器.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[沙箱与执行环境](CodeMigrator_沙箱与执行环境.md)、[Git 集成](CodeMigrator_工作空间与Git集成.md)、[工具系统与 Hook](CodeMigrator_工具系统与Hook.md)、[会话与运行时修正编排](CodeMigrator_会话与运行时修正编排.md)。
 
-跨语言翻译没有"逐文件改完即交付"：源项目（如 TypeScript）被全量翻译为目标语言（如 Python）新项目后，语义等价的唯一确定性主证是**翻译后测试套件在目标项目通过**（P-02；源无测试模块由测试生成 Slice 以源语义+契约签名为锚点承接，主证降一档，见生成测试的验证语义节），辅以描述符声明的编译/lint/类型检查。验证引擎因此围绕三层证据组织：Slice 候选的局部自检、每次集成后的增量全量检查、全部 Slice 终态后完整输出项目的翻译后全套测试。三层名称与确定性 fingerprint 机制沿用，检查内容按 V4 重定义；检查命令的唯一来源是 Run 创建时冻结的目标端工具链描述符 `CheckCommandTemplate`——不存在插件进程、BuildArgv 或 wire 命令面，V3 的受控重放验证、补丁重放语义与前置/替换/锚点/内容字节哈希全部废除，集成验证的对象改为"队首 Slice 输出文件集应用到当前 verified 后的 prospective commit"（不相交文件集应用，M-11）。
+跨语言翻译没有"逐文件改完即交付"：源项目（如 TypeScript）被全量翻译为目标语言（如 Python）新项目后，语义等价的唯一确定性主证是**翻译后测试套件在目标项目通过**（P-02；源无测试模块由测试生成 Slice 以源语义+契约签名为锚点承接，主证降一档，见生成测试的验证语义节），辅以描述符声明的编译/lint/类型检查。验证引擎因此围绕三层证据组织：Slice 候选的局部自检、每次集成后的增量全量检查、全部 Slice 终态后完整输出项目的翻译后全套测试。三层名称与确定性 fingerprint 机制沿用，检查内容按当前 V5 契约执行；检查命令的唯一来源是 Run 创建时冻结的目标端工具链描述符 `CheckCommandTemplate`——不存在插件进程、BuildArgv 或 wire 命令面，V3 的受控重放验证、补丁重放语义与前置/替换/锚点/内容字节哈希全部废除，集成验证的对象改为"队首 Slice 输出文件集应用到当前 verified 后的 prospective commit"（不相交文件集应用，M-11）。
 
-`CheckRunner` 已作为 Agent 工具退役（M-12），"Agent 自检与 Harness 验证共用同一命令面"的旧表述随之废除。会话自检走 `Shell`：EXECUTE Agent 在长驻沙箱内自由执行构建/依赖/探索/自检，自检=反馈不裁决，其结果只进模型上下文，不写 `CheckResult`、不推进 SliceAttemptStatus、不参与 fingerprint；裁决层 `InternalVerificationDispatch` 是唯一冻结通道——本篇定义的三层验证全部由 Run actor 经 M-09 的 `InternalVerificationDispatch` 受信派发（冻结检查集 + tested_commit overlay → fingerprint 完整保持），裁决由冻结检查集独立做出。模型在 VERIFY 阶段无任何工具（含 `ReadFile`），只能消费归因后的诊断与验证 receipt 投影——失败解释与修复路由是 Harness 职责，不是模型裁量。
+`CheckRunner` 已作为 Agent 工具退役（M-12），"Agent 自检与 Harness 验证共用同一命令面"的旧表述随之废除。会话自检走 `Shell`：EXECUTE Agent 在长驻沙箱内自由执行构建/依赖/探索/自检，自检=反馈不裁决，其结果只进模型上下文，不写 `CheckResult`、不推进 SliceAttemptStatus、不参与 fingerprint；裁决层 `InternalVerificationDispatch` 是唯一冻结通道——本篇定义的三层验证全部由 app 直接管理的 bwrap 执行（冻结检查集 + tested commit 临时物化目录 → fingerprint），裁决由冻结检查集独立做出。模型在 VERIFY 阶段无任何工具（含 `ReadFile`），只能消费归因后的诊断与验证 receipt 投影。
+
+## V5 当前对齐
+
+Oracle 的确定性裁决不变：三层验证、翻译后测试主证、测试生成 GENERATED/LOW_QUALITY 门槛、fingerprint、flaky、P-09 归因、结构守恒、行为 parity、反向自检和测试执行保序均保留。变化仅在执行物理面：app 直接管理 bwrap，验证从被测 commit 临时物化目录启动，默认拒绝网络；验证不读取 Slice 长期卷，也不使用 worker/UDS/overlay。Planner 只负责提出计划，验证引擎不接受其绕过冻结检查集的命令。
 
 ## 三层验证回答三个不同问题
 
@@ -17,7 +21,7 @@
 | `ProspectiveIntegration`（增量集成） | 队首 Slice 输出文件集应用到当前 verified 后的 prospective OID | required checks 中全部非 Scaffold 模板：目标编译 + 全项目 lint/类型检查 + 树上已集成测试 | 允许创建 `IntegrationIntent` 并以 expected-OID 推进 verified | 接口冲突在此暴露；归因 owning Slice → 下一 generation |
 | `FinalVerified`（最终主证） | 全部 Slice 终态后冻结的 verified head OID | Test 模板全集：翻译后全套测试（移植测试与生成测试同冻结检查集、同判据执行） | `VERIFYING → REPORTING` | fingerprint 漂移优先 `NONDETERMINISTIC_VERIFICATION`；普通失败归因 → owning Slice 定向重生成；无法归属且失败证据模糊 → 守恒信号辅助归因；仍无法归属 → Run 终态判断 |
 
-局部成功只证明候选在"基线 verified（契约波产物 + 已集成内容）+ 本 Slice 输出"上语法成立、与契约类型一致；跨 Slice 接口冲突（如实现 Slice 对他模块契约签名的误用）由集成层类型检查裁决；最终层以全套翻译后测试作为语义等价主证，同时负责暴露测试不稳定与环境漂移。前两层属于 Run 的 `EXECUTING`，只有最终层属于 `VERIFYING`。
+局部成功只证明候选在"基线 verified（已集成的前置 Slice 产物，含可选契约工件）+ 本 Slice 输出"上语法成立、与可用契约类型一致；跨 Slice 接口冲突（如实现 Slice 对他模块契约签名的误用）由集成层类型检查裁决；最终层以全套翻译后测试作为语义等价主证，同时负责暴露测试不稳定与环境漂移。前两层属于 Run 的 `EXECUTING`，只有最终层属于 `VERIFYING`。
 
 ```mermaid
 flowchart LR
@@ -38,16 +42,16 @@ flowchart LR
 
 ## 检查命令与检查集：描述符模板的层实例化
 
-检查命令只有一条来源链：Spec 锁定双工具链描述符 → Run 创建时冻结描述符版本与摘要 → Harness 从目标端 `CheckCommandTemplate`（action/program/argv/timeout_secs）以冻结参数实例化。模型与 worker 都不能提供 program、argv、shell 片段或环境变量；命令面之外的执行请求零执行（工具侧拒绝语义归 M-12，内部派发同样只在描述符面内）。`invocation_hash` 覆盖 canonical(模板 sha256 + program + argv + timeout_secs)，不含 overlay 路径与宿主环境——这是命令身份的哈希，不是文件内容的字节哈希，不参与任何写入守卫。
+检查命令只有一条来源链：Spec 锁定双工具链描述符 → Run 创建时冻结描述符版本与摘要 → app 从目标端 `CheckCommandTemplate`（action/program/argv/timeout_secs）以冻结参数实例化。模型不能提供 program、argv、shell 片段或环境变量；命令面之外的执行请求零执行。`invocation_hash` 覆盖 canonical(模板 sha256 + program + argv + timeout_secs)，不含临时验证目录路径与宿主环境——这是命令身份的哈希，不是文件内容的字节哈希，不参与任何写入守卫。
 
 三层从 Spec 冻结的 required checks 全集中按 `CheckAction` 筛选并实例化（Planner 不裁剪检查集，M-07；筛选规则由本篇拥有）：
 
 | CheckAction | 局部 | 集成 | 最终 | 说明 |
 |---|---|---|---|---|
 | Scaffold | — | — | — | 一次性项目初始化，由 Harness 在输出基线初始化时执行（M-08/M-11），不属于任何验证层 |
-| Compile | ✓ 语法检查 | ✓ 全量编译 | — | 局部层在候选 overlay 上以语法与结构完整性语义运行 |
+| Compile | ✓ 语法检查 | ✓ 全量编译 | — | 局部层在 candidate commit 的临时物化目录上以语法与结构完整性语义运行 |
 | Lint | — | ✓ | — | 全项目规范检查，项目不完整时无意义 |
-| TypeCheck | ✓ 对契约 | ✓ 裁决契约一致性 | — | 候选树含契约波产出的契约文件（如 `.pyi` 类型桩），peer 实现在类型层面由桩满足 |
+| TypeCheck | ✓ 对契约（若有） | ✓ 裁决可用契约一致性 | — | 候选树可含 Planner 选择的 Contract Slice 产出的契约文件（如 `.pyi` 类型桩）；没有契约 Slice 时按目标项目实际类型事实执行 |
 | Test | — | ✓ 已集成测试（在场门控过滤） | ✓ 翻译后全套 | 集成层运行 prospective 树上**合格**的测试文件——合格=文件存在于树 ∧ 其覆盖实现 Slice（按 M-07 冻结覆盖映射查表）已全部集成；被测实现在场方执行该测试，未就绪测试顺延至其被测实现集成后的最近一次 Test 检查主体（后续 prospective 或最终层）；合格集为空时按预派发跳过处理（见 Test 空集语义节），产生 Passed/SkippedEmpty 回执 |
 
 执行任何 check 前，Harness 按 `CheckId` 原始字节升序冻结该层 canonical 检查子集并计算 `frozen_required_checks_sha256`。一次 outcome 必须恰好覆盖其冻结集合；结果缺失、重复、额外或 invocation hash 不匹配都不能产生允许推进的 guard。
@@ -61,15 +65,15 @@ flowchart LR
 | 恰一覆盖且全 Passed | none | true | 仍需 Error UNKNOWN=0 |
 | 恰一覆盖但含任一非 Passed | none | false | 0 |
 
-每个 CheckId 都从 subject 的 `tested_commit_oid` 创建独立一次性 validation overlay（M-09）：检查间不共享可写工作区，候选工作区、integration scratch 与 verified 树不挂载给不可信进程；一个 check 的生成文件不能使另一个 check 偶然通过。worker 重派同一 check 时也创建新 overlay，旧进程只能污染旧副本。`CheckStatus` 只有 `Passed/Failed/TimedOut/OutputLimitExceeded/InfrastructureError`；取消不属于检查状态——M-09 返回 `TerminationReceipt`，验证引擎不发布 CheckResult、outcome 或 guard。active DispatchAttempt gate 在进入本模块前完成（M-03/M-09）。
+每个 CheckId 都从 subject 的 `tested_commit_oid` 创建独立临时物化目录（M-09）：检查间不共享可写工作区，候选长期卷、integration scratch 与 verified 树不挂载给不可信进程；一个 check 的生成文件不能使另一个 check 偶然通过。重派同一 check 时也创建新目录，旧进程只能污染旧副本。`CheckStatus` 只有 `Passed/Failed/TimedOut/OutputLimitExceeded/InfrastructureError`；取消不属于检查状态。active DispatchAttempt gate 在进入本模块前完成（M-03/M-09）。
 
 ## Test 空集语义：预派发跳过
 
 Test 检查的空集行为不依赖工具对"空收集"的退出行为。Harness 在派发前做一次确定性判定：action 为 Test，且该检查主体上的**合格测试集合为空**——合格=文件存在于检查 subject 树（集成层的 prospective、最终层的 verified）∧（最终层无附加条件；集成层该文件的覆盖实现 Slice 已按 M-07 冻结覆盖映射全部集成，即 M-10 在场门控）。这是 Git tree 与冻结计划上的确定性查表事实，零模型裁量，与工具运行时行为无关。
 
-判定成立时的处置是**不派发沙箱**（零 UDS 派发、零 overlay 创建、零沙箱开销），由 Harness 直接产生 `status=Passed` 且携带 `disposition=SkippedEmpty` 的 typed receipt。该回执不经执行事实归一（无执行事实可归一），但正常进入 CheckResult 账本与 verification fingerprint：`invocation_hash` 仍按冻结模板计算（命令身份与是否实际执行无关），诊断集为空，exact-set 恰一覆盖不变式照常成立。
+判定成立时的处置是**不启动 bwrap**（零执行位、零临时验证目录、零沙箱开销），由 Harness 直接产生 `status=Passed` 且携带 `disposition=SkippedEmpty` 的 typed receipt。该回执不经执行事实归一，但正常进入 CheckResult 账本与 verification fingerprint。
 
-该语义对集成与最终两层同构适用：集成层对应"合格测试集合为空（含在场门控过滤后为空——树上已有测试文件但其被测实现尚未集成的情形）"，最终层对应"计划确实不含任何测试产出"——源无测试模块经 `EmptyTestSuite` 标注（M-06）由 M-07 派生测试生成 Slice 承接，常态下最终层树上存在移植或生成测试文件，空集跳过保留为该派生未发生时的机制兜底；局部层不实例化 Test，不涉及。设计动机（D-033）：pytest 等真实工具对空收集返回非零 exit（pytest 为 5，`EXIT_NOTESTSCOLLECTED`），任何"工具空收集 exit code=0"的假设都会让契约波首次集成必然伪失败；预派发跳过把空集处理移出工具行为面，零工具特定 exit code 知识。
+该语义对集成与最终两层同构适用：集成层对应"合格测试集合为空（含在场门控过滤后为空——树上已有测试文件但其被测实现尚未集成的情形）"，最终层对应"计划确实不含任何测试产出"——源无测试模块经 `EmptyTestSuite` 标注（M-06）由 M-07 派生测试生成 Slice 承接，常态下最终层树上存在移植或生成测试文件，空集跳过保留为该派生未发生时的机制兜底；局部层不实例化 Test，不涉及。设计动机（D-033）：pytest 等真实工具对空收集返回非零 exit（pytest 为 5，`EXIT_NOTESTSCOLLECTED`），任何"工具空收集 exit code=0"的假设都会让带有契约前置的 Slice 首次集成必然伪失败；预派发跳过把空集处理移出工具行为面，零工具特定 exit code 知识。
 
 **在场门控的失败归因含义**：门控保证集成层 Test 执行时其全部被测实现在场，因此 import/收集失败不再出现"测试先于实现集成"的歧义态——符号级归因（P-09）的落点判定不会要求重生成一个尚未集成的 Slice；未就绪测试顺延执行后，其失败按既有符号级/文件级规则归因于已集成主体，generation 语义不被穿透。
 
@@ -97,7 +101,7 @@ Test 检查的空集行为不依赖工具对"空收集"的退出行为。Harness
 
 | 诊断类别 | 归因算法 | 结果 |
 |---|---|---|
-| 编译/lint/类型诊断（FileLine） | `file_path` 匹配各 Slice 冻结 write scope；write scope 两两不相交或有序串行保证唯一命中 | 命中唯一 Slice 即 owning Slice；契约文件（`.pyi`）与构建文件命中契约 Slice；实现文件对契约签名的误用诊断落在使用处文件，归实现 Slice |
+| 编译/lint/类型诊断（FileLine） | `file_path` 匹配各 Slice 冻结 write scope；write scope 两两不相交保证唯一命中 | 命中唯一 Slice 即 owning Slice；若计划包含 Contract Slice，契约文件（`.pyi`）与构建文件可命中该 Slice；没有契约 Slice 时按实际承载这些路径的 Slice 归属；实现文件对接口签名的误用诊断落在使用处文件，归实现 Slice |
 | 测试失败（TestIdentity）符号级主路径 | 失败测试用例经 PSF-2 符号级覆盖边（测试用例→被测符号，M-06）关联到被测符号；失败证据（异常栈、断言差值的 file:line）落点经 ReferenceSite 索引符号化后按引用闭包判定归属：落点符号定义于某实现 Slice 的 write scope → 归该实现 Slice；证据仅落在测试文件自身 → 归测试翻译/测试生成 Slice | 实现语义不等价归实现 Slice，重生成时以契约为对齐基准；翻译错误（断言翻译错、fixture 丢失、import 误写）与生成测试自身缺陷归测试翻译/测试生成 Slice |
 | 测试失败文件级两步归因（符号级解析失败时的降级路径） | 符号级解析失败（符号级覆盖边缺失、失败证据落点无法符号化、text-fallback 语言无 PSF-2 条目）时降级兼容既有文件级路径：第一步测试文件路径匹配 write scope → 候选归属为该测试翻译/测试生成 Slice；第二步失败证据落点判定：命中被测模块依赖闭包内某实现 Slice 的 write scope → 归该实现 Slice；仅落在测试文件自身 → 维持测试翻译/测试生成 Slice | 同上；模块级粒度是符号级解析失败时的兜底而非替代，符号级升级不丢失任何模块级事实（M-06） |
 | 归因失败 | 符号级与文件级均无命中、多义命中或 target 为 Unknown；失败证据模糊者先经守恒信号辅助归因（见下节） | 不触发重生成，进入所在层的终态路径（见失败处理） |
@@ -146,7 +150,7 @@ flowchart TB
 
 测试移植是一等设计线程，验证侧承接三组确定性机制。策略常量（重跑次数、判定阈值、反馈修复上限）纳入编译时冻结的验证策略资源并计算 SHA-256；描述符、模型与运行期配置都不能修改。
 
-**flaky 重跑策略**：仅适用于 Test action、`Failed` 状态、集成与最终两层。原始执行失败后，以同一 tested commit、同一冻结模板、全新 overlay 重跑 2 次，共 3 次执行，per-test 多数判定（≥2/3）。命令面冻结意味着重跑即重执行同一模板，不做单测筛选；判定以 per-test 结果稳定性为单位。
+**flaky 重跑策略**：仅适用于 Test action、`Failed` 状态、集成与最终两层。原始执行失败后，以同一 tested commit、同一冻结模板、全新临时物化目录重跑 2 次，共 3 次执行，per-test 多数判定（≥2/3）。命令面冻结意味着重跑即重执行同一模板，不做单测筛选；判定以 per-test 结果稳定性为单位。
 
 | per-test 三次结果 | 判定 | 语义与动作 |
 |---|---|---|
@@ -165,7 +169,7 @@ flaky 归一在 CheckResult 发布前完成，check 的 `status` 与 diagnostics
 
 源无测试模块（`EmptyTestSuite` 标注，M-06）由 Planner 派生测试生成 Slice（`SliceKind.TestGeneration`，M-07）——以源模块代码语义与契约签名为锚点生成目标语言测试，行为锚定源语义而非凭空编写（M-00）。其产出的生成测试在验证侧与移植测试同权执行、在证据侧降档区分。
 
-**同执行面，同判据**：生成测试与移植测试走完全相同的执行面——裁决层 `InternalVerificationDispatch` 以冻结检查集派发，从 `tested_commit_oid` 创建一次性 validation overlay，同一 `CheckCommandTemplate` 冻结实例化。不因 GENERATED 降低执行严格性：exact-set 恰一覆盖、invocation hash、执行事实归一、flaky 重跑策略、`CheckStatus` 语义与 Error UNKNOWN=0 门全部同判据适用；Test 空集预派发跳过语义亦同构——生成测试文件入树后，Test 检查即非空集。
+**同执行面，同判据**：生成测试与移植测试走完全相同的执行面——裁决层 `InternalVerificationDispatch` 以冻结检查集启动 app-managed bwrap，从 `tested_commit_oid` 创建临时物化目录，同一 `CheckCommandTemplate` 冻结实例化。不因 GENERATED 降低执行严格性：exact-set 恰一覆盖、invocation hash、执行事实归一、flaky 重跑策略、`CheckStatus` 语义与 Error UNKNOWN=0 门全部同判据适用。
 
 **GENERATED 标注贯通，fingerprint 计算规则不变**：生成测试的 CheckResult receipt 与验证 fingerprint 记录携带 GENERATED 标注，与移植测试严格区分（M-00 全链路语义：产出文件、CheckResult receipt、验证 fingerprint 与 REPORT 证据页四处显式标注）。GENERATED 是标注维度而非 fingerprint 计算输入——`verification_fingerprint` 仍只覆盖 `canonical(tested_commit_oid, frozen_required_checks_sha256, semantic_results)`，同一检查无论产出是否生成测试都按同一规则计算指纹；GENERATED 作为 evidence 呈现维度参与 M-15 投影（REPORT 证据页的 GENERATED 标注与双档分级展示）。
 
@@ -173,7 +177,7 @@ flaky 归一在 CheckResult 发布前完成，check 的 `status` 与 diagnostics
 
 ## Outcome 身份与语义 fingerprint 分离
 
-`VerificationOutcome.subject` 决定证据属于局部、集成还是最终；`tested_commit_oid` 必须等于 subject 中实际被检查的 OID。证据防替换由**完整 outcome 落库承载**——CheckResult、receipt、ArtifactRef 与 flaky 重跑原始 receipts 全量持久化；如实现期需要额外的证据身份派生值，属实现细节而非公共契约，不参与任何判定。fingerprint 机制对三层同构适用：`verification_fingerprint` 只覆盖 `tested_commit_oid + frozen_required_checks_sha256 + semantic_results`，其中 semantic results 按 CheckId 排序，每项只含 check_id/invocation_hash/status/diagnostic semantic hash；不含 Run/Slice/generation、subject variant、worker、DispatchAttempt、执行时长、receipt 或日志载体。fingerprint 的 canonical 计算输入也不含 GENERATED 标注与 Shell 会话自检结果：前者是随 CheckResult 账本记录呈现的标注维度（M-15 投影），不改变指纹值；后者是反馈通道而非裁决通道——裁决由冻结检查集独立做出（P-02），自检结果不进 fingerprint，指纹计算输入与无自检会话逐字节一致（M-12）。重新执行同一 commit 与检查集时，日志载体变化不改变 fingerprint（仅体现为不同的证据载体记录）；状态或诊断语义变化才改变 fingerprint。
+`VerificationOutcome.subject` 决定证据属于局部、集成还是最终；`tested_commit_oid` 必须等于 subject 中实际被检查的 OID。证据防替换由完整 outcome 落库承载——CheckResult、receipt、ArtifactRef 与 flaky 重跑原始 receipts 全量持久化。fingerprint 机制对三层同构适用：只覆盖 `tested_commit_oid + frozen_required_checks_sha256 + semantic_results`，不含 Run/Slice/generation、subject variant、DispatchAttempt、执行时长、receipt、日志载体、GENERATED 标注或 Shell 自检结果。重新执行同一 commit 与检查集时，日志载体变化不改变 fingerprint，状态或诊断语义变化才改变 fingerprint。
 
 **生成测试最低质量门槛**：每个生成测试文件至少含一个非平凡断言（断言对象非常量、比较两侧不恒等）；空断言与同义反复断言（`assert True` 类）在 CheckResult receipt 层标记 `LOW_QUALITY` 并计入 REPORT 证据页——此类产出不得作为生成测试主证的支撑条目。质量门槛是确定性 AST 计数判定，不经模型评审；变异测试类机制明确不做（对实现注入确定性变异以验证测试杀伤力属重机制，收益不抵复杂度，记录为已考虑并排除）。
 
@@ -188,7 +192,7 @@ flaky 归一在 CheckResult 发布前完成，check 的 `status` 与 diagnostics
 
 ## Oracle 是纯派生门
 
-`DerivedVerificationGuard` 只从 outcome 的 exact-set、invocation hash、CheckStatus 与 diagnostics 派生。提交许可严格等价于 `all_required_checks_passed && error_unknown_count == 0`；插件、worker、模型、API 与数据库写接口都不能直接提交这两个字段。`Shell` 会话自检（M-12）的结果不进入本门：自检=反馈不裁决，Agent 自检通过不等于局部验证通过，提交 checkpoint 后 Run actor 仍按冻结检查集独立派发局部验证——裁决只由冻结检查集经 `InternalVerificationDispatch` 产出。
+`DerivedVerificationGuard` 只从 outcome 的 exact-set、invocation hash、CheckStatus 与 diagnostics 派生。提交许可严格等价于 `all_required_checks_passed && error_unknown_count == 0`；Planner、模型、API 与数据库写接口都不能直接提交这两个字段。`Shell` 会话自检的结果不进入本门：自检=反馈不裁决，Agent 自检通过不等于局部验证通过，提交 checkpoint 后 Run actor 仍按冻结检查集由 app-managed bwrap 独立执行局部验证。
 
 | exact set / hash | statuses | Error UNKNOWN | guard 结果 |
 |---|---|---:|---|
@@ -210,7 +214,7 @@ LocalCandidate guard 只改变 Slice 局部投影（进入集成排队）；Pros
 
 ## 失败处理：反馈修复、定向重生成与终态归约
 
-失败类别只由 `VerificationSubject` 层级、`CheckAction`、稳定 `CheckStatus`、归因结果与 flaky 判定映射。模型说明、日志自然语言和人工偏好都不是分类输入。V3 的 `MIGRATION_*` 错误码 allowlist、基线对照签发与前置哈希冲突分类随字节哈希体系一并废除——V4 的可重生成判据只有一条：**P-09 归因唯一命中 owning Slice**。
+失败类别只由 `VerificationSubject` 层级、`CheckAction`、稳定 `CheckStatus`、归因结果与 flaky 判定映射。模型说明、日志自然语言和人工偏好都不是分类输入。V3 的 `MIGRATION_*` 错误码 allowlist、基线对照签发与前置哈希冲突分类随字节哈希体系一并废除——当前 V5 的可重生成判据只有一条：**P-09 归因唯一命中 owning Slice**。
 
 优先级从上到下只命中一次：
 
@@ -244,7 +248,7 @@ generation 语义与 M-00 一致：初始 `0`，语义重生成依次使用 `1`�
 
 ## 最终验证闭环：稳定性比较优先，归因驱动定向重生成
 
-全部 Slice 终态后，Run actor 冻结当前 verified OID 与最终检查集，进入 `VERIFYING` 并生成完整 FinalVerified outcome。与 V3"最终失败直接归约"不同，V4 的最终失败有价值路由：翻译后测试的失败大多可以归因到 owning Slice 并在其 generation 余额内修复。
+全部 Slice 终态后，Run actor 冻结当前 verified OID 与最终检查集，进入 `VERIFYING` 并生成完整 FinalVerified outcome。与 V3"最终失败直接归约"不同，当前 V5 的最终失败有价值路由：翻译后测试的失败大多可以归因到 owning Slice 并在其 generation 余额内修复。
 
 判定顺序固定，不可交换：
 
@@ -258,7 +262,7 @@ generation 语义与 M-00 一致：初始 `0`，语义重生成依次使用 `1`�
 sequenceDiagram
     participant R as Run actor 运行执行器
     participant V as Verification engine 验证引擎
-    participant W as sandbox worker M-09
+    participant W as app-managed bwrap M-09
     participant I as Integration Coordinator
     R->>V: 冻结 verified head + 最终检查集
     V->>W: InternalVerificationDispatch Test 全集
@@ -328,9 +332,9 @@ class StructuralConservationFacts(BaseModel):
 
 ## Run actor 内部派发与迟到结果
 
-`InternalVerificationDispatch` 是 Run actor 到 M-09 sandbox worker 的受信内部服务，不是模型工具、不在 phase policy 注册（M-00）。actor 可在 `EXECUTING` 对 `LocalCandidate` 与 `ProspectiveIntegration` 发起（常规调度），在 `VERIFYING` 对 `FinalVerified` 发起、并仅限终层归因驱动重生成的候选—集成子回路内对 `LocalCandidate` 与 `ProspectiveIntegration` 发起（V-M10-V4-014，子回路重集成同样走 intent/CAS/receipt 全链）；每次派发携带 `ExecutionSubject`、`DispatchAttemptId`、冻结 `RequiredCheck` 及其模板实例化、一次性 validation overlay grant，并受 `cancel_requested`、active-attempt gate、输出上限与沙箱策略约束。模型既不能请求此服务，也不能控制其 program、argv、检查集合、subject 或 overlay。
+`InternalVerificationDispatch` 是 Run actor 到 app-managed bwrap 的受信内部服务，不是模型工具、不在 phase policy 注册（M-00）。actor 可在 `EXECUTING` 对 `LocalCandidate` 与 `ProspectiveIntegration` 发起，在 `VERIFYING` 对 `FinalVerified` 发起，并仅限终层归因驱动重生成的候选—集成子回路内重试。每次派发携带 `ExecutionSubject`、`DispatchAttemptId`、冻结 `RequiredCheck` 及其模板实例化和 tested commit 临时物化目录，并受 `cancel_requested`、active-attempt gate、输出上限与沙箱策略约束。
 
-active key 为 `run_id + canonical(subject identity) + check_id`，每键恰有一个 active attempt；返回必须同时匹配 attempt、subject、check_id 与 `tested_commit_oid`，任一不匹配只追加迟到审计（`STALE_DISPATCH_RESULT`），CheckResult、outcome、candidate 与 verified 写入数均为零。app 与 worker 断连时受影响 entry 标 `INTERRUPTED`，Run 未取消且 subject 仍有效即以新 attempt 重派同 generation——物理重派不消耗 generation（M-09/M-00）。
+active key 为 `run_id + canonical(subject identity) + check_id`，每键恰有一个 active attempt；返回必须同时匹配 attempt、subject、check_id 与 `tested_commit_oid`，任一不匹配只追加迟到审计（`STALE_DISPATCH_RESULT`），CheckResult、outcome、candidate 与 verified 写入数均为零。bwrap 执行中断时受影响 entry 标 `INTERRUPTED`，Run 未取消且 subject 仍有效即以新 attempt 重派同 generation——物理重派不消耗 generation。
 
 ## 贯穿场景：TS→Python 的三层汇合
 
@@ -342,7 +346,7 @@ active key 为 `run_id + canonical(subject identity) + check_id`，每键恰有�
 4. **T2 集成的测试归因**：T2 集成时 prospective 树上已存在 api 测试，Test 模板运行 2 条失败——失败用例经 PSF-2 符号级覆盖边关联到 api 被测符号，异常栈落点符号化后落在被测 api 实现符号的定义处，符号级归因越过测试翻译 Slice 判定 owning 为 C（实现语义不等价）；C 再次定向重生成并按集成键先于 T2 重新集成，T2 重试通过。T1 同规则集成通过。
 5. **最终验证**：全部 Slice 终态后，在冻结 verified head 上执行翻译后全套测试。`test_order_create` 三次执行全部失败 → 真失败 → 栈落点符号化至 `src/pkg/models/user.py` 的被测符号，归 owning A；RunStatus 保持 VERIFYING，A 以 generation `1` 重生成、重集成，对新 head 重新最终验证后全部通过，进入 REPORTING。`test_format` 三次中一败两过 → FLAKY，语义取多数态、不触发重生成，`FLAKY_TEST_OBSERVED` 事件进入证据页。
 6. **边界**：若最终与最近 prospective 的 Test 语义漂移 → `NONDETERMINISTIC_VERIFICATION`，A 的重生成数为 0；若 A 重生成至 generation `2` 仍失败且其余内容依赖闭合 → Run 投影 `PARTIALLY_COMPLETED`，证据页呈现部分通过率与失败清单；旧 DispatchAttempt 在 A 重派后返回 Passed → 只形成丢弃审计。
-7. **生成测试与守恒辅助归因变体**：若 utils 在源项目中无测试（`EmptyTestSuite`，M-06），Planner 为其派生测试生成 Slice G（M-07）——G 以 utils 代码语义与契约签名为锚点生成目标测试，与 T1/T2 同执行面（同冻结检查集、同 tested_commit overlay、同判据）进入三层验证，CheckResult receipt 与 fingerprint 记录标注 GENERATED；最终验证通过后 utils 模块按生成测试主证降一档分级，证据页声明理解偏差风险。若某次最终验证 Test 超时且无法定位在途测试，而守恒计算发现 T1 断言数对齐比 `0.4`（低于 0.5 带宽下沿）——测试翻译丢断言的强信号——守恒辅助归因优先怀疑 T1 并定向重生成；守恒正常（无离群）时优先怀疑实现 Slice，仍无法判定才进入 Run 终态判断。
+7. **生成测试与守恒辅助归因变体**：若 utils 在源项目中无测试（`EmptyTestSuite`，M-06），Planner 可提出测试生成 Slice G（M-07）——G 以 utils 代码语义与契约签名为锚点生成目标测试，与 T1/T2 同执行面（同冻结检查集、同 tested commit 临时物化目录、同判据）进入三层验证，CheckResult receipt 与 fingerprint 记录标注 GENERATED；最终验证通过后 utils 模块按生成测试主证降一档分级，证据页声明理解偏差风险。若某次最终验证 Test 超时且无法定位在途测试，而守恒计算发现 T1 断言数对齐比 `0.4`，守恒辅助归因优先怀疑 T1 并定向重生成；守恒正常时优先怀疑实现 Slice，仍无法判定才进入 Run 终态判断。
 
 ## 修正的验证截止点
 
@@ -350,14 +354,22 @@ active key 为 `run_id + canonical(subject identity) + check_id`，每键恰有�
 
 任何修正都不能弱化冻结 required checks、Error UNKNOWN 门或 fingerprint 比较。最终报告只把 verified 上的有效事实视为结果，候选、失败与 superseded 尝试只作为审计历史展示；语义等价证据页（通过率、失败清单、flaky 清单、覆盖映射、测试来源标注、等价信心分级双档与验证边界声明）是交付语义等价的正式证据载体。
 
-## 可验收的结果
+## V5 可验收增量
 
-- [ ] V-M10-V4-001：局部层只实例化 Compile 与 TypeCheck 模板，UDS 派发记录中不存在局部层的 Test 或全量编译执行
-- [ ] V-M10-V4-002：集成层实例化 required checks 中全部非 Scaffold 模板；prospective 树上合格测试集合为空（无测试路径约定内文件，或仅有在场门控未就绪的测试文件）时，Test 检查零 UDS 派发即产生 Passed/SkippedEmpty typed receipt 并进入 fingerprint
+- [ ] 三层 Oracle 验证仍以冻结检查集和 tested commit 为输入；app 直接启动 bwrap，从独立临时物化目录执行，永不读取 Slice 长期卷。
+- [ ] Test 空集在派发前确定性跳过；生成测试与移植测试同执行面、同判据，GENERATED/LOW_QUALITY 只影响证据分级与门槛呈现，不降低执行严格性。
+- [ ] P-09 归因优先使用 PSF-2 符号级覆盖/引用事实，守恒与行为 parity 作为声明边界内的辅助取证；无法唯一归因时不猜测重生成对象。
+- [ ] Oracle 反向自检与行为 parity 作为批次/最终验证补充证据，verification fingerprint 只比较规范化语义结果，不受 receipt 或日志载体差异影响。
+- [ ] 集成层 Test 遵守 M-10 在场门控；结构修正与契约漂移不由验证引擎绕过 M-16 ImpactPreview 确认门。
+
+## V4 历史验收基线（追溯，非当前 V5 契约）
+
+ - [ ] V-M10-V4-001：局部层只实例化 Compile 与 TypeCheck 模板，app-managed bwrap 执行记录中不存在局部层的 Test 或全量编译执行
+ - [ ] V-M10-V4-002：集成层实例化 required checks 中全部非 Scaffold 模板；prospective 树上合格测试集合为空时，Test 检查零 bwrap 启动、零临时验证目录即产生 Passed/SkippedEmpty typed receipt 并进入 fingerprint
 - [ ] V-M10-V4-003：最终层只实例化 Test 模板全集；翻译后全套测试全部通过是进入 REPORTING 的必要条件
 - [ ] V-M10-V4-004：三层实例化的 program/argv/timeout 与 Run 冻结描述符逐字节一致；描述符命令面之外的执行请求零执行
 - [ ] V-M10-V4-005：缺失、重复、额外 CheckId 或 invocation hash 不匹配的结果使 guard 为 false，ref 推进数为 0
-- [ ] V-M10-V4-006：每个 check 从 tested commit 创建独立一次性 overlay，跨 check 可写文件继承数为 0；overlay 路径不进入 invocation_hash 或 fingerprint
+ - [ ] V-M10-V4-006：每个 check 从 tested commit 创建独立临时物化目录，跨 check 可写文件继承数为 0；临时目录路径不进入 invocation_hash 或 fingerprint
 - [ ] V-M10-V4-007：模板超时被终止的 check 记为 TimedOut 而非 Failed，且不进入 flaky 重跑；Test 超时能定位在途测试身份时走归因路径，不能定位时走守恒辅助归因三分支（见 V-M10-V4-025）
 - [ ] V-M10-V4-008：flaky 策略下 3/3 失败或多数失败判为真失败并归因；多数通过但曾失败判为 FLAKY——语义取多数态、恰一条 `FLAKY_TEST_OBSERVED` 事件、重生成数为 0
 - [ ] V-M10-V4-009：编译/lint/类型诊断 file:line 经 write scope 查表唯一命中 owning Slice；命中契约文件或构建文件归契约 Slice
@@ -368,17 +380,17 @@ active key 为 `run_id + canonical(subject identity) + check_id`，每键恰有�
 - [ ] V-M10-V4-014：最终验证普通失败经归因定向重生成期间 RunStatus 保持 VERIFYING，状态投影无 `VERIFYING → EXECUTING` 转移；重集成后对新 verified head 重新最终验证
 - [ ] V-M10-V4-015：FinalVerified 与最近同 tested OID 的 ProspectiveIntegration 在共有 CheckId 上语义漂移时返回 `NONDETERMINISTIC_VERIFICATION` 且代码重生成数为 0——比较以诊断 semantic hash 规范化（剥离时间戳、绝对路径归一、稳定排序）后的共有 CheckId 语义结果为单位，前提是两层在同一 tested commit 上实例化了同名 action；仅 receipt/stdout/stderr 载体差异时 fingerprint 不变、不触发该错误
 - [ ] V-M10-V4-016：`Shell` 会话自检（自检=反馈不裁决）不产生 CheckResult、不推进 SliceAttemptStatus、不进入 guard、不参与 fingerprint，fingerprint 计算输入与无自检会话逐字节一致；Agent 自检通过后 Run actor 仍按冻结检查集独立派发局部验证（裁决层 `InternalVerificationDispatch` 是唯一冻结通道）
-- [ ] V-M10-V4-017：迟到 attempt/subject/check/tested OID 的 worker 返回只产生丢弃审计事件，CheckResult、outcome 与 ref 推进均为 0
+ - [ ] V-M10-V4-017：迟到 attempt/subject/check/tested OID 的 bwrap 返回只产生丢弃审计事件，CheckResult、outcome 与 ref 推进均为 0
 - [ ] V-M10-V4-018：最终层部分失败且归因重生成耗尽时，`IndependentSliceTerminalFailure` 判定成立则 Run 投影 `PARTIALLY_COMPLETED` 且已集成成果、部分通过率与失败证据保留；不成立则以 `VerificationTerminal` 失败
 - [ ] V-M10-V4-019：Error 级 UNKNOWN 数大于 0 时任何层的 guard 均阻断；Warning UNKNOWN 进入报告但不阻断
 - [ ] V-M10-V4-020：全文档扫描零残留——不存在插件进程/BuildArgv/wire 命令来源、字节哈希参与验证判定、受控重放或补丁重放语义、`CheckRunner` 作为现存工具或命令面的有效引用（M-12 退役声明与旧表述废除声明除外）
-- [ ] V-M10-V4-021：Test 空集判定成立时，该 CheckId 的 UDS 派发数、overlay 创建数与沙箱启动数均为 0；回执为 Passed/SkippedEmpty typed receipt，被冻结集合 exact-set 覆盖与 fingerprint 正常收录
+ - [ ] V-M10-V4-021：Test 空集判定成立时，该 CheckId 的 bwrap 启动数、临时验证目录创建数与沙箱启动数均为 0；回执为 Passed/SkippedEmpty typed receipt，被冻结集合 exact-set 覆盖与 fingerprint 正常收录
 - [ ] V-M10-V4-022：结构守恒计算对同一 verified 树与同一冻结 grammar 输入重复执行，`StructuralConservationFacts` 逐字节一致；计算全程无模型调用，且不改变任何 guard/pass/fail 判定结果
-- [ ] V-M10-V4-023：生成测试（TestGeneration Slice 产出）与移植测试同执行面同判据——同一冻结检查集、同一 tested_commit 一次性 overlay、同一模板实例化，不存在因 GENERATED 降低执行严格性的分支；CheckResult receipt 与验证 fingerprint 记录携带 GENERATED 标注，fingerprint 计算规则保持 `canonical(tested_commit_oid, frozen_required_checks_sha256, semantic_results)` 不变
+ - [ ] V-M10-V4-023：生成测试（TestGeneration Slice 产出）与移植测试同执行面同判据——同一冻结检查集、同一 tested_commit 临时物化目录、同一模板实例化，不存在因 GENERATED 降低执行严格性的分支；CheckResult receipt 与验证 fingerprint 记录携带 GENERATED 标注，fingerprint 计算规则保持 `canonical(tested_commit_oid, frozen_required_checks_sha256, semantic_results)` 不变
 - [ ] V-M10-V4-024：等价信心分级双档输入固定——源有测试模块按移植测试主证、源无测试模块按生成测试主证（证据力降一档）分级，生成测试主证携带理解偏差风险声明（"翻译后代码自洽且符合源语义的 Agent 理解"）进入 REPORT 证据页（M-15 投影）
 - [ ] V-M10-V4-025：守恒信号辅助归因三分支——失败证据模糊（超时/OOM/栈不清晰，两步归因退化为 Run 级兜底的场景）且断言数/测试数对齐比任一离群时定向重生成测试翻译 Slice；模糊且无离群时优先定向重生成实现 Slice；守恒事实不可用（源侧基线为 0 或 Undetermined）或辅助归因后仍多义时维持 Run 级终态兜底；守恒事实自身不构成 pass/fail 判定输入，单独离群不触发任何动作
 - [ ] V-M10-V4-026：验证边界声明进入 REPORT 证据页——测试主证证明范围为行为等价（限于源测试覆盖范围），性能等价、安全等价与生态习惯适配显式声明不在主证证明范围；安全 linter（描述符 lint 档可选辅助检查，M-01）以普通 Lint 检查身份进入冻结检查集，其通过不改变主证边界
-- [ ] V-M10-V4-027：集成层 Test 在场门控——实例化执行的每个测试文件均满足"其覆盖实现 Slice（M-07 冻结覆盖映射查表）已全部集成"；不存在对未集成实现的测试执行记录；因门控未入场的测试文件在其被测实现集成后的最近一次 Test 检查主体自然入场，失败归因不指向任何未集成 Slice；合格集为空时零 UDS 派发产生 Passed/SkippedEmpty receipt
+ - [ ] V-M10-V4-027：集成层 Test 在场门控——实例化执行的每个测试文件均满足"其覆盖实现 Slice（M-07 冻结覆盖映射查表）已全部集成"；不存在对未集成实现的测试执行记录；因门控未入场的测试文件在其被测实现集成后的最近一次 Test 检查主体自然入场，失败归因不指向任何未集成 Slice；合格集为空时零 bwrap 启动产生 Passed/SkippedEmpty receipt
 - [ ] V-M10-V4-028：Oracle 反向自检——批次 1 验收时对冻结检查集执行一次变异式反证：向候选注入已知缺陷（翻转条件/删除关键调用），Test 检查必须产生 Failed；注入缺陷下全部 Passed 即裁判失效，冻结检查集返工后方可用于验收。反向自检为一次性验收记录（人工执行并归档证据），不建常驻变异机制
 - [ ] V-M10-V4-029：行为 parity 场景对比——用户确认场景清单后，最终验证通过阶段对源快照副本与目标项目运行同场景命令并 diff 输出摘要；每场景恰一条结果记录（Passed/Failed/Diff 摘要）进入 REPORT 证据页补充取证维度并标注场景覆盖范围；场景未确认或源侧不可隔离运行时手段整体缺席且边界声明如实披露；parity 结果不改变等价信心分级
 

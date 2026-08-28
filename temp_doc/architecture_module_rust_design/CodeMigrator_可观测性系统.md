@@ -1,19 +1,15 @@
 # CodeMigrator 运行证据、脱敏出口与稳定性信号
 
-> 文档状态：V5 方向对齐版；本篇拥有观测事件、核心指标 descriptor、SecretRegistry 和可选 exporter。  
-> 技术范围：观测事件输入源（`run_events` 同事务投影：`tool.call.pre/post`、`checkpoint.pre`、`TEST_FAILURE_ATTRIBUTED`、`FLAKY_TEST_OBSERVED`、Planner/PlanValidation、探索域扇出与合并、Shell 命令与 Exec 脚本审计事件、契约漂移修正观测事件）、核心八指标 descriptor 的跨语言翻译适配、脱敏出口与可选 exporter；默认仅 `app + PostgreSQL`，Prometheus、Grafana、Jaeger 与 MinIO 镜像均为显式 Compose profile。  
+> 文档状态：V4 当前架构基线；本篇拥有观测事件、核心指标 descriptor、SecretRegistry 和可选 exporter。  
+> 技术范围：观测事件输入源（`run_events` 同事务投影：`tool.call.pre/post`、`checkpoint.pre`、`TEST_FAILURE_ATTRIBUTED`、`FLAKY_TEST_OBSERVED`、拓扑层/测试翻译边界事件、Shell 命令与 Exec 脚本审计事件、契约漂移修正观测事件）、核心八指标 descriptor 的跨语言翻译适配、脱敏出口与可选 exporter；默认仅 `app + sandbox-worker + PostgreSQL`，Prometheus、Grafana、Jaeger 与 MinIO 镜像均为显式 Compose profile。  
 > 契约真相：Run 状态、SliceKind、CheckStatus、预算终态与保留策略由 [M-00 公共契约](CodeMigrator_垂类设计原则与架构哲学.md) 拥有；观测事件由 [M-12 工具系统与 Hook](CodeMigrator_工具系统与Hook.md)、[M-10 验证引擎](CodeMigrator_验证引擎.md) 等运行模块产生；本篇定义它们如何被脱敏记录和稳定观测。  
 > 关联文档：[Harness 总体设计](CodeMigrator_Harness总体设计.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[沙箱与执行环境](CodeMigrator_沙箱与执行环境.md)、[验证引擎](CodeMigrator_验证引擎.md)、[工具系统与 Hook](CodeMigrator_工具系统与Hook.md)、[Web 体验与迁移可视化工作台](CodeMigrator_Web体验与可视化工作台.md)。
 
-观测的第一目标不是采集尽可能多的数据，而是让一次跨语言翻译 Run 的关键事实可重建，同时保证源码正文、Agent 文件操作内容、prompt 和凭据不成为日志泄漏面。默认部署不依赖任何外部观测服务：structlog JSON 日志和八个核心指标在进程内工作，所有 exporter 都是可丢弃的已脱敏投影，不能阻塞领域事务或改变迁移终态。
-
-## V5 当前对齐
-
-默认服务拓扑记录为 app + PostgreSQL。除原有工具、checkpoint、验证、拓扑、Shell/Exec 和修正事件外，新增起草域扇出/合并、四工件确认、Planner 提案、PlanValidation、蓝图违规拒绝和三池容量/等待原因事件。核心八指标保持稳定，另对模型会话池、沙箱 bwrap 活跃位、裁决派发 gate、图覆盖和计划拒绝提供诊断维度；不再发布 worker 健康或 UDS 派发指标。
+观测的第一目标不是采集尽可能多的数据，而是让一次跨语言翻译 Run 的关键事实可重建，同时保证源码正文、Agent 文件操作内容、prompt 和凭据不成为日志泄漏面。默认部署不依赖任何外部观测服务：JSON tracing 和八个核心指标在进程内工作，所有 exporter 都是可丢弃的已脱敏投影，不能阻塞领域事务或改变迁移终态。
 
 ## 运行证据从一个事件进入多个安全出口
 
-每个 Run 创建 root span；ANALYZE、PLAN、EXECUTE、VERIFY、REPORT 各创建直接子 span，EXECUTE 内部的 Planner-selected Slice 会话、Slice 定向重生成与 Shell/Exec 沙箱执行再挂在对应 Phase 下。兼容展示可保留契约层/实现层标签，但不把它们当作固定波次。span 名固定为 `migration.run/phase/slice`，不得把 ID、路径或错误文本拼入 name。事件 ID、Run ID 与 Slice ID 使用 UUIDv7；trace/span ID 遵循 W3C Trace Context；所有时间使用 UTC RFC 3339。
+每个 Run 创建 root span；ANALYZE、PLAN、EXECUTE、VERIFY、REPORT 各创建直接子 span，EXECUTE 内部的拓扑层（契约层/实现层）会话、Slice 定向重生成与 Shell/Exec 沙箱执行再挂在对应 Phase 下。span 名固定为 `migration.run/phase/slice`，不得把 ID、路径或错误文本拼入 name。事件 ID、Run ID 与 Slice ID 使用 UUIDv7；trace/span ID 遵循 W3C Trace Context；所有时间使用 UTC RFC 3339。
 
 ```mermaid
 flowchart LR
@@ -30,7 +26,7 @@ flowchart LR
 
 | 证据层 | 持久内容 | 失败时的行为 | 是否影响 Run |
 |---|---|---|---:|
-| structlog JSON 日志 | 已脱敏 JSONL、trace 关系、固定错误码 | 本地不可写时退到 stdout；两者失败增加 dropped 计数 | 否 |
+| JSON tracing | 已脱敏 JSONL、trace 关系、固定错误码 | 本地不可写时退到 stdout；两者失败增加 dropped 计数 | 否 |
 | `run_events` | 追加序号、摘要、Artifact locator、fields hash | 事务失败则状态与事件一并不提交；`NOTIFY` 丢失只影响唤醒 | 是 |
 | 核心指标 | 八个固定 descriptor 与 60 秒 JSON 快照 | exporter 失败只丢投影 | 否 |
 | 模块诊断指标 | 经 registry 接纳的低基数 series | 拒绝非法或超限 series | 否 |
@@ -46,14 +42,14 @@ flowchart LR
 |---|---|---|---|
 | Validate | 类型化事件、UUID、UTC 时间、大小 | admitted event | 常量拒绝 receipt |
 | Redact | 注册 secret、禁止字段类、内存哨兵 | redacted object | payload 丢弃，所有 sink 接收数为 0 |
-| Serialize | 已过滤对象 | UTF-8 structlog JSON 记录 | 未过滤对象不得进入 serializer |
+| Serialize | 已过滤对象 | UTF-8 JSON tracing record | 未过滤对象不得进入 serializer |
 | Project | record、descriptor 或 exporter health | 本地、索引、指标或投影 | 增加既有 dropped 计数，不回滚领域调用 |
 
 启动前，stdout、本地 JSONL、PostgreSQL `run_events`、SSE、Problem Details、tool output、sandbox stdout/stderr、report、delivery、metric exemplar、CLI 的 TTY/append-only/JSON/JSONL renderer 以及每个已启用 profile 都运行四种编码的哨兵套件。任一明文命中使 server 不进入 ready。运行期每 10,000 个事件插入一个内存哨兵，并在每个启用出口前复验；任何 exporter 或 CLI verbosity 都不得绕过 SecretRegistry 自行序列化或扩大可见正文。
 
 ## 八个核心指标是稳定接口
 
-核心指标名、label key/value allowlist、直方图 bucket 边界和 logical labelset ceiling 组成静态 descriptor 集合，恰有八项。它们不随 profile、语言对描述符、Run 数量或模块诊断指标变化。V3 的补丁应用、意图归约与重放一致类指标随受控编辑链与插件事件源一并废除，本基线不存在对应 descriptor。74 是八个核心 descriptor 合计的最大 logical labelset 数，不是 Prometheus exporter 的 series 上限。
+核心指标名、label key/value allowlist、直方图 bucket 边界和 logical labelset ceiling 组成编译期 descriptor 集合，恰有八项。它们不随 profile、语言对描述符、Run 数量或模块诊断指标变化。V3 的补丁应用、意图归约与重放一致类指标随受控编辑链与插件事件源一并废除，本基线不存在对应 descriptor。74 是八个核心 descriptor 合计的最大 logical labelset 数，不是 Prometheus exporter 的 series 上限。
 
 | 指标 | 类型 | 标签与上限 |
 |---|---|---|
@@ -66,7 +62,7 @@ flowchart LR
 | `codemigrator_budget_ratio` | Gauge | `kind`：3 |
 | `codemigrator_observation_dropped_total` | Counter | `sink`：9 |
 
-核心指标只从 PostgreSQL `run_events` 同事务投影的领域事实与进程内确定投影派生，不引入第二事件通道：`codemigrator_slice_first_pass_total` 来自 Slice 集成终态事实——generation `0` 一次集成记 `first_pass`，经 P-09 归因定向重生成后集成记 `after_regeneration`，按 SliceKind 观察翻译首过率；`codemigrator_check_total` 来自三层验证与 Scaffold 初始化的 check 执行回执。`tool.call.pre/post`、`checkpoint.pre`、`TEST_FAILURE_ATTRIBUTED`、`FLAKY_TEST_OBSERVED`、Planner-selected Slice/测试翻译边界事件、Shell/Exec 审计事件与契约漂移观测事件属于模块诊断指标与 SSE 投影的输入源，不进入核心 descriptor。
+核心指标只从 PostgreSQL `run_events` 同事务投影的领域事实与进程内确定投影派生，不引入第二事件通道：`codemigrator_slice_first_pass_total` 来自 Slice 集成终态事实——generation `0` 一次集成记 `first_pass`，经 P-09 归因定向重生成后集成记 `after_regeneration`，按 SliceKind 观察翻译首过率；`codemigrator_check_total` 来自三层验证与 Scaffold 初始化的 check 执行回执。`tool.call.pre/post`、`checkpoint.pre`、`TEST_FAILURE_ATTRIBUTED`、`FLAKY_TEST_OBSERVED`、拓扑层/测试翻译边界事件、Shell/Exec 审计事件与契约漂移观测事件属于模块诊断指标与 SSE 投影的输入源，不进入核心 descriptor。
 
 指标命名规范（一句话）：全部指标使用静态 `codemigrator_*` 命名，`run_id/slice_id/path/error_message/URL/OID` 绝不进入 label 或动态指标名。实现注记（原 MetricRegistry exact-match 准入机关降格）：如实现保留注册期一致性校验，属实现细节而非独立机制；违规指标拒绝注册并只递增既有 dropped 计数，不新增 fallback 核心指标。新增指标的 review 清单一句话：声明静态 name、有限 label key/value allowlist 与 ceiling，并核对不与核心八项重名。
 
@@ -76,7 +72,7 @@ Prometheus exporter 的最大 series 数按 descriptor 计算：Counter 与 Gaug
 
 ## 模块诊断描述并行与翻译细节，而不改变核心八项
 
-核心 descriptor 是稳定性验收接口，不能因并行翻译调度而增加第九项。集成队列、bwrap 执行中断、事件回放延迟、checkpoint 提交、Agent 自检调用、翻译后测试逐用例结果、归因定向重生成、generation 消耗、integration_rank 等属于排障与质量信号，只能注册为低基数模块诊断指标；它们不参与核心 descriptor hash、74 个 logical labelset 上限或 287 条 exporter series 上限。
+核心 descriptor 是稳定性验收接口，不能因并行翻译调度而增加第九项。集成队列、worker 断连、事件回放延迟、checkpoint 提交、Agent 自检调用、翻译后测试逐用例结果、归因定向重生成、generation 消耗与拓扑层时长属于排障与质量信号，只能注册为低基数模块诊断指标；它们不参与核心 descriptor hash、74 个 logical labelset 上限或 287 条 exporter series 上限。
 
 | 模块诊断指标 | 类型 | 固定标签 | 用途与禁止行为 |
 |---|---|---|---|
@@ -86,7 +82,7 @@ Prometheus exporter 的最大 series 数按 descriptor 计算：Counter 与 Gaug
 | `codemigrator_attribution_regen_total` | Counter | `outcome`：`repaired`、`exhausted` | 观察 `TEST_FAILURE_ATTRIBUTED` 归因后定向重生成的修复成功率（归因准确率代理）；不得改变 generation 语义 |
 | `codemigrator_contract_drift_total` | Counter | `stage`：`preview`、`confirmed`、`downstream_invalidated`、`downstream_rebuilt` | 观察契约漂移修正协议的涟漪预览、确认门与下游作废/重建计数（协议 owner M-16，本篇观测）；不得改变 PlanRevision 或确认门语义 |
 
-诊断指标族收缩定案：仅保留上述五个高价值项；其余历史诊断信号（dispatch 中断计数、event lag、Shell 自检分布、generation 分布、Planner 分组时长、理解会话 token 分布）不再设独立指标，其事实改由 `run_events` 即席查询承载——其中理解会话 token 消耗按**起草期归属**记录（X1 产制点归一，ANALYZE 阶段只承担机械层与档案校验）。它们与其他模块诊断一样遵守命名规范与 review 清单；不能使用 `run_id`、`slice_id`、path、OID、URL 或错误正文作标签。查询和 SSE 回放直接消费 PostgreSQL `run_events`，投影由进程内有界队列处理，队列故障只递增既有 `codemigrator_observation_dropped_total`。
+诊断指标族收缩定案：仅保留上述五个高价值项；其余历史诊断信号（dispatch 中断计数、event lag、Shell 自检分布、generation 分布、拓扑层时长、理解会话 token 分布）不再设独立指标，其事实改由 `run_events` 即席查询承载——其中理解会话 token 消耗按**起草期归属**记录（X1 产制点归一，ANALYZE 阶段只承担机械层与档案校验）。它们与其他模块诊断一样遵守命名规范与 review 清单；不能使用 `run_id`、`slice_id`、path、OID、URL 或错误正文作标签。查询和 SSE 回放直接消费 PostgreSQL `run_events`，投影由进程内有界队列处理，队列故障只递增既有 `codemigrator_observation_dropped_total`。
 
 ## 工具面审计与漂移观测事件
 
@@ -126,7 +122,7 @@ BudgetGate 每次结算后写入 `budget_usage` 事件并更新 `codemigrator_bu
 
 ### 贯穿场景：没有任何可选 profile 的预算耗尽 Run
 
-默认 Compose 只启动 app 与 PostgreSQL。一个 TS→Python 翻译 Run 写入 root span 与五个 Phase span；起草域扇出、四工件确认、Planner 提案、机器校验和三池等待均写入低基数事件。输入预算达到 1.00 时，Harness 编排层关闭新的 provider/tool 调用，写 checkpoint，Git 层归档 candidate 并将 Run 以 `BudgetExhausted` 进入 FAILED。观测系统只接收 receipt：它不发起这些副作用，也不改变 Run 的终态。
+默认 Compose 只启动 app、sandbox-worker 与 PostgreSQL。一个 TS→Python 翻译 Run 写入 root span 与五个 Phase span；输入预算从 0.79 到 0.80，事件流记录一次 Warning；随后达到 1.00，记录一次 Critical。Harness 编排层关闭新的 provider/tool 调用，写 checkpoint，Git 层归档 candidate 并将 Run 以 `BudgetExhausted` 进入 FAILED。观测系统只接收 receipt：它不发起这些副作用，也不改变 Run 的终态。
 
 本地 JSONL 在此期间保持可读，PostgreSQL 事务提交后的 `run_events` 仍可由 SSE 按 sequence 回放。Prometheus、Grafana、Jaeger 与 MinIO 全部缺席时，核心八指标的 60 秒快照和 Run 的终态仍完整存在。这验证可选观测能力不会成为迁移正确性的隐形依赖。
 
@@ -169,7 +165,7 @@ Exporter 使用容量 4096 的有界内存队列；满时丢弃最旧投影并�
 
 ## 会话和模块账本也经过同一脱敏出口
 
-`migration.session.event`、Question、CorrectionIntent、ImpactPreview、Skill selection 与 ModuleChangeRecord 都是追加事实，进入 structlog JSON 日志、SSE、CLI human/JSON/JSONL 与 Web 前必须通过 SecretRegistry。`assistant.delta` 不持久化、不推进 session sequence；完整 message 落账后才可投影 `assistant.message.completed`。路径只允许授权本地用户在受限 display projection 中读取，真实宿主路径、源码、prompt、凭据、完整日志和 CAS 正文不进入公共事件、指标或分享链接。
+`migration.session.event`、Question、CorrectionIntent、ImpactPreview、Skill selection 与 ModuleChangeRecord 都是追加事实，进入 JSON tracing、SSE、CLI human/JSON/JSONL 与 Web 前必须通过 SecretRegistry。`assistant.delta` 不持久化、不推进 session sequence；完整 message 落账后才可投影 `assistant.message.completed`。路径只允许授权本地用户在受限 display projection 中读取，真实宿主路径、源码、prompt、凭据、完整日志和 CAS 正文不进入公共事件、指标或分享链接。
 
 会话与修正不扩容核心八指标 descriptor。它们仅以低基数模块诊断观察，例如交互等待、修正分类、输出物化和 module-change 追加的成功/拒绝计数；标签不包含 RunId、path、SliceId、QuestionId、用户文本或错误正文。
 

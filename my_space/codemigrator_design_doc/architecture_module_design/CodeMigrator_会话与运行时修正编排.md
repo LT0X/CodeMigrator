@@ -1,11 +1,16 @@
 # CodeMigrator 会话式迁移、途中修正与安全点编排
 
-> 文档状态：V4 当前架构基线；本篇为 M-16。  
+> 文档状态：V6 方向对齐版；本篇为 M-16。  
+> V6 演进：① 起草流程重排——探索扇出完成 → 归并 → 多轮 AskUser 对齐 → 工件草稿 → 试译校准 → 确认冻结；② 探索协调者切域调整权——探索切域由"Harness 确定性切域"扩展为"机器骨架 + 主会话切域调整建议 + Harness 机器校验后派发"，探索员可动态改派；③ AskUser 纪律修订——取消"一次最多三题"式框架限制，全周期按需由协调会话自主判断轮次；④ 全局修复会话免确认门语义——归因驱动内部闭环修复免 `ImpactPreview` 确认门，与用户发起的设计级变更（一律确认门）区分。V5 的安全点、契约漂移修正协议、修正边界与四件工件机制保持，V5 对齐段留存追溯。  
 > 技术范围：本地项目注册、MigrationSession、Spec 起草会话、风险驱动提问、运行中修正（PlanRevision）与契约漂移修正协议、薄 Skill 与托管输出；修正边界对齐 Migration Spec v3 与四类 Slice DAG。  
-> 契约真相：本篇拥有会话、问题、修正、PlanRevision、Spec 起草会话（会话流程、草稿数据模型与确认语义）、契约漂移修正协议（涟漪确认门与作废重建执行语义）、模块变更账本与交互门；Run/Slice/验证语义由 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 拥有，涟漪计算依赖图由 [M-07](CodeMigrator_迁移计划生成器.md) 拥有，REST/SSE 由 [M-02](CodeMigrator_系统后端架构.md) 拥有；会话输入不能直接写 Git、PostgreSQL、worker、candidate 或源项目，Run actor 只在安全点吸收已持久化的意图。  
+> 契约真相：本篇拥有会话、问题、修正、PlanRevision、四工件起草会话（会话流程、草稿数据模型与确认语义）、契约漂移修正协议（涟漪确认门与作废重建执行语义）、模块变更账本与交互门；Run/Slice/验证语义由 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 拥有，涟漪计算依赖图由 [M-07](CodeMigrator_迁移计划生成器.md) 拥有，REST/SSE 由 [M-02](CodeMigrator_系统后端架构.md) 拥有；会话输入不能直接写 Git、PostgreSQL、bwrap、candidate 或源项目，Run actor 只在安全点吸收已持久化的意图。  
 > 关联文档：[核心目录](CodeMigrator_核心目录架构设计.md)、[Run actor](CodeMigrator_Harness总体设计.md)、[Agent Loop](CodeMigrator_Agent_Loop设计.md)、[Spec](CodeMigrator_Migration_Spec抽象层.md)、[计划](CodeMigrator_迁移计划生成器.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[Git](CodeMigrator_工作空间与Git集成.md)、[上下文](CodeMigrator_记忆与上下文管理.md)、[CLI/Web 体验](CodeMigrator_Web体验与可视化工作台.md)。
 
-CodeMigrator 的交互不把跨语言翻译变成一段不可中断的黑箱，也不把聊天框变成绕过工程约束的第二个 Agent。用户从项目目录进入会话，先经 Spec 起草会话把自然语言需求收敛为可审阅的 Spec 草稿，再确认一份冻结的跨语言翻译任务——语言对、双端工具链描述符锁、检查集与分解策略；Run 开始后，用户仍能基于正在产生的模块变更、验证和日志投影提出自然语言修正。消息先成为可审计事实，再由 Run actor 在安全点暂停整条 Run、分类影响并生成新的计划修订（PlanRevision）。V4 下受控编辑链与插件进程已废除：修正的吸收面是冻结的四类 Slice DAG 与描述符锁，已验证主线只向前推进、不回写。
+CodeMigrator 的交互不把跨语言翻译变成一段不可中断的黑箱，也不把聊天框变成绕过工程约束的第二个 Agent。用户从项目目录进入会话，先经 Spec 起草会话把自然语言需求收敛为可审阅的四件工件草稿，再确认冻结的跨语言翻译任务——语言对、双端工具链描述符锁、检查集、理解档案、目标蓝图与规则手册；Run 开始后，用户仍能基于正在产生的模块变更、验证和日志投影提出自然语言修正。消息先成为可审计事实，再由 Run actor 在安全点暂停整条 Run、分类影响并生成新的计划修订（PlanRevision）。V5 不再沿用受控编辑链与插件进程：修正的吸收面是 Planner 冻结的 Slice DAG、四件工件引用与描述符锁，已验证主线只向前推进、不回写。
+
+## V5 当前对齐
+
+起草会话的确认包从三件工件扩展为四件：Spec、UnderstandingDossier、TargetProjectBlueprint、MigrationRulebook。主会话可从知识图谱域扇出只读探索并合并结构化报告，用户只在四工件确认处决策。计划校验和冻结后不逐 Slice 询问；运行期结构修正与契约漂移都通过安全点 ImpactPreview，由用户确认后对未集成部分重规划。已验证主线不回写，消息和报告不能直接写 Git、PostgreSQL、候选工作区或源项目。
 
 ## 从只读项目到托管输出
 
@@ -33,7 +38,7 @@ flowchart LR
 | `CANCELLED` | 有 verified 推进才物化 | 取消前已验证边界 |
 | `FAILED` | 仅有有效 verified 进展才物化 | 失败原因与非成功标识 |
 
-物化先写同一文件系统的临时目录，再原子 rename；未完成复制时正式 `project/` 不可见。`output show`、`output open` 与 `output export <destination>` 是用户显式动作，export 不回写源项目。
+物化先写同一文件系统的临时目录，再原子 `os.replace`；未完成复制时正式 `project/` 不可见。`output show`、`output open` 与 `output export <destination>` 是用户显式动作，export 不回写源项目。
 
 脏工作树是唯一需要用户选择的输入事实：干净仓库冻结当前 HEAD；有未提交修改时，AskUser 要求在“仅当前 HEAD”与“把当前工作树只读复制为 synthetic snapshot”间选择。后者包含 tracked 修改，未跟踪文件只有在用户明确确认后纳入；synthetic commit 只写托管输出仓库。
 
@@ -41,13 +46,15 @@ flowchart LR
 
 手写完整 Spec JSON 对多数用户并不现实：语言对、范围模式、检查集与分解策略的字段语义超出普通用户的书写能力，而既有的 AskUser 只覆盖关键决策缺口（脏工作树选择、运行中风险提问），不承担从零构造任务的职责。Spec 起草会话填补这一门槛空隙：它是 ANALYZE 之前、CreateRun 之前的交互阶段，把"描述迁移什么"交给自然语言，把"构造正确的 Spec 草稿"交给会话 Agent，把"草稿是否生效"交给用户确认。会话类型（四类 Slice 会话之外的一类模型会话）与工具面、循环边界由 [M-04](CodeMigrator_Agent_Loop设计.md) 定义，本篇是起草会话的设计 owner——拥有会话流程、草稿数据模型与确认语义；上下文装配同受 [M-14](CodeMigrator_记忆与上下文管理.md) 预算治理约束。
 
-流程自用户选定源项目路径开始：CLI 为主入口（`codemigrator migrate start` 衔接既有入口，Git root 发现与脏工作树确认沿用既有规则；Web 只读边界不变，[M-15](CodeMigrator_Web体验与可视化工作台.md)）。用户以自然语言输入迁移需求后，会话 Agent 以 ANALYZE 级只读授权探索源项目（ReadFile/QuerySourceAst/Exec 只读编排批量探索，[M-04](CodeMigrator_Agent_Loop设计.md)）——探索对象是用户选定项目的只读事实，不触达任何候选工作区或托管输出，全程对源项目零写入。起草分两段、产出三件工件：先浅探索产出 Spec 草稿——语言对、翻译范围与排除项、工件策略建议值（ArtifactKind 分类，真相仍归描述符 `artifact_rules`）与测试策略建议值（落位于检查集与分解策略字段）；再深潜探索产出《项目理解档案》UnderstandingDossier 草稿（语义模块划分、依赖消解判定、风险热点、策略建议，[M-04](CodeMigrator_Agent_Loop设计.md) 理解会话节/M-00 公共契约）；随档案一并产出《迁移规则手册》MigrationRulebook 初版（惯用法映射/命名约定/错误处理模式/框架 idiom，M-00 契约）。三件工件一并呈现给用户。关键决策缺口经 AskUser 补齐，复用既有 InteractionStatus 交互门与提问纪律：一次最多三题、互斥选项与推荐项、无法从 Git、manifest、描述符或 Spec 推导的关键缺口才允许提问、相同回答幂等，默认值必须在草稿预览中可见。
+流程自用户选定源项目路径开始：CLI 为主入口，Web 只读边界不变。用户以自然语言输入迁移需求后，会话 Agent 以 ANALYZE 级只读授权消费预索引知识图谱（ReadFile/QuerySourceAst/Exec 只读编排批量探索，[M-04](CodeMigrator_Agent_Loop设计.md)）。探索扇出切域由"机器骨架 + 主会话（探索协调者）调整建议 + Harness 机器校验"协作完成：Harness 先生成确定性切域骨架，主会话作为探索协调者可给出切域调整建议（合并/拆分/重点标注，并为探索员生成 focus brief），Harness 机器校验确保覆盖恰好一次与扇出/预算上限后派发；探索员可据 focus brief 动态改派聚焦域。focus brief 的具体生成模板与 Harness 机器校验的细化项实施期开放，架构约束不变。子会话不直接通信，只提交带 file:range 锚点、覆盖率和置信度理由的报告，由主会话归并并显式记录冲突。起草产出四件工件：MigrationSpec、UnderstandingDossier、TargetProjectBlueprint、MigrationRulebook。关键决策缺口经 AskUser 补齐，复用既有 InteractionStatus 交互门与提问纪律。
 
-产制点归一（X1 定案）：**起草会话深潜阶段＝理解会话本体**——《项目理解档案》在此产出并随 Spec/Rulebook 一并经用户确认冻结为 Run 三件输入；ANALYZE 阶段不再产出档案，只执行机械完备层管线并消费已冻结档案做一致性校验（M-00 信息分层原则/M-04 阶段表同步口径）。
+**V6 起草流程重排**：探索扇出完成 → 主会话（探索协调者）归并报告（含冲突/风险热点/语义模块划分建议）→ **基于归并发现的多轮 AskUser 对齐**（逐项对齐语义模块划分、依赖判定分歧、风险处置、测试策略、蓝图原则）→ 对齐结论固化为四件工件草稿 → 试译校准 → 用户显式确认冻结。即先由探索扇出完成事实采集，主会话归并并收敛冲突与风险热点，再经多轮 AskUser 逐项对齐关键分歧，随后产出工件草稿，最后在确认冻结点收敛。
 
-**试译-弃稿校准环节**：三件工件确认前，Agent 选取 2–3 个代表性文件做试译演练——同一文件分别按规则手册约束与"自由发挥"各译一版，在会话内并排呈现差异供用户对比；差异结论用于校准规则手册条目与档案（如发现规则缺失或语义分组不当）。试译产物仅在会话内呈现、显式标记弃稿——零落盘、零候选工作区触碰、零 Run 副作用，其价值是磨规则而非攒进度（Anthropic 迁移实践吸收：扇出前的 shakedown cruise）。
+产制点归一：起草会话深潜阶段＝理解会话本体；四件工件经用户一次确认后分别记录版本与 hash，一起冻结为 Run 输入。ANALYZE 阶段不再产出档案，只执行机械完备层管线并消费冻结工件做一致性校验。
 
-用户审阅的是三份草稿全文：可以自然语言提出修改意见，Agent 修订草稿并再次呈现，多轮修改与再对齐各自留版本、全部经会话通道入账；对理解档案与规则手册的修改意见同样进入修订循环（如"这两个目录其实是一个模块""这个动态 import 可以忽略""错误处理统一用 Result 风格"）。用户显式确认后三件工件才生效：被确认的 Spec 草稿 revision 由 TaskDraftRevision 生成 canonical Spec Artifact/hash（[M-05](CodeMigrator_Migration_Spec抽象层.md) 的"草稿→确认→冻结"），被确认的档案以内容 hash 冻结为 Run 第三件输入（PLAN 消费，M-07），被确认的规则手册以 version 1 冻结为 Run 知识工件（运行中经受控追加演进，M-00），一并进入 CreateRun 流程；确认后的冻结与能力门预检按"会话先冻结目标，再创建 Run"的既有规则执行。
+**试译-弃稿校准环节**：四件工件确认前，主会话选取 2–3 个代表性文件做试译演练——同一文件分别按规则手册约束与自由发挥各译一版，在会话内并排呈现差异供用户对比；差异结论用于校准蓝图、规则手册与档案。试译产物仅在会话内呈现并标记弃稿，零落盘、零候选工作区触碰、零 Run 副作用。
+
+用户审阅的是四份草稿全文：可以自然语言提出修改意见，Agent 修订草稿并再次呈现，多轮修改与再对齐各自留版本、全部经会话通道入账。用户显式确认后四件工件才生效：Spec 生成 canonical Artifact/hash，档案、蓝图与规则手册分别以内容 hash/version 冻结，一并进入 CreateRun 流程；确认后的冻结与能力门预检按会话先冻结目标、再创建 Run 的规则执行。
 
 边界四条：
 
@@ -64,7 +71,9 @@ flowchart LR
 
 状态收敛说明（消费方口径，与 M-00 枚举表同变更集同步）：`CorrectionIntentStatus` 收敛为七值——`Classifying` 归入 `Received`（分类是 actor 即时行为而非持久态）、`Superseded` 并入 lineage/Attempt History 记录（被取代不是意图自身的状态，取代事实经 `supersedes_slice_id` lineage 可查）、`DeferredToFollowUp` 保留为显式挂起终态；本篇及各消费方不得再引用被合并态。`InteractionStatus` 辨析：`PausingForInput`＝正在排空至安全点的瞬态（在途原子操作计数由 Run 投影表达），`WaitingForUser`＝已抵达安全点等待输入的稳态——UI 在前者呈现"暂停中"、后者呈现"等待输入"，两者不混用。
 
-AskUser 不是模型工具：它不属于任何 phase 工具箱（M-12 边界），只属于 Session Agent 与 Steering Interpreter。一次最多三题，每题都有 QuestionId、互斥选项、推荐项、影响说明、自由文本许可和绑定 revision。无法从 Git、manifest、描述符或 Spec 推导的关键缺口才允许提问；相同回答幂等，过期 question revision 的冲突回答固定拒绝。CLI 用编号选择，Web 用选择卡，默认值必须在 TaskDraft 预览中可见。
+AskUser 不是模型工具：它不属于任何 phase 工具箱（M-12 边界），只属于 Session Agent 与 Steering Interpreter。**V6 取消"一次最多三题"式框架限制**：全周期（起草会话 + 运行期）不设硬性提问次数上限，由协调会话按需自主判断提问轮次与单轮题量；每题质量标准不变——QuestionId、互斥选项、推荐项、影响说明、自由文本许可和绑定 revision。无法从 Git、manifest、描述符或 Spec 推导的关键缺口才允许提问；相同回答幂等，过期 question revision 的冲突回答固定拒绝。CLI 用编号选择，Web 用选择卡，默认值必须在 TaskDraft 预览中可见。
+
+与"前期做足、后期放手"的关系：放手仍指不逐 Slice 确认——硬确认门收敛为两处：四件工件确认冻结与运行期 `ImpactPreview` 确认（含契约漂移确认门）；软性 AskUser 由 agent 自主发起，起草会话与运行期全周期可用，不设次数上限，由协调会话按需权衡触发。
 
 ## 修正先入账，再在安全点吸收
 
@@ -87,11 +96,15 @@ RunStatus 不增加“等待用户”枚举。`InteractionStatus` 独立表达�
 
 结构修正影响多个 Slice、DAG、write scope、候选集合或已集成效果时，系统必须先给出 `ImpactPreview`。预览列出 preserved、invalidated、replacement 与 compensation Slice、新冻结集成后缀以及保持不变的 checks、描述符锁和安全边界；四类 Slice 的影响差异分别呈现——替换实现或测试翻译 Slice 只重派生该组的目标输出路径集合，契约与其他 Slice 不失效；调整分解策略（目标模块粒度、测试分组）会重建未集成实现/测试翻译 Slice 的分组与依赖边，契约 Slice 的集成事实不变；已集成 Slice 永不失效，对其效果的修正只能从最新 verified 产生 compensation Slice（契约源头错误的波及修正除外，见下文契约漂移修正协议）。用户确认 preview hash 后才创建 PlanRevision。已进入 verified 的历史不回写。`CandidateGeneration` 的 `0/1/2` 只表达同一 replacement Slice 的验证重生成，用户消息不消耗它。
 
+**归因驱动修复的免确认门边界（V6）**：验证失败归因驱动的修复——包括跨 Slice 的全局修复会话——属于归因驱动的内部闭环，免 `ImpactPreview` 确认门：问题已由一次具体验证失败定位并归因到实现/测试 Slice 时，修复经既有定向重生成或 PlanRevision 落定，不另设人工确认门。此与用户发起的契约漂移/结构修正（设计级变更，一律经确认门）区分：用户表达意图、或需触发涟漪作废重建的修正属于设计级变更，必过 `ImpactPreview` 确认门；归因驱动内部闭环修复不在该门之列。边界准则：**归因驱动内部闭环 vs 用户发起设计级变更**——凡仅回放既有验证失败归因的内部闭环不设确认门，凡用户发起或触及已集成设计级决策的变更设确认门。修复决策（归因、处置选择与落地）全量经 [M-13](CodeMigrator_可观测性系统.md) 追加进 `run_events` 审计；Supervisor 判断归因有歧义或风险时，可建议 actor 触发 AskUser 澄清后再落地。
+
 进入 Final Verify 后当前 Run 不回到 EXECUTING。新的用户消息形成基于当前 verified 的后续 TaskDraft，用户确认后创建后续 Run。语言对、描述符锁、required checks、Skill catalog、base snapshot 与安全策略不接受运行中自然语言削弱或替换；缩小翻译范围、调整目标结构偏好等修正只能经 PlanRevision 重规划未集成 Slice，不回写冻结 Spec 本体。
 
 ## 契约漂移修正先算涟漪，再经确认门作废重建
 
-契约 Slice 集成后发现签名/设计级错误时，问题不在某一个实现：其全部下游实现/测试翻译/测试生成 Slice 都构建在该契约之上，错误前提波及整条依赖闭包。既有机制各有覆盖——PlanRevision 重规划未集成 Slice、generation `0/1/2` 定向重生成承接实现级失败、compensation Slice 修正已集成结果的局部偏差——唯独"契约源头错误的波及修正"的涟漪成本与决策门槛没有定义，契约漂移修正协议填补这一空隙。触发来源两类：集成层验证发现契约签名与实现/测试用法不一致（归因落到契约 Slice 本身），或用户经会话确认契约需要变更——后者仍先入账为 CorrectionIntent、在安全点吸收；实现级错误（归因落到具体实现/测试 Slice）不触发本协议，仍走既有定向重生成。
+V5 中 Contract Slice 是 Planner 的可选技术手段。若不存在独立 Contract Slice，契约漂移以受影响的接口工件、符号和其所属 Slice 作为 ImpactPreview 锚点；其余符号引用闭包、未集成重规划、已验证主线不回写和用户确认门语义不变。
+
+若 Planner 选择 Contract Slice，集成后发现签名/设计级错误时，问题不在某一个实现：其全部下游实现/测试翻译/测试生成 Slice 都可能构建在该契约之上，错误前提波及相应依赖闭包。没有 Contract Slice 时，契约漂移以受影响的接口工件、符号和其所属 Slice 为锚。既有机制各有覆盖——PlanRevision 重规划未集成 Slice、generation `0/1/2` 定向重生成承接实现级失败、compensation Slice 修正已集成结果的局部偏差——唯独"契约源头错误的波及修正"的涟漪成本与决策门槛没有定义，契约漂移修正协议填补这一空隙。触发来源两类：集成层验证发现接口签名与实现/测试用法不一致，或用户经会话确认契约需要变更——后者仍先入账为 CorrectionIntent、在安全点吸收；实现级错误（归因落到具体实现/测试 Slice）不触发本协议，仍走既有定向重生成。
 
 涟漪成本模型的事实来源是 [M-07](CodeMigrator_迁移计划生成器.md) 涟漪计算依赖图的三步确定性查表：
 
@@ -107,11 +120,11 @@ RunStatus 不增加“等待用户”枚举。`InteractionStatus` 独立表达�
 
 | 受影响对象 | 集成状态 | 处置 | 通道 |
 |---|---|---|---|
-| 契约 Slice（错误源头） | 已集成 | replacement lineage 重生成：新 SliceId、`supersedes_slice_id`、继承 Contract SliceKind、generation 从 `0` 起 | 既有 PlanRevision |
-| 下游 Slice | 已集成 | generation 重置为 `0`——开启**新候选流**（旧流 superseded 归档，M-00 generation 语义的唯一受控例外），从最新 verified（含重生成后的契约）重跑完整候选流程且新流同样受 `0..2` 约束；原集成事实保留，新代经验证集成后向前取代 | 既有定向重生成 |
+| Planner 选择的 Contract Slice（若存在，错误源头） | 已集成 | replacement lineage 重生成：新 SliceId、`supersedes_slice_id`、继承 Contract SliceKind、generation 从 `0` 起 | 既有 PlanRevision |
+| 下游 Slice | 已集成 | generation 重置为 `0`——开启**新候选流**（旧流 superseded 归档，M-00 generation 语义的唯一受控例外），从最新 verified（含重生成后的契约）重跑完整候选流程且新流同样受 `0`~`2` 约束；原集成事实保留，新代经验证集成后向前取代 | 既有定向重生成 |
 | 下游 Slice | 未开始或在途 | 作废重派：在途 candidate、上下文包与工具授权失效归档，新冻结输入绑定修正后契约 | 既有 PlanRevision replacement |
 
-两种重建都只向前取代：原契约与原下游的集成事实以 superseded 记入 ModuleChangeRecord 与 Attempt History，verified 历史在任何路径下零回写。修正落地仍走 PlanRevision 全部规则（write scope 派生、环拒绝、集成键、5000 上限，[M-07](CodeMigrator_迁移计划生成器.md)）；重跑过程中的失败按既有 `0/1/2` generation 预算定向重生成。重建走正常 DAG 就绪：契约 Slice 重新集成后，仅依赖该契约的下游 Slice 依赖闭包即就绪、即可进入 `RUNNING` 重建，不等任何全局屏障（依赖闭包就绪即启动，[M-00](CodeMigrator_垂类设计原则与架构哲学.md)/[M-07](CodeMigrator_迁移计划生成器.md)）。
+两种重建都只向前取代：原契约与原下游的集成事实以 superseded 记入 ModuleChangeRecord 与 Attempt History，verified 历史在任何路径下零回写。修正落地仍走 PlanRevision 全部规则（Planner 重新提案、write scope/蓝图/环校验、实施期规模边界与集成键，[M-07](CodeMigrator_迁移计划生成器.md)）；重跑过程中的失败按既有 `0/1/2` generation 预算定向重生成。重建走正常 DAG 就绪：若新提案包含 Contract Slice，仅依赖该契约的下游 Slice 在依赖闭包满足后即可进入 `RUNNING`，不等任何全局屏障（依赖闭包就绪即启动，[M-00](CodeMigrator_垂类设计原则与架构哲学.md)/[M-07](CodeMigrator_迁移计划生成器.md)）。
 
 与 compensation Slice 的边界：compensation 处理"已集成结果的局部修正"（既有）——错误源于实现的局部偏差，已集成 Slice 永不失效，修正从最新 verified 以 compensation Slice 向前推进；本协议处理"契约源头错误的波及修正"（新增）——错误源于契约本身的签名/设计级缺陷，波及全部建于其上的下游。两层衔接：契约修正（本协议）之后，下游已集成结果的处置依错误性质分流——实现局部偏差由 compensation 承接，契约源头错误导致的整体性偏差走本协议的作废重建；判断准则是错误是否源于契约本身（签名/设计级）而非实现局部偏差。"已集成 Slice 永不失效"保持为运行中修正的默认边界，本协议是其唯一成文的受控例外，例外范围由确认门约束——正因触及已集成成果，作废重建必须经人工确认。
 
@@ -130,7 +143,7 @@ RunStatus 不增加“等待用户”枚举。`InteractionStatus` 独立表达�
 
 ## 模块变化记录把最终事实与尝试分开
 
-模块粒度优先使用源端描述符清单解析识别的 npm workspace、Java module、Go module、Rust crate、Python package/project 或其他 typed module fact；识别失败时退化为 Slice 与文件清单。`ProjectModuleId` 投影固定保存模块名称、仓库相对根、language/描述符、build system 与 Slice 集合。
+模块粒度优先使用源端描述符清单解析识别的 npm workspace、Java module、Go module、Python package/project 或其他 typed module fact；识别失败时退化为 Slice 与文件清单。`ProjectModuleId` 投影固定保存模块名称、仓库相对根、language/描述符、build system 与 Slice 集合。
 
 每次 integrated、superseded、failed 或 compensated 动作都追加 `ModuleChangeRecord`：它关联 ProjectModuleId、PlanRevision、Slice lineage、SliceKind、generation、CorrectionIntent、文件新增/修改/删除/重命名清单、candidate/prospective/verified OID、三层验证摘要、integration receipt、路径/hash/ArtifactRef 与 UTC 时间；不保存源码正文或完整日志。
 
@@ -142,7 +155,7 @@ RunStatus 不增加“等待用户”枚举。`InteractionStatus` 独立表达�
 
 | 投影 | 允许提交 | 明确拒绝 |
 |---|---|---|
-| CLI/Web 会话 | message、answer、confirmed draft、confirmed correction | patch、Git、worker、数据库直写、交付重试 |
+| CLI/Web 会话 | message、answer、confirmed draft、confirmed correction | patch、Git、bwrap/执行面、数据库直写、交付重试 |
 | Web 项目选择 | 已注册本地项目、托管 snapshot、远端 Git | 任意宿主目录浏览 |
 | 输出信息 | 授权用户的 source/output display path、OID、模块摘要 | 真实路径进入日志、指标、公共 SSE、错误或分享链接 |
 | API source | `RemoteRepository` 或 `RegisteredProject` 判别来源 | 客户端提供任意 output path |

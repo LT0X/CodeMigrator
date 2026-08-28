@@ -1,11 +1,20 @@
 # CodeMigrator 工具系统与 Hook：六工具 IDE 工具箱、Phase 授权与路径安全门
 
-> 文档状态：V4 当前架构基线；ToolGateway 是模型工具调用的唯一入口，只加载 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 的 phase policy。CheckRunner 已作为 Agent 工具退役：会话自检并入 Shell，裁决层是唯一冻结通道。  
+> 文档状态：V6 方向对齐版；ToolGateway 是模型工具调用的唯一入口，只加载 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 的 phase policy。CheckRunner 已作为 Agent 工具退役：会话自检并入 Shell，裁决层是唯一冻结通道。  
+> V6 演进：为修复场景扩展 ReadFile 读视野（全境读+域内写），phase 工具授权矩阵新增常驻会话/修复会话行，新增判断层 advice 产生/收养审计点位；V5 六工具、路径安全门与 write scope 双轨防护机制保持，V5 对齐段留存追溯（见"V5 当前对齐（V6 追溯留存）"一节）。  
 > 技术范围：六工具（ReadFile/WriteFile/EditFile/QuerySourceAst/Shell/Exec）四层工具面调用规范、closed-schema 输入与返回、路径安全门与 write scope 双轨防护、执行面分工、最小 Hook 审计点位与拒绝传播。  
-> 契约真相：phase 授权矩阵、WriteScope、CheckCommandTemplate（模型侧消费者已清零，仅服务裁决层 InternalVerificationDispatch 与 Scaffold 基线初始化）与稳定错误码由 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 唯一拥有；QuerySourceAst 行为与 PSF-2 项目索引由 [M-06](CodeMigrator_代码分析与AST引擎.md) 拥有；候选工作区即沙箱卷的生命周期、checkpoint commit 与批量校验由 [M-08](CodeMigrator_候选工作区与工具网关.md) 拥有；UDS worker 协议、一次性 overlay 与 Shell/Exec 执行面由 [M-09](CodeMigrator_沙箱与执行环境.md) 拥有。  
+> 契约真相：phase 授权矩阵、WriteScope、CheckCommandTemplate（模型侧消费者已清零，仅服务裁决层 InternalVerificationDispatch 与 Scaffold 基线初始化）与稳定错误码由 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 唯一拥有；QuerySourceAst 行为与 PSF-2/PSF-3 图导航由 [M-06](CodeMigrator_代码分析与AST引擎.md) 拥有；候选工作区即沙箱卷的生命周期、checkpoint commit 与批量校验由 [M-08](CodeMigrator_候选工作区与工具网关.md) 拥有；app 直接管理 bwrap、长期卷与验证临时物化由 [M-09](CodeMigrator_沙箱与执行环境.md) 拥有。  
 > 关联文档：[Agent Loop](CodeMigrator_Agent_Loop设计.md)、[验证引擎](CodeMigrator_验证引擎.md)、[记忆与上下文](CodeMigrator_记忆与上下文管理.md)、[可观测性](CodeMigrator_可观测性系统.md)、[会话与修正](CodeMigrator_会话与运行时修正编排.md)。
 
-工具系统的职责是授权投影与副作用约束：把冻结 phase 允许的最小能力集合变成可审计的类型化调用，并保证任一门禁失败时下游执行与副作用为零。V4 之下 Agent 直写代码（P-01）：EXECUTE 的 Agent 持类 IDE 工具箱在候选工作区自由迭代。垂类约束不再体现为"模型只能提案"，而体现为工具面的三个冻结——工具集合冻结（六工具，无扩展注册）、授权冻结（M-00 phase policy，运行期不可放宽）、路径域冻结（可读根与 write scope 随 Slice 派生冻结，运行期不可扩大）。六工具按四层分工：L1 结构化文件工具（ReadFile/WriteFile/EditFile——原子写、逐写路径门、精细审计）、L2 结构化导航（QuerySourceAst——源快照符号级只读导航，查 PSF-2 索引）、L3 能力通道（Shell——长驻沙箱内自由执行：构建/依赖/探索/会话自检）、L4 编排通道（Exec——嵌入式 JS 引擎编排 L1-L3，一次模型调用多步执行）。验证裁决不属于任何一层、不经任何模型工具，只走裁决层 InternalVerificationDispatch 的冻结通道（冻结检查集 + tested_commit overlay → fingerprint，M-00/M-09）；源码与工具输出进入对话上下文时遵循 M-14 的数据块边界。本文"工具调用"均指模型经 ToolGateway 的调用；Run actor 的内部验证派发不是模型工具，不经本网关（M-00/M-09 边界）。
+工具系统的职责是授权投影与副作用约束：把冻结 phase 允许的最小能力集合变成可审计的类型化调用，并保证任一门禁失败时下游执行与副作用为零。V5 的 EXECUTE Agent 持类 IDE 工具箱在候选工作区自由迭代；工具集合、授权和路径域仍冻结。六工具按四层分工：L1 结构化文件工具，L2 图导航，L3 长驻沙箱 Shell，L4 app 内 Exec 编排。验证裁决不属于任何一层、不经任何模型工具，只走冻结检查集 + tested commit 临时物化目录 → fingerprint 的内部通道；源码与工具输出进入对话上下文时遵循 M-14 的数据块边界。
+
+## V5 当前对齐（V6 追溯留存）
+
+六工具 closed schema、四层工具面、phase 授权、ReadFile 的 cas 数据块、结构化逐写路径门、Shell checkpoint 整体校验、Exec 编排和最小 Hook 审计全部保留。执行面改为 app 直接管理 bwrap；M-09 的长期 Slice 卷与验证临时物化目录分别承载 Agent 迭代和 Oracle 裁决。工具系统不提供 pi 风格开放扩展生态，QuerySourceAst 的图导航能力由 M-06 冻结。V5 对齐段在此留存以供追溯，V6 在上面的基础上追加修复场景的读视野扩展、会话级授权行与 advice 审计点位（见后续各节）。
+
+## V6 方向对齐
+
+V6 在 V5 冻结工具系统之上补齐修复会话与常驻协调会话的工具授权投影：ReadFile 读视野按会话类型条件化扩展、phase 授权矩阵补入非 phase 的会话级授权行、判断层 Advice 的产生/收养纳入 Hook 审计。V6 六工具、路径安全门与 write scope 双轨防护不变；VERIFY/REPORT 零模型硬边界仍适用。读视野条件化扩展的精确判定与 schema 标注为实施期开放项，不以本篇冻结为设备契约。
 
 ## 授权唯一来自 M-00 phase policy
 
@@ -19,21 +28,32 @@
 | `VERIFY` | 空集合 |
 | `REPORT` | 空集合 |
 
-策略由 `codemigrator-core` 以编译时资源 `core://phase-tool-policy/v2` 原子嵌入。网关启动时读取受信 descriptor 的 `payload_sha256`，核验 `SHA-256(JCS(payload))` 后将 Registry descriptor 与 payload exact-compare；哈希不匹配时 app 不进入 ready。Run 创建时冻结该资源版本与哈希，运行期不存在第二次加载。允许性只由 `tool ∈ phase.tools` 派生：`VERIFY`/`REPORT` 请求任何工具（含 `ReadFile`、`Shell` 与 `Exec`）固定返回 `TOOL_PHASE_DENIED`；非 `EXECUTE` phase 请求 `WriteFile`/`EditFile`/`Shell`/`Exec` 在同一步拒绝。不存在本地 fallback、通配符、降级读取或"为修复临时开放"的分支。
+V6 在 phase 授权之上补入非 phase 的会话级授权行（下表为引用快照，共同组成会话的最终工具集合）：
 
-phase 授权只回答"能不能调"；文件类工具的可读根随 phase 进一步收窄：
+| 会话类型 | 唯一授权工具集合 |
+|---|---|
+| 常驻协调会话（探索协调者） | `ReadFile`、`QuerySourceAst`（ANALYZE 级只读集，零写权） |
+| 常驻协调会话（EXECUTE Supervisor） | 只读：态势快照、定向事件投影、只读查询（零写权） |
+| 修复会话 | EXECUTE 六工具 + 升级读视野（见 ReadFile 节）+ 联合域写 |
 
-| Phase | 绑定的可读根 | 说明 |
+> VERIFY/REPORT 零模型硬边界仍适用于全部会话：任何会话在 VERIFY/REPORT 阶段请求任何工具（含 `ReadFile`、`Shell` 与 `Exec`）均固定返回 `TOOL_PHASE_DENIED`。
+
+策略由 `codemigrator.core` 以包内静态资源 `core://phase-tool-policy/v2` 发布。网关启动时读取受信 descriptor 的 `payload_sha256`，核验 `SHA-256(JCS(payload))` 后将 Registry descriptor 与 payload exact-compare；哈希不匹配时 app 不进入 ready。Run 创建时冻结该资源版本与哈希，运行期不存在第二次加载。允许性由 `tool ∈ phase.tools` 派生，叠加 V6 会话级授权行（见上表）：`VERIFY`/`REPORT` 对任何会话请求任何工具（含 `ReadFile`、`Shell` 与 `Exec`）固定返回 `TOOL_PHASE_DENIED`；非 `EXECUTE` phase 请求 `WriteFile`/`EditFile`/`Shell`/`Exec` 在同一步拒绝。不存在本地 fallback、通配符或降级读取的分支；修复会话的读视野扩展开的是读视野维度（见下节），不改变 phase 层"零写入/零 Shell 硬边界"。
+
+phase 授权只回答"能不能调"；文件类工具的可读根随 phase 进一步收窄（V6 修复会话的可读根为条件化扩展，见下）：
+
+| Phase / 会话类型 | 绑定的可读根 | 说明 |
 |---|---|---|
-| `ANALYZE`/`PLAN` | 源项目快照根 | 契约引用与候选工作区此时尚不存在 |
-| `EXECUTE` | 源项目快照根 + 本 Slice 契约引用集合 + 本 Slice 候选工作区根 | 后两者随 Slice 派发冻结，运行期不可扩大 |
-| `VERIFY`/`REPORT` | 无（无授权工具） | 一切读取请求在成员测试处终止 |
+| `ANALYZE`/`PLAN` | 源项目快照根 | 契约引用与候选工作区此时尚不存在；普通并行会话读视野保持 V5 口径 |
+| `EXECUTE` | 源项目快照根 + 本 Slice 契约引用集合 + 本 Slice 候选工作区根 | 后两者随 Slice 派发冻结，运行期不可扩大；普通并行 Slice 会话可读根保持 V5 口径（源快照 + 契约引用 + 本工作区）不变 |
+| 修复会话 | 源项目快照根 + 契约引用集合 + 本域候选工作区根 + **修复集相关 verified 内容（全境读）** | 读视野条件化扩展（见 ReadFile 节）；**写权限仍限本域/联合域 write scope**，读写分离落地 |
+| `VERIFY`/`REPORT` | 无（无授权工具） | 一切读取请求在成员测试处终止（对任何会话均成立） |
 
 ```mermaid
 flowchart LR
     Call["Agent 工具调用\nclosed schema 输入"] --> Policy["phase policy 成员测试\ncore://phase-tool-policy/v2"]
     Policy --> Schema["schema admission\n未知字段 / 枚举 / 上限"]
-    Schema --> Path["路径安全门\ndirfd + openat2 约束解析"]
+    Schema --> Path["路径安全门\ndirfd + O_NOFOLLOW 约束解析"]
     Path --> Scope["域校验\nread roots / write scope"]
     Scope --> Ex["执行面\n进程内文件操作 / 沙箱卷 Shell / 进程内 JS 引擎"]
     Ex --> Audit["审计点位\ntool.call.pre / post → run_events"]
@@ -52,79 +72,126 @@ flowchart LR
 | L3 | `Shell` | 长驻沙箱内自由命令执行：构建/依赖/探索/会话自检 | 该 Slice 专属长驻沙箱卷（M-08/M-09） | `SHELL_TIMEOUT`、`SHELL_LIMIT_EXCEEDED` |
 | L4 | `Exec` | 嵌入式 JS 引擎编排 L1-L3，一次模型调用多步执行 | app 进程内嵌入式 JS 引擎（M-08/M-09） | `EXEC_TIMEOUT`、`EXEC_SCRIPT_ERROR` |
 
-调用协议是单一判别联合，`deny_unknown_fields` 使 schema 拒绝发生在反序列化时刻：
+调用协议是单一判别联合，各变体 `model_config = ConfigDict(extra="forbid")` 使 schema 拒绝发生在解析校验时刻：
 
-```rust
-#[serde(tag = "tool", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
-pub enum ToolCall {
-    ReadFile { path: RepoRelativePath, range: Option<LineRange> },
-    WriteFile { path: RepoRelativePath, content: String },
-    EditFile {
-        path: RepoRelativePath,
-        old_text: String,
-        new_text: String,
-        occur: Option<u32>,           // 1 起始；多命中时必填
-    },
-    QuerySourceAst(SourceAstQuery),   // 四操作枚举由 M-06 拥有
-    Shell {
-        command: String,                    // 自由命令文本（含参数），无命令面白名单
-        workdir: Option<RepoRelativePath>,  // 缺省 = 候选工作区根
-        timeout_secs: Option<u32>,          // 缺省 60 秒模型工具档，可上调受限上限
-    },
-    Exec {
-        script: String,                     // JS 源码字符串，经工具桥编排 L1-L3
-        timeout_secs: Option<u32>,          // 缺省按模型工具档
-    },
-}
+```python
+class ReadFileCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal["READ_FILE"]
+    path: RepoRelativePath
+    range: LineRange | None = None
+
+
+class WriteFileCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal["WRITE_FILE"]
+    path: RepoRelativePath
+    content: str
+
+
+class EditFileCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal["EDIT_FILE"]
+    path: RepoRelativePath
+    old_text: str
+    new_text: str
+    occur: int | None = None        # 1 起始；多命中时必填
+
+
+class QuerySourceAstCall(SourceAstQuery):   # 载荷与四操作枚举由 M-06 拥有
+    tool: Literal["QUERY_SOURCE_AST"]
+
+
+class ShellCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal["SHELL"]
+    command: str                             # 自由命令文本（含参数），无命令面白名单
+    workdir: RepoRelativePath | None = None  # 缺省 = 候选工作区根
+    timeout_secs: int | None = None          # 缺省 60 秒模型工具档，可上调受限上限
+
+
+class ExecCall(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal["EXEC"]
+    script: str                              # JS 源码字符串，经工具桥编排 L1-L3
+    timeout_secs: int | None = None          # 缺省按模型工具档
+
+
+ToolCall: TypeAlias = Annotated[
+    ReadFileCall | WriteFileCall | EditFileCall | QuerySourceAstCall | ShellCall | ExecCall,
+    Field(discriminator="tool"),
+]
 ```
 
 返回侧同为 closed schema 的判别联合；`QuerySourceAst` 的返回结构由 M-06 拥有，此处仅登记变体占位：
 
-```rust
-#[serde(tag = "tool", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
-pub enum ToolOutput {
-    ReadFile(ReadFileOutput),
-    WriteFile(WriteReceipt),
-    EditFile(EditReceipt),
-    QuerySourceAst(SourceAstResult),   // 归 M-06
-    Shell(ShellOutput),
-    Exec(ExecOutput),
-}
+```python
+class ReadFileOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-pub struct ReadFileOutput {
-    pub path: RepoRelativePath,
-    pub body: String,            // 带行号正文，行号 1 起始
-    pub total_lines: u32,
-    pub truncated: bool,         // 超出单次上限时 true，附总行数与分段续读建议
-}
+    tool: Literal["READ_FILE"]
+    path: RepoRelativePath
+    body: str                # 带行号正文，行号 1 起始
+    total_lines: int
+    truncated: bool          # 超出单次上限时 True，附总行数与分段续读建议
 
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum WriteDisposition { Created, Overwritten }
 
-pub struct WriteReceipt {
-    pub path: RepoRelativePath,
-    pub bytes_written: u64,
-    pub disposition: WriteDisposition,
-}
+class WriteDisposition(str, Enum):
+    Created = "CREATED"
+    Overwritten = "OVERWRITTEN"
 
-pub struct EditReceipt {
-    pub path: RepoRelativePath,
-    pub replaced_line: u32,      // 替换处行号
-    pub bytes_before: u64,
-    pub bytes_after: u64,
-}
 
-pub struct ShellOutput {
-    pub exit_code: i32,          // 命令退出码；非 0 是正常反馈而非工具拒绝
-    pub stdout: String,          // 按 M-14 数据块边界进上下文的输出正文，超限截断
-    pub stderr: String,          // 同上；完整原文落 host CAS，不整段进工具 frame
-    pub truncated: bool,         // 任一流超出单次上限时 true
-}
+class WriteReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-pub struct ExecOutput {
-    pub result: String,          // 脚本返回值的 JSON 序列化，按 M-14 数据块边界治理
-    pub step_count: u32,         // 工具桥完成的调用笔数；逐笔回执进 run_events
-}
+    tool: Literal["WRITE_FILE"]
+    path: RepoRelativePath
+    bytes_written: int
+    disposition: WriteDisposition
+
+
+class EditReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal["EDIT_FILE"]
+    path: RepoRelativePath
+    replaced_line: int       # 替换处行号
+    bytes_before: int
+    bytes_after: int
+
+
+class ShellOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal["SHELL"]
+    exit_code: int           # 命令退出码；非 0 是正常反馈而非工具拒绝
+    stdout: str              # 按 M-14 数据块边界进上下文的输出正文，超限截断
+    stderr: str              # 同上；完整原文落 host CAS，不整段进工具 frame
+    truncated: bool          # 任一流超出单次上限时 True
+
+
+class ExecOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal["EXEC"]
+    result: str              # 脚本返回值的 JSON 序列化，按 M-14 数据块边界治理
+    step_count: int          # 工具桥完成的调用笔数；逐笔回执进 run_events
+
+
+# QuerySourceAst 的返回结构由 M-06 拥有，此处仅登记变体占位：
+class QuerySourceAstOutput(SourceAstResult):
+    tool: Literal["QUERY_SOURCE_AST"]
+
+
+ToolOutput: TypeAlias = Annotated[
+    ReadFileOutput | WriteReceipt | EditReceipt | QuerySourceAstOutput | ShellOutput | ExecOutput,
+    Field(discriminator="tool"),
+]
 ```
 
 ### 模型↔Harness 动作编码
@@ -143,7 +210,7 @@ pub struct ExecOutput {
 | 维度 | 规范 |
 |---|---|
 | 输入 | 路径形态：`{ path: RepoRelativePath, range?: { start_line, end_line } }`；数据块形态：`{ cas: "cas://<sha256>", range?: { start_line, end_line } }`（closed-schema 二选一） |
-| 可读域 | 路径形态：路径必须解析进当前 phase 绑定的可读根集合——源项目快照根（全 phase）；本 Slice 依赖的已集成契约工件引用集合（EXECUTE，M-07 冻结的上下文引用）；本 Slice 候选工作区根（EXECUTE）。契约引用与候选工作区根在 Slice 派发时绑定，ANALYZE/PLAN 只有源快照根。数据块形态：仅限本 Run 产生的 ArtifactRef 数据块（宿主 CAS 中以 Run 归属账本校验），只读、零写入语义 |
+| 可读域 | 路径形态：路径必须解析进当前 phase 绑定的可读根集合——源项目快照根（全 phase）；本 Slice 依赖的已集成契约工件引用集合（EXECUTE，M-07 冻结的上下文引用）；本 Slice 候选工作区根（EXECUTE）。契约引用与候选工作区根在 Slice 派发时绑定，ANALYZE/PLAN 只有源快照根；修复会话的可读根为条件化扩展（全境读，见下）。数据块形态：仅限本 Run 产生的 ArtifactRef 数据块（宿主 CAS 中以 Run 归属账本校验），只读、零写入语义 |
 | 执行语义 | 路径形态：在归属根 dirfd 下打开并读取；数据块形态：按 digest 从 host CAS 流式读取。输出均为带行号文本（行号 1 起始、右对齐 + 制表符 + 原文） |
 | 返回 | `ReadFileOutput`：行号正文 + 总行数 + 截断标记；超出单次上限时 `truncated=true`，Agent 以 `range` 分段续读 |
 | 上限 | 单文件/单数据块 64 MiB；单次返回正文 256 KiB；每 agent 会话调用 2 000 次 |
@@ -151,13 +218,15 @@ pub struct ExecOutput {
 
 `cas://` 数据块形态是超限大输出的模型侧取回通道：Shell/检查完整输出外置 CAS 为 ArtifactRef 后（M-14 头尾双窗摘要），关键信号落在摘要窗口之外（如长输出头部的首错与栈顶帧）时，模型以 `cas://<digest>` 精确取回对应数据块分段，替代"用 Shell 重跑过滤"的预算消耗路径；每次取回逐笔过网关并进入 `tool.call.pre/post` 审计与脱敏出口（M-13）。六工具冻结不变——这是 ReadFile 的第二输入形态，不是第七工具。
 
+**读视野条件化扩展（V6 方向）**：ReadFile 的读视野不再恒等于写权限域，二者解绑。修复会话（含全局修复会话与原 Slice 重生的升级包）读视野扩至修复集相关 verified 内容——即全境读（源快照根 + 契约引用集合 + 本域候选工作区根之外的 verified 内容），而**写权限仍限本域/联合域 write scope**。这是"读写分离（Global Read, Scoped Write）"在工具层的落地——读视野与写权限解绑，解决 V5"读视野被写权限绑架"的问题（修复一个横切缺陷时不得不借 Shell 偷读，读视野受写权限域约束导致自纠盲目）。普通并行 Slice 会话可读根保持 V5 口径（源快照 + 契约引用 + 本工作区）不变。读视野条件化扩展的精确定义（如"修复集相关 verified"的判定边界与 ReadFile 输入 schema）标注为实施期开放项，不以本篇冻结为设备契约；运行时仍统一过路径安全门与域校验，全境读只扩读、不扩写。
+
 ### WriteFile
 
 | 维度 | 规范 |
 |---|---|
 | 输入 | `{ path, content }`；`content` 是完整文件正文（UTF-8），不存在追加、部分写或补丁语义 |
-| 写域 | 规范路径必须命中本 Slice 冻结 `WriteScope::Out.write_paths`，或位于某 `create_root` 之下且不命中任何其他 Slice 的冻结集合（M-00/M-07 全计划冻结 scope 表判定）；仍受路径安全门约束 |
-| 执行语义 | 在候选工作区目标目录内创建固定前缀临时文件 → 写入 + fsync → 原子 `rename(2)` 覆盖目标；任一步失败即清理临时文件，目标保持旧内容 |
+| 写域 | 规范路径必须命中本 Slice 冻结 `WriteScope.out.write_paths`，或位于某 `create_root` 之下且不命中任何其他 Slice 的冻结集合（M-00/M-07 全计划冻结 scope 表判定）；仍受路径安全门约束 |
+| 执行语义 | 在候选工作区目标目录内创建固定前缀临时文件 → 写入 + `os.fsync` → 原子 `os.replace` 覆盖目标；任一步失败即清理临时文件，目标保持旧内容 |
 | 返回 | `WriteReceipt`：路径、字节数、新建或覆盖 |
 | 上限 | 单文件 64 MiB；每 Slice 会话写入总量受 Harness 预算（M-03）约束 |
 | 拒绝 | 域外 `WRITE_SCOPE_VIOLATION`（文件写入、candidate ref 推进、checkpoint receipt 均为 0，M-00）；超限 `WRITE_LIMIT_EXCEEDED` |
@@ -170,7 +239,7 @@ pub struct ExecOutput {
 |---|---|
 | 输入 | `{ path, old_text, new_text, occur? }`；`old_text` 非空，`occur` 为 1 起始的命中序号 |
 | 写域 | 同 WriteFile：本 Slice 冻结 write scope，且目标必须是候选工作区内已存在的文件 |
-| 执行语义 | 读全文 → 按 UTF-8 字节精确匹配 `old_text`：恰一次命中直接替换；多次命中且未标注 `occur` 拒绝；标注 `occur` 替换第 `occur` 处；替换后整文件经临时文件 + 原子 rename 写回（同 WriteFile） |
+| 执行语义 | 读全文 → 按 UTF-8 字节精确匹配 `old_text`：恰一次命中直接替换；多次命中且未标注 `occur` 拒绝；标注 `occur` 替换第 `occur` 处；替换后整文件经临时文件 + 原子 `os.replace` 写回（同 WriteFile） |
 | 返回 | `EditReceipt`：替换处行号、前后字节数 |
 | 上限 | 单文件 64 MiB；`old_text`/`new_text` 单项 1 MiB |
 | 拒绝 | 零命中或 `occur` 越界 `EDIT_TARGET_NOT_FOUND`；多命中无 `occur` `EDIT_AMBIGUOUS`（附全部命中行号）；域外 `WRITE_SCOPE_VIOLATION` |
@@ -181,7 +250,7 @@ pub struct ExecOutput {
 
 | 维度 | 规范 |
 |---|---|
-| 输入 | closed-schema 四操作（M-06 `SourceAstQuery` 枚举）：`find_symbol`（符号名 + 可选模块过滤）、`definition`（使用处 `file:range`）、`references`（符号名）、`extract`（`file:range` 子树文本）；自由查询正文与任何修改语义在反序列化时拒绝 |
+| 输入 | closed-schema 四操作（M-06 `SourceAstQuery` 枚举）：`find_symbol`（符号名 + 可选模块过滤）、`definition`（使用处 `file:range`）、`references`（符号名）、`extract`（`file:range` 子树文本）；自由查询正文与任何修改语义在解析校验时拒绝 |
 | 数据面 | 只读冻结源快照（符号级操作应答自 PSF-2 索引，M-06）；不读候选工作区、不读宿主工作树 |
 | 返回 | `SourceAstResult`（M-06 拥有）：命中列表或子树文本，含截断标记 |
 | 上限 | 单次调用 60 秒（M-00 模型工具档）；命中 200 条、单次文本合计 256 KiB——与 M-06 完全一致 |
@@ -204,8 +273,8 @@ pub struct ExecOutput {
 
 | 维度 | 规范 |
 |---|---|
-| 输入 | `{ script, timeout_secs? }`；`script` 是 JS 源码字符串——脚本是 LLM 运行时生成的输出数据，宿主保持 100% Rust；`timeout_secs` 缺省按模型工具档（60 秒） |
-| 执行形态 | app 进程内嵌入式 JS 引擎（deno_core/rquickjs 类成熟 Rust crate，实施期选型）解释执行；脚本经工具桥 `await tools.xxx()` 编排 L1-L3 工具（循环/条件/并行 `Promise.all` 组合），一次模型调用完成多步确定性编排——串行 LLM 循环瓶颈的解法 |
+| 输入 | `{ script, timeout_secs? }`；`script` 是 JS 源码字符串——脚本是 LLM 运行时生成的输出数据，宿主保持 100% Python；`timeout_secs` 缺省按模型工具档（60 秒） |
+| 执行形态 | app 进程内嵌入式 JS 引擎（QuickJS 类成熟引擎的 Python 绑定，实施期选型）解释执行；脚本经工具桥 `await tools.xxx()` 编排 L1-L3 工具（循环/条件/并行 `Promise.all` 组合），一次模型调用完成多步确定性编排——串行 LLM 循环瓶颈的解法 |
 | 选择规则 | "单步直调，多步编排"：单条命令直调 Shell，批量同构操作/多工具组合流程用 Exec 脚本；写入工具描述由模型自然遵循，无硬性门控。典型场景：批量源结构探索（20 轮模型调用变 1 轮）、契约变更后跨文件一致性修订、查→读→改→shell 验证组合流程、测试生成批量产出 |
 | 防护 | 底层每次工具调用逐笔过 ToolGateway（write scope/路径门照常，防护与直调不降级）；脚本零环境权威——引擎不暴露文件系统/网络/进程 API，唯一出口=工具桥；验证裁决不经 Exec（P-02 不破坏） |
 | 审计 | 脚本全文 + 逐笔回执入工具审计/run_events；回执溯源语义（V-M04-V4-013 联动）："该轮之前的回执"含 Exec 内回执序 |
@@ -220,11 +289,11 @@ CheckRunner 不再是 Agent 工具：模型工具注册表移出该变体，全�
 退役语义四条：
 
 - **会话自检并入 Shell**：自由命令自由参数，长驻沙箱内执行，构建缓存/依赖驻留复用（见 Shell 节）；自检仍是反馈不裁决——不写 `CheckResult` 账本、不推进 Slice 状态、不进 verification fingerprint。
-- **UDS 派发链基础设施保留**：消费者恰为两项——裁决层 `InternalVerificationDispatch` 与 Scaffold 基线初始化（M-09）；不存在任何由模型工具触发的 UDS 派发。
+- **app 直接管理裁决与 Scaffold**：`InternalVerificationDispatch` 与 Scaffold 仍不是模型工具，但由 app 直接启动受控 bwrap；不存在 UDS 派发链或由模型工具触发的隐藏执行。
 - **能力路线取代关系（D-034 记录）**：CheckRunner 原结构化诊断（`DiagnosticMapping` file:line）与 Test action+test_filter 有界参数路线被 Shell 自由命令取代——模型读原始输出自纠，放弃结构化诊断；验证独立性本就不依赖自检同面（裁决永远由冻结检查集独立做出，P-02）。
 - **描述符命令模板的模型侧消费者清零**：`CheckCommandTemplate`（M-00/M-01）只服务裁决层与 Scaffold，模型工具面与描述符命令面不再有交集。
 
-`Scaffold` 维持不开放给 Agent：脚手架是带文件写入副作用的一次性项目初始化动作，由 Harness 在输出基线初始化时执行（M-08/M-11）；它经 UDS 派发链落地，是该链除裁决层外唯一的消费者。
+`Scaffold` 维持不开放给 Agent：脚手架是带文件写入副作用的一次性项目初始化动作，由 Harness 在输出基线初始化时执行（M-08/M-11）；它由 app 直接放入受控临时目录并受信吸收声明产物，不经 UDS。
 
 ## 为什么是分层工具面
 
@@ -232,7 +301,7 @@ D-034 原以"为什么没有自由 shell"立论，其四条理由中的信任模
 
 - **结构化通道（L1/L2）保确定性**：原子写、逐写路径门、精细审计——每次写入与导航都是类型化、可逐笔拦截、可逐笔回执的，候选工作区的受信演进由这条通道承担主责。
 - **Shell 通道（L3）保能力**：语言无关的自由执行——构建、依赖安装、探索、临场操作不再要求描述符预声明每个命令；长驻沙箱卷提供物理边界，写效果由 checkpoint 批量校验兜底。
-- **验证只走裁决层冻结通道**：`InternalVerificationDispatch` 以冻结检查集 + tested_commit overlay 计算 fingerprint，与 Agent 工具面零共享——模型无论在 L3/L4 执行了什么，fingerprint 的计算输入不受任何影响（P-02 验证独立性的根基，"Agent 自选考题"在结构上不可能）。
+- **验证只走裁决层冻结通道**：`InternalVerificationDispatch` 以冻结检查集 + tested commit 临时物化目录计算 fingerprint，与 Agent 工具面零共享——模型无论在 L3/L4 执行了什么，fingerprint 的计算输入不受任何影响。
 - **write scope 防护双轨**：结构化工具事前逐写拦截 + Shell 写效果事后 checkpoint 批量校验——防线从单轨逐笔拦截扩展为事前+事后双轨，完整性不降。
 - **Exec（L4）为编排通道**：一次模型调用编排多步确定性执行，解决串行 LLM 循环瓶颈；底层每次工具调用逐笔过 ToolGateway，防护不因编排降级。
 
@@ -247,7 +316,7 @@ D-034 原以"为什么没有自由 shell"立论，其四条理由中的信任模
 | `Shell` | 该 Slice 专属长驻沙箱卷内直接执行，bubblewrap 隔离（M-08/M-09） | 不可信执行面 | 沙箱卷内文件系统（含构建缓存/依赖驻留）；越界写由 checkpoint 批量校验兜底，宿主零触碰 |
 | `Exec` | app 进程内嵌入式 JS 引擎解释执行（M-08/M-09） | 受信面：脚本零环境权威，唯一出口=工具桥 | 引擎实例内存/CPU 上限内；副作用经工具桥逐笔落底层工具的既定副作用面 |
 
-文件工具与 Exec 不进沙箱：文件操作由 app 进程内的确定性 Rust 代码执行，Exec 脚本在 app 进程内嵌入式引擎解释执行（零环境权威，唯一出口=工具桥）；候选工作区物理上是该 Slice 专属长驻沙箱卷，宿主 app 经共享挂载对其读写，越权风险由路径安全门与冻结域承担。Shell 是唯一的不可信执行面：命令在长驻沙箱卷内直接执行，构建缓存与已装依赖跨命令驻留复用；其写效果不走逐写路径门，由 checkpoint 提交时的批量校验兜底（M-08）。裁决层检查执行保留同一条 UDS 派发、active-attempt 约束与 overlay 销毁链（M-09），消费者只有裁决层 `InternalVerificationDispatch` 与 Scaffold 基线初始化两项——Agent 工具面与裁决执行面之间不再共享任何通道。
+文件工具与 Exec 不进沙箱：文件操作由 app 进程内的确定性 Python 代码执行，Exec 脚本在 app 进程内嵌入式引擎解释执行；候选工作区物理上是该 Slice 专属长驻沙箱卷，宿主 app 经共享挂载对其读写，越权风险由路径安全门与冻结域承担。Shell 是唯一的不可信执行面：命令在长驻沙箱卷内直接执行，构建缓存与已装依赖跨命令驻留复用；其写效果不走逐写路径门，由 checkpoint 提交时的批量校验兜底。裁决层检查由 app 直接在 tested commit 临时物化目录启动，受 active-attempt 约束，与 Agent 工具面不共享任何通道。
 
 ```mermaid
 sequenceDiagram
@@ -274,11 +343,11 @@ sequenceDiagram
 | 2 | 绝对路径与 `~` 前缀拒绝 | `PATH_DENIED` |
 | 3 | 路径遍历拒绝：`.`、`..` 段在任何位置；百分号或 Unicode 编码变体在规范化后复检 | `PATH_DENIED` |
 | 4 | `.git` 拒绝：首段或任一段等于 `.git`（按字节精确匹配，不做大小写折叠） | `PATH_DENIED` |
-| 5 | 符号链接 no-follow：解析带 `RESOLVE_NO_SYMLINKS \| RESOLVE_NO_MAGICLINKS`，路径含任何链接段即拒绝，不跟随 | `PATH_DENIED` |
-| 6 | 根绑定与挂载点校验：每个可读根/可写根在创建时预打开独立 dirfd；一次调用只绑定一个根，在该根 dirfd 下以 `RESOLVE_BENEATH` 解析，`RESOLVE_NO_XDEV` 阻止越出根的挂载边界。源快照根与候选工作区根是互不相同的目录树（不同挂载点），不存在从一根拼接进另一根的合法路径 | `PATH_DENIED` |
+| 5 | 符号链接 no-follow：逐段 `os.open` 携带 `O_NOFOLLOW` 解析（等价 `RESOLVE_NO_SYMLINKS`/`RESOLVE_NO_MAGICLINKS` 的内核约束），路径含任何链接段即拒绝，不跟随 | `PATH_DENIED` |
+| 6 | 根绑定与挂载点校验：每个可读根/可写根在创建时预打开独立 dirfd；一次调用只绑定一个根，在该根 dirfd 下逐段相对解析（不越出根，等价 `RESOLVE_BENEATH`），并逐段校验 `st_dev` 阻止越出根的挂载边界（等价 `RESOLVE_NO_XDEV`）。源快照根与候选工作区根是互不相同的目录树（不同挂载点），不存在从一根拼接进另一根的合法路径 | `PATH_DENIED` |
 | 7 | 打开后替换竞争：句柄绑定旧 inode，回执标记实际 inode 与长度，不重新按路径打开 | —（正确性标注，非拒绝） |
 
-该门同样约束 WriteFile/EditFile 的临时文件物化（临时文件必须落在目标目录所属根内）、overlay grant 与审计 Artifact 写入，不允许任何辅助文件绕开所属根。Shell 的写效果不经此门（命令重定向无法逐笔拦截），由 checkpoint 提交时的 Git diff 批量校验承担（M-08）；Exec 内经工具桥发起的每次结构化调用照常过门。
+该门同样约束 WriteFile/EditFile 的临时文件物化（临时文件必须落在目标目录所属根内）、验证临时目录的受信物化与审计 Artifact 写入，不允许任何辅助文件绕开所属根。Shell 的写效果不经此门（命令重定向无法逐笔拦截），由 checkpoint 提交时的 Git diff 批量校验承担（M-08）；Exec 内经工具桥发起的每次结构化调用照常过门。
 
 ## 拒绝码与失败传播
 
@@ -298,12 +367,11 @@ sequenceDiagram
 
 失败不隐藏：每次拒绝都以结构化错误对象返回模型对话上下文，模型据此在同 phase 内自纠；网关不重试、不代改、不降级。
 
-```rust
-pub struct ToolError {
-    pub code: ToolErrorCode,
-    pub retryable_in_phase: bool,     // 几乎全部为 true；TOOL_PHASE_DENIED 恒为 false
-    pub facts: Vec<ErrorFact>,        // 机器可读上下文：命中行号、截断建议、域边界提示
-}
+```python
+class ToolError(BaseModel):
+    code: ToolErrorCode
+    retryable_in_phase: bool      # 几乎全部为 True；TOOL_PHASE_DENIED 恒为 False
+    facts: list[ErrorFact]        # 机器可读上下文：命中行号、截断建议、域边界提示
 ```
 
 | 错误码 | facts 携带的自纠事实 |
@@ -332,23 +400,27 @@ V3 的七步 Hook 链在 V4 下按"安全判断内化为门禁、审计保留为
 | Execute | 执行面（进程内文件操作 / 沙箱卷 Shell / 进程内 JS 引擎） |
 | Redact & record | `tool.call.post` 审计点位 + M-13 脱敏 |
 
-保留的最小集是两个工具审计点位与一个 checkpoint 前钩子。
+保留的最小集是两个工具审计点位、一个 checkpoint 前钩子，外加 V6 新增的判断层 advice 产生/收养审计点位。
 
 | 点位 | 触发 | 记录内容 | 不记录 |
 |---|---|---|---|
 | `tool.call.pre` | 每次调用进入网关（含将被拒绝的调用） | run/slice/generation/phase、工具名、参数摘要（canonical 哈希 + 路径类别/命令文本摘要/脚本哈希）、时间戳 | 输入正文、匹配内容 |
 | `tool.call.post` | 调用终结（成功、拒绝或超时） | 终态、错误码、时长、结果状态与副作用摘要（成功写入的目标路径、字节数；Shell 的退出码与输出摘要；Exec 的脚本哈希与逐笔步数） | 正文、stdout/stderr |
 | `checkpoint.pre` | Harness 将候选工作区文件集提交为 checkpoint commit 前（生命周期归 M-08） | 工作区 Git diff ⊆ 冻结 write scope 的批量校验结论（覆盖 Shell 写效果）、文件数与字节摘要 | 文件内容 |
+| `advice.proposed` | 判断层产生一条 Advice 时 | **Advice 全量进 run_events**：实体/phase/触发源、上下文摘要、`proposal_hash`（供收养核验） | 工具正文、被拒路径原文 |
+| `advice.adopted` | 判断层收养一条 Advice 时 | 收养判定与落点摘要、`proposal_hash` 关联回溯源 | 正文、匹配内容 |
+
+> **Advice 不是模型工具**：判断层 advice 的产生/收养属判断层内部动作，不从模型工具面发起，不经 ToolGateway 工具面，也不进入 six-tool 授权集合；经 `advice.proposed` / `advice.adopted` 审计点位全量投影进 run_events（M-13/M-02），`proposal_hash` 建立产生—收养的核验关联。
 
 `checkpoint.pre` 承担 write scope 双轨防护的事后批量校验：结构化工具（含 Exec 工具桥发起的底层调用）已在事前逐笔拦截越界写；Shell 的写效果不经逐写路径门（命令重定向无法逐笔拦截），此处在整体提交前校验工作区 Git diff 全部落在冻结 write scope 内，越界拒绝提交且工作区不污染 verified（M-08）。越界来源分两类处置（owner：M-08/V-M08-V4-007）：纯 Shell 越界写属可预期失败面——中止提交、零 ref 推进、产生告警事件，越界路径清单回 Agent 上下文自纠，Agent 回退越界变更后重新声明完成，generation 不消耗、工作区保留；若结构化工具审计存在越界记录，则意味着网关被绕过或实现缺陷，属基础设施事故——工作区整体丢弃，原 generation 物理重派从最近合法 checkpoint 重建（不消耗 generation，M-00/M-08）。
 
-点位是网关与 Harness 内的固定代码路径，不是可注入脚本：不设用户自定义 Hook 扩展点，工具面封闭——六工具 + M-00 policy，不存在第三方注册入口、Hook 配置文件或动态加载。审计事件与 M-02 的 `run_events` 同事务投影：每次工具调用的工具名、参数摘要与结果状态进入事件流（Shell 命令附退出码与输出摘要，Exec 附脚本全文与逐笔回执），供 M-13 可观测性指标与 M-15 工作台（卡片实时动作展示）消费。AskUser 与 Skill 不登记为模型工具（M-16）：聊天输入与知识正文不能经任何点位获得源码、路径或编辑权限。
+点位是网关与 Harness 内的固定代码路径，不是可注入脚本：不设用户自定义 Hook 扩展点，工具面封闭——六工具 + M-00 policy，不存在第三方注册入口、Hook 配置文件或动态加载。审计事件与 M-02 的 `run_events` 同事务投影：每次工具调用的工具名、参数摘要与结果状态进入事件流（Shell 命令附退出码与输出摘要，Exec 附脚本全文与逐笔回执），供 M-13 可观测性指标与 M-15 工作台（卡片实时动作展示）消费。AskUser、Skill 与判断层 Advice 均不登记为模型工具（M-16）：聊天输入、知识正文与判断层建议不能经任何点位获得源码、路径或编辑权限。
 
 ## 贯穿场景
 
 ### 场景一：EditFile 匹配失败与自纠
 
-EXECUTE 实现 Slice B 的 Agent 要把 `src/api/client.py` 中一处 `dict[str, Any]` 换成强类型模型。`EditFile` 到达网关：EXECUTE 授权、schema 合法、路径在 B 的冻结 write scope 内、安全门通过；但全文扫描命中 3 处，返回 `EDIT_AMBIGUOUS`，错误对象附 3 处命中行号（L42/L87/L121）。Agent 核对行号后以 `occur=2` 重发，恰替换第 2 处，整文件经临时文件 + 原子 rename 写回，返回 `EditReceipt`（替换行号 L87、前后字节数）。全程零 ref 推进——checkpoint 由 Harness 在自检完成后统一提交。
+EXECUTE 实现 Slice B 的 Agent 要把 `src/api/client.py` 中一处 `dict[str, Any]` 换成强类型模型。`EditFile` 到达网关：EXECUTE 授权、schema 合法、路径在 B 的冻结 write scope 内、安全门通过；但全文扫描命中 3 处，返回 `EDIT_AMBIGUOUS`，错误对象附 3 处命中行号（L42/L87/L121）。Agent 核对行号后以 `occur=2` 重发，恰替换第 2 处，整文件经临时文件 + 原子 `os.replace` 写回，返回 `EditReceipt`（替换行号 L87、前后字节数）。全程零 ref 推进——checkpoint 由 Harness 在自检完成后统一提交。
 
 ### 场景二：Shell 自检反馈驱动修正
 
@@ -362,16 +434,24 @@ Agent 需要为 20 个模块逐一核对契约符号的引用位置。串行直�
 
 最终验证阶段某测试失败，模型想读取该测试文件解释原因。请求在网关成员测试处即得 `TOOL_PHASE_DENIED`（M-00：VERIFY 授权集合为空）：零文件打开、零工具执行，仅一条拒绝审计事件。模型只能消费 M-10 归因后的诊断与验证 receipt 投影；失败归因（测试文件 write scope + 被测模块依赖 → owning Slice 定向重生成）是 Harness 职责，验证阶段不会演化为不受控的修复循环。
 
-## 可验收的结果
+## V5 可验收增量
+
+- [ ] 运行期工具面恰为 ReadFile、WriteFile、EditFile、QuerySourceAst、Shell、Exec 六工具；CheckRunner 不再是 Agent 工具，VERIFY/REPORT 不能通过工具面执行。
+- [ ] QuerySourceAst 使用 PSF-2 图谱导航（符号、caller/callee、impact、context、FTS），ReadFile 支持受控 `cas://` 数据块读取；两者均只读且带来源审计。
+- [ ] app 直接管理 bwrap；Shell 使用 Slice 长期沙箱卷，裁决验证使用独立临时物化目录；不存在 UDS 派发链或 overlay 授权路径。
+- [ ] WriteFile/EditFile 逐写拦截越界，Shell 越界写由 checkpoint.pre 批量拒绝；拒绝不推进 candidate、verified 或 checkpoint receipt。
+- [ ] Exec 内工具桥调用逐笔经过同一 ToolGateway，脚本不能触达宿主文件系统、网络或进程 API。
+
+## V4 历史验收基线（追溯，非当前 V5 契约）
 
 - [ ] V-M12-V4-001：VERIFY/REPORT 请求任一工具（含 ReadFile、QuerySourceAst、Shell、Exec）返回 `TOOL_PHASE_DENIED`，文件打开与沙箱命令执行数为 0
 - [ ] V-M12-V4-002：`core://phase-tool-policy/v2` payload 哈希不匹配时 app 不进入 ready；运行期不存在第二次策略加载
 - [ ] V-M12-V4-003：WriteFile/EditFile 写域外路径（不命中 `write_paths` 且不位于合法 `create_root` 之下，含新建命中他 Slice 冻结路径）返回 `WRITE_SCOPE_VIOLATION`，文件写入、candidate ref 推进与 checkpoint receipt 均为 0
-- [ ] V-M12-V4-004：WriteFile/EditFile 写入过程注入崩溃，候选工作区不出现半写文件或残留临时文件（原子 rename 验证）
+- [ ] V-M12-V4-004：WriteFile/EditFile 写入过程注入崩溃，候选工作区不出现半写文件或残留临时文件（原子 `os.replace` 验证）
 - [ ] V-M12-V4-005：EditFile 零命中返回 `EDIT_TARGET_NOT_FOUND`；多命中无 `occur` 返回 `EDIT_AMBIGUOUS` 且错误对象含全部命中行号；标注 `occur` 后恰替换指定一处
 - [ ] V-M12-V4-006：ReadFile 读取可读根外路径返回 `READ_OUT_OF_SCOPE`；ANALYZE/PLAN 请求候选工作区路径同样拒绝
 - [ ] V-M12-V4-007：QuerySourceAst 的操作集、60 秒超时、200 条命中与 256 KiB 截断行为与 M-06 定义逐项一致；`definition`/`references` 应答来自 PSF-2 项目索引查询而非按需计算
-- [ ] V-M12-V4-008：模型工具注册表无 CheckRunner（请求该工具名返回 `TOOL_NOT_FOUND`，全部 phase 授权集合不含它）；UDS 派发链消费者恰为裁决层 `InternalVerificationDispatch` 与 Scaffold 基线初始化两项，不存在由模型工具触发的 UDS 派发
+- [ ] V-M12-V4-008（V4 历史协议部分已退役）：模型工具注册表无 CheckRunner（请求该工具名返回 `TOOL_NOT_FOUND`，全部 phase 授权集合不含它）；V5 不存在 UDS 派发链，裁决层 `InternalVerificationDispatch` 与 Scaffold 基线初始化均由 app 直接管理 bwrap，且不存在由模型工具触发的验证执行
 - [ ] V-M12-V4-009：Shell 命令在该 Slice 专属长驻沙箱卷内执行，宿主文件系统零触碰；同会话第二次构建/测试复用驻留的构建缓存与已装依赖（无重复下载与冷编译）
 - [ ] V-M12-V4-010：Shell 越界写（重定向至冻结 write scope 外路径）在 checkpoint 提交时被批量校验拒绝：commit 不创建、零 ref 推进、verified 不被污染，拒绝事件含越界路径清单
 - [ ] V-M12-V4-011：绝对路径、`..`、`.git`、symlink、跨根/跨挂载样本注入全部返回 `PATH_DENIED`，目标不被打开

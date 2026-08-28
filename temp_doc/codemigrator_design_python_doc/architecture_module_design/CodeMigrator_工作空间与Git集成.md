@@ -1,11 +1,15 @@
 # CodeMigrator Git 真相、Slice 候选与确定性交付
 
-> 文档状态：V4 当前架构基线。  
+> 文档状态：V5 方向对齐版。  
 > 技术范围：单个迁移 Run 的托管输出仓库、源项目只读快照、内部 refs、不相交文件集集成、expected-OID CAS 事务、非 force push 交付、可选 PR 与托管输出 export。  
 > 契约真相：[M-00 公共契约](CodeMigrator_垂类设计原则与架构哲学.md)拥有 `GitRunRefs`、`CandidateGeneration`、`IntegrationIntent`、`RunStatus`、`VerificationOutcome` 与 `DeliveryChannelStatus`；本篇拥有其 Git 落地、文件集应用与恢复规则，以及输出物化的 Git 侧语义。  
 > 关联文档：[运行协调](CodeMigrator_Harness总体设计.md)、[并行计划](CodeMigrator_迁移计划生成器.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[三层验证](CodeMigrator_验证引擎.md)、[外部 API](CodeMigrator_系统后端架构.md)、[会话与托管输出](CodeMigrator_会话与运行时修正编排.md)、[Web 体验与迁移可视化工作台](CodeMigrator_Web体验与可视化工作台.md)。
 
 Git 在 CodeMigrator 中保存两类互相独立的事实：冻结的**源项目只读快照**与**目标项目的输出历史**。源快照是源项目零写入承诺的 Git 侧表达——只在托管 clone 中只读存在，永不推进；目标项目（构建文件、目录结构、翻译后的源码与测试）的全部产出落在从空输出基线开始的独立历史中。每个 Slice generation 的候选在独立候选工作区生成，Agent 直写目标代码，Harness 把完成的文件集冻结为 checkpoint commit；Integration Coordinator 按冻结集成序把队首 checkpoint 的输出文件集**直接应用**到唯一 `verified` 主线——没有补丁重放，也没有编辑序列重演；语义正确性由集成后的增量验证裁决。目录和 worktree 都可删除后重新物化；commit、ref、PostgreSQL intent 与 receipt 才是崩溃恢复能信任的证据。
+
+## V5 当前对齐
+
+Git 仍是源快照和目标输出的真相，CAS 单写者、checkpoint receipt、直接文件集应用和 verified 单主线均保留。Planner 冻结的 integration_rank 是唯一集成序；它来自已确认的计划提案，不能由完成时间、旧的 topological_layer 或 deterministic_plan_order_key 改写。验证目录从被测 commit 临时物化，长期 Slice 沙箱卷只承载候选迭代和构建缓存。
 
 ## 源快照与输出基线：两个互不重叠的 Git 根事实
 
@@ -20,7 +24,7 @@ verified 输出历史的根是输出基线，不含源快照的任何 commit：�
 
 ## 一条 verified 主线，多条独立候选线
 
-每个 Slice generation 拥有独立 candidate ref。generation `0` 从创建该候选时读取的最新 verified OID 分叉（Run 内首次即输出基线）；generation `1`、`2` 从触发重生成时的最新 verified 重新建立完整候选。物理 worker 重派只改变 `DispatchAttemptId`，不创建新代次。
+每个 Slice generation 拥有独立 candidate ref。generation `0` 从创建该候选时读取的最新 verified OID 分叉（Run 内首次即输出基线）；generation `1`、`2` 从触发重生成时的最新 verified 重新建立完整候选。bwrap 物理重派只改变 `DispatchAttemptId`，不创建新代次。
 
 ```mermaid
 flowchart LR
@@ -52,11 +56,11 @@ flowchart LR
 | 源快照 | 冻结的 commit OID | Run 创建一次，此后只读 | 以再次 fetch 覆盖来源事实 |
 | base（输出基线） | 空 tree root commit OID | Run 创建时写一次 | 被改写、推进或解释为源历史 |
 | Slice candidate | `CandidateGeneration` 的 commit OID | 该 Slice 的每次 checkpoint 以 expected-OID CAS 推进 | 成为用户分支或另一 Slice 的输入 |
-| integration scratch | prospective commit OID | Coordinator 应用队首 checkpoint 文件集后临时创建 | 交给 agent、worker 或作为正式交付 |
+| integration scratch | prospective commit OID | Coordinator 应用队首 checkpoint 文件集后临时创建 | 交给 agent、bwrap 或作为正式交付 |
 | verified | 唯一正式 commit OID | prospective 增量验证 Oracle 通过后原子推进 | 被局部验证、push 或报告直接推进 |
 | 用户分支 | verified commit OID | 仅在代码交付时从 verified 建立或前推 | 指向 candidate、scratch 或 tree OID |
 
-上述 ref 一律指向 commit，不指向 tree。candidate 的候选工作区是该 Slice/generation 私有物；沙箱每个 check 只读取由被测 commit 物化的一次性 validation overlay，绝不挂载 canonical candidate、scratch 或 verified 的工作区，不可信构建输出因此既不能污染下一次 checkpoint，也不能修改 Git ref。
+上述 ref 一律指向 commit，不指向 tree。candidate 的候选工作区是该 Slice/generation 私有物；验证从被测 commit 物化临时目录，绝不挂载 canonical candidate、scratch 或 verified 的工作区，不可信构建输出因此既不能污染下一次 checkpoint，也不能修改 Git ref。
 
 ## Ref 名称把并行边界写进仓库
 
@@ -73,7 +77,7 @@ flowchart LR
 Run 级共享 `work` ref 不存在。并发保护由三件事承担，不依赖任何字节哈希：
 
 1. **输出路径集合互斥**——M-07 在 PLAN 冻结 write scope（write_paths + create_roots），write_paths 相交或 create_roots 与他 Slice 冻结集合相交时加入确定性 `OrderedBefore`，因此任意时刻处于生成期的 Slice 其输出路径两两不相交；
-2. **冻结集成序**——Coordinator 只按 M-07 冻结的 `topological_layer ASC → deterministic_plan_order_key ASC → SliceId ASC` 消费队首；
+2. **冻结集成序**——Coordinator 只按 M-07 冻结的 `integration_rank ASC → SliceId ASC` 消费队首；
 3. **expected-OID CAS**——candidate checkpoint、scratch 建立与 verified 推进都要求显式 expected OID。
 
 precondition/replacement/anchor 三哈希与 `content_sha256` 体系全部废除：目标文件由 Slice 新建、源文件只读、输出路径互斥，字节级前置守卫没有对应场景。write scope 防护为双轨（M-08/M-12）：结构化工具的越界写在落盘前被逐笔拦截返回 `WRITE_SCOPE_VIOLATION`；Shell 写效果不经逐笔拦截，由 checkpoint 批量校验在事实固化时点整体裁决——越界拒绝提交、工作区不污染 verified。两轨均不扩大集合，也不创建额外 ref。
@@ -90,7 +94,7 @@ tree 条目是 blob 指针不是内容：checkpoint tree 与 verified tree 的�
 |---|---|---|---|
 | 候选迭代 | Slice、generation、冻结 write scope、候选工作区 | 无 | `WRITE_SCOPE_VIOLATION`（结构化工具落盘前拒绝）；Shell 越界写由 checkpoint 批量校验拒绝提交（M-08） |
 | checkpoint | 工作区文件集、expected candidate OID | 仅 candidate ref CAS | `CANDIDATE_REF_CONFLICT` |
-| 局部验证 | candidate commit 的一次性 overlay | 无 canonical ref 写入 | 验证失败语义归 M-10 |
+| 局部验证 | candidate commit 的临时物化目录 | 无 canonical ref 写入 | 验证失败语义归 M-10 |
 | 集成排队 | 局部通过的 Slice/generation | 无 | 队列仍按冻结集成键消费 |
 
 checkpoint 幂等键覆盖 `run_id/slice_id/generation/candidate_commit_oid/checkpoint 内容摘要`（M-00 冻结），仅服务崩溃后的 receipt 对账。贯穿场景中，翻译 `models` 的 Slice A 与翻译 `api` 的 Slice B 各自在独立 candidate ref 上推进 checkpoint 链；即使 B 先局部通过，Coordinator 仍按冻结序先消费 A，B 的 candidate 保持不变并在队列等待。
@@ -188,7 +192,14 @@ flowchart LR
 
 partial export 无需特殊裁剪逻辑：verified head 本身就是"已按冻结序集成的 Slice 闭包"，物化它即得到依赖闭合的部分目标项目，失败与缺失模块由 M-16 的账本标注。`migration-log.md` 与 manifest 只写托管输出目录；用户显式 export 才复制到其指定 destination，source repo 不在 export 的写入目标之列。没有有效 verified 的 FAILED/CANCELLED Run 不制造输出。
 
-## 可证伪施工验收
+## V5 可验收增量
+
+- [ ] 源项目与源仓库全程零写入；目标输出只进入托管 Git 根与 verified 主线。
+- [ ] 每个 Slice generation 使用独立 candidate ref 与长期沙箱卷，验证从 tested commit 临时物化目录执行，不把验证目录混入候选卷。
+- [ ] 集成只由 Integration Coordinator 按冻结 `integration_rank ASC → SliceId ASC` 串行推进，expected-OID CAS 防止并发改写；完成顺序不能改变 verified 历史。
+- [ ] PlanRevision 只能经 M-16 安全点/确认门产生新计划或补偿 Slice，已验证历史不被回写；交付失败只改变交付通道状态。
+
+## V4 历史验收基线（追溯，非当前 V5 契约）
 
 - [ ] V-M11-V4-001：Run 全程对源快照与源仓库的写入数为 0——源仓库文件、`.git`、ref 与 mtime 变化均为 0，托管 clone 中源快照 commit 的推进次数为 0。
 - [ ] V-M11-V4-002：`runs/<run_id>/base` 在 Run 创建时初始化为空输出基线且此后零变化；verified 历史的根 commit 等于该基线，输出历史包含的源项目 commit 数为 0。

@@ -1,11 +1,15 @@
 # CodeMigrator Migration Spec：从迁移意图到可验证输入
 
-> 文档状态：V4 当前架构基线。  
+> 文档状态：V5 方向对齐版。  
 > 适用范围：迁移意图作者、Spec 上传端、CreateRun 前置校验。  
 > 契约真相：公共 ID、`ToolchainDescriptor`、`SourceToolchain`、`TargetToolchain`、`CheckCommandTemplate`、`CheckAction`、`RequiredCheck` 与检查超时由 [M-00：设计原则、并行系统地图与公共契约](CodeMigrator_垂类设计原则与架构哲学.md) 唯一定义；本篇拥有 Spec 的业务语义和规范化规则。  
 > 关联文档：[工程边界与目录架构](CodeMigrator_核心目录架构设计.md)、[外部 API 与投影](CodeMigrator_系统后端架构.md)、[源端代码分析](CodeMigrator_代码分析与AST引擎.md)、[并行计划生成器](CodeMigrator_迁移计划生成器.md)、[沙箱与执行环境](CodeMigrator_沙箱与执行环境.md)、[验证引擎](CodeMigrator_验证引擎.md)。
 
-Migration Spec 不是"给模型的一段需求"，而是一份可持久化、可审计、可在运行前拒绝的问题定义。它把跨语言迁移意图收束为一个已锁定的语言对、两份精确锁定的工具链描述符资源、一个有限的迁移范围和一组必须完成的检查。这样，后续模块接到的是确定输入，而不是用户命令、自由 prompt 或构建脚本。翻译语义本身不进入 Spec：由 EXECUTE 的 Agent 依契约层产出的接口直接承担，Spec 只锁定"翻译成什么语言、翻哪些路径、用什么检查证明"。
+Migration Spec 不是"给模型的一段需求"，而是一份可持久化、可审计、可在运行前拒绝的问题定义。它把跨语言迁移意图收束为一个已锁定的语言对、两份精确锁定的工具链描述符资源、一个有限的迁移范围和一组必须完成的检查。这样，后续模块接到的是确定输入，而不是用户命令、自由 prompt 或构建脚本。翻译语义本身不进入 Spec：由 EXECUTE 的 Agent 依 Planner 选择的 Slice 与其可能存在的契约上下文承担，Spec 只锁定"翻译成什么语言、翻哪些路径、用什么检查证明"。
+
+## V5 当前对齐
+
+Spec v3 仍是迁移意图、语言对、描述符锁、范围和检查集的兼容输入，但其中的分解策略只作为 Planner 的原则性提示，不再机械派生 Slice、DAG、write scope 或目标目录。起草确认包新增 TargetProjectBlueprint，并与 UnderstandingDossier、MigrationRulebook 一起和 Spec 形成四件冻结输入；四件工件的版本与 hash 进入 Run bundle。具体提案由 Planner 产出，M-07 的机器校验负责拒绝不合规结果。
 
 ## Spec 的边界：声明什么，不声明什么
 
@@ -20,7 +24,7 @@ Migration Spec 不是"给模型的一段需求"，而是一份可持久化、可
 | 分解策略 | 目标模块粒度、并行度上限、测试分组策略（可选） | 只约束计划形状，不触碰 write scope 或检查内容 |
 | 自由命令或 prompt | 不允许 | 避免绕过类型化执行与不可信数据边界 |
 
-write scope 不是 Spec 字段：M-00 规定 `WriteScope` 由 Planner 从分析产物与描述符派生，Spec 与模型都不能提交或覆盖它。Spec 中出现任何 write scope 声明字段按 unknown-field deny 拒绝。
+write scope 不是 Spec 字段：M-00 规定 `WriteScope` 由 Planner 提案并由 PlanValidation 校验，Spec、描述符与模型都不能在计划冻结后提交或覆盖它。Spec 中出现任何 write scope 声明字段按 unknown-field deny 拒绝。
 
 ### 固定输入门槛
 
@@ -44,7 +48,7 @@ flowchart LR
     C --> X
 ```
 
-门之间不存在"尽量继续"的分支：任一门失败，该次上传不产生 Spec 正文；CreateRun 的描述符资源门失败则不分配 `run_id`，Run、`run_events` 与 Git ref 新增数均为 `0`。资源预检发生在 CreateRun 事务之前，因此失败路径也不会创建 Slice、candidate generation 或 worker dispatch。
+门之间不存在"尽量继续"的分支：任一门失败，该次上传不产生 Spec 正文；CreateRun 的描述符资源门或四工件完整性门失败则不分配 `run_id`，Run、`run_events` 与 Git ref 新增数均为 `0`。资源预检发生在 CreateRun 事务之前，因此失败路径也不会创建 Slice、candidate generation 或 bwrap dispatch。
 
 | 门 | 检查事实 | 成功产物 | 主要拒绝 |
 |---|---|---|---|
@@ -220,7 +224,7 @@ Spec 层没有命令参数面。`required_checks` 只携带 action 与模板摘�
 
 ## 交接给分析与计划
 
-Spec 进入 Run 后保持不可变。M-06 使用源项目快照、源端解析器引用与测试识别配置建立 import 图、模块清单与测试覆盖图；M-07 接收范围、检查集、分解策略与描述符锁，构造契约/实现/测试翻译/测试生成四类 `MigrationSlice`（M-00 `SliceKind`）并从描述符派生 write scope；首版所有 Slice 完整继承 Spec 全量冻结检查集，没有按文件裁剪或局部检查子集。三层验证消费的是同一冻结集合，各层实例化该集合的哪个子集由 M-10 的分层检查表唯一定义（NONDETERMINISM 守卫以共有 CheckId 规范化语义结果为单位比较，不要求两层 frozen set 全等，见 M-00/M-10）。Spec 不能因为某个 Slice 失败而被局部改写或临时放宽。
+Spec 进入 Run 后保持不可变。M-06 使用源项目快照、源端解析器引用与测试识别配置建立 import 图、模块清单与测试覆盖图；M-07 接收四件冻结工件、范围、检查集、分解原则与描述符锁，交由 Planner 提案并经机器校验生成 Slice、边、write scope 和 integration_rank。SliceKind 仍包含 Contract/Implementation/TestTranslation/TestGeneration，但 Contract 可不创建。三层验证消费冻结检查集合，各层实例化哪个子集由 M-10 定义；Spec 不能因为某个 Slice 失败而被局部改写或临时放宽。
 
 不可变性有机制支撑而不只是承诺：`migration_specs` 行不存在 UPDATE 路径，修正迁移意图只能上传新正文并获得新 `SpecId`；Run、计划、验证证据与报告全部以 canonical hash 作为引用键，而不是行位置或可变指针。因此描述符资源后续升级、模式白名单扩展或 schema 升级都不会追溯改写历史 Run 的输入定义，对同一 Spec 的任意次读取都得到字节相同的 canonical JSON。
 
@@ -250,7 +254,7 @@ Spec 进入 Run 后保持不可变。M-06 使用源项目快照、源端解析�
 
 Spec 生命周期的前段是"草稿→确认→冻结"。Spec 起草会话（[M-04](CodeMigrator_Agent_Loop设计.md) 定义工具面与循环边界，会话 Agent 与 TaskDraft/草稿数据模型 owner 为 [M-16](CodeMigrator_会话与运行时修正编排.md)）发生在 ANALYZE 之前：用户选定源项目路径并输入自然语言迁移需求，Agent 以只读探索（ReadFile/QuerySourceAst）起草 Spec 草稿——自然语言收敛为语言对、范围与工件策略、测试策略的建议值；经 AskUser 补齐关键决策、用户多轮审阅修改后，草稿经用户显式确认才由 TaskDraftRevision 生成本篇的 canonical Spec Artifact/hash 并进入 CreateRun 流程。Agent 只起草不提交，确认权在用户；未经显式确认的草稿不产生任何 Run 副作用。
 
-会话目标不是第二种 Spec 输入：草稿阶段不占用本篇 Spec 语义，canonical Spec 仍唯一。工件分类与处理策略的真相在描述符 `artifact_rules` 声明（见上文能力预检），测试策略落位于检查集与分解策略字段；描述符锁由系统按语言对从当前资源账本解析并写入，TaskDraft、message 或会话上下文不能直接指定它，也不能覆盖 write scope 或安全策略。
+会话目标不是第二种 Spec 输入：草稿阶段不占用本篇 Spec 语义，canonical Spec 仍唯一。四件工件的确认包是 Spec 的冻结伴随输入；工件分类与工具链事实仍由描述符声明，目标结构与执行切分由 Blueprint/Planner/PlanValidation 决定。描述符锁由系统按语言对从当前资源账本解析并写入，TaskDraft、message 或会话上下文不能直接指定它，也不能覆盖 write scope 或安全策略。
 
 运行中修正如改变这些冻结事实，必须按结构修正产生 ImpactPreview，确认后创建新的 PlanRevision；去掉 Compile/Test 检查、替换描述符锁、扩大范围越过模式白名单或削弱安全策略固定拒绝。这样用户可以修正迁移意图，却不能把自然语言变成任意命令面。
 

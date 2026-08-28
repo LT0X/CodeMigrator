@@ -1,6 +1,6 @@
 # CodeMigrator Web 体验与迁移可视化工作台
 
-> 文档状态：V4 当前架构基线；本篇为 M-15，拥有 Web 页面与 CLI/Web 展示体验的展示模型、persona 舞台、场分区、事件→动作归约、视觉与动画语义。  
+> 文档状态：V5 方向对齐版；本篇为 M-15，拥有 Web 页面与 CLI/Web 展示体验的展示模型、persona 舞台、场分区、事件→动作归约、视觉与动画语义。  
 > 技术范围：跨语言翻译 Run 的展示体验——persona 舞台与四场分区、语义等价证据页、报告与系统页面、快照/SSE 前端归约、CLI 精简过程视图；覆盖桌面主工作台、平板降级视图与移动端观察视图。  
 > 契约真相：REST/SSE 投影与事件回放由 [M-02：系统后端架构](CodeMigrator_系统后端架构.md) 拥有；`SliceAttemptStatus`、`SliceKind`、并发上限公式与事件术语由 [M-00：设计原则、并行系统地图与公共契约](CodeMigrator_垂类设计原则与架构哲学.md) 拥有；四类 Slice DAG、冻结集成序与边 provenance 由 [M-07：迁移计划生成器](CodeMigrator_迁移计划生成器.md) 拥有；三层验证、归因（含守恒辅助归因信号）与 flaky 事件、GENERATED 标注维度与验证边界声明语义由 [M-10：验证引擎](CodeMigrator_验证引擎.md) 拥有，本篇只呈现、不修改其语义；候选工作区与 checkpoint 由 [M-08：候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md) 拥有；会话与修正确认由 [M-16：会话与运行时修正编排](CodeMigrator_会话与运行时修正编排.md) 拥有。本篇不重复定义公共状态、HTTP DTO 或指标 descriptor。  
 > 产品边界与关联：CLI 是创建、取消、服务管理、交付重试与自动化的主入口；Web 以观察为主，只开放会话输入、问题回答与修正确认，不执行迁移控制、代码修改、Git 写操作、取消或交付重试。关联 [Harness 总体设计](CodeMigrator_Harness总体设计.md)、[Git 集成](CodeMigrator_工作空间与Git集成.md)、[可观测性](CodeMigrator_可观测性系统.md)、[上下文管理](CodeMigrator_记忆与上下文管理.md)。  
@@ -8,6 +8,10 @@
 Web 不是第二个控制台。它让用户看懂一个已经由 CLI 或 Web 会话确认后发起的跨语言翻译：TypeScript 源项目被只读分析，哪些 Slice 正在并行翻译、哪个 agent 会话正在作业哪个 Slice、为什么一个候选在等待契约或排队集成、哪次集成失败正在定向重生成，以及最终哪些目标代码真正汇入了唯一 verified 主线。CLI 同样持续展示工作过程，只是把复杂事实压缩为可读的终端过程流。浏览器只能读取稳定的 REST/SSE 事实，并提交会话消息、问题回答和已生成预览的修正确认。
 
 基于旧文档的初版web页面原型 ref/codemigrator-web-prototype/ 页面布局和样式和动画效果，后面实现需要参考这个原型。
+
+## V5 当前对齐
+
+起草视图需要展示知识图谱域扇出、各探索报告的 file:range 覆盖与冲突、四件工件草稿及一次确认门；规划视图展示 Planner proposal、机器校验四项门槛和自动冻结结果，不显示逐 Slice 用户确认。执行视图保留 Slice 并行、长期卷、checkpoint 与 integration_rank；验证视图保留 Oracle 三层证据、测试保序、GENERATED、parity 与修正 ImpactPreview。Web 仍只读运行投影并提交允许的会话/确认动作。
 
 ## 迁移汇流场，而不是 AI 办公室
 
@@ -133,15 +137,15 @@ stateDiagram-v2
 
 舞台默认**跟随最近状态变化的 Slice**：最近一条改变 Slice 状态的事件所指向的卡片获得舞台焦点（放大、描边强调、检查器联动），让用户不操作也能持续看到"正在发生什么"。用户点击任意卡片或 DAG 节点即**锁定**该对象：锁定期间聚焦不再自动跟随；锁定对象自身发生状态变化（分区迁移、动作切换、归因事件）时，卡片以强调色高亮脉冲提示一次，不抢走焦点、不打断输入。再次点击锁定对象或按 Esc 解除锁定，恢复自动跟随。
 
-### 契约层先行与依赖闭包就绪的汇入
+### Planner 选择的 Slice 与依赖闭包汇入
 
-汇流场隐喻适配拓扑分层调度（M-07，依赖闭包就绪即启动）：
+汇流场隐喻适配 Planner 冻结的 DAG（M-07，依赖闭包就绪即启动）：
 
-- **契约层独奏**：契约 Slice 通常最先作业。它作业期间舞台上只有它一张 persona 卡片在作业区奔跑（独奏），身后是整片尚在低饱和等待的占位卡——用户一眼看懂"地基未成"。占位卡标注"等待其依赖闭包内的契约 Slice 集成"，对应等待区·契约阻塞。
-- **闭包就绪、逐个汇入**：任一 Slice（实现/测试翻译/测试生成）在其依赖闭包内全部契约 Slice 集成后即可上场——多契约长尾期，已就绪 Slice 与在途契约 Slice 同台并行，不等待全仓库契约清空（V-M00-V4-001）。persona 在汇流口庆祝退场后，后续 Slice 依 DAG ready 并行上场（数量受并发上限与 ready 集合约束），舞台进入多 persona 并行作业态。完成先后不改变冻结集成序（M-07 集成键），先完成者只能在等待区排队。
-- **测试翻译/测试生成 Slice 的展示**：测试翻译 Slice 在其覆盖模块归属的契约 Slice 集成后 ready，可与被测实现 Slice 并行上场；其测试执行裁决由 M-10 在场门控保序（V-M10-V4-027，被测实现在场方执行），舞台不因此改变其上场时机。测试生成 Slice（源模块无测试时派生，M-00/M-07）同规则上场；两者以同一套 persona 卡片呈现，SliceKind 标签区分类别，测试生成 Slice 相关证据在证据页以 GENERATED 标注与移植测试严格区分（见下文）；其排队、集成、归因重生成（`TEST_FAILURE_ATTRIBUTED` 两步归因可能把失败归属实现 Slice）与庆祝退场使用同一状态机。
+- **可选契约 Slice**：若 Planner 选择 Contract Slice，它可以先行产出骨架与契约事实；依赖它的 persona 卡片显示“等待依赖闭包”，不相关分支仍按各自 DAG ready 条件推进。若计划不含 Contract Slice，舞台不展示虚构的契约独奏，其他 Slice 按其实际前驱直接上场。
+- **闭包就绪、逐个汇入**：任一 Slice 在其 Requires/OrderedBefore 依赖闭包满足后即可上场——多分支计划中，已就绪 Slice 与在途前驱同台并行，不等待全仓库某类 Slice 清空。persona 在汇流口庆祝退场后，后续 Slice 依 DAG ready 并行上场（数量受三池资源、并发上限与 ready 集合约束），完成先后不改变冻结集成序，先完成者只能在等待区排队。
+- **测试翻译/测试生成 Slice 的展示**：若 Planner 选择相关 Contract Slice，测试翻译/测试生成 Slice 可在其依赖闭包满足后与被测实现 Slice 并行上场；没有 Contract Slice 时按实际 DAG 前驱上场。其测试执行裁决由 M-10 在场门控保序（V-M10-V4-027，被测实现在场方执行），舞台不因此改变其上场时机。测试生成 Slice（源模块无测试时派生，M-00/M-07）同规则上场；两者以同一套 persona 卡片呈现，SliceKind 标签区分类别，测试生成 Slice 相关证据在证据页以 GENERATED 标注与移植测试严格区分（见下文）；其排队、集成、归因重生成（`TEST_FAILURE_ATTRIBUTED` 两步归因可能把失败归属实现 Slice）与庆祝退场使用同一状态机。
 
-以贯穿场景（TS→Python，冻结集成序 CT→A→B→C→T1→T2，M-07/M-10）走一遍舞台时间线：CT 独奏 → 汇流口庆祝退场 → A、B 双 persona 并行上场 → B 先局部通过进等待区（wait），A 后通过也排队，Coordinator 仍先集成 A → A 庆祝退场、B 集成 → C 上场；C 集成时类型检查发现对 models 契约误用，`TEST_FAILURE_ATTRIBUTED` 归因 C，C 的 persona 移入重生成位（error）展示"契约签名不一致 · client.py:42 → g1" → g1 局部通过回等待区 → 集成庆祝退场 → T1、T2 依序上场、集成。最终验证（VERIFYING）不属于舞台 persona：它在冻结 verified head 上执行翻译后全套测试，进度以 Run 头部阶段条与事件时间线呈现，失败归因触发对应 Slice 重生成时该 Slice 的 persona 重新上场走完整状态机。
+以贯穿场景（TS→Python，Planner 选择 Contract Slice，冻结集成序 CT→A→B→C→T1→T2，M-07/M-10）走一遍舞台时间线：CT 独奏 → 汇流口庆祝退场 → A、B 双 persona 并行上场 → B 先局部通过进等待区（wait），A 后通过也排队，Coordinator 仍先集成 A → A 庆祝退场、B 集成 → C 上场；C 集成时类型检查发现对 models 契约误用，`TEST_FAILURE_ATTRIBUTED` 归因 C，C 的 persona 移入重生成位（error）展示"契约签名不一致 · client.py:42 → g1" → g1 局部通过回等待区 → 集成庆祝退场 → T1、T2 依序上场、集成。若 Planner 不选择 Contract Slice，则时间线从其 DAG 的实际源点开始，不生成 CT 独奏。最终验证（VERIFYING）不属于舞台 persona：它在冻结 verified head 上执行翻译后全套测试，进度以 Run 头部阶段条与事件时间线呈现，失败归因触发对应 Slice 重生成时该 Slice 的 persona 重新上场走完整状态机。
 
 ## 页面地图：从 Run 到证据
 
@@ -151,7 +155,7 @@ stateDiagram-v2
 | `/runs/:runId` | 迁移汇流场 | 谁在作业、谁在等待、谁在重生成、什么已汇入主线？ |
 | `/runs/:runId/report` | 报告与语义等价证据页 | 翻译结果、验证证据与交付分别是什么？ |
 | `/sessions/new`、`/sessions/:sessionId` | 会话输入 | 任务草稿与修正确认如何进入 Run？ |
-| `/system` | 系统状态 | app、worker、PostgreSQL 与描述符资源是否可用？ |
+| `/system` | 系统状态 | app、PostgreSQL、三池与描述符资源是否可用？ |
 
 `/runs/:runId` 接受 `slice`、`check`、`event`、`panel`、`viewport`、`focus` 和 `filter` 查询参数。它们只保存用户选择、舞台焦点与过滤条件；URL 中不得出现 credential、ArtifactRef、源码正文、日志正文或宿主路径。刷新或分享链接后，页面必须恢复同一对象的检查器上下文与舞台焦点（含锁定状态）。
 
@@ -163,7 +167,7 @@ stateDiagram-v2
 
 活动 Run 使用迁移流卡片展示：仓库、Spec、语言对、RunStatus、活动 Slice 数、已集成 Slice 数、当前验证层和最后事件。活动卡片可有低频边缘呼吸；终态 Run 保持静态。历史不超过 20 条时使用卡片，超过后切换紧凑列表，并支持仓库、日期、RunStatus、部分完成、报告交付与代码交付过滤。
 
-页面底部的 Environment Strip 只显示 app、sandbox-worker、PostgreSQL 与双工具链描述符资源的安全摘要。它链接到系统状态页，不暴露 DSN、socket 路径、凭据或宿主文件路径。
+页面底部的 Environment Strip 只显示 app、PostgreSQL、模型会话池/沙箱执行池/裁决派发池与双工具链描述符资源的安全摘要。它链接到系统状态页，不暴露 DSN、socket 路径、凭据或宿主文件路径。
 
 | 情况 | 页面行为 | 禁止行为 |
 |---|---|---|
@@ -184,13 +188,13 @@ stateDiagram-v2
 | 节点形状按 SliceKind | 契约 / 实现 / 测试翻译 / 测试生成 四类 | 选中打开检查器 |
 | 实线箭头 | `Requires`（实现→契约、实现→实现、测试翻译/测试生成→契约） | 选中后高亮依赖闭包 |
 | 虚线箭头 | `OrderedBefore`（Unknown 保守边、写冲突边） | 显示 provenance 与排序原因 |
-| 冻结集成序号 | 集成键序（`topological_layer → plan_order_key → SliceId`） | 跳转集成队列对应位置 |
+| 冻结集成序号 | 集成键序（`integration_rank → SliceId`） | 跳转集成队列对应位置 |
 
 Slice 节点默认只展示短 SliceId、SliceKind、`SliceAttemptStatus`、`g0/g1/g2`、write scope 文件数与冻结集成序号。详细的 write scope、generations 历史、provenance 与事件只在右侧检查器展开，不能以弹窗淹没画布。
 
 ### 冻结集成队列与 Verified Spine
 
-等待区旁保留一条显眼但克制的冻结集成队列视图，严格消费 M-07 冻结的 `topological_layer ASC → deterministic_plan_order_key ASC → SliceId ASC`。候选完成速度只影响"已经准备好"的状态，不改变队列位置。队首 Slice 进入集成（prospective 建立与增量验证）期间，后续 Slice 可继续局部计算，但不能越过队首正式集成。
+等待区旁保留一条显眼但克制的冻结集成队列视图，严格消费 M-07 冻结的 `integration_rank ASC → SliceId ASC`。候选完成速度只影响"已经准备好"的状态，不改变队列位置。队首 Slice 进入集成（prospective 建立与增量验证）期间，后续 Slice 可继续局部计算，但不能越过队首正式集成。
 
 ```mermaid
 flowchart LR
@@ -339,7 +343,7 @@ TTY 采用"持久过程流 + 固定摘要"的混合形式：顶部 Header（仓�
 
 ### Ctrl+C 是取消 Run，不是仅退出观察
 
-跟踪中第一次 Ctrl+C 停止新增终端动画，以当前可信 version 发送 `If-Match` Cancel 请求，显示 `Cancelling Run…`，等待 Run actor 持久化取消事实并补读 `CANCELLED`。第二次 Ctrl+C 立即退出本地 CLI，但必须说明取消是否确认；未确认时输出 `codemigrator run show <run_id>` 与 `codemigrator run cancel <run_id>`。返回 `STALE_VERSION` 时读取一次最新投影重试一次，第二次仍冲突则报告取消未确认。CLI 永远不能直接终止 worker、写 PostgreSQL 或修改 Git。
+跟踪中第一次 Ctrl+C 停止新增终端动画，以当前可信 version 发送 `If-Match` Cancel 请求，显示 `Cancelling Run…`，等待 Run actor 持久化取消事实并补读 `CANCELLED`。第二次 Ctrl+C 立即退出本地 CLI，但必须说明取消是否确认；未确认时输出 `codemigrator run show <run_id>` 与 `codemigrator run cancel <run_id>`。返回 `STALE_VERSION` 时读取一次最新投影重试一次，第二次仍冲突则报告取消未确认。CLI 永远不能直接终止 bwrap、写 PostgreSQL 或修改 Git。
 
 | 已知结果 | Exit code |
 |---|---:|
@@ -362,7 +366,7 @@ M-15 不拥有 HTTP 契约，但要求 M-02 提供以下只读投影：
 | `GET /api/v1/migrations/{run_id}/events` | SSE 与 Last-Event-ID 回放 |
 | `GET /api/v1/migrations/{run_id}/report` | 报告与语义等价证据页投影 |
 | `GET /api/v1/migrations/{run_id}/evidence/{receipt_id}` | 授权且脱敏的证据分页 |
-| `GET /api/v1/system/health` | 安全化系统状态（app、worker、PostgreSQL、描述符资源） |
+| `GET /api/v1/system/health` | 安全化系统状态（app、PostgreSQL、三池、描述符资源） |
 
 `workspace` 是展示聚合，不能成为新的运行真相源；它只能由 PostgreSQL、Git receipt 与既有只读投影构建。SSE 沿用 M-02 的 envelope 版本化事件流，本篇至少消费：`run.status_changed`、`slice.status_changed`、`candidate.generation_started`、`dispatch.started`、`dispatch.interrupted`、`dispatch.discarded`、`verification.completed`、`integration.queued`、`integration.started`、`integration.completed`、`verified.advanced`、`TEST_FAILURE_ATTRIBUTED`、`FLAKY_TEST_OBSERVED`、`report.completed`、`delivery.status_changed`。新增事件类型只扩展映射表行，不改变四动作四分区模型。渲染完备性验收义务：新事件类型必须与定义它的同一变更集交付渲染 case，或提供可理解的 default 呈现——不允许出现"入流但无渲染语义"的不可见事件（实测 40.4% 事件无终端渲染 case 的教训成文为验收项）。
 
@@ -386,7 +390,7 @@ M-15 不拥有 HTTP 契约，但要求 M-02 提供以下只读投影：
 
 桌面端提供完整四区工作台；平板端把检查器改为抽屉；移动端降级为按冻结顺序排列的 Slice 卡片列表（保留四动作图标）与时间线。DAG 必须同时提供等价的树形或列表视图；键盘可选择卡片与节点、打开检查器和跳转事件；SSE 更新不能抢走焦点；新事件通过非打断式 ARIA live 摘要表达；Tooltip 不得承载唯一信息；persona 动画在 reduced-motion 下退化为静态姿态图符。
 
-首版性能目标是 200 个 Slice、500 条边、10,000 条事件、20 个同时活动的对象投影；M-07 上限 5000 Slice 时自动降级为列表视图。舞台 persona 卡片恒 ≤ 4，卡片动画开销天然有界。事件只更新受影响卡片与节点；时间线虚拟滚动；日志和证据分页；详情按需加载；终态停止 SSE；画布不可见时降低刷新和动画频率。
+首版性能目标是 200 个 Slice、500 条边、10,000 条事件、20 个同时活动的对象投影；超过 M-07 实施期规模上限时自动降级为列表视图（具体上限待定稿）。舞台 persona 卡片恒 ≤ 4，卡片动画开销天然有界。事件只更新受影响卡片与节点；时间线虚拟滚动；日志和证据分页；详情按需加载；终态停止 SSE；画布不可见时降低刷新和动画频率。
 
 ## 前端包与 CLI 应用的施工边界
 
@@ -439,7 +443,7 @@ M-15 不拥有 HTTP 契约，但要求 M-02 提供以下只读投影：
 
 用户在项目根或子目录运行裸 `codemigrator` 时，CLI 自动发现最近 Git root，并以 `当前项目 → 翻译目标` 作为过程流 Header，例如 `legacy-console → Python`。会话确认后，CLI 和 Web 都在展开区域显示同一组受限事实：Source 是只读项目名和授权 display path，Target 是目标语言与工具链描述符摘要，Output 是托管输出工作区，Base/Verified 只显示短 OID。真实路径、ArtifactRef、源码正文和凭据从 URL、公共 SSE、错误文本与分享链接中排除。
 
-`/sessions/new` 只能选择 CLI 已注册项目、既有托管 snapshot 或远端 Git，不能浏览服务器任意目录；`/sessions/:sessionId` 由会话流、TaskDraft 预览、问题卡、context chip、ImpactPreview 和模块变化视图组成。Web 只能提交自然语言 message、Question answer、TaskDraft confirm 或 ImpactPreview confirm；不会出现隐藏的代码修改、Git、worker、数据库、Cancel 或 delivery retry 按钮。**起草会话边界**：Spec 起草会话批次 1 以 CLI 为主入口；Web 的 TaskDraft confirm 仅把草稿确认事实写入会话通道（TaskDraftRevision 账本），不触发 CreateRun——Run 创建仍仅由 CLI 主入口发起（V-M15-V4-001 Web 无 CreateRun 入口不变）。**理解档案呈现**：起草会话的《项目理解档案》与 Spec 草稿并列呈现供用户审阅（章节导航 + 锚点跳转源快照只读视图）；确认状态与内容 hash 随会话投影展示；档案摘录随各 Slice 卡片详情只读可查——均为已冻结事实的投影，本篇零自行判定。
+`/sessions/new` 只能选择 CLI 已注册项目、既有托管 snapshot 或远端 Git，不能浏览服务器任意目录；`/sessions/:sessionId` 由会话流、探索报告、四件工件草稿、问题卡、context chip、PlanValidation、ImpactPreview 和模块变化视图组成。Web 只能提交自然语言 message、Question answer、TaskDraft confirm 或 ImpactPreview confirm；不会出现隐藏的代码修改、Git、bwrap、数据库、Cancel 或 delivery retry 按钮。**起草会话边界**：TaskDraft confirm 仅把四件工件的确认事实写入会话通道，不直接触发 Slice 执行；Run 创建仍由 CLI 主入口发起。探索报告、覆盖率和冲突以只读事实呈现，本篇零自行判定。
 
 ```mermaid
 flowchart LR
@@ -464,7 +468,14 @@ CLI 在会话模式保留固定输入行，支持 `/status`、`/skills`、`/chan
 
 Run 工作台的右侧检查器提供 `Corrections` 与 `Module Changes` 标签，但不改变 DAG 基本位置或冻结集成顺序。局部修正显示 superseded Slice 到 replacement Slice 的 lineage；结构修正显示确认过的 preview 摘要；已集成修改显示 compensation Slice 重新上场的过程。旧 generation、失效候选与 discarded attempt 只能进入 Attempt History，不能点亮成功动画。会话流使用持久 `migration.session.event` 与短暂 `assistant.delta`：前者按 sequence 归约，后者只用于正在形成的回复，不能使舞台状态或动画提前发生。
 
-## 可证伪验收
+## V5 可验收增量
+
+- [ ] 起草视图呈现知识图谱域扇出、锚点覆盖/置信度/冲突、四件工件草稿与一次确认门；不提供逐 Slice 确认入口。
+- [ ] 规划视图呈现 Planner proposal、PlanValidation 结果、蓝图约束与自动冻结的 DAG/integration_rank；Contract Slice 可不存在。
+- [ ] 执行视图按实际 DAG ready、三池资源和冻结集成序展示 Slice；不把 Contract Slice 渲染为全局启动屏障。
+- [ ] 证据页只读呈现 Oracle 三层结果、GENERATED/LOW_QUALITY、parity、守恒与 ImpactPreview；Web 不新增 CreateRun、Cancel、Git 或代码写入通道。
+
+## V4 历史验收基线（追溯，非当前 V5 契约）
 
 - [ ] V-M15-V4-001：CLI 可在不打开浏览器的情况下创建、追踪、取消和查看迁移；Web 没有 CreateRun、Cancel、delivery retry 或 Git 写操作入口。
 - [ ] V-M15-V4-002：M-00 的 owner 索引和阅读路径均能到达本篇；本篇不重复定义公共状态、HTTP DTO、指标 descriptor 或安全策略。
@@ -475,7 +486,7 @@ Run 工作台的右侧检查器提供 `Corrections` 与 `Module Changes` 标签�
 - [ ] V-M15-V4-007：全部上场、退场、动作切换由 `run_events` 按 sequence 归约驱动；关闭事件源后舞台零变化；无事件对应的动画不存在。
 - [ ] V-M15-V4-008：舞台默认聚焦最近状态变化的 Slice；用户点击锁定后不再自动跟随，锁定对象状态变化时高亮脉冲一次且不抢焦点；Esc 或再次点击解除锁定。
 - [ ] V-M15-V4-009：舞台按 Slice 自身就绪语义展示——任一 Slice 在其依赖闭包内全部契约 Slice 集成后即显示为上场作业（依赖闭包就绪即启动，V-M00-V4-001），多契约长尾期已就绪 Slice 与在途契约 Slice 同台；低饱和契约阻塞占位卡仅针对闭包尚未满足的 Slice，不得出现"全仓库契约清空前隐藏已就绪 Slice"的全局屏障式展示。
-- [ ] V-M15-V4-010：改变各 Slice 完成顺序 100 次，冻结集成队列与 Verified Spine 展示顺序保持 `topological_layer ASC → deterministic_plan_order_key ASC → SliceId ASC`。
+ - [ ] V-M15-V4-010：改变各 Slice 完成顺序 100 次，冻结集成队列与 Verified Spine 展示顺序保持 `integration_rank ASC → SliceId ASC`。
 - [ ] V-M15-V4-011：三层验证（局部语法+契约类型检查 / 集成增量全量 / 最终翻译后全套测试）在页面上可区分；Error UNKNOWN 大于零时明确显示 Oracle 阻断。
 - [ ] V-M15-V4-012：Final 与同 commit/检查集的 prospective 语义 fingerprint 不一致时显示 `NONDETERMINISTIC_VERIFICATION` 分叉；仅 receipt/日志载体差异不触发。
 - [ ] V-M15-V4-013：语义等价证据页呈现通过率、失败清单（含 `TEST_FAILURE_ATTRIBUTED` 归因与 generation 轨迹）、flaky 清单、覆盖映射、结构守恒与等价信心分级，全部来自 M-02 投影，前端零自行计算。

@@ -1,11 +1,20 @@
 # CodeMigrator 记忆与上下文管理：预算治理、数据边界与会话重建
 
-> 文档状态：V4 当前架构基线；本篇是 Context Pack 装配与冻结、四类会话上下文的管理策略、运行期数据块边界与中断会话重建的唯一 owner。  
+> 文档状态：V6 方向对齐版；本篇是 Context Pack 装配与冻结、四类会话上下文的管理策略、运行期数据块边界与中断会话重建的唯一 owner。  
+> V6 演进：新增常驻协调会话（探索协调者 / EXECUTE Supervisor）预算档；新增常驻会话特有的有界滚动摘要机制；全局修复会话改为导航索引式装配。"无自由记忆"原则精确化为"主 Agent 记忆 = 审计事实的结构化投影（可从 run_events 事件流重建），不含自由对话史"。三条增量均不触碰 V4/V5 已建立的预算治理、数据块边界、外置存储、逐出与中断重建机制，V5 对齐段保留作追溯基线。  
 > 技术范围：Context Pack identity 与预算档、源码与工具输出（含 Shell 命令输出与 Exec 脚本结果）进入上下文的尺寸边界、ArtifactRef 外置、逐出与摘要、会话重建、缓存与保留期。  
 > 契约真相：公共类型、预算终态与留存规则由 [M-00 垂类设计原则与架构哲学](CodeMigrator_垂类设计原则与架构哲学.md) 唯一拥有；四类会话（含测试生成）与 Spec 起草会话的上下文构成与来源使用边界由 [M-04 Agent Loop](CodeMigrator_Agent_Loop设计.md) 唯一拥有；工具调用规范与工具输出上限由 [M-12 工具系统与 Hook](CodeMigrator_工具系统与Hook.md) 拥有（`QuerySourceAst` 行为归 M-06）；checkpoint commit 与恢复窗口由 [M-08 候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md) 拥有。  
 > 关联文档：[Agent Loop](CodeMigrator_Agent_Loop设计.md)、[工具系统与 Hook](CodeMigrator_工具系统与Hook.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[代码分析与 AST 引擎](CodeMigrator_代码分析与AST引擎.md)、[验证引擎](CodeMigrator_验证引擎.md)、[Harness 总体设计](CodeMigrator_Harness总体设计.md)、[可观测性](CodeMigrator_可观测性系统.md)、[会话与运行时修正编排](CodeMigrator_会话与运行时修正编排.md)。
 
-上下文管理不再回答"预投影多少源码给模型"，而回答三个问题：每段初始输入从哪个冻结事实装配而来（装配与溯源）、会话如何在预算内持续运转（运行期治理）、中断之后如何从审计事实恢复而不伪造记忆（会话重建）。V4 之下源码是数据不是指令（P-05）：Agent 在运行期自由 `ReadFile` 源项目快照，Harness 不做源码预投影裁剪；本篇的管理对象因此从"注入哪些源码切片"转为"预算、冻结、逐出、外置与重建"。它只组装不可变引用与受控初始装配，不存储自由记忆或跨运行学习结论。
+上下文管理不再回答"预投影多少源码给模型"，而回答三个问题：每段初始输入从哪个冻结事实装配而来（装配与溯源）、会话如何在预算内持续运转（运行期治理）、中断之后如何从审计事实恢复而不伪造记忆（会话重建）。当前设计下源码是数据不是指令（P-05）：Agent 在运行期自由 `ReadFile` 源项目快照，Harness 不做源码预投影裁剪；本篇的管理对象因此从"注入哪些源码切片"转为"预算、冻结、逐出、外置与重建"。它只组装不可变引用与受控初始装配，不存储自由记忆或跨运行学习结论。
+
+## V5 当前对齐
+
+起草上下文新增四件工件的版本化引用：Spec、UnderstandingDossier、TargetProjectBlueprint、MigrationRulebook；同时承载按域扇出的探索报告、锚点覆盖聚合、显式冲突和置信度理由。Planner pack 只读消费四件冻结输入与 M-06 关系图，产出提案和机器校验结果；EXECUTE pack 继承蓝图摘录、规则手册消费版本和冻结 write scope。CAS、预算、数据块边界、源码是数据不是指令、会话信息防火墙及重建规则不变。
+
+## V6 当前对齐
+
+在 V5 对齐基础上新增三类增量：其一，**常驻会话预算档**——Context Pack 会话类型新增常驻协调会话（探索协调者 / EXECUTE Supervisor）预算档，常驻会话计入模型会话池并受独立预算档约束（数值实施期基准）；其二，**滚动摘要机制**（常驻会话特有）——历史唤醒记录蒸馏为有界滚动窗口，近期唤醒保详情、远期蒸馏为摘要；"常驻"仅指会话上下文跨触发连续，而非持续消费事件流；观察成本受独立预算档治理。Supervisor 触发时注入基线态势快照（机器计算，本身不入上下文）与本次决策定向事件投影；其三，**修复会话导航索引式装配**——全局修复会话初始装配不再一次性装满全境，修复简报为必要输入（不可静默截断），其余以导航索引形态给出（涉及文件 + 位置清单），Agent 按需 `ReadFile` 拉取，超限部分外置 host CAS 并经 `cas://` 取回。V4/V5 的预算治理、数据块边界、外置存储与中断重建机制原样保持，V5 对齐段留存作追溯基线。
 
 ## 职能边界：M-14 拥有什么，引用什么
 
@@ -50,52 +59,57 @@ flowchart LR
 
 Context Pack 是 dispatch 时冻结的初始装配，不是运行期增长的容器。identity 由 Run、Phase、会话类型、Slice generation 引用与三个冻结哈希共同决定；任一字段变化即产生新 identity，旧 pack 整体失效。
 
-```rust
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SessionKind {
-    AnalyzeAuxiliary, PlanAuxiliary,
-    Contract, Implementation, TestTranslation, TestGeneration,
-}
+```python
+class SessionKind(str, Enum):
+    AnalyzeAuxiliary = "ANALYZE_AUXILIARY"
+    PlanAuxiliary = "PLAN_AUXILIARY"
+    Contract = "CONTRACT"
+    Implementation = "IMPLEMENTATION"
+    TestTranslation = "TEST_TRANSLATION"
+    TestGeneration = "TEST_GENERATION"
+    # V6 新增：常驻协调会话（跨 Slice 协调，非单一 Slice 专属）
+    ExploreCoordinator = "EXPLORE_COORDINATOR"   # 探索协调者
+    ExecuteSupervisor = "EXECUTE_SUPERVISOR"     # EXECUTE Supervisor
 
-pub struct SliceGenerationRef {
-    pub slice_id: SliceId,
-    pub generation: CandidateGeneration,
-    pub baseline_candidate_oid: Option<GitOid>,  // dispatch 时 candidate ref 指向；该 generation 尚无 checkpoint 则为 None
-}
 
-pub struct ContextPackIdentity {
-    pub run_id: RunId,
-    pub phase: Phase,
-    pub session: SessionKind,
-    pub slice: Option<SliceGenerationRef>,       // 仅 EXECUTE 四类会话携带
-    pub spec_sha256: Sha256,
-    pub model_binding_sha256: Sha256,
-    pub phase_policy_sha256: Sha256,             // core://phase-tool-policy/v2
-    pub contract_refs_sha256: Sha256,            // dispatch 时冻结的契约引用集合
-}
+class SliceGenerationRef(BaseModel):
+    slice_id: SliceId
+    generation: CandidateGeneration
+    baseline_candidate_oid: GitOid | None   # dispatch 时 candidate ref 指向；该 generation 尚无 checkpoint 则为 None
 
-pub struct SessionBudgetProfile {
-    pub session: SessionKind,
-    pub initial_pack_token_cap: u64,             // 初始装配上限
-    pub session_token_cap: u64,                  // 会话累计（含工具结果与逐出摘要）
-    pub eviction_watermark_pct: u8,              // 净输入水位，触发逐出与摘要
-}
 
-pub struct ContextPack {
-    pub identity: ContextPackIdentity,
-    pub budget: SessionBudgetProfile,
-    pub assembled_tokens: u64,                   // provider adapter 精确计数
-}
+class ContextPackIdentity(BaseModel):
+    run_id: RunId
+    phase: Phase
+    session: SessionKind
+    slice: SliceGenerationRef | None        # 仅 EXECUTE 四类会话携带
+    spec_sha256: Sha256
+    model_binding_sha256: Sha256
+    phase_policy_sha256: Sha256             # core://phase-tool-policy/v2
+    contract_refs_sha256: Sha256            # dispatch 时冻结的契约引用集合
+
+
+class SessionBudgetProfile(BaseModel):
+    session: SessionKind
+    initial_pack_token_cap: int             # 初始装配上限
+    session_token_cap: int                  # 会话累计（含工具结果与逐出摘要）
+    eviction_watermark_pct: int             # 净输入水位，触发逐出与摘要
+
+
+class ContextPack(BaseModel):
+    identity: ContextPackIdentity
+    budget: SessionBudgetProfile
+    assembled_tokens: int                   # provider adapter 精确计数
 ```
 
 Pack 的内容构成（任务简报、契约工件引用、约定块各放什么）由 M-04 的四类会话构成表唯一定义，本篇不复制第二份清单；本篇拥有的是各会话类型的预算档与重建策略。Spec 起草会话（M-04 独立成节定义，ANALYZE 前交互阶段）发生在 CreateRun 之前，不属于 Run 内 Context Pack identity 体系：其上下文构成与工具面归 M-04，会话账本与草稿持久化归 M-16（草稿走会话通道，无写权限）；本篇的数据块边界与预算治理规则同样约束其工具结果进入上下文的方式。
 
 | 会话类型（构成归 M-04） | 初始 pack 侧重 | 预算档语义 | 重建策略 |
 |---|---|---|---|
-| 契约会话（Contract，拓扑层：契约层） | 结构事实、构建清单摘要、目标端工具链约定 | 中初始 / 中累计 / 少轮次，接口形状一次收敛 | 输入全部是冻结事实，pack 可整体重装配；工作区无 checkpoint 时按空基线恢复 |
-| 实现会话（Implementation，拓扑层：实现层） | 源模块清单、依赖契约工件引用、目标端约定 | 中初始 / 高累计，多轮工具循环是预算主体 | 从最近 checkpoint commit 重建工作区（M-08）+ 重装配 pack + 恢复简报 |
-| 测试翻译会话（TestTranslation，拓扑层：实现层） | 源测试清单、覆盖模块契约签名、目标测试框架约定（信息防火墙：不含被测实现目标正文，M-04） | 中初始 / 中高累计 | 同实现会话；契约引用复用 dispatch 时冻结集合 |
-| 测试生成会话（TestGeneration，拓扑层：实现层） | 源模块正文、契约签名（ContractArtifact）、目标测试框架生成指引（同受信息防火墙约束） | 中初始 / 中高累计 | 同实现会话；契约引用复用 dispatch 时冻结集合 |
+| 契约会话（Contract，可选） | 结构事实、构建清单摘要、目标端工具链约定 | 中初始 / 中累计 / 少轮次，接口形状一次收敛 | 输入全部是冻结事实，pack 可整体重装配；工作区无 checkpoint 时按空基线恢复 |
+| 实现会话（Implementation） | 源模块清单、依赖契约工件引用（如计划提供）、目标端约定 | 中初始 / 高累计，多轮工具循环是预算主体 | 从最近 checkpoint commit 重建工作区（M-08）+ 重装配 pack + 恢复简报 |
+| 测试翻译会话（TestTranslation） | 源测试清单、覆盖模块契约签名（如计划提供）、目标测试框架约定（信息防火墙：不含被测实现目标正文，M-04） | 中初始 / 中高累计 | 同实现会话；契约引用复用 dispatch 时冻结集合 |
+| 测试生成会话（TestGeneration） | 源模块正文、契约签名（如计划提供）、目标测试框架生成指引（同受信息防火墙约束） | 中初始 / 中高累计 | 同实现会话；契约引用复用 dispatch 时冻结集合 |
 | 理解会话（起草会话深潜阶段＝理解会话本体，产制点归一起草期；Reasoning 档） | 机械完备候选摘要（F1-F4/PSF 投影）、用户迁移需求上下文、运行期 ReadFile/QuerySourceAst/Exec 只读探索 | 预算档语义随迁起草期（`Shallow/Deep` 两档，数值实施期基准）；CreateRun 后 ANALYZE 仅做机械层与已冻结档案校验，消耗按辅助会话档 | 失败重开；档案草稿经 TaskDraft 通道持久化，不依赖 pack 重建 |
 | ANALYZE / PLAN 辅助会话 | 结构化分析（机械层管线＋档案一致性校验） / 计划事实投影 | 低初始 / 低累计 | Run 级短会话，失败重开，无重建语义 |
 
@@ -110,6 +124,27 @@ REPORT 无模型会话：报告正文由确定性模板从 verified facts 拼装
 重生成会话（generation 更替）的 pack 在该会话类型的标准构成之外注入两段历史事实摘要：前代失败诊断摘要（前代终态的验证与归因审计事实派生）与前代 checkpoint diff 摘要（前代 candidate 与其 baseline 的结构化差异，自 Git 审计派生）。它们是历史事实供给而非自由记忆——摘要由 Harness 从已持久化审计事实确定性派生，不含前代对话历史；除此之外不注入任何前代会话内容（M-04/M-16）。预算边界：历史注入计入该会话初始装配预算档并精确计量；超限时 checkpoint diff 摘要降级为 ArtifactRef 引用（正文外置 host CAS，可按需受控重读），失败诊断摘要属于不可静默截断集合——诊断语义缺失会使定向重生成失去修复依据。
 
 失效语义：`baseline_candidate_oid` 变化（物理重派绑定新 checkpoint）、generation 更替、Run 取消、M-16 冻结的 PlanRevision 或 Skill catalog hash 变化，任一发生即旧 pack 失效并归档为审计对象，不得再次进入 provider 请求；新 pack 按新 identity 重新装配。不存在 pack 的原地修改或追加注入。
+
+## V6 增量机制：常驻协调会话、滚动摘要与修复会话导航装配
+
+### 常驻会话预算档
+
+Context Pack 会话类型在四类 EXECUTE 会话与理解/辅助会话之外，新增**常驻协调会话**：探索协调者（探索期协调多路探索，EXECUTE 阶段不参与）与 EXECUTE Supervisor（EXECUTE 阶段全局协调与修复编排）。二者不针对单一 Slice，而是跨 Slice 的协调上下文，因此需要独立的 `SessionBudgetProfile` 档位——初始装配上限制于装配协调态势与基线，会话累计上限约束跨触发的滚动观察成本。常驻会话计入模型会话池（受 Run 的会话配额治理），并受独立预算档约束，不与普通会话共享档位；档位**数值为实施期基准**，由版本化配置资源给出并随 Run 创建冻结（对齐 M-00 Q-V4-003 的资源档位边界）。
+
+会话类型构成定义归 M-04，本篇只叠加预算档与重建策略；常驻会话不属于 EXECUTE 四类会话，不携带 `SliceGenerationRef`。
+
+### 滚动摘要机制（常驻会话特有）
+
+"常驻"仅指会话上下文**跨触发连续**，而非持续消费事件流。常驻会话在两次触发之间并不实时吞入全量事件；其观察成本受独立预算档治理，历史唤醒记录被蒸馏为**有界滚动窗口**——近期唤醒保详情、远期蒸馏为结构化摘要，窗口有界、受预算档约束并从最远开始淘汰。Supervisor 每次被触发时注入两件事：
+
+- **基线态势快照**：由 Harness 机器确定性计算（涉及 Slice / 运行状态 / 已验证事实 / 当前 candidate OID 等态势），**本身不入上下文**，仅作为本次决策投影的派生态势来源；
+- **本次决策定向事件投影**：仅投影本次决策所需的目标事件（相关 Slice 进展、失败/阻塞信号、验收回执），而非全量事件流。
+
+滚动摘要与定向投影均由 Harness 从 `run_events` 审计事实确定性派生、可回溯审计事件，不构成自由记忆、不含对话史。
+
+### 修复会话导航索引式装配
+
+全局修复会话（Supervisor 驱动、跨 Slice 的全面修复）初始装配**不一次性装满全境**——不把全部源文件正文与全部失败诊断唯一进程地注入。改为**导航索引式**：修复简报为必要输入（不可静默截断）；其余待处理材料以导航索引形态给出（涉及文件 + 位置清单），Agent 按需 `ReadFile` 拉取定位。索引超限部分外置 host CAS 为 ArtifactRef，经 `ReadFile` 的 `cas://<digest>` 形态受控取回（M-12）。原 Slice 重生升级包同样注入修复简报（前代终态诊断 + 定向修复事实），作为重生会话的定向修复输入。
 
 ## 运行期数据块边界与外置存储
 
@@ -163,9 +198,9 @@ ArtifactRef 外置原则：凡是大对象正文——检查与 Shell 命令的 
 
 ## 会话重建：从审计事实恢复，不伪造记忆
 
-重建的触发是 M-08 恢复窗口中的同 generation 物理重派：迭代中崩溃、worker 断连、`checkpoint.pre` 终检失败重派，以及同 generation 内可修复问题的续作会话。generation 更替（语义重生成）不是重建——那是从最新 verified 重新分叉、重新装配契约输入的全新会话（M-00/M-08）。
+重建的触发是 M-08 恢复窗口中的同 generation 物理重派：迭代中崩溃、bwrap 执行中断、`checkpoint.pre` 终检失败重派，以及同 generation 内可修复问题的续作会话。generation 更替（语义重生成）不是重建——那是从最新 verified 重新分叉、重新装配冻结工件的全新会话（M-00/M-08）。
 
-重建的材料只有三件，全部是已持久化事实：
+重建的材料全部是已持久化事实，包括 checkpoint/receipt、事件回放和四件冻结工件的引用：
 
 | 材料 | 来源 | 提供什么 |
 |---|---|---|
@@ -190,25 +225,24 @@ sequenceDiagram
 
 恢复简报是确定性派生物，由 Harness 从审计事件生成，无任何模型生成叙述：
 
-```rust
-pub struct CheckpointSummary {
-    pub candidate_commit_oid: GitOid,
-    pub file_count: u32,
-    pub total_bytes: u64,
-}
+```python
+class CheckpointSummary(BaseModel):
+    candidate_commit_oid: GitOid
+    file_count: int
+    total_bytes: int
 
-pub struct CheckFeedbackSummary {
-    pub action: CheckAction,           // M-00：Compile | Test | Lint | TypeCheck（Shell 自检命令的 action 语义投影）
-    pub exit_code: i32,                // Shell 自检命令退出码；不写 CheckResult、不进 fingerprint（M-12）
-    pub output_digest: Sha256,         // 自检输出摘要（完整正文外置 host CAS，M-14）
-}
 
-pub struct RecoveryBrief {
-    pub slice: SliceGenerationRef,
-    pub latest_checkpoint: Option<CheckpointSummary>,
-    pub recent_check_feedback: Vec<CheckFeedbackSummary>,  // 最近若干次会话内自检结论
-    pub discarded_turns: u32,                             // 崩溃前未 checkpoint 的轮次（审计计数）
-}
+class CheckFeedbackSummary(BaseModel):
+    action: CheckAction          # M-00：Compile | Test | Lint | TypeCheck（Shell 自检命令的 action 语义投影）
+    exit_code: int               # Shell 自检命令退出码；不写 CheckResult、不进 fingerprint（M-12）
+    output_digest: Sha256        # 自检输出摘要（完整正文外置 host CAS，M-14）
+
+
+class RecoveryBrief(BaseModel):
+    slice: SliceGenerationRef
+    latest_checkpoint: CheckpointSummary | None
+    recent_check_feedback: list[CheckFeedbackSummary]   # 最近若干次会话内自检结论
+    discarded_turns: int                               # 崩溃前未 checkpoint 的轮次（审计计数）
 ```
 
 诚实语义三条：其一，对话历史不回放——崩溃前未 checkpoint 的轮次只计入 `discarded_turns`，模型不"记得"它们；其二，恢复简报只含审计事实的结构化摘要，不夹带叙述；其三，重建会话从新 pack 与重建工作区起步，Agent 以 `ReadFile` 自看工作区现状（含 checkpoint 文件集）完成对齐，不依赖对话记忆。重建复用 dispatch 时冻结的契约引用集合，而非恢复时点的最新 verified——保证同 generation 的上下文基线不因其他 Slice 的集成而漂移。
@@ -225,11 +259,11 @@ Context Pack 是冻结事实的派生物，不是真相；缓存只服务装配�
 | 工具日志与检查 stdout/stderr | host CAS + PostgreSQL 引用账本 | 非终态 Run 禁止 GC；终态后 30 天 | 保留期到期且无受保护引用 |
 | 会话审计事件 | `run_events`（M-02） | 与 Run ledger 同期限 | — |
 
-无自由记忆：不存在跨 Run 学习结论、偏好或历史对话存储；pack 与会话审计不包含上一会话的对话历史（RecoveryBrief 的审计摘要除外）。M-16 的会话消息以脱敏、结构化的目标/禁止项/验收要求进入受限上下文，Skill 目录只作为上下文选择输入参与各阶段——其中嵌入的工具、shell 与 hook 指令一律忽略并记录（M-04/M-16）。
+无自由记忆（精确化）：主 Agent 记忆 = 审计事实的结构化投影——任何"记忆"都可由 `run_events` 事件流确定性重建，**不含自由对话史**。不存在跨 Run 学习结论、偏好或历史对话的持久化；会话不跨 Run 学习结论——规则手册的归因驱动追加通道保持不变，结论只能经该受控通道进入规则手册，而非由会话自发生长。pack 与会话审计不包含上一会话的对话历史（RecoveryBrief 的审计摘要除外）。会话重建语义对常驻会话同样成立：常驻会话的观察状态可由 `run_events` 事件流重建（滚动摘要即其审计投影），不依赖对话历史。M-16 的会话消息以脱敏、结构化的目标/禁止项/验收要求进入受限上下文，Skill 目录只作为上下文选择输入参与各阶段——其中嵌入的工具、shell 与 hook 指令一律忽略并记录（M-04/M-16）。
 
-## 贯穿场景：TS→Python 实现会话的预算治理与崩溃重建
+## 贯穿示例：TS→Python 实现会话的预算治理与崩溃重建
 
-TS→Python Run 中实现 Slice A 负责 `models` 模块，依赖已集成的契约 Slice C：
+以下假设 Planner 选择并已集成 Contract Slice C；没有 C 时，A 使用计划指定的其他接口事实与上下文，预算、冻结和重建纪律不变：
 
 1. **装配**：A 进入 ready，Harness 重装配实现会话 pack——任务简报（把 `models/**` 翻译到 `src/models/**`）、C 的 ContractArtifact 引用（目标路径与公开签名）、目标端约定摘要（uv/pytest/mypy 命令面）；`assembled_tokens` 由 adapter 精确计数，远低于净输入上限，契约引用集合取自当时 verified 并冻结。
 2. **运转**：Agent `ReadFile` `models/user.ts`（1.1 MiB，分五段带截断标记）、`QuerySourceAst` 确认导出结构、`WriteFile` `src/models/user.py`、`Shell` 跑 mypy 自检并依退出码与输出摘要定位 3 处类型错误后 `EditFile` 修正；一次自检的 1.2 MiB stderr 外置 CAS，上下文只见 256 KiB 内的输出摘要与 ArtifactRef。
@@ -238,7 +272,24 @@ TS→Python Run 中实现 Slice A 负责 `models` 模块，依赖已集成的契
 5. **续作中崩溃**：续修第 5 轮 app 崩溃，脏工作区丢弃；恢复后仍同 generation 物理重派，从同一 checkpoint 重建工作区与 pack，`discarded_turns` 累计 5；契约输入复用 dispatch 冻结集合，不取此刻的最新 verified。
 6. **收口**：Agent 修正后再次声明完成，checkpoint 推进 candidate ref，A 进入集成队列。同组的测试翻译 Slice T 走同一机制，差异只在 pack 侧重（源测试文件 + 覆盖模块契约签名 + pytest 约定；信息防火墙——不含 A/B 的目标实现正文，M-04），契约引用同样取自 dispatch 冻结集合。
 
-## 可证伪施工验收
+## V5 可验收增量
+
+- [ ] 起草期四件工件、域探索报告、覆盖聚合与冲突均按版本/hash进入受控上下文；理解档案在用户确认前不进入 Run。
+- [ ] Planner pack 只读消费四件冻结工件与 M-06 图谱事实；EXECUTE pack 按 Planner 选择的 Slice 注入蓝图摘录、规则手册版本和可用接口事实。
+- [ ] 测试翻译/测试生成 pack 不含被测实现目标正文；日志/大输出正文外置 ArtifactRef，`cas://` 取回仍受工具网关与审计约束。
+- [ ] 会话重建只从 checkpoint、Git、PostgreSQL、CAS 与冻结工件引用恢复；物理中断不伪造记忆、不改变 generation。
+
+## V6 可验收增量
+
+- [ ] 常驻协调会话（探索协调者 / EXECUTE Supervisor）具备独立 `SessionBudgetProfile` 档位；常驻会话计入模型会话池且受独立预算档约束；档位数值实施期基准待版本化配置资源定案后随 Run 创建冻结。
+- [ ] 常驻会话滚动摘要为有界滚动窗口：近期唤醒保详情、远期蒸馏为结构化摘要，并从最远开始淘汰；观察成本计入独立预算档。
+- [ ] "常驻"语义为会话上下文跨触发连续；常驻会话两次触发之间消费事件流条目数为 0。
+- [ ] Supervisor 触发时注入的基线态势快照由 Harness 机器确定性计算、本身不入上下文；决策投影为定向事件投影而非全量事件流；两者均可回溯 `run_events`。
+- [ ] 全局修复会话初始装配采用导航索引式：修复简报不可静默截断，其余以涉及文件 + 位置清单形态给出、由 Agent 按需 `ReadFile` 拉取；超限索引外置 host CAS 并经 `cas://` 取回。
+- [ ] 原 Slice 重生升级包注入修复简报（前代终态诊断 + 定向修复事实），作为重生会话定向修复输入。
+- [ ] 主 Agent 记忆为审计事实的结构化投影（可由 `run_events` 事件流重建）；自由对话史持久化条数为 0；跨 Run 学习结论数为 0（规则手册归因驱动追加通道不变）。
+
+## V4 历史验收基线（追溯，非当前 V5 契约）
 
 - [ ] V-M14-V4-001：初始 Context Pack 中源码正文出现数为 0；分析事实以结构化摘要进入，会话内源码获取全部经运行期 `ReadFile` 完成且可溯源冻结快照 OID
 - [ ] V-M14-V4-002：各会话类型按 `SessionKind` 取预算档，档位随 Run 创建冻结；运行期档位变更数为 0

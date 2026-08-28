@@ -1,15 +1,11 @@
 # CodeMigrator 候选工作区与工具网关：隔离迭代、执行侧落地与 checkpoint 提交
 
-> 文档状态：V5 方向对齐版；本篇是候选工作区生命周期、六工具执行侧与 checkpoint commit 的唯一 owner。工作区即沙箱卷：每 Slice 候选工作区是 app 直接管理的专属长驻 bwrap 沙箱卷；write scope 防护双轨——结构化工具逐写路径门拦截 + Shell 写效果 checkpoint 批量校验；CheckRunner 已作为 Agent 工具退役。  
-> 技术范围：候选工作区（沙箱卷）创建/自由迭代/冻结/清理、六工具（ReadFile/WriteFile/EditFile/QuerySourceAst/Shell/Exec）在候选工作区的执行落地与执行面分工、工作区文件操作审计、checkpoint commit 与 `checkpoint.pre` 批量校验的执行侧、write scope 防护双轨、生成 action 执行侧（`ArtifactKind.GeneratedCode`）、恢复与中断窗口。  
-> 契约真相：Phase 工具授权、`WriteScope`、稳定错误码与路径安全门由 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 与 [M-12 工具系统与 Hook](CodeMigrator_工具系统与Hook.md) 唯一拥有；Git ref 物理事务与 expected-OID CAS 由 [M-11](CodeMigrator_工作空间与Git集成.md) 拥有；bwrap 隔离、资源公式、长期卷与验证临时物化由 [M-09](CodeMigrator_沙箱与执行环境.md) 拥有；会话循环与会话失效由 [M-04](CodeMigrator_Agent_Loop设计.md) 拥有。  
+> 文档状态：V4 当前架构基线；本篇是候选工作区生命周期、六工具执行侧与 checkpoint commit 的唯一 owner。工作区即沙箱卷（fb7 对齐）：每 Slice 候选工作区物理上是宿主 app 与该 Slice 专属长驻沙箱共享挂载的沙箱卷；write scope 防护双轨——结构化工具逐写路径门拦截 + Shell 写效果 checkpoint 批量校验；CheckRunner 已作为 Agent 工具退役（自检并入 Shell，M-12）。  
+> 技术范围：候选工作区（沙箱卷）创建/自由迭代/冻结/清理、六工具（ReadFile/WriteFile/EditFile/QuerySourceAst/Shell/Exec）在候选工作区的执行落地与执行面分工、工作区文件操作审计、checkpoint commit 与 `checkpoint.pre` 批量校验的执行侧、write scope 防护双轨、生成 action 执行侧（`ArtifactKind::GeneratedCode`）、恢复与中断窗口。  
+> 契约真相：Phase 工具授权、`WriteScope`、稳定错误码与路径安全门由 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 与 [M-12 工具系统与 Hook](CodeMigrator_工具系统与Hook.md) 唯一拥有；Git ref 物理事务与 expected-OID CAS 由 [M-11](CodeMigrator_工作空间与Git集成.md) 拥有；沙箱物理隔离（bubblewrap 参数、无凭据挂载、网络策略）、资源公式与裁决层一次性 validation overlay（以 tested commit 为源）由 [M-09](CodeMigrator_沙箱与执行环境.md) 拥有；会话循环与会话失效由 [M-04](CodeMigrator_Agent_Loop设计.md) 拥有。  
 > 关联文档：[Agent Loop](CodeMigrator_Agent_Loop设计.md)、[工具系统与 Hook](CodeMigrator_工具系统与Hook.md)、[沙箱与执行环境](CodeMigrator_沙箱与执行环境.md)、[Git 集成](CodeMigrator_工作空间与Git集成.md)、[验证引擎](CodeMigrator_验证引擎.md)、[记忆与上下文管理](CodeMigrator_记忆与上下文管理.md)。
 
-本篇回答四个问题：Agent 的工具调用落在哪里（候选工作区——物理上即沙箱卷）、六工具调用如何变成磁盘状态与审计事实（执行侧）、Shell 写效果如何被整体裁决（checkpoint 批量校验）、生成代码类工件如何产出（生成 action 执行侧）。在当前 V5 设计下，Agent 持六工具（L1 结构化文件 / L2 结构化导航 / L3 Shell / L4 Exec，M-12）在候选工作区直接写目标代码（P-01）：每个 Slice generation 拥有一个独立候选工作区（P-07）——物理上是一个沙箱卷，宿主 app 与该 Slice 专属长驻沙箱共享挂载；Agent 在其中自由迭代——没有提案链、没有批次、没有字节级哈希守卫；Harness 编排层不逐键介入文件内容，只在迭代终点把工作区文件集整体提交为 checkpoint commit，并以 expected old OID 推进同 generation 的 candidate ref。V3 的 GuardedPatch、批次链、三哈希与受控重放全部废除，并发保护收敛为两条：计划冻结的输出路径集合互斥，加上 Git ref 推进的 expected-OID CAS；write scope 防护收敛为双轨：结构化工具事前逐笔拦截，Shell 写效果事后由 checkpoint 批量校验整体裁决。
-
-## V5 当前对齐
-
-ToolGateway 仍提供六工具；沙箱进程由 app 内部直接管理，不存在 worker/UDS。checkpoint 继续是候选文件集的整体事实提交，Git expected-OID CAS 仍是并发保护；验证不复用 Slice 长期卷，而从 tested commit 临时物化目录执行。Blueprint/Planner 的 write scope 提案由 M-07 所有，本篇只实施路径门、checkpoint 批量校验和生命周期。
+本篇回答四个问题：Agent 的工具调用落在哪里（候选工作区——物理上即沙箱卷）、六工具调用如何变成磁盘状态与审计事实（执行侧）、Shell 写效果如何被整体裁决（checkpoint 批量校验）、生成代码类工件如何产出（生成 action 执行侧）。V4 之下 Agent 持六工具（L1 结构化文件 / L2 结构化导航 / L3 Shell / L4 Exec，M-12）在候选工作区直接写目标代码（P-01）：每个 Slice generation 拥有一个独立候选工作区（P-07）——物理上是一个沙箱卷，宿主 app 与该 Slice 专属长驻沙箱共享挂载；Agent 在其中自由迭代——没有提案链、没有批次、没有字节级哈希守卫；Harness 编排层不逐键介入文件内容，只在迭代终点把工作区文件集整体提交为 checkpoint commit，并以 expected old OID 推进同 generation 的 candidate ref。V3 的 GuardedPatch、批次链、三哈希与受控重放全部废除，并发保护收敛为两条：计划冻结的输出路径集合互斥，加上 Git ref 推进的 expected-OID CAS；write scope 防护收敛为双轨：结构化工具事前逐笔拦截，Shell 写效果事后由 checkpoint 批量校验整体裁决。
 
 ## 职能边界：M-08 拥有什么，引用什么
 
@@ -18,17 +14,17 @@ ToolGateway 仍提供六工具；沙箱进程由 app 内部直接管理，不存
 | 候选工作区生命周期：创建、自由迭代期、冻结、集成/废弃清理，含专属长驻沙箱（沙箱卷）的创建与销毁时机 | 本篇 | 唯一 owner |
 | 六工具执行侧：WriteFile/EditFile/ReadFile 在工作区（沙箱卷）的落地、Shell 入该 Slice 长驻沙箱、Exec 引擎宿主与工作区状态 | 本篇 | 唯一 owner |
 | checkpoint commit 与 `checkpoint.pre` 批量校验（write scope 防护双轨的事后防线）的执行侧 | 本篇 | 唯一 owner（点位定义与记录内容由 M-12 拥有） |
-| 生成 action 执行侧：`ArtifactKind.GeneratedCode` 的从源头重新生成与 scaffold 档命令落地 | 本篇 | 唯一 owner（工件分类契约归 M-00/M-01，派生归属归 M-07） |
+| 生成 action 执行侧：`ArtifactKind::GeneratedCode` 的从源头重新生成与 scaffold 档命令落地 | 本篇 | 唯一 owner（工件分类契约归 M-00/M-01，派生归属归 M-07） |
 | 工具 schema、拒绝码、路径安全门、phase 授权 | [M-12](CodeMigrator_工具系统与Hook.md) / [M-00](CodeMigrator_垂类设计原则与架构哲学.md) | 只引用；本篇不复制第二套规则 |
 | candidate/integration/verified ref 物理事务与 expected-OID CAS | [M-11](CodeMigrator_工作空间与Git集成.md) | 只引用：checkpoint 请求 ref 推进 |
 | 沙箱物理隔离（bubblewrap 参数、无凭据挂载、网络策略）与并发资源公式 | [M-09](CodeMigrator_沙箱与执行环境.md) | 只引用：长驻沙箱卷的隔离边界与资源语义 |
-| 裁决层 tested commit 临时物化目录的创建与销毁 | [M-09](CodeMigrator_沙箱与执行环境.md) | 只引用：验证目录与候选长期卷零共享 |
+| 裁决层一次性 validation overlay（以 tested commit 为源）的创建与销毁 | [M-09](CodeMigrator_沙箱与执行环境.md) | 只引用：overlay 与候选工作区零共享 |
 | 会话循环、会话身份三元组与失效 | [M-04](CodeMigrator_Agent_Loop设计.md) | 只引用：会话终止触发 checkpoint 或废弃 |
 | 局部/集成/最终验证 | [M-10](CodeMigrator_验证引擎.md) | 只引用：checkpoint 后移交 |
 | 不相交文件集应用与冻结集成序 | [M-11](CodeMigrator_工作空间与Git集成.md) / [M-00](CodeMigrator_垂类设计原则与架构哲学.md) | 只引用：集成 receipt 触发工作区清理 |
 | 托管输出工作区物理目录布局 | [M-01](CodeMigrator_核心目录架构设计.md) | 只引用 |
 
-M-08 与 M-12 的边界一句话：M-12 拥有"调用是否被允许"的全部判断（schema admission、phase 成员测试、路径安全门、write scope 域校验、拒绝码与错误 facts）；M-08 拥有"允许之后发生什么"——文件在工作区（沙箱卷）的原子落地、工作区状态迁移、逐次写操作的审计账本，以及迭代终点的 checkpoint 提交与批量校验。CheckRunner 已作为 Agent 工具退役：会话自检并入 Shell 在长驻沙箱内自由执行；裁决层 `InternalVerificationDispatch` 不是模型工具、不经网关模型工具通道，其临时验证目录纪律归 M-09。
+M-08 与 M-12 的边界一句话：M-12 拥有"调用是否被允许"的全部判断（schema admission、phase 成员测试、路径安全门、write scope 域校验、拒绝码与错误 facts）；M-08 拥有"允许之后发生什么"——文件在工作区（沙箱卷）的原子落地、工作区状态迁移、逐次写操作的审计账本，以及迭代终点的 checkpoint 提交与批量校验。CheckRunner 已作为 Agent 工具退役（M-12）：会话自检并入 Shell 在长驻沙箱内自由执行，本篇保证自检副作用留在该 Slice 沙箱卷内、由 checkpoint 批量校验整体裁决；裁决层 `InternalVerificationDispatch` 不是模型工具、不经网关模型工具通道，其 overlay 纪律归 M-09（M-00/M-09 边界）。
 
 ## 候选工作区生命周期
 
@@ -53,7 +49,7 @@ stateDiagram-v2
 
 沙箱生命周期随之从"单次检查"延展为 Slice 全生命周期：Slice generation 派发时与工作区同生（创建沙箱卷），经自由迭代期长驻——构建缓存与已装依赖跨命令驻留于卷内，同会话第二次构建/测试无冷编译、无重复下载（迭代加速）；集成 receipt 或废弃终态时与工作区同灭（销毁沙箱卷）。长驻只延展时间维度，不改变隔离语义：bubblewrap 参数、无凭据挂载与网络策略均与 [M-09](CodeMigrator_沙箱与执行环境.md) 冻结的隔离边界一致，沙箱内进程始终不可信，宿主凭据、Git refs 与控制面存储不进入挂载表。
 
-资源语义随长驻联动：长驻卷及其文件态构建缓存跟随 Slice 保留，但仅有卷或模型会话不占用活跃 bwrap 执行位；Shell、Scaffold 与裁决层验证实际启动 bwrap 时，按 M-09 沙箱执行池公式取用并在结束后归还。并行度受计划 DAG、write scope 互斥和执行池槽位共同约束，[M-03](CodeMigrator_Harness总体设计.md) 在各池之上执行跨 Run 公平轮转。
+资源语义随长驻联动：长驻沙箱的内存驻留计入 M-09 并发资源公式（驻留内存 × 并发 Slice 数）——工作区数量不再只是磁盘目录数，而是带内存驻留的沙箱实例数；并行度受计划分解（M-07）与并发槽位共同约束，[M-03](CodeMigrator_Harness总体设计.md) 在槽位之上执行跨 Run 公平轮转。
 
 ### 创建
 
@@ -79,7 +75,7 @@ Shell 自检在此期间随时可用：自检命令（如 `uv run pytest -q`、`
 
 ### 冻结：checkpoint 提交
 
-Agent 声明完成或预算节点到达时，工作区进入冻结路径（详见下节 checkpoint commit）：文件集经 `checkpoint.pre` 批量校验（工作区 Git diff ⊆ 冻结 write scope）后提交为 commit、candidate ref 以 expected OID 推进、receipt 落库。此后工作区转为只读证据面——局部与后续验证一律从 candidate commit 临时物化目录执行（M-09/M-10），不再读写迭代期工作区；对该 Slice 的一切进一步修改只能经由新 generation 会话（M-04）。
+Agent 声明完成或预算节点到达时，工作区进入冻结路径（详见下节 checkpoint commit）：文件集经 `checkpoint.pre` 批量校验（工作区 Git diff ⊆ 冻结 write scope）后提交为 commit、candidate ref 以 expected OID 推进、receipt 落库。此后工作区转为只读证据面——局部与后续验证一律从 candidate commit 的一次性 overlay 执行（M-09/M-10），不再读写迭代期工作区；对该 Slice 的一切进一步修改只能经由新 generation 会话（M-04）。
 
 ### 集成/废弃清理
 
@@ -120,7 +116,7 @@ flowchart LR
 | L3 | Shell | 该 Slice 专属长驻沙箱卷内执行（隔离 M-09） | 卷内物理边界 + checkpoint 批量校验（本篇） |
 | L4 | Exec | app 进程内嵌入式 JS 引擎；经工具桥逐笔过网关编排 L1-L3 | 底层调用逐笔过网关（M-12，防护不降级） |
 
-验证裁决不经网关模型工具通道：裁决层 `InternalVerificationDispatch` 不是模型工具，以冻结检查集 + tested commit 临时物化目录独立执行（M-00/M-09/M-10），与六工具面零共享——模型无论在 L3/L4 执行了什么，fingerprint 的计算输入不受任何影响（P-02）。
+验证裁决不经网关模型工具通道：裁决层 `InternalVerificationDispatch` 不是模型工具，以冻结检查集 + tested commit overlay 独立执行（M-00/M-09/M-10），与六工具面零共享——模型无论在 L3/L4 执行了什么，fingerprint 的计算输入不受任何影响（P-02）。
 
 执行侧的职责清单：
 
@@ -128,20 +124,19 @@ flowchart LR
 2. **工作区状态**：维护工作区（沙箱卷）在生命周期状态机中的位置；批量校验拒绝时工作区保留供 Agent 自纠（回退越界变更后重新声明完成）；`checkpoint.pre` 的基础设施事故路径或会话失效后，执行侧负责工作区（含沙箱）的原子丢弃与从 checkpoint 基线重建。
 3. **审计**：每次成功结构化写操作记录一条账本（下表），并与 M-12 的 `tool.call.pre/post` 审计点衔接——`tool.call.pre` 记录"有这次调用"，`tool.call.post` 记录"调用的终态与副作用摘要"，本篇账本补足"副作用落在工作区的哪个文件、多少字节、何种 disposition"，三者同事务进入 `run_events`（M-02），供 M-13 指标与 M-15 工作台消费。
 
-```python
-class WorkspaceWriteTool(str, Enum):
-    WriteFile = "WRITE_FILE"
-    EditFile = "EDIT_FILE"
+```rust
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkspaceWriteTool { WriteFile, EditFile }
 
-
-class WorkspaceFileOperation(BaseModel):
-    run_id: RunId
-    slice_id: SliceId
-    generation: CandidateGeneration
-    tool: WorkspaceWriteTool
-    path: RepoRelativePath
-    bytes_written: int
-    disposition: WriteDisposition       # M-12：Created | Overwritten
+pub struct WorkspaceFileOperation {
+    pub run_id: RunId,
+    pub slice_id: SliceId,
+    pub generation: CandidateGeneration,
+    pub tool: WorkspaceWriteTool,
+    pub path: RepoRelativePath,
+    pub bytes_written: u64,
+    pub disposition: WriteDisposition,   // M-12：Created | Overwritten
+}
 ```
 
 审计边界：账本记录路径与字节摘要，不记录文件正文——正文只在候选工作区与 checkpoint commit 中；对外投影（run_events）与 M-12 拒绝审计一致，不携带正文、匹配内容或 stdout/stderr。
@@ -152,12 +147,12 @@ class WorkspaceFileOperation(BaseModel):
 
 | 侧面 | 语义 | owner |
 |---|---|---|
-| 工件分类 | `artifact_rules` 以 `ArtifactKind.GeneratedCode` 声明 pattern 与 source_pattern（如 `**/*_pb2.py` ← `**/*.proto`） | M-01（描述符）/ M-00（契约） |
+| 工件分类 | `artifact_rules` 以 `ArtifactKind::GeneratedCode` 声明 pattern 与 source_pattern（如 `**/*_pb2.py` ← `**/*.proto`） | M-01（描述符）/ M-00（契约） |
 | 生成命令 | 目标侧从源头（`.proto`）用目标工具链重新生成；grpcio-tools 类重新生成命令入目标端描述符 scaffold 档——`CheckCommandTemplate` 命令模板机制的自然用法（向 scaffold 档追加一条命令模板），零机制新增 | M-12（命令面）/ M-09（执行面） |
-| 派生归属 | 生成 action 归 Planner 选择的承载 Slice（若计划包含 Contract Slice 可归其）：`.proto` 源文件作为接口事实源进入相应上下文，生成产物路径划入该 Slice 的冻结 write scope | M-07 |
+| 派生归属 | 生成 action 归契约层 Slice 派生：`.proto` 源文件作为接口事实源被契约层消费，生成产物路径划入该契约 Slice 的冻结 write scope | M-07 |
 | 执行语义 | 生成产物不进入 Agent 翻译面——不存在"翻译 `_pb2.py`"的 Slice；生成命令本身确定性执行，无模型裁量 | 本篇 |
 
-执行面经沙箱（[M-09](CodeMigrator_沙箱与执行环境.md)）：生成命令作为 scaffold 档模板实例化后在沙箱内执行，产物由 Harness 从中受信提取应用（M-09 Scaffold 语义）——不经 Agent 工具面，也不占用 Agent 会话预算。承载该 action 的 Slice 会话对生成产物的触达与对其它工作区文件一致：ReadFile 引用，或在冻结 write scope 允许时的结构化编辑；越界修改与其它路径一样受双轨防护。
+执行面经沙箱（[M-09](CodeMigrator_沙箱与执行环境.md)）：生成命令作为 scaffold 档模板实例化后在沙箱内执行，产物由 Harness 从中受信提取应用（M-09 Scaffold 语义）——不经 Agent 工具面，也不占用 Agent 会话预算。Agent（契约 Slice 会话）对生成产物的触达与对其它工作区文件一致：ReadFile 引用，或在冻结 write scope 允许时的结构化编辑；越界修改与其它路径一样受双轨防护。
 
 ## checkpoint commit：提交、批量校验与幂等
 
@@ -215,23 +210,24 @@ write scope 防护从单轨逐笔拦截扩展为事前+事后双轨：
 
 checkpoint 幂等键由 M-00 冻结：覆盖 `run_id/slice_id/generation/candidate_commit_oid/checkpoint 内容摘要`；generation 或 candidate OID 变化必须生成新键，同键重复提交幂等返回原 receipt。内容摘要只作幂等与审计成分，不承担任何"编辑前置验证"职责——这是它与被废除的 V3 `content_sha256` 守卫的本质区别。
 
-```python
-class CheckpointManifest(BaseModel):
-    slice_candidate: SliceCandidate        # M-00：run/slice/generation/base_verified/candidate OID
-    file_count: int
-    total_bytes: int
-    file_set_digest: Sha256                # canonical(路径→字节摘要)；仅幂等键成分与审计
-    scope_check_passed: bool               # checkpoint.pre 批量校验结论（Git diff ⊆ 冻结 write scope）
+```rust
+pub struct CheckpointManifest {
+    pub slice_candidate: SliceCandidate,   // M-00：run/slice/generation/base_verified/candidate OID
+    pub file_count: u32,
+    pub total_bytes: u64,
+    pub file_set_digest: Sha256,           // canonical(路径→字节摘要)；仅幂等键成分与审计
+    pub scope_check_passed: bool,          // checkpoint.pre 批量校验结论（Git diff ⊆ 冻结 write scope）
+}
 
-
-class CheckpointReceipt(BaseModel):
-    run_id: RunId
-    slice_id: SliceId
-    generation: CandidateGeneration
-    expected_candidate_oid: GitOid
-    new_candidate_oid: GitOid
-    manifest: CheckpointManifest
-    idempotency_key: Sha256                # 构成由 M-00 冻结
+pub struct CheckpointReceipt {
+    pub run_id: RunId,
+    pub slice_id: SliceId,
+    pub generation: CandidateGeneration,
+    pub expected_candidate_oid: GitOid,
+    pub new_candidate_oid: GitOid,
+    pub manifest: CheckpointManifest,
+    pub idempotency_key: Sha256,           // 构成由 M-00 冻结
+}
 ```
 
 ## 并发保护：路径集合互斥 + Git CAS
@@ -266,26 +262,18 @@ Git 与 PostgreSQL 不共享事务，但 checkpoint 的可见范围很小：它�
 
 恢复只由启动扫描、断连、已知 receipt 缺口等事实触发（M-00 恢复协议），不设常驻轮询；工作区本身是可丢弃的派生物——控制面真相在 PostgreSQL，代码与集成真相在 Git refs，两者都能在丢失工作区后重建全部必要状态。
 
-## 贯穿示例：实现 Slice A 的一次完整候选周期
+## 贯穿场景：实现 Slice A 的一次完整候选周期
 
-以下假设 Planner 选择并已集成 Contract Slice C；它只说明候选工作区与网关纪律，不代表 Contract Slice 必然存在。若没有 C，A 依据实际提案中的上下文和依赖闭包启动：
+TS→Python Run 中实现 Slice A（`src/models/**`）与 B（`src/api/**`）write scope 不相交，契约 Slice C 已集成：
 
-1. **创建**：A 的提案依赖已满足且 write scope 与在途 Slice 不相交，Harness 为 A 创建 generation `0` 候选工作区（空基线，`base_verified_oid` = 当前 verified）——物理上创建一个沙箱卷，宿主 app 与 A 专属长驻沙箱共享挂载；开启会话并注入实现会话 Context Pack（M-04/M-14）。
+1. **创建**：A 的依赖契约已集成且 write scope 与在途 Slice 不相交，Harness 为 A 创建 generation `0` 候选工作区（空基线，`base_verified_oid` = 当前 verified）——物理上创建一个沙箱卷，宿主 app 与 A 专属长驻沙箱共享挂载；开启会话并注入实现会话 Context Pack（M-04/M-14）。
 2. **自由迭代**：Agent ReadFile 契约目标路径、QuerySourceAst 确认 `models/user.ts` 导出结构，WriteFile `src/models/user.py`——执行侧落盘并追加一条 `WorkspaceFileOperation`（WriteFile/路径/字节/Created），与 `tool.call.post` 同事务投影。期间一次尝试写 `src/api/client.py`（命中 B 的冻结 `write_paths`）被 M-12 网关以 `WRITE_SCOPE_VIOLATION` 拒绝：零落盘、零账本副作用、会话继续。
 3. **自检**：Agent 调 Shell `uv run mypy .`——命令直接在 A 的长驻沙箱卷内执行（工作区即执行现场，无 overlay 拷贝），诊断回上下文，Agent EditFile 修正签名；首次自检安装的 mypy 与依赖驻留卷内，后续自检直接复用，无重复下载与冷编译。
 4. **checkpoint**：Agent 声明完成。`checkpoint.pre` 批量校验确认工作区 Git diff ⊆ A 的冻结 write scope——若期间某条 Shell 命令曾重定向写入 `src/api/client.py`，此处拒绝提交：越界路径清单回上下文，A 回退该文件后重新声明完成；校验通过则 commit 创建、candidate ref 以 expected OID 推进、receipt 落库，工作区冻结为只读证据面，A 进入局部验证（M-10）。
 5. **插曲：迭代中崩溃**：若第 3 步中途 app 崩溃，脏工作区与沙箱整体丢弃；恢复后 A 以原 generation 物理重派——该 generation 尚无 checkpoint，工作区从空基线重来；若崩溃前已有预算节点 checkpoint，则从该 commit 重建工作区，generation 均保持 `0`。
 6. **清理**：A 集成 receipt 落库后，candidate ref 与工作区（沙箱卷）一并销毁——先终止沙箱进程组再删卷；若 A 在 generation `2` 仍无法集成，工作区与沙箱销毁、failed ref 保留 30 天，恰一次 `SLICE_REGENERATION_EXHAUSTED`。
 
-## V5 可验收增量
-
-- [ ] 每个 Slice generation 拥有独立长期沙箱卷；工作区写入、Shell 自检和缓存复用均发生在该卷内，源项目与 host 控制面不被触碰。
-- [ ] write scope 由 Planner 提案并经 PlanValidation 冻结；结构化工具逐写拦截，Shell 越界效果由 checkpoint.pre 批量拒绝，拒绝不污染 verified。
-- [ ] checkpoint 只推进本 Slice candidate；Integration Coordinator 负责后续 verified 集成，验证目录从 tested commit 临时物化而非复用长期卷。
-- [ ] 三类工件按 M-07 Planner 选择的承载 Slice 与描述符策略执行；GeneratedCode 不经模型翻译，目标路径不由描述符目录模板机械授权。
-- [ ] bwrap 中断或 app 崩溃可由 PostgreSQL、Git 与 CAS 事实重建；物理重派替换 attempt，不消耗 generation。
-
-## V4 历史验收基线（追溯，非当前 V5 契约）
+## 可证伪施工验收
 
 - [ ] V-M08-V4-001：每个进入迭代的 Slice generation 恰有一个候选工作区（沙箱卷）；write scope 不相交的并行 Slice 的工作区目录、dirfd、沙箱卷、账本与 Artifact 命名空间两两不相交
 - [ ] V-M08-V4-002：generation 首次派发的工作区在 write scope 内初始文件数为 0；同 generation 物理重派且存在已成功 checkpoint 时，工作区从该 checkpoint commit 重建，逐文件一致
@@ -302,6 +290,6 @@ Git 与 PostgreSQL 不共享事务，但 checkpoint 的可见范围很小：它�
 - [ ] V-M08-V4-013：Shell 自检在该 Slice 长驻沙箱卷内执行，宿主文件系统零触碰；自检不写 `CheckResult` 账本、不推进 Slice 状态、不进 verification fingerprint（fingerprint 计算输入与无 Shell 会话逐字节一致，P-02）
 - [ ] V-M08-V4-014：运行时扫描不存在 GuardedPatch、edit intent、50 条批次链、precondition/replacement/anchor/content_sha256 守卫、patch 幂等键矩阵、受控重放、candidate 重定位或已退役 CheckRunner 工具注册的代码路径与配置残留
 - [ ] V-M08-V4-015：每个进入迭代的 Slice generation 的候选工作区物理上是一个沙箱卷——宿主 app 与该 Slice 专属长驻沙箱共享挂载同一卷；沙箱生命周期覆盖 Slice 全生命周期（创建→集成/废弃）；同会话第二次构建/测试复用卷内驻留的构建缓存与已装依赖（无重复下载与冷编译）；集成 receipt 或废弃终态后卷与沙箱一并销毁
-- [ ] V-M08-V4-016：`ArtifactKind.GeneratedCode` 工件零翻译——目标项目中此类产物全部由目标侧从源头（如 `.proto`）用目标工具链在沙箱内重新生成，grpcio-tools 类命令实例化自目标端描述符 scaffold 档命令模板；生成产物路径归契约层 Slice 冻结 write scope（M-07），不存在"翻译生成物"的 Slice；生成 action 不经 Agent 工具面、不占用会话预算
+- [ ] V-M08-V4-016：`ArtifactKind::GeneratedCode` 工件零翻译——目标项目中此类产物全部由目标侧从源头（如 `.proto`）用目标工具链在沙箱内重新生成，grpcio-tools 类命令实例化自目标端描述符 scaffold 档命令模板；生成产物路径归契约层 Slice 冻结 write scope（M-07），不存在"翻译生成物"的 Slice；生成 action 不经 Agent 工具面、不占用会话预算
 
 > 设计演进、历史缺陷处置和变更理由见：[文档迭代记录](文档迭代记录.md)。
