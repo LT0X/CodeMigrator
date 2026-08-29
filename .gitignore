@@ -22,8 +22,8 @@ rad.json
 #Test results file
 TestResults.xml
 
-
-my_space/
+my_space/temp/
+my_space/model_api_key.json
 .dsh/
 .trae/
 ref/test_project/
