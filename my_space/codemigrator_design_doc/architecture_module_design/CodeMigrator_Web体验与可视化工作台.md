@@ -1,6 +1,7 @@
 # CodeMigrator Web 体验与迁移可视化工作台
 
 > 文档状态：V6 方向对齐版；本篇为 M-15，拥有 Web 页面与 CLI/Web 展示体验的展示模型、persona 舞台、场分区、事件→动作归约、视觉与动画语义。  
+> V6 收敛（fb11）：Run 阶段条/过程流按四阶段 PLAN/EXECUTE/VERIFY/REPORT 呈现，页面无 ANALYZE 阶段展示（ANALYZE 职责并入 CreateRun）；Supervisor 判断层与全局修复会话为事件触发式新会话，其 persona/决策视图只读呈现，不新增写通道承诺不变。  
 > 技术范围：跨语言翻译 Run 的展示体验——persona 舞台与四场分区、语义等价证据页、报告与系统页面、快照/SSE 前端归约、CLI 精简过程视图；覆盖桌面主工作台、平板降级视图与移动端观察视图。  
 > 契约真相：REST/SSE 投影与事件回放由 [M-02：系统后端架构](CodeMigrator_系统后端架构.md) 拥有；`SliceAttemptStatus`、`SliceKind`、并发上限公式与事件术语由 [M-00：设计原则、并行系统地图与公共契约](CodeMigrator_垂类设计原则与架构哲学.md) 拥有；四类 Slice DAG、冻结集成序与边 provenance 由 [M-07：迁移计划生成器](CodeMigrator_迁移计划生成器.md) 拥有；三层验证、归因（含守恒辅助归因信号）与 flaky 事件、GENERATED 标注维度与验证边界声明语义由 [M-10：验证引擎](CodeMigrator_验证引擎.md) 拥有，本篇只呈现、不修改其语义；候选工作区与 checkpoint 由 [M-08：候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md) 拥有；会话与修正确认由 [M-16：会话与运行时修正编排](CodeMigrator_会话与运行时修正编排.md) 拥有。本篇不重复定义公共状态、HTTP DTO 或指标 descriptor。  
 > 产品边界与关联：CLI 是创建、取消、服务管理、交付重试与自动化的主入口；Web 以观察为主，只开放会话输入、问题回答与修正确认，不执行迁移控制、代码修改、Git 写操作、取消或交付重试。关联 [Harness 总体设计](CodeMigrator_Harness总体设计.md)、[Git 集成](CodeMigrator_工作空间与Git集成.md)、[可观测性](CodeMigrator_可观测性系统.md)、[上下文管理](CodeMigrator_记忆与上下文管理.md)。  
@@ -15,7 +16,7 @@ Web 不是第二个控制台。它让用户看懂一个已经由 CLI 或 Web 会
 
 ## V6 方向对齐：全局修复会话 persona 与 Supervisor 决策视图
 
-V6 引入常驻主 Agent 判断层与全局修复。舞台展示模型据此补充两类**只读**呈现，均不新增 Web 写通道：
+V6 引入事件触发式主 Agent 判断层与全局修复（判断层与修复会话以事件触发式新会话呈现，无常驻被动唤醒）。舞台展示模型据此补充两类**只读**呈现，均不新增 Web 写通道：
 
 - **全局修复会话作为新会话类型呈现**：全局修复会话不作为既有 Slice 或其某一 generation 呈现，而是作为新的会话类型独立呈现，带全局修复集 / 联合域 / "不属原 Slice" 的状态标识；其生命周期事件经 M-02 投影（与 M-13 观测同源）进入舞台，与会话输入/修正确认同为只读消费。前端零判断：是否构成全局修复集由后端判定，本篇只呈现其结果事实。
 - **EXECUTE Supervisor 决策视图**：EXECUTE 阶段呈现 Supervisor 决策视图，仅展示**已收养**的修复决策与路由结论，只读，不提供收养/否决/改派操作。

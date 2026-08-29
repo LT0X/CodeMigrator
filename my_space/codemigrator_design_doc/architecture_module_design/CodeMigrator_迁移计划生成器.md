@@ -1,6 +1,6 @@
 # CodeMigrator 迁移计划生成器：LLM Planner、机器校验与 Slice DAG
 
-> 文档状态：V6 方向对齐版。  
+> 文档状态：V6 收敛版（fb11，归因→修复集映射确立：候选修复集 + 归因可靠性分类，见下方 V6 方向对齐）。  
 > 技术范围：M-06 分析事实、Migration Spec v3、四件冻结工件与只读关系图进入 LLM Planner，产出经机器校验的 Slice 提案、依赖边、write scope、integration_rank、三类工件处理和契约漂移涟漪计算。依赖闭包就绪即启动，计划冻结后不可变。  
 > 契约真相：`MigrationSlice`、`SliceKind`（含 `TestGeneration`）、`ArtifactKind` 三类工件处理策略、`WriteScope`、`PlanEdge`、`integration_rank`、`GENERATED` 标注全链路语义与等价信心分级由 [M-00：设计原则、系统地图与公共契约](CodeMigrator_垂类设计原则与架构哲学.md) 唯一定义；四类分析事实、PSF-2 项目索引与 PSF-3 关系图由 [M-06：代码分析与 AST 引擎](CodeMigrator_代码分析与AST引擎.md) 唯一定义；本篇拥有 Planner 提案、机器校验、Slice 派生、依赖边、write scope、涟漪计算与计划冻结语义。  
 > 关联文档：[公共契约](CodeMigrator_垂类设计原则与架构哲学.md)、[Migration Spec](CodeMigrator_Migration_Spec抽象层.md)、[代码分析与 AST 引擎](CodeMigrator_代码分析与AST引擎.md)、[Harness 总体设计](CodeMigrator_Harness总体设计.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[验证引擎](CodeMigrator_验证引擎.md)、[Git 集成](CodeMigrator_工作空间与Git集成.md)、[会话与运行时修正](CodeMigrator_会话与运行时修正编排.md)。
@@ -12,7 +12,7 @@
 V5 确立的 Planner 提案 + 机器校验 + 冻结 DAG / integration_rank 主链路保持不变，V6 在此之上做两处方向性精化：
 
 - **write scope 互斥的条件化联合域例外**：write scope 互斥（两两不相交）的唯一目的是**防止并行写冲突**。V6 为修复场景引入条件化例外——**全局修复会话**可持修复集内各 Slice 的 write scope 并集（联合域）写权限。该例外是 write scope 互斥的**条件安全精化**，不是破坏不变量，仅用于归因驱动的全局修复会话（M-00 P-09 / Supervisor 决策）；详见"write scope 派生"章的"条件化联合域例外"小节。
-- **归因→修复集映射确立**：M-10 的机械归因输出由"唯一命中 Slice"升级为**候选修复集**，两级路由（唯一命中→原 Slice 重生；复杂场景→升级 Supervisor→全局修复会话），具体路由判据归 M-10；本篇承接修复集对应的联合域 write scope 语义，详见"归因→修复集映射"节。
+- **归因→修复集映射确立（V6 收敛）**：M-10 的机械归因输出由"唯一命中 Slice"升级为**候选修复集 + 归因可靠性分类**——静态诊断（编译/lint/类型）唯一命中=可靠域直通标记（原 Slice 重生）；静态多命中 / 动态测试失败=Supervisor 证据输入（统一唤醒 Supervisor）。机械归因从路由判据**降级为 Supervisor 输入证据**（候选修复集 + 可靠性分类作决策参考），判定形态由两级路由收敛为「可靠域直通 + 其余统一 Supervisor」；具体判定归 M-10，本篇承接修复集对应的联合域 write scope 语义，详见"归因→修复集映射"节。
 
 V5 对齐段（下节"V5 当前对齐"）与 V5 可验收增量留存作追溯，不随 V6 改动而删减。
 
@@ -151,12 +151,14 @@ write scope 互斥（两两不相交）的唯一目的是**防止并行写冲突
 
 ### 归因→修复集映射
 
-M-10 的机械归因输出由"唯一命中 Slice"升级为**候选修复集**：write scope 查表输出的是命中归属的集合而非强制要求唯一命中。两级路由确立：
+M-10 的机械归因输出由"唯一命中 Slice"升级为**候选修复集 + 归因可靠性分类**：write scope 查表输出的是命中归属的集合而非强制要求唯一命中，并附加可靠性分类（可靠性分类的具体数值/枚举为实施期开放项，本篇不臆造 schema）。判定形态收敛为「可靠域直通 + 其余统一 Supervisor」：
 
-- **唯一命中**：诊断 `file:line` 在 write scope 查表中唯一命中某一 Slice → 映射到该原 Slice 的重生（定向重生成）。
-- **复杂场景**：诊断跨 Slice / 命中集合含多个 Slice / 无唯一归属 / 反复归因指向同一 Slice 等 → 升级 Supervisor，进入**全局修复会话**，持修复集内各 Slice 的联合域 write scope（见"条件化联合域例外"小节）。
+- **可靠域直通标记**：静态诊断（编译/lint/类型）在 write scope 查表**唯一命中**单 Slice 且无强耦合信号 → 机械归因标记可靠域直通，映射到该原 Slice 的重生（原 Slice 重生，占其 generation 0-2，零模型判断）。
+- **Supervisor 证据输入**：静态诊断**多命中**，或**动态测试失败**（归因不满锐）时，机械归因不直接分流裁决，而是把**候选修复集 + 归因可靠性分类**作为证据输入**统一唤醒 EXECUTE Supervisor**，由其出修复决策（全局修复会话或单 Slice 委派）。
 
-两级路由的具体路由判据（何时判定为"复杂场景"）由 M-10 定义并实施期定稿，本篇不臆造判定算法；本篇只承接修复集对应的联合域 write scope 语义（即条件化联合域例外）。归因仍不修改计划事实：归因仅是查表与路由，不改写各自 Slice 的冻结 write scope。
+V6 收敛后，机械归因从"两级路由的分流裁决判据"**降级为 Supervisor 的输入证据**——它提供候选修复集与可靠性分类作决策参考，不再承担严格的分流路由。全局修复会话持修复集内各 Slice 的联合域 write scope（见"条件化联合域例外"小节）。
+
+归因仍不修改计划事实：归因仅是查表与证据提供，不改写各自 Slice 的冻结 write scope；`file:line`→write scope 查表映射（P-09）随计划持久化后不变。
 
 ## DAG 就绪调度：依赖闭包由 DAG 表达，不由状态机表达
 

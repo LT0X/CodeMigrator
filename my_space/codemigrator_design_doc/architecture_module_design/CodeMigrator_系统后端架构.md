@@ -1,6 +1,7 @@
 # CodeMigrator 系统后端与交付边界
 
 > 文档状态：V6 方向对齐版；本篇拥有 REST/SSE 投影 DTO、`run_events` 事件集与控制面事务、幂等边界。  
+> V6 收敛说明：ANALYZE 阶段并入 CreateRun——createRun 后置断言分支（投影存在断言 + 档案一致性断言）取代独立分析阶段，档案一致性失败以 `DOSSIER_INCONSISTENT` 零副作用拒绝；迁移推进为四阶段（PLANNING → EXECUTING → VERIFYING → REPORTING），无 ANALYZING 中间态，`run_events` 首个 `run.status_changed` 事件直接落到 PLANNING。  
 > 技术范围：REST API 与外部安全面、SSE 事件投影与回放、幂等与控制面事务、PostgreSQL 单存储表结构适配、交付状态拆分。  
 > 契约真相：Run 与交付状态、`CreateRun`、公共 ID 与限额以 [M-00：设计原则、并行系统地图与公共契约](CodeMigrator_垂类设计原则与架构哲学.md) 为准；Spec v3 语义与拒绝码以 [Migration Spec 抽象层](CodeMigrator_Migration_Spec抽象层.md) 为准；四类 Slice 与集成键以 [迁移计划生成器](CodeMigrator_迁移计划生成器.md) 为准；工具审计点位以 [工具系统与 Hook](CodeMigrator_工具系统与Hook.md) 为准；验证事件语义以 [验证引擎](CodeMigrator_验证引擎.md) 为准；本篇拥有 REST/SSE DTO 形状、`run_events` 事件集归属与投影事务语义。  
 > 关联文档：[工程边界与目录架构](CodeMigrator_核心目录架构设计.md)、[Migration Spec 抽象层](CodeMigrator_Migration_Spec抽象层.md)、[Harness 总体设计](CodeMigrator_Harness总体设计.md)、[迁移计划生成器](CodeMigrator_迁移计划生成器.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[验证引擎](CodeMigrator_验证引擎.md)、[工具系统与 Hook](CodeMigrator_工具系统与Hook.md)、[工作空间与 Git 集成](CodeMigrator_工作空间与Git集成.md)、[可观测性系统](CodeMigrator_可观测性系统.md)、[Web 体验与迁移可视化工作台](CodeMigrator_Web体验与可视化工作台.md)、[会话与运行时修正编排](CodeMigrator_会话与运行时修正编排.md)。
@@ -62,6 +63,7 @@ sequenceDiagram
     A->>A: body、认证、schema、BranchPrefix 分支前缀 校验
     A->>R: descriptor preflight 描述符资源预检
     R->>R: 冻结双工具链描述符选择
+    R->>R: createRun 后置断言：投影存在断言 + 档案一致性断言
     R->>P: Run、幂等记录、首个 run_event 同事务写入
     P-->>R: RunId 与 version 版本
     R-->>A: MigrationView 迁移视图
@@ -72,7 +74,7 @@ sequenceDiagram
     A-->>C: migration.event 迁移事件
 ```
 
-描述符资源预检发生在 CreateRun 事务之前。Spec 锁定的双工具链描述符版本与资源摘要、源端 tree-sitter grammar 与目标端工具链镜像摘要未全部命中时，服务按 M-05 返回稳定拒绝码，响应不含 `run_id`，Run、`run_events` 和 Git 的新增记录均为零。CreateRun 请求同时携带四件已确认工件的 ref/hash：Spec、UnderstandingDossier、TargetProjectBlueprint、MigrationRulebook；工件正文以 ArtifactRef 先行落 host CAS 并计入 Run 归属账本（M-12/M-16），hash 进入 plan bundle。预检通过后，Run、幂等记录和首个 `run_events` 事件必须在同一 PostgreSQL 事务中提交；bwrap/model dispatch 属于事务后的可恢复效果，不影响创建响应的确定性。
+描述符资源预检发生在 CreateRun 事务之前。Spec 锁定的双工具链描述符版本与资源摘要、源端 tree-sitter grammar 与目标端工具链镜像摘要未全部命中时，服务按 M-05 返回稳定拒绝码，响应不含 `run_id`，Run、`run_events` 和 Git 的新增记录均为零。CreateRun 请求同时携带四件已确认工件的 ref/hash：Spec、UnderstandingDossier、TargetProjectBlueprint、MigrationRulebook；工件正文以 ArtifactRef 先行落 host CAS 并计入 Run 归属账本（M-12/M-16），hash 进入 plan bundle。描述符资源预检之后、写入 Run 之前，CreateRun 执行两项后置校验（ANALYZE 阶段已并入 CreateRun，属断言分支而非独立阶段）：**投影存在断言**——校验 V6 项目注册预索引的投影已存在，键 = snapshot OID + 描述符摘要；**档案一致性断言**——对已确认 UnderstandingDossier 与机械事实做一致性核对。档案一致性断言失败时以 fail-fast 错误码 `DOSSIER_INCONSISTENT` 零副作用拒绝：不分配 `run_id`，Run、幂等记录、`run_events` 与 Git 新增均为 0。预检与后置断言通过后，Run、幂等记录和首个 `run_events` 事件必须在同一 PostgreSQL 事务中提交；bwrap/model dispatch 属于事务后的可恢复效果，不影响创建响应的确定性。首个 `run.status_changed` 事件直接落到 `PLANNING`（Run 创建即 CREATED，无 ANALYZING 中间态）——ANALYZE 已并入 CreateRun 的断言分支。
 
 | 外部资源 | 写入规则 | 幂等或并发边界 |
 |---|---|---|

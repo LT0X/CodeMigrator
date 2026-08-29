@@ -2,7 +2,8 @@
 
 > 文档状态：V6 方向对齐版  
 > 适用范围：单写者控制面、单个 Run 的命令归约、Planner 冻结计划后的并行 Slice 调度（依赖闭包就绪即启动，无全局屏障）、app 直接管理 bwrap、取消、预算终止与崩溃恢复  
-> V6 演进说明：引入三层架构——权力层 Harness / 判断层常驻主 Agent / 执行层工作会话，以及 actor 对判断层建议（Advice）的两级收养规则。V5 的确定性控制面、单写者、dispatch 接管与恢复语义保持不变；V5 对齐段（见下）留存为追溯。  
+> V6 演进说明：引入三层架构——权力层 Harness / 判断层 Supervisor（每次触发即新决策会话）/ 执行层工作会话，以及 actor 对判断层建议（Advice）的两级收养规则。V5 的确定性控制面、单写者、dispatch 接管与恢复语义保持不变；V5 对齐段（见下）留存为追溯。  
+> V6 收敛说明：Supervisor 每次触发=新会话，由统一 Context Manager 定向装配上下文（基线态势快照机器算不入上下文 + 本次决策定向事件投影），取消被动唤醒式常驻与滚动摘要表述；全局修复会话完成 checkpoint 后按 FIFO 入 Integration Coordinator 串行队列（与普通 Slice 同队），prospective 建立在集成时最新 verified 上，修复决策层级设独立重试上限（数值为实施期开放项），Run 级预算断路器兜底防修复循环。  
 > 契约真相：[M-00 垂类设计原则与架构哲学](CodeMigrator_垂类设计原则与架构哲学.md)拥有 `RunStatus`、`SliceAttemptStatus`、`CandidateGeneration`、`DispatchAttemptId`、失败原因、Git refs 与固定保留期  
 > 关联文档：[系统后端架构](CodeMigrator_系统后端架构.md)、[Agent Loop](CodeMigrator_Agent_Loop设计.md)、[迁移计划生成器](CodeMigrator_迁移计划生成器.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[沙箱与执行环境](CodeMigrator_沙箱与执行环境.md)、[验证引擎](CodeMigrator_验证引擎.md)、[工作空间与 Git 集成](CodeMigrator_工作空间与Git集成.md)、[Web 体验与迁移可视化工作台](CodeMigrator_Web体验与可视化工作台.md)
 
@@ -141,13 +142,17 @@ CLI 的 Ctrl+C 仍通过 `CancelCommand(expected_version)` 进入本 actor；会
 
 ## 判断层接入与减法降级
 
-判断层常驻主 Agent 以 Advisor 身份存在，不进入执行层工作会话，也不改写控制面事实；它对 actor 输出 `Advice` 建议（见上文"每个 Run 由一个 actor 串行决定"）。EXECUTE Supervisor 触发事件集仅两条：
+判断层 Supervisor 以 Advisor 身份存在，不进入执行层工作会话，也不改写控制面事实；**每次触发即新建决策会话**，上下文由统一 Context Manager 定向装配（见下），不再是被动唤醒的常驻主 Agent。它对 actor 输出 `Advice` 建议（见上文"每个 Run 由一个 actor 串行决定"）。EXECUTE Supervisor 触发事件集仅两条：
 
 - **归因多义/双错**：候选修复集 >1 时，触发全局修复决策建议（避免 actor 机械归约无法在多义间取舍）。
 - **Slice 会话失败停止**：Slice 会话失败且停止时，触发异常语义路由建议（把失败原因映射到既有异常处置路径）。
 
-Supervisor 观察为被动唤醒式：基线态势快照由机器计算并持久化，不注入上下文；仅在触发事件到达时的间歇性注入态势快照与定向事件投影，供主 Agent 生成 Advice。
+Supervisor **每次触发即新建决策会话**，由统一 Context Manager 定向装配：基线态势快照由机器计算并持久化、不注入上下文，仅由本次决策的定向事件投影作为输入，供主 Agent 生成 Advice——不存在被动唤醒的常驻观察态，也不对上下文做滚动摘要。
 
 关键约束：主 Agent 是增益层不是依赖层。判断层缺席（模型故障、预算耗尽）时，控制面完整性与机制完全相同；系统退回机械归约，优雅降级，不成为新的单点。VERIFY/REPORT 的零模型硬边界不变。
+
+## 全局修复会话的集成序与重试边界
+
+全局修复会话完成 checkpoint 后，其产出按 **FIFO** 进入 Integration Coordinator 串行队列——与普通 Slice 同队，不优先插队，仅冻结的集成序决定先后，执行补丁不被当作特殊通道。修复集成与普通 Slice 收敛同一规则：prospective 建立在**集成时最新 verified** 之上，verified 单写者串行推进、互斥写集保证安全，集成准入仍受冻结队首、局部验证 receipt 与 integration intent/receipt 约束，不因会话来源而跳过 M-10 prospective checks。修复决策层级设**独立重试上限**（与 generation 0-2 同构，具体数值为实施期开放项）——每次修复由新证据驱动，超过该上限即停止当前修复层级，避免在旧证据上无意义重试；Run 级预算断路器兜底，防修复循环耗尽预算。并行冲突由两层兜底：文件级以计划期 write scope 全局互斥作结构性保证，语义级由增量验证 + 最终验证双层兜底；修复不阻塞并行——verified 主线保持单写者串行，其余 Slice 仍在资源池并行执行。
 
 > 设计演进、历史缺陷处置和变更理由见：[文档迭代记录](文档迭代记录.md)。

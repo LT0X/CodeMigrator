@@ -1,7 +1,7 @@
 # CodeMigrator Agent Loop：阶段编排与工具箱调用循环
 
-> 文档状态：V6 方向对齐版；本篇是五阶段模型会话编排、EXECUTE 模型↔工具箱调用循环、常驻协调会话、修复会话与会话隔离边界的唯一 owner。  
-> 技术范围：阶段与模型档绑定、EXECUTE 六工具调用循环（L1-L4 四层）、Shell 会话自检与 Exec 编排、四类 Slice 会话上下文构成、Spec 起草会话、常驻协调会话类型、修复会话与重生升级包、重生成历史注入、P-05 数据边界、失败传播与会话失效。  
+> 文档状态：V6 收敛版（fb11）；本篇是四阶段模型会话编排、EXECUTE 模型↔工具箱调用循环、协调会话、修复会话与会话隔离边界的唯一 owner。  
+> 技术范围：阶段与模型档绑定、EXECUTE 六工具调用循环（L1-L4 四层）、Shell 会话自检与 Exec 编排、四类 Slice 会话上下文构成、Spec 起草会话、协调会话类型（事件触发式 EXECUTE Supervisor / 交互式探索协调者）、会话创建机制与三段式前缀架构、修复会话与重生升级包、重生成历史注入、P-05 数据边界、失败传播与会话失效。  
 > 契约真相：Phase、RunStatus、ModelProfile、Phase 工具授权矩阵、WriteScope、稳定错误码与预算语义以 [M-00 垂类设计原则与架构哲学](CodeMigrator_垂类设计原则与架构哲学.md) 为准；本篇只定义它们在循环中的使用边界。  
 > 关联文档：[Harness 总体设计](CodeMigrator_Harness总体设计.md)、[Migration Spec](CodeMigrator_Migration_Spec抽象层.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[工具系统与 Hook](CodeMigrator_工具系统与Hook.md)、[记忆与上下文管理](CodeMigrator_记忆与上下文管理.md)、[验证引擎](CodeMigrator_验证引擎.md)、[会话与运行时修正编排](CodeMigrator_会话与运行时修正编排.md)
 
@@ -24,13 +24,21 @@ V6 在 V5 的方向对齐基础上补充两类会话形态；V5 的阶段编排�
 
 本章节标题沿用惯例命名，编号与后续章节顺序保持既有；本节点明 V6 相对 V5 的增量，其余章节文字保留原样，保证追溯一致。
 
-## 五阶段的职责边界
+### V6 收敛说明（fb11）
 
-阶段不是五个模型产品。Run 创建时冻结两档 `ModelProfile { Reasoning, Code }` 到五个阶段的绑定（M-00：ANALYZE→Reasoning、PLAN→Reasoning、EXECUTE→Code；VERIFY 不开模型会话、REPORT 正文由确定性模板从 verified facts 拼装——两者均无模型档位），缺失绑定在 CreateRun 前拒绝。分工基线是信息分层：机械完备层产候选事实，起草期多会话探索与主会话合并产出四件工件并经用户确认入闸，PLAN 由 LLM Planner 提案再经机器校验；模型在 EXECUTE 担任执行主体，VERIFY/REPORT 无模型会话。
+本篇正文随架构收敛改写（历史 V5 / V6 方向对齐段留存追溯，不改动）：
+
+- **去常驻化**：协调会话不再是被动唤醒式常驻会话；EXECUTE Supervisor 改为事件触发式新会话，由统一 Context Manager 定向装配。
+- **五阶段→四阶段**：ANALYZE 并入 CreateRun，作为非模型 phase 由 M-06 机械完备层承担，不再开设模型会话。
+- **KV-cache 前缀架构**：上下文统一三段式前缀架构（稳定前缀段 / 演进段 / 定向增量段），以符合 provider prefix cache。
+- **会话创建机制**：本架构无子 agent 工具，会话创建统一为 actor 编排派发（静态会话模板库 + Context Manager 装配，任何模型不准备其他会话提示词）。
+
+## 四阶段的职责边界
+
+阶段不是四个模型产品。ANALYZE 已并入 CreateRun，作为**非模型 phase** 由 M-06 机械完备层承担，不进模型会话、不入阶段编排。Run 创建时冻结两档 `ModelProfile { Reasoning, Code }` 到四个阶段的绑定（PLAN→Reasoning、EXECUTE→Code；VERIFY 不开模型会话、REPORT 正文由确定性模板从 verified facts 拼装——两者均无模型档位），缺失绑定在 CreateRun 前拒绝。分工基线是信息分层：机械完备层产候选事实，起草期多会话探索与主会话合并产出四件工件并经用户确认入闸，PLAN 由 LLM Planner 提案再经机器校验；模型在 EXECUTE 担任执行主体，VERIFY/REPORT 无模型会话。
 
 | 阶段 | 进入状态 | 主要输入 | 可产生的结果 | 确定性管线与模型的边界 |
 |---|---|---|---|---|
-| ANALYZE | `ANALYZING` | 冻结源快照 OID、M-06 机械完备层产物与四件冻结工件 | 机械层↔冻结档案一致性校验结论（偏差记入分析投影，不回写工件） | M-06 负责机械枚举；本阶段不重新生成语义档案 |
 | PLAN | `PLANNING` | M-06 事实与关系图、四件冻结工件、Spec 分解原则 | 无（Loop 只消费计划投影） | Planner（M-07）生成 PlanProposal；机器校验四项门禁后自动冻结 Slice、DAG、write scope 与 integration_rank |
 | EXECUTE | `EXECUTING` | 本 Slice generation 的冻结 Context Pack（含档案相关摘录） | 候选工作区中的目标代码文件 | 模型与工具箱的循环是执行主体；Harness 不逐键介入文件内容，只做 write scope 校验、checkpoint 与验证 |
 | VERIFY | `VERIFYING` | 冻结最终 verified head、最终验证 receipt | 无（Loop 只消费 receipt 投影） | 零工具、零模型副作用；最终检查由 Run actor 经 InternalVerificationDispatch 派发（M-09/M-10） |
@@ -38,14 +46,14 @@ V6 在 V5 的方向对齐基础上补充两类会话形态；V5 的阶段编排�
 
 ```mermaid
 flowchart LR
-  A["ANALYZE 分析\n机械完备层管线 + 消费已冻结理解档案校验\n（档案产制＝起草会话深潜 → 用户确认冻结）"] --> P["PLAN 规划\nPlanner 消费四件冻结工件 + M-06 事实\n提案 → 机器校验 → 冻结 DAG"]
+  C["CreateRun（含并入的 ANALYZE 非模型 phase）\nM-06 机械完备层产候选事实 + 档案一致性校验\n（档案产制＝起草会话深潜 → 用户确认冻结）"] --> P["PLAN 规划\nPlanner 消费四件冻结工件 + M-06 事实\n提案 → 机器校验 → 冻结 DAG"]
   P --> X["EXECUTE Planner 选择的 Slice 会话\nDAG 依赖闭包 + 三池资源许可即启动"]
   X --> V["VERIFY 最终验证\n零工具 只消费 receipt"]
   V --> R["REPORT 报告\n确定性模板从 verified facts 拼装正文"]
   R --> T["Terminal projection 终态投影"]
 ```
 
-ANALYZE 的边界：import 图、模块清单、测试清单与构建清单是 PLAN 与四类会话上下文的公共输入，必须可由冻结快照 OID 确定性重建（M-06）。分析期模型摘要只服务于人类可读投影，省略它不改变任何下游输入；辅助核验的工具面与授权矩阵中 ANALYZE 的只读子集一致（ReadFile/QuerySourceAst），不引入新的信任面。
+ANALYZE 的边界（已并入 CreateRun，作为非模型 phase）：import 图、模块清单、测试清单与构建清单是 PLAN 与四类会话上下文的公共输入，必须可由冻结快照 OID 确定性重建（M-06）。ANALYZE 不再开设模型会话——机械完备层产候选事实与档案一致性校验全程由 M-06 确定性管线承担；不引入任何模型工具面，亦无分析期模型摘要侧（人类可读投影由确定性投影生成，省略它不改变任何下游输入）。
 
 PLAN 的边界：依赖边、write scope 与集成序是并发安全与结果确定性的载体（P-03）。Planner 从 M-06 事实、关系图和四件冻结工件提出方案；机器校验四项门禁后，actor 冻结计划。运行中的计划调整一律经 M-16 的 PlanRevision 由 actor 冻结后再生效；模型在任何时点都不可直接写已冻结 DAG 边、write scope 或 integration_rank。
 
@@ -55,7 +63,7 @@ EXECUTE 不再把 Slice 固定为契约层/实现层两波；Planner 提案中�
 
 Loop 在每个阶段入口检查 phase/status 配对、Run 取消标记、冻结 binding 与预算门；EXECUTE 会话另须匹配 Slice、active generation 与创建时 candidate OID。任一检查失败时模型请求、工具调用和 outcome 发布均为零。Run version 只用于外部 API 的 `If-Match`，不进入每次模型调用。
 
-会话粒度随阶段变化：ANALYZE 与 PLAN 是 Run 级的少量短会话——输入是 M-06/M-07 的确定性产物，无候选工作区，工具面只有只读两件；EXECUTE 是每 Slice generation 一个长会话，绑定候选工作区（长驻沙箱卷）与六工具；VERIFY 与 REPORT 均不开设模型会话（REPORT 正文由确定性模板从 verified facts 拼装）。五阶段之前还存在 Spec 起草会话——ANALYZE 前的交互阶段（含深潜理解阶段，即理解会话本体），由 M-16 会话 Agent 承担，本篇在"Spec 起草会话"一节定义其工具面与循环边界。各 phase 的调用批量与预算档位由 M-14 差异化配置。
+会话粒度随阶段变化：PLAN 是 Run 级的少量短会话——输入是 M-07 的确定性产物，无候选工作区，工具面只有只读两件（ANALYZE 已并入 CreateRun 非模型 phase，不开设模型会话）；EXECUTE 是每 Slice generation 一个长会话，绑定候选工作区（长驻沙箱卷）与六工具；VERIFY 与 REPORT 均不开设模型会话（REPORT 正文由确定性模板从 verified facts 拼装）。四阶段之前还存在 Spec 起草会话——CreateRun（含并入的 ANALYZE）前的交互阶段（含深潜理解阶段，即理解会话本体），由 M-16 会话 Agent 承担，本篇在"Spec 起草会话"一节定义其工具面与循环边界。各 phase 的调用批量与预算档位由 M-14 差异化配置。
 
 所有阶段输入都由 actor 注入并携带来源身份：分析事实带冻结快照 OID，计划输入带计划指纹，会话上下文带 generation 与 candidate OID。Loop 不自行采集输入——它消费的每一条上下文都能回答"从哪个冻结事实来"，这是 M-14 上下文投影与调用审计的前提。
 
@@ -199,11 +207,11 @@ sequenceDiagram
 
 **规则条目提案出口**（fb8 续对齐，Anthropic 迁移实践吸收）：重生成会话的归因诊断揭示**系统性**误译模式（同一规则缺失跨文件重复致错）时，owning 会话除修正代码外可附《规则条目提案》——条目带归因引用与理由，经 Harness 记入 `run_events` 审计后写入 MigrationRulebook 并递增版本（M-00 契约）；新版本即时生效于**后续派发**会话的 Context Pack 规则书章节，已集成成果零追溯。提案是会话产出的可选组成，不构成写通道——采纳与入账由 Harness 完成，模型不能直接修改任何其他 Slice 或已冻结工件。
 
-**会话类型扩展的上下文构成补充**：上述四类 Slice 会话的测试类**信息防火墙保持不变**——测试翻译/测试生成会话仍不注入被测实现的目标语言正文（已集成与否均然），被测行为事实仅经契约签名进入上下文。新增的常驻协调会话与修复会话的上下文构成标注如下：
+**会话类型扩展的上下文构成补充**：上述四类 Slice 会话的测试类**信息防火墙保持不变**——测试翻译/测试生成会话仍不注入被测实现的目标语言正文（已集成与否均然），被测行为事实仅经契约签名进入上下文。新增的协调会话与修复会话的上下文构成标注如下：
 
 | 会话 | 上下文构成 | 备注 |
 |---|---|---|
-| 探索协调者 / EXECUTE Supervisor（常驻协调会话） | 机器态势快照（不入上下文）+ 触发时定向事件投影注入 + 滚动摘要（历史唤醒有界窗口） | 只出建议（Advice）、零直写；输入经 Harness 注入，不带自由跨会话记忆 |
+| 探索协调者 / EXECUTE Supervisor（协调会话） | 机器态势基线（不入上下文）+ 触发时统一 Context Manager 定向事件投影注入（本次失败证据；无跨次滚动摘要） | 只出建议（Advice）、零直写；输入经 actor 注入，不带自由跨会话记忆 |
 | 修复会话 | 修复简报（必要输入）+ 全 Run verified 树 / 源快照 / 失败测试 / PSF-2 调用链（导航索引式按需 `ReadFile`） | 身份 `(run_id, repair_decision_id)`，不占原 Slice generation 0-2 |
 | 原 Slice 重生会话（升级包场景） | 常规重生成 Context Pack（含前代失败诊断与前代 diff 摘要）+ 全境读视野 + 修复简报 | 仍占用原 Slice generation，验证走 checkpoint→局部→集成 |
 
@@ -227,24 +235,38 @@ Spec 起草会话是四类 Slice 会话之外的一类模型会话，发生在 A
 
 边界：Agent 只起草、不提交——草稿生效的确认权在用户，未经确认的草稿不产生任何 Run 副作用；起草会话工具面为只读探索 + AskUser，无写权限（无 WriteFile/EditFile/Shell/Exec），Spec 草稿的持久化走会话通道（TaskDraftRevision 账本，M-16）而非 WriteFile；探索对象为用户选定项目的只读事实，不触达任何候选工作区或托管输出。AskUser 属于会话 Agent 通道而非 phase 工具面（见"会话 Agent 与迁移 Agent 的隔离"）。
 
-## 常驻协调会话类型（判断层落地于 Agent Loop）
+## 协调会话类型（判断层落地于 Agent Loop）
 
-两类常驻协调会话把判断层落地在 Agent Loop，二者均**只出建议（Advice）、零直写权**，计入模型会话池并受独立预算档（预算档位由 M-14 差异化配置）；VERIFY/REPORT 零模型硬边界不破——常驻协调会话同样不进入 VERIFY 裁决面。
+两类协调会话把判断层落地在 Agent Loop，二者均**只出建议（Advice）、零直写权**，计入模型会话池并受独立预算档（预算档位由 M-14 差异化配置）；VERIFY/REPORT 零模型硬边界不破——协调会话同样不进入 VERIFY 裁决面。
 
 ### 探索协调者（起草期）
 
-探索协调者是起草期主会话的升级形态，在深潜理解阶段承担只读探索子会话的调度协调。它持有**切域调整建议权**：围绕 Harness 产出的机器骨架，可建议对探索域做合并/拆分/重点标注，并为每名探索员下发展 `focus brief`。这些建议经 Harness 机器校验（覆盖恰好一次、扇出与预算上限）后才派发；需要时探索员可按需改派。探索协调者仅持有只读探索工具面（ReadFile/QuerySourceAst/Exec 编排只读三件），**无任何写权限**——WriteFile/EditFile/Shell 零接纳，与 Spec 起草会话同源的行为限制（草稿与档案经会话通道持久化，不经 WriteFile）。
+探索协调者是起草期主会话的升级形态，在深潜理解阶段承担只读探索子会话的调度协调。它是交互式会话，天然贯穿起草全程，无需特殊化的"常驻"表述，走标准 M-14 上下文机制。它持有**切域调整建议权**：围绕 Harness 产出的机器骨架，可建议对探索域做合并/拆分/重点标注，并为每名探索员下发展 `focus brief`。这些建议经 Harness 机器校验（覆盖恰好一次、扇出与预算上限）后才派发；需要时探索员可按需改派。探索协调者仅持有只读探索工具面（ReadFile/QuerySourceAst/Exec 编排只读三件），**无任何写权限**——WriteFile/EditFile/Shell 零接纳，与 Spec 起草会话同源的行为限制（草稿与档案经会话通道持久化，不经 WriteFile）。
 
 ### EXECUTE Supervisor（执行期）
 
-EXECUTE Supervisor 是被动唤醒式常驻会话，在 Slice 会话运行期常驻但默认静默，仅承担两个职责：
+EXECUTE Supervisor 是**事件触发式新会话**：每次触发即开启一个新会话，不存在跨次唤醒的常驻会话本体。会话由统一 Context Manager 定向装配，仅承担两个职责：
 
-1. 归因多义/双错 → 全局修复决策；
+1. 归因多义/双错（静态多命中且动态测试全失败）→ 建议**全局修复会话**或**单 Slice 委派重生**；
 2. Slice 会话失败停止 → 异常语义路由建议。
 
-其观察模型是**态势快照**：态势由机器算入、不导入模型上下文以控制 token 占用；仅当被触发时做**定向事件投影注入**（把相关事件事实投影注入上下文），并配**滚动摘要**——历史唤醒保持有界窗口。Supervisor 只输出建议（Advice）、零直写权：全局修复经"修复会话"落地（见下节），异常语义路由建议仅供 Harness/M-10 参考，模型不经 Supervisor 直接修改任何 Slice 候选。
+其上下文装配原则：机器态势基线统计由机器算入、不入上下文以控制 token 占用；每次触发由统一 Context Manager 定向装配——**基线态势快照机器算不入上下文** + **本次决策的定向事件投影**（本次失败证据），不含任何跨次唤醒的滚动摘要（"被动唤醒式常驻"与"滚动摘要"表述已作废）。Supervisor 只输出建议（Advice）、零直写权：全局修复经"修复会话"落地（见下节），异常语义路由建议仅供 Harness/M-10 参考，模型不经 Supervisor 直接修改任何 Slice 候选。
 
-两者均计入模型会话池、受独立预算档，其工具面沿既有六工具 L1-L4 分层的只读子集，不新增信任面。（探索协调者切域调整的机器校验门禁、Supervisor 唤醒阈值、滚动摘要的有界窗口/预算数值为实施期开放项，归 M-14/M-16 定案前不臆造。）
+两者均计入模型会话池、受独立预算档，其工具面沿既有六工具 L1-L4 分层的只读子集，不新增信任面；上下文装配规则见下节"会话创建机制与三段式前缀架构"。（探索协调者切域调整的机器校验门禁、Supervisor 触发阈值为实施期开放项，归 M-14/M-16 定案前不臆造。）
+
+## 会话创建机制与三段式前缀架构
+
+**会话创建机制（无子 agent 工具 + 静态模板库 + 提示词分工）**：本架构**没有子 agent 工具**——任何模型都不能 spawn 模型，P-01 六工具（ReadFile/WriteFile/EditFile/QuerySourceAst/Shell/Exec）不提供扩展注册路径，不存在让模型派生新会话或拼接他人上下文的通道。会话创建一律由 Harness / actor 编排派发，与派发 Slice 会话（dispatch ready Slice、绑定身份三元组）是同一机制。提示词分工明确：**角色系统提示来自 Harness 静态会话模板库**——版本化受信资源，与 phase policy 同类管理、不可被模型改写；**上下文内容段由 Context Manager 确定性装配**＋Supervisor 决策注入的**修复简报**（唯一由模型产出的上下文段，经归一器收敛 + actor 校验后才进入）。任何模型都不为其他会话准备提示词。
+
+**三段式 KV-cache 前缀架构**：Supervisor / 修复会话 / 重生会话的上下文装配采用三段式前缀，以最大化 provider prefix cache 命中——以共享共识前缀驱动缓存命中而非滚动变量前缀：
+
+- **稳定前缀段**：角色系统提示 + 冻结工件引用 + Run 级固定事实；字节不变，跨会话 / 跨次触发可整体命中。
+- **演进段**：verified 演进摘要；每集成一个 Slice 只在段尾**增量追加**——"新来的 Slice"集成时追加自身摘要条目，历史段零变动，只动尾部保缓存命中。
+- **定向增量段**：本次失败证据（归因诊断、失败测试、修复简报相关事件投影）；每次不同。
+
+**逐出交叉约束**：逐出只作用于**定向增量段**内旧轮次工具结果；稳定前缀段＋演进段受**不可逐出集合**保护（见 M-14）。
+
+**实施期开放项**：前缀字节稳定性保证（稳定前缀段与演进段在装配与逐出时点字节精确不变、可哈希核验）与 provider 适配差异（不同 provider 对 prefix cache 命中判定粒度 / 预算语义不同）视为实施期开放项，在 M-14 / M-16 定案前不臆造。
 
 ## 修复会话：全局修复的专门会话
 
@@ -253,7 +275,8 @@ EXECUTE Supervisor 是被动唤醒式常驻会话，在 Slice 会话运行期常
 - **读**：全 Run verified 树 + 源快照 + 失败测试 + PSF-2 调用链 + 修复简报。
 - **写**：修复集联合域——并集内路径无在途并行写者的条件下构成**条件安全联合域**；写范围由 Harness 基于在途并行写入状态在派发时冻结。
 - **验证**：走 `checkpoint → 局部 → 集成` 的既有裁决链。
-- **简单场景**：当失败清晰归因于单个 Slice 且无需跨域协调时，由原 Slice 的**重生会话**承担修复；重生会话获"**升级包**"——全境读视野 + 修复简报，作为其 Context Pack 的补充输入（仍占用原 Slice generation，验证亦走 checkpoint→局部→集成）。
+- **路由收敛**：修复归因统一为两分支——**简单静态唯一命中**（失败由单 Slice 静态断言唯一命中）→ 原 Slice **重生会话**直修；**静态多命中**（归因在多个候选间静态歧义）且**全部动态测试失败** → 上报 **Supervisor**，建议派发**全局修复会话**或**单 Slice 委派重生**。沿用既有重生 / 修复两型处置，不与另一套分类法重复。
+- **简单场景**：当失败清晰归因于单个 Slice（静态唯一命中）且无需跨域协调时，由原 Slice 的**重生会话**承担修复；重生会话获"**升级包**"——全境读视野 + 修复简报，作为其 Context Pack 的补充输入（仍占用原 Slice generation，验证亦走 checkpoint→局部→集成）。
 
 修复简报是修复会话与重生升级包会话的**必要输入**（含归因结论、失败测试、影响范围）；其余读路径（verified 树、源快照、调用链细部）采用**导航索引式按需 ReadFile**——超限细节的装配与预算治理归 M-14。（修复集联合域的在途并行写者判定语义、修复简报字段 schema 为实施期开放项，在 M-14/M-16 定案前不臆造。）
 
@@ -335,6 +358,13 @@ provider 的可重试基础设施错误只在 Run 未取消、当前 generation/
 - [ ] EXECUTE 会话只消费 Planner 冻结的 Slice、DAG、write scope、integration_rank 与六工具授权；Contract Slice 可为 0，依赖闭包就绪即启动。
 - [ ] 测试翻译与测试生成会话不接收被测实现目标正文；生成测试产出全链路携带 GENERATED，VERIFY/REPORT 不开启模型会话。
 - [ ] 运行期结构变化只经 M-16 安全点与 ImpactPreview 确认后重规划未集成部分，已验证主线不被会话直接改写。
+
+## V6 收敛增量（fb11）
+
+- [ ] EXECUTE Supervisor 为事件触发式新会话——每次触发开启新会话、由统一 Context Manager 定向装配，不存在被动唤醒式常驻会话与"滚动摘要"；探索协调者为交互式会话贯穿起草全程，走标准 M-14 上下文机制；两者只出 Advice、零直写，VERIFY/REPORT 零模型硬边界不破。
+- [ ] 会话创建无子 agent 工具——任何模型不能 spawn 模型，P-01 六工具不存在扩展注册路径，不存在模型为其他会话准备提示词的通道；会话统一由 actor 编排派发；角色系统提示来自 Harness 静态会话模板库，上下文内容段由 Context Manager 确定性装配。
+- [ ] Supervisor / 修复会话 / 重生会话上下文采用三段式前缀（稳定前缀段 / 演进段 / 定向增量段）；逐出只作用于定向增量段旧轮次工具结果，稳定前缀段＋演进段受不可逐出集合保护。
+- [ ] 修复归因路由收敛——简单静态唯一命中 → 原 Slice 重生；静态多命中且全部动态测试失败 → Supervisor → 全局修复会话或单 Slice 委派重生。
 
 ## V4 历史验收基线（追溯，非当前 V5 契约）
 

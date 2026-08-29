@@ -1,7 +1,7 @@
 # CodeMigrator 会话式迁移、途中修正与安全点编排
 
 > 文档状态：V6 方向对齐版；本篇为 M-16。  
-> V6 演进：① 起草流程重排——探索扇出完成 → 归并 → 多轮 AskUser 对齐 → 工件草稿 → 试译校准 → 确认冻结；② 探索协调者切域调整权——探索切域由"Harness 确定性切域"扩展为"机器骨架 + 主会话切域调整建议 + Harness 机器校验后派发"，探索员可动态改派；③ AskUser 纪律修订——取消"一次最多三题"式框架限制，全周期按需由协调会话自主判断轮次；④ 全局修复会话免确认门语义——归因驱动内部闭环修复免 `ImpactPreview` 确认门，与用户发起的设计级变更（一律确认门）区分。V5 的安全点、契约漂移修正协议、修正边界与四件工件机制保持，V5 对齐段留存追溯。  
+> V6 演进：① 起草流程重排——探索扇出完成 → 归并 → 多轮 AskUser 对齐 → 工件草稿 → 试译校准 → 确认冻结；② 探索协调者切域调整权——探索切域由"Harness 确定性切域"扩展为"机器骨架 + 主会话切域调整建议 + Harness 机器校验后派发"，探索员可动态改派；③ AskUser 纪律修订——取消"一次最多三题"式框架限制，全周期按需由协调会话自主判断轮次；④ 全局修复会话免确认门语义——归因驱动内部闭环修复免 `ImpactPreview` 确认门，与用户发起的设计级变更（一律确认门）区分；⑤ V6 收敛（fb11）——CreateRun 内含一条档案一致性断言分支（已确认 UnderstandingDossier 与机械事实不一致时返回 `DOSSIER_INCONSISTENT` 零副作用拒绝，fail-fast，个人项目极少出现，一条断言分支即全部处置、无分档）；ANALYZE 职责并入 CreateRun，无独立阶段；起草流程不受影响——探索协调者交互式会话天然贯穿起草全程，判断层/全局修复会话以事件触发式新会话呈现。V5 的安全点、契约漂移修正协议、修正边界与四件工件机制保持，V5 对齐段留存追溯。  
 > 技术范围：本地项目注册、MigrationSession、Spec 起草会话、风险驱动提问、运行中修正（PlanRevision）与契约漂移修正协议、薄 Skill 与托管输出；修正边界对齐 Migration Spec v3 与四类 Slice DAG。  
 > 契约真相：本篇拥有会话、问题、修正、PlanRevision、四工件起草会话（会话流程、草稿数据模型与确认语义）、契约漂移修正协议（涟漪确认门与作废重建执行语义）、模块变更账本与交互门；Run/Slice/验证语义由 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 拥有，涟漪计算依赖图由 [M-07](CodeMigrator_迁移计划生成器.md) 拥有，REST/SSE 由 [M-02](CodeMigrator_系统后端架构.md) 拥有；会话输入不能直接写 Git、PostgreSQL、bwrap、candidate 或源项目，Run actor 只在安全点吸收已持久化的意图。  
 > 关联文档：[核心目录](CodeMigrator_核心目录架构设计.md)、[Run actor](CodeMigrator_Harness总体设计.md)、[Agent Loop](CodeMigrator_Agent_Loop设计.md)、[Spec](CodeMigrator_Migration_Spec抽象层.md)、[计划](CodeMigrator_迁移计划生成器.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[Git](CodeMigrator_工作空间与Git集成.md)、[上下文](CodeMigrator_记忆与上下文管理.md)、[CLI/Web 体验](CodeMigrator_Web体验与可视化工作台.md)。
@@ -50,7 +50,7 @@ flowchart LR
 
 **V6 起草流程重排**：探索扇出完成 → 主会话（探索协调者）归并报告（含冲突/风险热点/语义模块划分建议）→ **基于归并发现的多轮 AskUser 对齐**（逐项对齐语义模块划分、依赖判定分歧、风险处置、测试策略、蓝图原则）→ 对齐结论固化为四件工件草稿 → 试译校准 → 用户显式确认冻结。即先由探索扇出完成事实采集，主会话归并并收敛冲突与风险热点，再经多轮 AskUser 逐项对齐关键分歧，随后产出工件草稿，最后在确认冻结点收敛。
 
-产制点归一：起草会话深潜阶段＝理解会话本体；四件工件经用户一次确认后分别记录版本与 hash，一起冻结为 Run 输入。ANALYZE 阶段不再产出档案，只执行机械完备层管线并消费冻结工件做一致性校验。
+产制点归一：起草会话深潜阶段＝理解会话本体；四件工件经用户一次确认后分别记录版本与 hash，一起冻结为 Run 输入；ANALYZE 职责并入 CreateRun——不设独立 ANALYZE 阶段时长或阶段展示，其机械完备层管线与消费冻结工件做一致性校验随 CreateRun 完成。
 
 **试译-弃稿校准环节**：四件工件确认前，主会话选取 2–3 个代表性文件做试译演练——同一文件分别按规则手册约束与自由发挥各译一版，在会话内并排呈现差异供用户对比；差异结论用于校准蓝图、规则手册与档案。试译产物仅在会话内呈现并标记弃稿，零落盘、零候选工作区触碰、零 Run 副作用。
 
@@ -67,7 +67,7 @@ flowchart LR
 
 `MigrationSession` 与 Run 分离，使任务澄清、会话消息和运行期间修正都能有独立账本。全部会话 ID、`MigrationSessionStatus`、`InteractionStatus` 与 `CorrectionIntentStatus` 是 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 的 UUID v7 公共契约；本篇只规定它们的存储、触发和消费边界。
 
-会话先收集用户目标，Session Agent 读取项目摘要、双端工具链描述符能力与锁定 Skill catalog；只在答案会改变语言对、翻译范围、目标结构、输出或验证时调用 AskUser。TaskDraftRevision 冻结 snapshot、语言对与目标、翻译范围与排除项、required checks、Spec Artifact/hash（含双端描述符锁）、分解策略、Skill catalog hash、用户消息 sequence 与默认输出目录。用户确认指定 revision，能力门预检（描述符、grammar 与工具链镜像摘要）通过后才允许创建 Run；预检失败不创建 Run。
+会话先收集用户目标，Session Agent 读取项目摘要、双端工具链描述符能力与锁定 Skill catalog；只在答案会改变语言对、翻译范围、目标结构、输出或验证时调用 AskUser。TaskDraftRevision 冻结 snapshot、语言对与目标、翻译范围与排除项、required checks、Spec Artifact/hash（含双端描述符锁）、分解策略、Skill catalog hash、用户消息 sequence 与默认输出目录。用户确认指定 revision，能力门预检（描述符、grammar 与工具链镜像摘要）通过后才允许创建 Run；预检失败不创建 Run。CreateRun 内另含一条档案一致性断言分支：若已经用户确认的 UnderstandingDossier 经机械完备层校验与机械事实不一致，直接返回 `DOSSIER_INCONSISTENT` 并零副作用拒绝（fail-fast——个人项目极少出现，一条断言分支即全部处置，无分档），不创建 Run，不产生任何 Run、`run_events`、Slice、candidate 或托管输出新增。
 
 状态收敛说明（消费方口径，与 M-00 枚举表同变更集同步）：`CorrectionIntentStatus` 收敛为七值——`Classifying` 归入 `Received`（分类是 actor 即时行为而非持久态）、`Superseded` 并入 lineage/Attempt History 记录（被取代不是意图自身的状态，取代事实经 `supersedes_slice_id` lineage 可查）、`DeferredToFollowUp` 保留为显式挂起终态；本篇及各消费方不得再引用被合并态。`InteractionStatus` 辨析：`PausingForInput`＝正在排空至安全点的瞬态（在途原子操作计数由 Run 投影表达），`WaitingForUser`＝已抵达安全点等待输入的稳态——UI 在前者呈现"暂停中"、后者呈现"等待输入"，两者不混用。
 

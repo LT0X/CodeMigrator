@@ -3,8 +3,8 @@
 > 文档状态：V6 方向对齐版；本篇是跨模块公共类型、运行语义、协调边界与**三层架构**（权力层/判断层/执行层）的唯一 owner。\
 > 技术范围：Python 3.12+ 单包 src-layout（uv 管理、import-linter 依赖契约）、单机 Docker Compose、双工具链描述符、应用直接管理 bwrap、PostgreSQL 控制面。\
 > 部署基线：一个 `app`、一个 PostgreSQL；每个 Slice 的长期沙箱卷由 app 直接创建并管理，验证在被测提交的临时物化目录中执行。\
-> 本轮边界（V6）：保留确定性 Oracle、Git/CAS 单写入、六工具闭环和三层验证；将规划、探索与目标结构提案交给 LLM，并由机器校验后冻结；**新增常驻主 Agent 判断层**（探索协调者 + EXECUTE Supervisor），只出建议、决策权在 Harness 白名单收养；不定义语言 grammar 内容、检查 argv 明细或 HTTP DTO。\
-> V5→V6 演进：V6 依据 fb10 架构反馈对齐记录（`feedback_doc/fb10_align_records.md`）引入常驻主 Agent 分阶段常驻、知识图谱构建前移与两级修复路由；V5 的确定性 Oracle、六工具、Git/CAS、三层验证与恢复语义保持。V5 当前对齐段与 V4 验收段留存为追溯。\
+> 本轮边界（V6）：保留确定性 Oracle、Git/CAS 单写入、六工具闭环和三层验证；将规划、探索与目标结构提案交给 LLM，并由机器校验后冻结；**常驻主 Agent 判断层**（探索协调者 + EXECUTE Supervisor）为事件触发式新会话、统一装配，只出建议、决策权在 Harness 白名单收养；不定义语言 grammar 内容、检查 argv 明细或 HTTP DTO。\
+> V5→V6 演进：V6 依据 fb10/fb11 架构反馈对齐记录（`feedback_doc/fb10_align_records.md`、`fb11_align_records.md`）引入主 Agent 判断层（事件触发式新会话+统一装配）、知识图谱构建前移、ANALYZE 合并入 CreateRun 与修复路由收敛；V5 的确定性 Oracle、六工具、Git/CAS、三层验证与恢复语义保持。V5 当前对齐段与 V4 验收段留存为追溯。\
 > 关联文档：[工程边界与目录架构](CodeMigrator_核心目录架构设计.md)、[外部 API 与事件投影](CodeMigrator_系统后端架构.md)、[Run actor 与恢复](CodeMigrator_Harness总体设计.md)、[并行计划](CodeMigrator_迁移计划生成器.md)、[Git 真相](CodeMigrator_工作空间与Git集成.md)、[Web 体验与迁移可视化工作台](CodeMigrator_Web体验与可视化工作台.md)。
 
 CodeMigrator 是跨语言代码迁移 Agent：源语言项目（如 TypeScript）是只读输入，产出是目标语言（如 Python）的全新项目——新构建文件、新目录结构与翻译后的测试套件。系统不锁死语言对；语言差异由源端与目标端两份声明式工具链描述符承担，新增语言对只需新增描述符资源，核心架构零改动。源仓库零写入，目标输出全部落在受 Git refs 管理的托管输出工作区。
@@ -25,7 +25,7 @@ CodeMigrator 是跨语言代码迁移 Agent：源语言项目（如 TypeScript�
 
 * 资源分为模型会话池、沙箱执行池和裁决派发池。app 直接管理 bwrap，并设置 `PDEATHSIG` 与 cgroup；Slice 长期沙箱卷跨命令保留构建缓存，验证则从被测提交临时物化到新目录。网络按 Shell 受控代理与验证默认拒绝分档。**常驻协调会话（探索协调者/Supervisor）计入模型会话池**并受独立预算档约束。
 
-* **三层架构**：权力层 Harness（Run actor，单写者，全部决策权）/ 判断层常驻主 Agent（探索协调者 + EXECUTE Supervisor，跨域视野、零直写权、以 advice 出建议）/ 执行层工作会话（探索员、Slice 会话、全局修复会话，各域施工、域内写、升级读）。核心语义见下文"三层架构与主 Agent 判断层"节。
+* **三层架构**：权力层 Harness（Run actor，单写者，全部决策权）/ 判断层常驻主 Agent（探索协调者 + EXECUTE Supervisor，跨域视野、零直写权、以 advice 出建议）/ 执行层工作会话（探索员、Slice 会话、全局修复会话，各域施工、域内写、升级读）。迁移链为**四阶段**（ANALYZE 职责并入 CreateRun）、Supervisor 为**事件触发式新会话 + 统一装配**、修复路由为**可靠域直通 + 其余统一 Supervisor**。核心语义见下文"三层架构与主 Agent 判断层"节。
 
 ## V5 当前生效的总覆盖（追溯）
 
@@ -68,7 +68,7 @@ V6 将运行抽象为三个职责分明的层，它们共同回答"谁有视野�
 | 拥有 | 状态机、事务、调度、安全、**全部决策权**   | 跨域视野、设计判断、**零直写权**      |
 | 输入 | 完整控制面事实（命令/回执/事件）        | 态势快照 + 定向事件投影（受控观察）     |
 | 输出 | 事实变更（状态/ref/事件）          | `Advice`（actor 邮箱新消息类型） |
-| 记忆 | PostgreSQL/Git/CAS（持久真相） | 滚动摘要（会话连续性，可从事件流重建）     |
+| 记忆 | PostgreSQL/Git/CAS（持久真相） | 审计事实的结构化投影（可从事件流重建，无自由记忆） |
 | 失效 | 系统不可用（重启恢复）              | **退化为 V5 机械路径**（控制面完好）  |
 
 **三条关系原则**：
@@ -82,7 +82,7 @@ V6 将运行抽象为三个职责分明的层，它们共同回答"谁有视野�
 | 角色                 | 阶段  | 协调职责                                                                                         | 观察方式                                                    |
 | ------------------ | --- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
 | 探索协调者              | 起草期 | 机器骨架 → 切域调整建议（合并/拆分/重点标注 + 探索员 focus brief）→ 机器校验覆盖恰好一次与扇出/预算上限后派发；归并报告，经多轮 AskUser 对齐收敛四件工件 | 消承起草会话的受控观察（源快照 + PSF 投影 + 探索报告）                        |
-| EXECUTE Supervisor | 执行期 | **仅两个职责**：①归因多义/双错 → 全局修复决策；②Slice 会话失败停止 → 异常语义路由建议                                         | **被动唤醒式常驻**：基线态势快照机器持续算但不进上下文，触发时注入态势 + 定向事件投影；历史唤醒滚动摘要 |
+| EXECUTE Supervisor | 执行期 | **仅两个职责**：①归因多义/双错 → 全局修复决策；②Slice 会话失败停止 → 异常语义路由建议                                         | **事件触发式新会话 + 统一装配**：每次触发＝新会话，触发时由统一 Context Manager 定向装配（基线态势快照机器持续算但不进上下文 + 本次决策相关定向事件投影）；上下文压缩全程统一、无关会话类型（见 M-14） |
 
 Supervisor 精简定案：不设工具拒绝风暴/重试风暴/误译自动蒸馏/卡滞预警等防御性触发（现代模型能力足够，避免过度设计）；经验蒸馏回归归因驱动的规则手册追加通道（M-00 既有机制）。VERIFY/REPORT 阶段零模型硬边界不破——判断层在这两个阶段只读不语。
 
@@ -93,7 +93,7 @@ flowchart LR
     Draft["起草：知识图谱域扇出 + 主会话合并"] --> Artifacts["Spec + Dossier + Blueprint + Rulebook 四件工件"]
     Artifacts --> Confirm["用户确认并 hash 冻结"]
     Confirm --> Gate["Descriptor gate 描述符资源预检"]
-    Gate --> Analyze["ANALYZE 机械完备事实与冻结输入一致性"]
+    Gate --> Analyze["CreateRun：机械完备事实与冻结输入一致性（ANALYZE 职责并入）"]
     Analyze --> Plan["PLAN LLM Planner 提案 + PlanValidation 机器校验"]
     Plan --> Queue["冻结 integration_rank 队列"]
     Plan --> Execute["EXECUTE Planner 选择的 Slice 并行"]
@@ -140,10 +140,10 @@ flowchart LR
 | P-03 | Planner 提案经机器校验后冻结              | LLM Planner 消费四件冻结输入与 M-06 事实，提出可选 Contract Slice、切分、内容、桩、write scope 和 DAG；机器校验两两范围不相交、Blueprint 合规、源文件覆盖恰好一次、无环及规模上限后自动冻结。只允许 DAG ready 且 write scope 互斥的 Slice 并行；同输入不保证同计划                                                                                                                                                                                                                                                                                                                                                                            |
 | P-04 | 单写者控制面与三池治理                     | 一个 app 持有 PostgreSQL session advisory lock；每个 Run 由一个内存 actor 串行处理控制命令；模型会话池、bwrap 沙箱执行池和裁决派发池分别受其配额/gate 约束                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | P-05 | 源码是数据不是指令                       | Agent 可自由 `ReadFile` 源项目快照并用 `QuerySourceAst` 导航；源码正文不进入 system message；不设不可信投影机制                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| P-06 | 五阶段、两模型档                        | `ANALYZE/PLAN/EXECUTE/VERIFY/REPORT` 映射 `Reasoning/Reasoning/Code/—/—`——VERIFY 不开模型会话（裁决层独立执行），REPORT 无模型会话（报告正文由确定性模板从 verified facts 拼装）；`ModelProfile` 仅 `{Reasoning, Code}` 两档，映射在 Run 创建时冻结；EXECUTE 的 Slice 分组不预设契约/实现两波，依赖闭包就绪即启动，RunStatus 状态机不变                                                                                                                                                                                                                                                                                                   |
+| P-06 | 四阶段、两模型档                        | `PLAN/EXECUTE/VERIFY/REPORT` 映射 `Reasoning/Code/—/—`——ANALYZE 职责并入 CreateRun、不再是模型 phase；VERIFY 不开模型会话（裁决层独立执行），REPORT 无模型会话（报告正文由确定性模板从 verified facts 拼装）；`ModelProfile` 仅 `{Reasoning, Code}` 两档不变，映射在 Run 创建时冻结；EXECUTE 的 Slice 分组不预设契约/实现两波，依赖闭包就绪即启动，RunStatus 状态机不变                                                                                                                                                                                                                                                                                                   |
 | P-07 | 每 Slice 独立候选工作区                 | 每个 Slice generation 拥有独立 candidate ref、候选工作区、上下文与 Artifact 命名空间；不存在 Run 级 `work` ref，候选不得直接发布到用户分支                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | P-08 | 双工具链描述符                         | 源端（语言 id、扩展名、tree-sitter 解析器、清单解析）与目标端（包管理器、构建/测试/lint/类型检查命令模板、工具链镜像摘要）均为声明式资源；Spec 锁定描述符版本与摘要，不设进程级语言扩展                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| P-09 | 诊断归因到 Slice，复杂场景升级修复路由          | 编译器/测试诊断（file:line 或测试名）经输出 write scope 与测试覆盖图归属 owning Slice，守恒信号（断言数/测试数对齐比离群，D-033）升级为归因第三信号维度；**归因输出为候选修复集**（write scope 查表输出集合而非要求唯一）。两级路由：唯一命中且无强耦合信号 → owning Slice generation 内定向重生成（重生会话升级包：全境读视野 + 修复简报）；复杂场景（多义/守恒后仍多义/同类失败跨代复发/强耦合信号）→ 升级 EXECUTE Supervisor 出修复决策 → 派发**全局修复会话**（持修复集联合域写权限，不占原 Slice 的 generation `0`\~`2`）。"仍多义→Run 终态兜底"改为"升级 Supervisor → 全局修复先试 → 实在修不好才终态失败"                                                                                                                                                           |
+| P-09 | 诊断归因到 Slice，可靠域直通 + 其余统一 Supervisor 修复路由          | 编译器/测试诊断（file:line 或测试名）经输出 write scope 与测试覆盖图归属 owning Slice，守恒信号（断言数/测试数对齐比离群，D-033）升级为归因第三信号维度；机械归因（file:line→write scope 查表）输出**候选修复集 + 归因可靠性分类**（Supervisor 的输入证据、非分流裁决）。**可靠域直通**：静态诊断（编译/lint/类型）唯一命中单 Slice 且无强耦合信号 → 原 Slice generation 内定向重生成（重生会话升级包：全境读视野 + 修复简报），零模型判断、省调用。**其余统一**：静态诊断多命中 + 全部动态测试失败 → 统一唤醒 EXECUTE Supervisor（事件触发式新会话）出修复决策 → 派发**全局修复会话**（多 Slice 耦合时持联合域写权限、不占原 Slice 的 generation `0`\~`2`）。"仍多义→Run 终态兜底"改为"升级 Supervisor → 全局修复先试 → 实在修不好才终态失败"                                                                                                                                                           |
 | P-10 | 部分迁移有效                          | 独立 Slice 终态失败时 Run 可投影 `PARTIALLY_COMPLETED`，已集成成果、验证证据与失败 Slice 证据均保留                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 核心不承诺同语言框架/版本/API 迁移支持，不承诺向源仓库写入任何文件。它不接受用户提供的 shell、命令行正文或 system prompt，不以未验证候选当作交付，不为水平扩展保留分布式周期协调，也不把 Redis、MinIO 或观测 profile 作为迁移成功前提。
@@ -184,11 +184,11 @@ SSE 不设置独立事件发件表或中继。Run 状态变化与对应 `run_eve
 
 | 层     | 生产者                                              | 职责                                                                                                                              | 信任来源            |
 | ----- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------- | --------------- |
-| 机械完备层 | tree-sitter/清单解析（M-06 确定性管线，ANALYZE 阶段执行）        | **枚举完备性**：文件清单、import 候选全集、位置身份（file:range）——候选集宁多勿漏；不做语义判断                                                                     | 确定性代码路径 + 可证伪验收 |
+| 机械完备层 | tree-sitter/清单解析（M-06 确定性管线，注册预索引/CreateRun 预检执行）        | **枚举完备性**：文件清单、import 候选全集、位置身份（file:range）——候选集宁多勿漏；不做语义判断                                                                     | 确定性代码路径 + 可证伪验收 |
 | 语义消解层 | Reasoning 理解会话＝Spec 起草会话深潜阶段（产制点归一起草期，M-16/M-04） | 在完备候选集上**定向探索并消解**：语义模块划分、Unknown/动态依赖判定（带置信理由）、测试地图、迁移风险热点——产出一等公民工件《项目理解档案》UnderstandingDossier，全条目 file:range 锚点必填 + 探索覆盖率自述 | 锚点可验证 + 预算档约束   |
 | 用户确认门 | Spec 起草会话一并审阅拍板                                  | 档案随 Spec 草稿经用户多轮审阅、显式确认后**哈希冻结为 Run 输入**——语义模块划分由用户最终定夺                                                                         | 人工终审            |
 
-产制点归一：理解会话本体＝起草会话的深潜阶段；起草确认时，Spec、UnderstandingDossier、TargetProjectBlueprint、MigrationRulebook 四件工件一起哈希冻结为 Run 输入。ANALYZE 阶段仍只负责机械完备层管线与冻结输入一致性校验，不承担运行期语义消解产出。
+产制点归一：理解会话本体＝起草会话的深潜阶段；起草确认时，Spec、UnderstandingDossier、TargetProjectBlueprint、MigrationRulebook 四件工件一起哈希冻结为 Run 输入。ANALYZE 职责并入 CreateRun：仅负责机械完备层管线与冻结输入一致性校验，不承担运行期语义消解产出。
 
 计划派生（PLAN/Planner）由 LLM 依据四件冻结输入和 M-06 事实提出 PlanProposal，再由机器校验产生 PlanValidation 与冻结计划；不要求同输入必得同计划。Oracle（P-02）不受影响。执行继承蓝图摘录、规则书消费版本和档案相关风险叙事（M-04/M-14）。
 
@@ -446,7 +446,6 @@ CreateRunSource: TypeAlias = RemoteRepository | RegisteredProject
 
 class RunStatus(str, Enum):
     Created = "CREATED"
-    Analyzing = "ANALYZING"
     Planning = "PLANNING"
     Executing = "EXECUTING"
     Verifying = "VERIFYING"
@@ -458,7 +457,8 @@ class RunStatus(str, Enum):
 
 
 class FailureReason(str, Enum):
-    AnalysisFailed = "ANALYSIS_FAILED"
+    AnalysisFailed = "ANALYSIS_FAILED"             # 保留：CreateRun 侧机械完备管线失败语义
+    DossierInconsistent = "DOSSIER_INCONSISTENT"   # CreateRun 侧档案一致性断言分支拒绝码（ANALYZE 职责并入）
     PlanFailed = "PLAN_FAILED"
     ExecutionFailed = "EXECUTION_FAILED"
     VerificationTerminal = "VERIFICATION_TERMINAL"
@@ -483,7 +483,6 @@ class ModelProfile(str, Enum):  # 挡位收敛：Fast 档删除——VERIFY 不�
 
 
 class Phase(str, Enum):
-    Analyze = "ANALYZE"
     Plan = "PLAN"
     Execute = "EXECUTE"
     Verify = "VERIFY"
@@ -839,20 +838,17 @@ Agent 间 P2P 消息在本架构无必需场景（契约歧义走漂移修正协
 ```mermaid
 stateDiagram-v2
     [*] --> CREATED : 已创建
-    CREATED --> ANALYZING : 开始分析
-    ANALYZING --> PLANNING : 分析完成
+    CREATED --> PLANNING : 预检+档案一致性校验通过（ANALYZE 职责并入 CreateRun）
     PLANNING --> EXECUTING : 规划完成
     EXECUTING --> VERIFYING : Slice 集成处理结束
     VERIFYING --> REPORTING : 最终全量验证稳定通过
     REPORTING --> COMPLETED : 全部切片已验证
     REPORTING --> PARTIALLY_COMPLETED : 独立切片终态失败
     CREATED --> CANCELLED : 用户取消
-    ANALYZING --> CANCELLED : 用户取消
     PLANNING --> CANCELLED : 用户取消
     EXECUTING --> CANCELLED : 用户取消
     VERIFYING --> CANCELLED : 用户取消
     REPORTING --> CANCELLED : 用户取消
-    ANALYZING --> FAILED : 分析失败
     PLANNING --> FAILED : 规划失败
     EXECUTING --> FAILED : 执行失败
     VERIFYING --> FAILED : 验证终态失败
@@ -871,11 +867,12 @@ stateDiagram-v2
 
 | Phase     | 唯一授权工具集合                                                          |
 | --------- | ----------------------------------------------------------------- |
-| `ANALYZE` | `ReadFile`、`QuerySourceAst`、`Exec`（编排只读批量探索；脚本零环境权威，仅可编排本行三件只读工具） |
-| `PLAN`    | `ReadFile`、`QuerySourceAst`                                       |
+| `PLAN`    | `ReadFile`、`QuerySourceAst`、`Exec`（编排只读批量探索；脚本零环境权威，仅可编排本行工具） |
 | `EXECUTE` | `ReadFile`、`WriteFile`、`EditFile`、`QuerySourceAst`、`Shell`、`Exec` |
 | `VERIFY`  | 空集合                                                               |
 | `REPORT`  | 空集合                                                               |
+
+> V6 收敛：`ANALYZE` 不再作为独立 phase——V6 已把 tree-sitter 解析前移至项目注册预索引，ANALYZE 剩余职责（复用投影、冻结校验、档案一致性校验）并入 CreateRun，非模型 phase。原 `ANALYZE` 阶段的只读探索工具能力已并入 `PLAN`（Planner 消费四件冻结工件与 M-06 事实），探索协调者/探索员（起草期判断层）的只读工具面见 M-04。
 
 工具面四层表述（EXECUTE 授权集合即 L1-L4 四层全量）：
 
@@ -913,7 +910,7 @@ stateDiagram-v2
 
 以下是 Planner 选择 Contract Slice 的一种可行提案，不是 V5 的固定数量、固定拓扑或固定路径。该提案产生四个 Slice：契约 Slice C 覆盖目标构建文件与两个模块的接口契约；实现 Slice A、B 分别翻译 `models` 与 `api` 模块，输出路径不相交；测试翻译 Slice T 覆盖 A、B 模块的测试文件（Requires 前驱为契约 Slice C，生成可与 A、B 并行）。冻结集成序为 C、A、B、T；若 Planner 不选择 Contract Slice，则按另一份通过校验的实际 DAG 执行。
 
-1. 能力门预检 Spec 锁定的 typescript/python 双描述符、tree-sitter grammar 与工具链镜像摘要全部命中后 Run 创建；ANALYZE 产出 import 图、模块清单与测试覆盖图，PLAN 冻结四个 Slice 的 kind、write scope、Requires 边与集成序。
+1. 能力门预检 Spec 锁定的 typescript/python 双描述符、tree-sitter grammar 与工具链镜像摘要全部命中后 Run 创建；注册预索引/CreateRun 产出 import 图、模块清单与测试覆盖图（ANALYZE 职责并入），PLAN 冻结四个 Slice 的 kind、write scope、Requires 边与集成序。
 2. EXECUTE 契约层：C 进入 `RUNNING`，Agent 在候选工作区直接产出 `pyproject.toml`、目标目录骨架与 A/B 模块的 `ContractArtifact`（目标路径、公开签名、types\_hash）；C 通过局部验证（语法+契约类型检查模板）后作为队首集成，verified 从空输出基线推进。
 3. 实现层：A、B 同时进入 `RUNNING`——write scope（`src/models/…` 与 `src/api/…`）不相交且依赖闭包就绪（依赖契约已集成）；两个 Agent 各持六工具直接写目标代码，import 契约目标路径对齐签名。
 4. B 先完成局部验证但只进入 `INTEGRATION_QUEUED`；A 后完成，Integration Coordinator 仍先集成 A：把 A 的输出文件集应用到当前 verified 建立 prospective head，执行增量验证（目标编译+已集成部分可运行测试），通过后 verified 以 expected OID 推进，再处理 B。完成时间变化不改变 A、B 顺序。

@@ -1,7 +1,7 @@
 # CodeMigrator 工具系统与 Hook：六工具 IDE 工具箱、Phase 授权与路径安全门
 
 > 文档状态：V6 方向对齐版；ToolGateway 是模型工具调用的唯一入口，只加载 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 的 phase policy。CheckRunner 已作为 Agent 工具退役：会话自检并入 Shell，裁决层是唯一冻结通道。  
-> V6 演进：为修复场景扩展 ReadFile 读视野（全境读+域内写），phase 工具授权矩阵新增常驻会话/修复会话行，新增判断层 advice 产生/收养审计点位；V5 六工具、路径安全门与 write scope 双轨防护机制保持，V5 对齐段留存追溯（见"V5 当前对齐（V6 追溯留存）"一节）。  
+> V6 收敛（fb11）：phase 授权矩阵的非 phase 会话级授权行更新——探索协调者 / EXECUTE Supervisor 均为**事件触发式新会话（只读，零写权）**；登记 Harness **静态会话模板库**（角色系统提示为版本化受信资源，与 phase policy 同类管理；不是模型工具、不经 ToolGateway 工具面；每种会话类型一个模板）。为修复场景扩展 ReadFile 读视野（全境读+域内写）、修复会话授权行与判断层 advice 产生/收养审计点位保留；V5 六工具、路径安全门与 write scope 双轨防护机制保持，V5 对齐段留存追溯（见"V5 当前对齐（V6 追溯留存）"一节）。  
 > 技术范围：六工具（ReadFile/WriteFile/EditFile/QuerySourceAst/Shell/Exec）四层工具面调用规范、closed-schema 输入与返回、路径安全门与 write scope 双轨防护、执行面分工、最小 Hook 审计点位与拒绝传播。  
 > 契约真相：phase 授权矩阵、WriteScope、CheckCommandTemplate（模型侧消费者已清零，仅服务裁决层 InternalVerificationDispatch 与 Scaffold 基线初始化）与稳定错误码由 [M-00](CodeMigrator_垂类设计原则与架构哲学.md) 唯一拥有；QuerySourceAst 行为与 PSF-2/PSF-3 图导航由 [M-06](CodeMigrator_代码分析与AST引擎.md) 拥有；候选工作区即沙箱卷的生命周期、checkpoint commit 与批量校验由 [M-08](CodeMigrator_候选工作区与工具网关.md) 拥有；app 直接管理 bwrap、长期卷与验证临时物化由 [M-09](CodeMigrator_沙箱与执行环境.md) 拥有。  
 > 关联文档：[Agent Loop](CodeMigrator_Agent_Loop设计.md)、[验证引擎](CodeMigrator_验证引擎.md)、[记忆与上下文](CodeMigrator_记忆与上下文管理.md)、[可观测性](CodeMigrator_可观测性系统.md)、[会话与修正](CodeMigrator_会话与运行时修正编排.md)。
@@ -14,7 +14,7 @@
 
 ## V6 方向对齐
 
-V6 在 V5 冻结工具系统之上补齐修复会话与常驻协调会话的工具授权投影：ReadFile 读视野按会话类型条件化扩展、phase 授权矩阵补入非 phase 的会话级授权行、判断层 Advice 的产生/收养纳入 Hook 审计。V6 六工具、路径安全门与 write scope 双轨防护不变；VERIFY/REPORT 零模型硬边界仍适用。读视野条件化扩展的精确判定与 schema 标注为实施期开放项，不以本篇冻结为设备契约。
+V6 在 V5 冻结工具系统之上补齐修复会话与协调会话的工具授权投影：ReadFile 读视野按会话类型条件化扩展、phase 授权矩阵补入非 phase 的会话级授权行、判断层 Advice 的产生/收养纳入 Hook 审计。协调级会话（探索协调者 / EXECUTE Supervisor）为**事件触发式新会话（只读，零写权）**，不作为常驻会话存在。V6 六工具、路径安全门与 write scope 双轨防护不变；VERIFY/REPORT 零模型硬边界仍适用。读视野条件化扩展的精确判定与 schema 标注为实施期开放项，不以本篇冻结为设备契约。
 
 ## 授权唯一来自 M-00 phase policy
 
@@ -32,13 +32,15 @@ V6 在 phase 授权之上补入非 phase 的会话级授权行（下表为引用
 
 | 会话类型 | 唯一授权工具集合 |
 |---|---|
-| 常驻协调会话（探索协调者） | `ReadFile`、`QuerySourceAst`（ANALYZE 级只读集，零写权） |
-| 常驻协调会话（EXECUTE Supervisor） | 只读：态势快照、定向事件投影、只读查询（零写权） |
+| 协调会话（探索协调者，事件触发式新会话） | `ReadFile`、`QuerySourceAst`（ANALYZE 级只读集，零写权） |
+| 协调会话（EXECUTE Supervisor，事件触发式新会话） | 只读：基线态势快照、定向事件投影、只读查询（零写权） |
 | 修复会话 | EXECUTE 六工具 + 升级读视野（见 ReadFile 节）+ 联合域写 |
 
 > VERIFY/REPORT 零模型硬边界仍适用于全部会话：任何会话在 VERIFY/REPORT 阶段请求任何工具（含 `ReadFile`、`Shell` 与 `Exec`）均固定返回 `TOOL_PHASE_DENIED`。
 
-策略由 `codemigrator.core` 以包内静态资源 `core://phase-tool-policy/v2` 发布。网关启动时读取受信 descriptor 的 `payload_sha256`，核验 `SHA-256(JCS(payload))` 后将 Registry descriptor 与 payload exact-compare；哈希不匹配时 app 不进入 ready。Run 创建时冻结该资源版本与哈希，运行期不存在第二次加载。允许性由 `tool ∈ phase.tools` 派生，叠加 V6 会话级授权行（见上表）：`VERIFY`/`REPORT` 对任何会话请求任何工具（含 `ReadFile`、`Shell` 与 `Exec`）固定返回 `TOOL_PHASE_DENIED`；非 `EXECUTE` phase 请求 `WriteFile`/`EditFile`/`Shell`/`Exec` 在同一步拒绝。不存在本地 fallback、通配符或降级读取的分支；修复会话的读视野扩展开的是读视野维度（见下节），不改变 phase 层"零写入/零 Shell 硬边界"。
+策略由 `codemigrator.core` 以包内静态资源 `core://phase-tool-policy/v2` 发布。网关启动时读取受信 descriptor 的 `payload_sha256`，核验 `SHA-256(JCS(payload))` 后将 Registry descriptor 与 payload exact-compare；哈希不匹配时 app 不进入 ready。Run 创建时冻结该资源版本与哈希，运行期不存在第二次加载。允许性由 `tool ∈ phase.tools` 派生，叠加 V6 会话级授权行（见上表）：`VERIFY`/`REPORT` 对任何会话请求任何工具（含 `ReadFile`、`Shell` 与 `Exec`）固定返回 `TOOL_PHASE_DENIED`；非 `EXECUTE` phase 请求 `WriteFile`/`EditFile`/`Shell`/`Exec` 在同一步拒绝。不存在本地 fallback、通配符或降级读取的分支；修复会话的读视野扩展开的是读视野维度（见下节），不改变 phase 层"零写入/零 Shell"硬边界。
+
+**静态会话模板库登记**：Harness 维护**静态会话模板库**——角色系统提示为版本化受信资源，与 phase policy 同类管理（启动核验、Run 创建冻结、运行期零变更）。模板库**不是模型工具、不经 ToolGateway 工具面**，只是装配侧的角色/系统提示来源；上下文内容段由 M-14 装配器确定性装配（角色系统提示 + 确定性内容段，Supervisor 修复简报按需注入）。**每种会话类型一个模板**；会话差异体现在模板与预算档，不分类型各搞一套实现。
 
 phase 授权只回答"能不能调"；文件类工具的可读根随 phase 进一步收窄（V6 修复会话的可读根为条件化扩展，见下）：
 

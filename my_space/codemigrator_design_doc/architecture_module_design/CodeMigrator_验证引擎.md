@@ -1,6 +1,6 @@
 # CodeMigrator 验证引擎：三层验证、测试移植主证与诊断归因
 
-> 文档状态：V6 方向对齐版。  
+> 文档状态：V6 收敛版（fb11，自 V6 方向对齐版收敛而来，迭代历史见[文档迭代记录](文档迭代记录.md)）。  
 > 技术范围：三层检查集实例化、描述符命令面、执行事实归一、P-09 符号级诊断归因与守恒信号辅助归因、测试移植验证侧（flaky 重跑/超时/部分完成）、生成测试验证语义（TestGeneration 同执行面、GENERATED 标注与信心分级双档）、行为 parity 场景对比（无测试模块的黑盒补充取证）、Test 空集预派发跳过、目标侧结构守恒计算、Oracle 派生与反向自检、验证边界声明、语义 fingerprint 与非确定性检测。  
 > 契约真相：`CheckResult`、`VerificationSubject`、`VerificationOutcome`、`verification_fingerprint`、`DerivedVerificationGuard`、`CheckCommandTemplate`、`CheckStatus` 与 `DiagnosticMapping` 由 [M-00：设计原则、系统地图与公共契约](CodeMigrator_垂类设计原则与架构哲学.md) 唯一定义；write scope 查表基础与 required checks 冻结由 [M-07：迁移计划生成器](CodeMigrator_迁移计划生成器.md) 拥有；F3 覆盖映射、F2 import 图与 PSF-2 项目索引（符号级覆盖边）由 [M-06：代码分析与 AST 引擎](CodeMigrator_代码分析与AST引擎.md) 拥有；`Shell` 会话自检通道（自检=反馈不裁决）与工具面边界由 [M-12：工具系统与 Hook](CodeMigrator_工具系统与Hook.md) 拥有；本篇拥有三层检查集合实例化、Test 空集预派发跳过语义、生成测试验证语义（同执行面与 GENERATED 标注）、目标侧结构守恒计算、守恒信号辅助归因、验证边界声明、Oracle 派生、失败归因与 generation 失败归约。  
 > 关联文档：[公共契约](CodeMigrator_垂类设计原则与架构哲学.md)、[Harness 总体设计](CodeMigrator_Harness总体设计.md)、[代码分析与 AST 引擎](CodeMigrator_代码分析与AST引擎.md)、[迁移计划生成器](CodeMigrator_迁移计划生成器.md)、[候选工作区与工具网关](CodeMigrator_候选工作区与工具网关.md)、[沙箱与执行环境](CodeMigrator_沙箱与执行环境.md)、[Git 集成](CodeMigrator_工作空间与Git集成.md)、[工具系统与 Hook](CodeMigrator_工具系统与Hook.md)、[会话与运行时修正编排](CodeMigrator_会话与运行时修正编排.md)。
@@ -11,14 +11,14 @@
 
 ## V6 方向对齐
 
-在 V5 稳定机制之上，V6 升级失败处理的**判定深度**，形成两条演进主线：
+在 V5 稳定机制之上，V6 升级失败处理的**判定深度**，V6 收敛将判定形态统一为「可靠域直通 + 其余统一 Supervisor」：
 
-1. **归因输出升级**：机械归因（P-09）输出由"唯一命中 Slice"升级为**候选修复集**——write scope 查表按命中输出集合，不再要求唯一（集合在不相交 write scope 下通常仍至多单元素，但语义上以集合承载）。
-2. **确立两级路由**：机械归因输出候选修复集后，由 Run actor 依**两级路由**判定——简单场景（唯一命中单 Slice 且无强耦合信号）在 owning Slice generation 内定向重生成（原机制）；复杂场景（多义/守恒辅助后仍多义/同类失败跨 generation 复发/强耦合信号）升级 EXECUTE Supervisor 出修复决策，派发**全局修复会话**。Supervisor 不参与路由本身（路由是机械判定），只出建议、actor 白名单收养。
+1. **归因输出升级（含可靠性分类）**：机械归因（P-09，`file:line`→write scope 查表）输出由"唯一命中 Slice"升级为**候选修复集 + 归因可靠性分类**——write scope 查表按命中输出集合，不再要求唯一；可靠性分类区分**静态诊断（编译/lint/类型）唯一命中=可靠域直通标记** 与 **静态多命中 / 动态测试失败=Supervisor 证据输入**。可靠性分类的具体数值/枚举为实施期开放项。
+2. **可靠域直通 + 其余统一**：静态诊断唯一命中单 Slice 且无强耦合信号 → **可靠域直通**，owning Slice generation 内定向重生成（原 Slice 重生，占 generation 0-2，带升级包），零模型判断、省调用；静态诊断多命中 / 全部动态测试失败 / 守恒辅助后仍多义 / 跨 generation 复发 / 强耦合信号 → **其余统一**，统一唤醒 EXECUTE Supervisor（事件触发式新会话）出修复决策，派发**全局修复会话**（多 Slice 耦合联合域，不占 generation 0-2）或单 Slice 委派重生。机械归因从两级路由的"分流裁决判据"**降级为 Supervisor 的输入证据**——候选修复集 + 可靠性分类作决策参考，不再作为严格分流路由判据。
 
-对应地，失败处理多义路径由 V5 的"无法唯一归属 → Run/层终态"改为"无法唯一归属 → 升级 Supervisor → 全局修复先试 → 全局修复仍失败才 Run 终态失败"。**终态仅留给全局修复仍失败**；最终验证失败走同一机制（证据落点 → 候选修复集 → 两级路由）。
+对应地，失败处理多义路径由 V5 的"无法唯一归属 → Run/层终态"改为"**仍多义 → 升级 Supervisor → 全局修复先试 → 全局修复重试耗尽才 Run 终态失败**"。**终态仅留给全局修复重试耗尽仍失败**；最终验证失败走同一机制（证据落点 → 候选修复集 + 可靠性分类 → 可靠域直通 / 升级 Supervisor）。
 
-V5 的三层验证、测试移植主证、fingerprint、flaky、结构守恒、行为 parity、Test 空集、Oracle 派生与验收段全部保持，机制不被本次修订弱化；下述章节仅修订归因输出、新增两级路由小节并调整失败处理表与最终验证闭环路径。V5 对齐段（含 V5 可验收增量与 V4 历史验收基线）留存作追溯。
+V5 的三层验证、测试移植主证、fingerprint、flaky、结构守恒、行为 parity、Test 空集、Oracle 派生与验收段全部保持，机制不被本次修订弱化；下述章节修订归因输出（含可靠性分类）、将「两级路由」改写为「可靠域直通 + 其余统一」并调整失败处理表与最终验证闭环路径。V5 对齐段（含 V5 可验收增量与 V4 历史验收基线）留存作追溯。
 
 ## V5 当前对齐
 
@@ -30,7 +30,7 @@ Oracle 的确定性裁决不变：三层验证、翻译后测试主证、测试�
 |---|---|---|---|---|
 | `LocalCandidate`（局部自检） | 本 Slice 当前 generation 的 candidate checkpoint OID | Compile 模板（语法检查）+ TypeCheck 模板（对契约的类型检查）；项目不完整，不跑全量编译、不跑测试 | `LOCALLY_VERIFIED → INTEGRATION_QUEUED` | 本 Slice write scope 内诊断走同 generation 反馈修复；跨 scope 或反馈耗尽进入重生成 |
 | `ProspectiveIntegration`（增量集成） | 队首 Slice 输出文件集应用到当前 verified 后的 prospective OID | required checks 中全部非 Scaffold 模板：目标编译 + 全项目 lint/类型检查 + 树上已集成测试 | 允许创建 `IntegrationIntent` 并以 expected-OID 推进 verified | 接口冲突在此暴露；归因 owning Slice → 下一 generation |
-| `FinalVerified`（最终主证） | 全部 Slice 终态后冻结的 verified head OID | Test 模板全集：翻译后全套测试（移植测试与生成测试同冻结检查集、同判据执行） | `VERIFYING → REPORTING` | fingerprint 漂移优先 `NONDETERMINISTIC_VERIFICATION`；普通失败证据落点经机械归因输出候选修复集 → 两级路由：唯一命中单 Slice 且无强耦合 → owning Slice 定向重生成；守恒辅助后仍多义 / 跨 generation 复发 / 强耦合 → 升级 Supervisor 全局修复先试；全局修复仍失败才 Run 终态 |
+| `FinalVerified`（最终主证） | 全部 Slice 终态后冻结的 verified head OID | Test 模板全集：翻译后全套测试（移植测试与生成测试同冻结检查集、同判据执行） | `VERIFYING → REPORTING` | fingerprint 漂移优先 `NONDETERMINISTIC_VERIFICATION`；普通失败证据落点经机械归因输出候选修复集 + 归因可靠性分类 → 可靠域直通与其余统一：静态唯一命中单 Slice 且无强耦合 → owning Slice 定向重生成；静态多命中 / 动态测试失败 / 守恒辅助后仍多义 / 跨 generation 复发 / 强耦合 → 其余统一升级 Supervisor 全局修复先试；全局修复重试耗尽仍失败才 Run 终态 |
 
 局部成功只证明候选在"基线 verified（已集成的前置 Slice 产物，含可选契约工件）+ 本 Slice 输出"上语法成立、与可用契约类型一致；跨 Slice 接口冲突（如实现 Slice 对他模块契约签名的误用）由集成层类型检查裁决；最终层以全套翻译后测试作为语义等价主证，同时负责暴露测试不稳定与环境漂移。前两层属于 Run 的 `EXECUTING`，只有最终层属于 `VERIFYING`。
 
@@ -112,14 +112,14 @@ Test 检查的空集行为不依赖工具对"空收集"的退出行为。Harness
 
 | 诊断类别 | 归因算法 | 结果 |
 |---|---|---|
-| 编译/lint/类型诊断（FileLine） | `file_path` 匹配各 Slice 冻结 write scope，按命中输出**候选修复集**（write scope 两两不相交时该集至多唯一命中，但输出语义是集合而非"要求唯一命中"）；若计划包含 Contract Slice，契约文件（`.pyi`）与构建文件可命中该 Slice；没有契约 Slice 时按实际承载这些路径的 Slice 归属；实现文件对接口签名的误用诊断落在使用处文件，归实现 Slice | 候选修复集交由两级路由判定：唯一命中单元素且无强耦合信号 → owning Slice 定向重生成；集合为空、多元素或带强耦合信号 → 复杂场景升级 Supervisor（见两级路由节） |
+| 编译/lint/类型诊断（FileLine） | `file_path` 匹配各 Slice 冻结 write scope，按命中输出**候选修复集 + 归因可靠性分类**（write scope 两两不相交时该集至多唯一命中，但输出语义是集合而非"要求唯一命中"）；若计划包含 Contract Slice，契约文件（`.pyi`）与构建文件可命中该 Slice；没有契约 Slice 时按实际承载这些路径的 Slice 归属；实现文件对接口签名的误用诊断落在使用处文件，归实现 Slice | 静态唯一命中单元素且无强耦合信号 → 可靠域直通（owning Slice 定向重生成）；集合为空、静态多元素 / 动态测试失败或带强耦合信号 → 其余统一，候选修复集 + 可靠性分类作为**Supervisor 证据输入**统一唤醒 Supervisor（见"可靠域直通与其余统一"节） |
 | 测试失败（TestIdentity）符号级主路径 | 失败测试用例经 PSF-2 符号级覆盖边（测试用例→被测符号，M-06）关联到被测符号；失败证据（异常栈、断言差值的 file:line）落点经 ReferenceSite 索引符号化后按引用闭包判定归属：落点符号定义于某实现 Slice 的 write scope → 归该实现 Slice；证据仅落在测试文件自身 → 归测试翻译/测试生成 Slice | 实现语义不等价归实现 Slice，重生成时以契约为对齐基准；翻译错误（断言翻译错、fixture 丢失、import 误写）与生成测试自身缺陷归测试翻译/测试生成 Slice |
 | 测试失败文件级两步归因（符号级解析失败时的降级路径） | 符号级解析失败（符号级覆盖边缺失、失败证据落点无法符号化、text-fallback 语言无 PSF-2 条目）时降级兼容既有文件级路径：第一步测试文件路径匹配 write scope → 候选归属为该测试翻译/测试生成 Slice；第二步失败证据落点判定：命中被测模块依赖闭包内某实现 Slice 的 write scope → 归该实现 Slice；仅落在测试文件自身 → 维持测试翻译/测试生成 Slice | 同上；模块级粒度是符号级解析失败时的兜底而非替代，符号级升级不丢失任何模块级事实（M-06） |
-| 归因失败 | 符号级与文件级均无命中（候选修复集为空）、多义命中或 target 为 Unknown；失败证据模糊者先经守恒信号辅助归因（见下节） | 不直接触发定向重生成；空集/仍多义属复杂场景，进入两级路由升级 Supervisor，全局修复仍失败才进层/ Run 终态（见两级路由与失败处理节） |
+| 归因失败 | 符号级与文件级均无命中（候选修复集为空）、多义命中或 target 为 Unknown；失败证据模糊者先经守恒信号辅助归因（见下节） | 不直接触发定向重生成；空集/仍多义属其余统一场景，统一唤醒 Supervisor 全局修复先试，全局修复重试耗尽才进层/ Run 终态（见"可靠域直通与其余统一"与"失败处理"节） |
 
 归属结果以 `TEST_FAILURE_ATTRIBUTED` 类事件记录（M-00），归因诊断进入重生成 Slice 的冻结上下文，驱动 generation 余额内定向重生成。
 
-**归因禁猜硬边界**：定向重生成只允许由可归因证据驱动——仅当候选修复集**唯一命中单 Slice** 且无强耦合信号时才直接在 owning Slice generation 内定向重生成；多义命中经守恒信号辅助排序后仍多义的，进入两级路由**复杂场景升级 Supervisor**。升级 Supervisor 是**路由到 Supervisor 出修复决策**（在可归因证据支撑下的证据驱动路由），不是猜测型 fallback——全局修复仍须以可归因证据（候选修复集、守恒信号、跨 generation 复发记录、耦合信号）支撑其修复决策，故不违反本硬边界；禁止任何"按顺序默认取第一个候选"式猜测型归属（无证据的猜测型归属会错杀无辜 Slice，实测曾致三代误重生成 ≈35min，教训成文为硬边界）。
+**归因禁猜硬边界**：定向重生成只允许由可归因证据驱动——仅当候选修复集**唯一命中单 Slice**（静态诊断可靠域直通）且无强耦合信号时才直接在 owning Slice generation 内定向重生成；静态多命中 / 动态测试失败 / 多义命中经守恒信号辅助排序后仍多义的，进入**其余统一的 Supervisor 唤醒路径**——机械归因在此降级为 Supervisor 证据输入（候选修复集 + 可靠性分类作决策参考，不再作为严格分流路由判据，见"可靠域直通与其余统一"节）。升级 Supervisor 是**证据输入到 Supervisor 出修复决策**（在可归因证据支撑下的证据驱动唤醒），不是猜测型 fallback——全局修复仍须以可归因证据（候选修复集、可靠性分类、守恒信号、跨 generation 复发记录、耦合信号）支撑其修复决策，故不违反本硬边界；禁止任何"按顺序默认取第一个候选"式猜测型归属（无证据的猜测型归属会错杀无辜 Slice，实测曾致三代误重生成 ≈35min，教训成文为硬边界）。
 
 ### 守恒信号辅助归因：第三信号维度
 
@@ -129,15 +129,15 @@ Test 检查的空集行为不依赖工具对"空收集"的退出行为。Harness
 |---|---|---|
 | 模糊（超时/OOM/栈不清晰，两步归因退化为 Run 级兜底的场景） | 断言数对齐比或测试数对齐比任一离群 | 优先怀疑测试翻译 Slice——断言数守恒离群是测试翻译丢断言的强信号 → 定向重生成测试翻译 Slice |
 | 模糊（超时/OOM/栈不清晰） | 守恒正常（无离群） | 优先怀疑实现 Slice → 结合覆盖映射与依赖闭包选定后定向重生成实现 Slice |
-| 模糊但守恒事实不可用（源侧基线为 0 或覆盖状态 Undetermined），或辅助归因后仍多义 | — | 并入复杂场景，升级 EXECUTE Supervisor 出修复决策；全局修复仍无法判定才进层 / Run 终态（见两级路由与失败处理节） |
+| 模糊但守恒事实不可用（源侧基线为 0 或覆盖状态 Undetermined），或辅助归因后仍多义 | — | 并入其余统一场景，统一唤醒 EXECUTE Supervisor 出修复决策；全局修复重试耗尽仍无法判定才进层 / Run 终态（见"可靠域直通与其余统一"与"失败处理"节） |
 
 这不是新机制，而是既有两块机制的语义升级：守恒计算（D-033，见结构守恒计算节）从"只降低证据分级"扩展为"模糊失败时的归属排序信号"，归因规则（P-09）的输入从诊断证据扩展到守恒事实。守恒事实自身仍不构成 pass/fail 判定输入——离群单独存在时不失败 Run、不触发任何动作，只有与模糊失败证据结合时才驱动定向重生成；辅助归因的归属结果同样以 `TEST_FAILURE_ATTRIBUTED` 类事件记录并进入重生成上下文。守恒计算不依赖检查通过与否（见结构守恒计算节），最终验证失败场景下守恒事实同样可得，供本规则消费。
 
 ```mermaid
 flowchart TB
-    D["DiagnosticMapping 诊断"] -->|FileLine| W["write scope 查表 · M-07 冻结映射\n输出候选修复集"]
-    W -->|唯一命中单 Slice 且无强耦合| OS["owning Slice\ngeneration 内定向重生成 原机制"]
-    W -->|空 / 多义命中 / 强耦合信号| X["复杂场景\n升级 EXECUTE Supervisor 出修复决策"]
+    D["DiagnosticMapping 诊断"] -->|FileLine| W["write scope 查表 · M-07 冻结映射\n输出候选修复集 + 归因可靠性分类"]
+    W -->|静态唯一命中单 Slice 且无强耦合<br/>可靠域直通| OS["owning Slice\ngeneration 内定向重生成 原机制"]
+    W -->|静态多命中 / 动态测试失败 / 空 / 多义 / 强耦合信号<br/>其余统一| X["候选修复集+可靠性分类作为证据输入<br/>统一唤醒 EXECUTE Supervisor 出修复决策"]
     D -->|TestIdentity| SY["符号级主路径\nPSF-2 覆盖边 测试用例→被测符号 M-06\n失败证据落点符号化后引用闭包判定"]
     SY -->|落点符号在实现 Slice| OI["归实现 Slice"]
     SY -->|证据仅落测试文件| OT["归测试翻译/测试生成 Slice"]
@@ -156,7 +156,7 @@ flowchart TB
     RT --> EV
     RI --> EV
     X -->|actor 白名单收养建议| G["全局修复会话\n不占原 Slice generation 0-2\ncheckpoint→局部→集成→重验证"]
-    G -->|仍失败| TER["层 / Run 终态只留给全局修复仍失败"]
+    G -->|重试耗尽仍失败| TER["层 / Run 终态只留给全局修复重试耗尽仍失败"]
 ```
 
 ## 测试移植的验证侧：flaky、超时与部分完成
@@ -227,7 +227,7 @@ LocalCandidate guard 只改变 Slice 局部投影（进入集成排队）；Pros
 
 ## 失败处理：反馈修复、定向重生成与终态归约
 
-失败类别只由 `VerificationSubject` 层级、`CheckAction`、稳定 `CheckStatus`、归因结果与 flaky 判定映射。模型说明、日志自然语言和人工偏好都不是分类输入。V3 的 `MIGRATION_*` 错误码 allowlist、基线对照签发与前置哈希冲突分类随字节哈希体系一并废除——当前 V6 的可重生成判据升级为**两级路由**：机械归因输出候选修复集后，actor 判定简单（唯一命中单 Slice 且无强耦合信号）→ owning Slice 定向重生成；复杂（多义 / 守恒辅助后仍多义 / 跨 generation 复发 / 强耦合信号）→ 升级 EXECUTE Supervisor 全局修复先试；Run 终态仅留给全局修复仍失败。
+失败类别只由 `VerificationSubject` 层级、`CheckAction`、稳定 `CheckStatus`、归因结果与 flaky 判定映射。模型说明、日志自然语言和人工偏好都不是分类输入。V3 的 `MIGRATION_*` 错误码 allowlist、基线对照签发与前置哈希冲突分类随字节哈希体系一并废除——当前 V6 的可重生成判据收敛为**可靠域直通 + 其余统一**：机械归因输出候选修复集 + 归因可靠性分类后，actor 判定静态唯一命中（单 Slice 且无强耦合信号）→ 可靠域直通（owning Slice 定向重生成）；静态多命中 / 动态测试失败 / 多义 / 守恒辅助后仍多义 / 跨 generation 复发 / 强耦合信号 → 其余统一，升级 EXECUTE Supervisor 全局修复先试；Run 终态仅留给全局修复重试耗尽仍失败。
 
 优先级从上到下只命中一次：
 
@@ -244,11 +244,11 @@ LocalCandidate guard 只改变 Slice 局部投影（进入集成排队）；Pros
 | LocalCandidate | 全部阻断诊断命中本 Slice write scope | 同 generation 反馈修复：诊断作为结构化输入派回本 Slice agent 会话，在候选工作区修正后提交新 checkpoint、重新局部验证；上限 2 次且受预算与取消边界约束，不创建新 generation、不扩大 write scope（会话机制归 M-04/M-08） |
 | LocalCandidate | 任一 Error 诊断命中其他 Slice write scope（如契约文件），或反馈修复耗尽 | 本 generation 终止 → 从最新 verified 创建下一 generation（重生成上下文含归因诊断） |
 | ProspectiveIntegration | 唯一归属 owning Slice（含已集成的实现/契约 Slice） | owning Slice 从最新 verified 创建下一 generation，按其集成键位置重新排队集成 |
-| ProspectiveIntegration | 无法唯一归属（候选修复集为空 / 多义 / 强耦合） | 升级 EXECUTE Supervisor 出修复建议 → 全局修复会话先试（不占原 Slice generation 0-2）；全局修复仍无法唯一归属 → 该 Slice 终态归约（`IndependentSliceTerminalFailure` 判定） |
+| ProspectiveIntegration | 静态多命中 / 动态测试失败 / 多义 / 强耦合（候选修复集为空、多元素或带强耦合信号） | 其余统一：升级 EXECUTE Supervisor 出修复决策 → 全局修复会话先试（不占原 Slice generation 0-2）；全局修复重试耗尽仍无法唯一归属 → 该 Slice 终态归约（`IndependentSliceTerminalFailure` 判定） |
 | FinalVerified | 唯一归属 owning Slice | VERIFYING 内定向重生成（见下节），RunStatus 不变 |
-| FinalVerified | 无法唯一归属（含守恒辅助归因三分支后仍多义 / 跨 generation 复发 / 强耦合） | 升级 EXECUTE Supervisor 出修复建议 → 全局修复会话先试（不占原 Slice generation 0-2）；全局修复仍失败才 Run 终态：`VerificationTerminal` → `FAILED`，不返回 EXECUTING |
+| FinalVerified | 静态多命中 / 动态测试失败 / 守恒辅助归因三分支后仍多义 / 跨 generation 复发 / 强耦合 | 其余统一：升级 EXECUTE Supervisor 出修复决策 → 全局修复会话先试（不占原 Slice generation 0-2）；全局修复重试耗尽仍失败才 Run 终态：`VerificationTerminal` → `FAILED`，不返回 EXECUTING |
 
-generation 语义与 M-00 一致：初始 `0`，语义重生成依次使用 `1`、`2`，每次从最新 verified 重新运行完整候选流程（agent 候选 → checkpoint → 局部验证 → 集成）。
+generation 语义与 M-00 一致：初始 `0`，语义重生成依次使用 `1`、`2`，每次从最新 verified 重新运行完整候选流程（agent 候选 → checkpoint → 局部验证 → 集成）。**修复循环上限与 Run 终态边界**：全局修复决策层级另设**独立重试上限**（与 generation 0-2 同构，具体数值为实施期开放项），每次修复须由新归因证据驱动，Run 预算断路器兜底；全局修复重试耗尽之前 Run 不进入终态失败（Run 终态仅 `VerificationTerminal` → `FAILED` 或 `IndependentSliceTerminalFailure` → `PARTIALLY_COMPLETED` 两种去向，详见下文"可靠域直通与其余统一"节）。
 
 | 当前 generation | 结果 | 处理 |
 |---:|---|---|
@@ -259,28 +259,28 @@ generation 语义与 M-00 一致：初始 `0`，语义重生成依次使用 `1`�
 
 后续 Slice 可以继续候选计算与局部验证，但冻结集成队列不能越过正在重生成的前序 Slice（M-00/M-07）。
 
-### 两级路由：简单定向重生成与复杂场景升级 Supervisor
+### 可靠域直通与其余统一（V6 收敛，替代"两级路由"）
 
-机械归因输出候选修复集后，由 Run actor 依**两级路由**判定处置途径。路由本身是机械判定（对候选修复集、守恒信号、generation 历史与耦合信号的确定性查表），**Supervisor 不参与路由本身**——升级与否不由 Supervisor 判断，只由路由判据命中；Supervisor 仅在升级后出修复建议，由 actor 白名单收养。
+机械归因（`file:line`→write scope 查表）输出**候选修复集 + 归因可靠性分类**后，由 Run actor 判定处置途径，判定形态由"两级路由"收敛为「可靠域直通 + 其余统一」：
 
-| 路由判据 | 判定 | 处置 |
-|---|---|---|
-| 简单场景：候选修复集唯一命中单 Slice，且无强耦合信号 | 定向重生成 | owning Slice 在其 generation 余额 `0..=2` 内定向重生成（原机制）。重生会话获得**升级包**：全境读视野（可见已集成 Slice 产物与关联证据，而不仅是本 Slice write scope）+ 修复简报（归因诊断、守恒信号、候选证据的冻结摘要），作为重生成上下文 |
-| 复杂场景：任一命中——①多义（证据落点跨多个 write scope）②守恒辅助排序后仍多义 ③同类失败跨 generation 复发 ④强耦合信号（证据同时涉及接口签名定义处与调用处） | 升级 Supervisor | 升级 EXECUTE Supervisor 出修复决策 → 派发**全局修复会话**。全局修复会话**不占原 Slice generation 0-2**（独立核算走 checkpoint → 局部 → 集成闭环，随后对新 head 重新验证）；修复简报 schema 与路由判据阈值标注为实施期开放项，不在本文档预设 |
+- **可靠域直通**：静态诊断（编译/lint/类型）唯一命中单 Slice 且无强耦合信号 → owning Slice 在其 generation 余额 `0..=2` 内**原 Slice 重生**（原机制，带升级包：全境读视野 + 修复简报），零模型判断、省调用。
+- **其余统一**：任一命中——①静态诊断多命中（候选修复集含多个 Slice）②**全部动态测试失败**（测试行为类、数值不符预期等），或守恒辅助排序后仍多义 ③同类失败跨 generation 复发 ④强耦合信号（证据同时涉及接口签名定义处与调用处）——统一唤醒 **EXECUTE Supervisor**（事件触发式新会话）出修复决策：多 Slice 耦合联合域 → 派发**全局修复会话**（不占原 Slice generation 0-2；独立核算走 checkpoint → 局部 → 集成闭环，随后对新 head 重新验证）；可唯一归因单 Slice → 单 Slice 委派重生。修复简报 schema 与可靠性分类的具体数值/枚举标注为**实施期开放项**，不在本文档预设。
 
-**与硬边界的关系**：两级路由把"多义/复发/耦合"从"Run 终态兜底"改为"升级 Supervisor 全局修复先试"，终态仅留给全局修复仍失败。路由升级是证据驱动的机械判定（候选修复集 + 守恒信号 + 复发记录 + 耦合信号命中），不是猜测型 fallback——因此不违反归因禁猜硬边界（见诊断归因节）；全局修复会话仍须以可归因证据支撑其修复决策方可被 actor 采纳。
+**机械归因降级为 Supervisor 证据输入**：归因输出的候选修复集 + 归因可靠性分类作为 Supervisor 的**决策参考**（证据输入），不再作为严格分流路由判据；Supervisor 仅在统一唤醒后出修复决策，由 actor 白名单收养。保留既有兜底顺序——**仍多义 → 升级 Supervisor → 全局修复先试 → 全局修复重试耗尽才 Run 终态失败**。修复循环上限与 Run 终态边界：全局修复决策层级设独立重试上限（与 generation 0-2 同构，具体数值为实施期开放项），每次修复由新证据驱动，Run 预算断路器兜底；全局修复重试耗尽前 Run 不进入终态失败。
+
+**与硬边界的关系**：可靠域直通与升级 Supervisor 都是证据驱动的机械判定（候选修复集 + 可靠性分类 + 守恒信号 + 复发记录 + 耦合信号命中），不是猜测型 fallback——因此不违反归因禁猜硬边界（见诊断归因节）；全局修复会话仍须以可归因证据支撑其修复决策方可被 actor 采纳。
 
 ## 最终验证闭环：稳定性比较优先，归因驱动定向重生成
 
-全部 Slice 终态后，Run actor 冻结当前 verified OID 与最终检查集，进入 `VERIFYING` 并生成完整 FinalVerified outcome。与 V3"最终失败直接归约"不同，当前 V6 的最终失败有价值路由：翻译后测试的失败大多可以归因到 owning Slice 并在其 generation 余额内修复；无法唯一归属或复杂场景经两级路由升级 Supervisor 全局修复，终态仅留给全局修复仍失败。
+全部 Slice 终态后，Run actor 冻结当前 verified OID 与最终检查集，进入 `VERIFYING` 并生成完整 FinalVerified outcome。与 V3"最终失败直接归约"不同，当前 V6 的最终失败有价值路由：翻译后测试的失败大多可以归因到 owning Slice 并在其 generation 余额内定向重生成（可靠域直通）；静态多命中 / 动态测试失败 / 无法唯一归属或复杂场景经"可靠域直通与其余统一"升级 Supervisor 全局修复，终态仅留给全局修复重试耗尽仍失败。
 
 判定顺序固定，不可交换：
 
 1. **先收齐并持久化完整 outcome**，再与最近同 `tested_commit_oid` 的 ProspectiveIntegration 做稳定性比较（冻结集相同时比较整体 fingerprint，不同时对共有 CheckId 逐项比较语义）。此比较优先于解释 Final 的 Passed/Failed、TimedOut 或 Error UNKNOWN。
 2. fingerprint 或共有检查语义漂移 → 无论 Final 本身状态如何，优先以 `FailureReason.NondeterministicVerification` 失败，保留两份完整 outcome，代码重生成数为 0——不稳定的检查面不允许靠重生成"修到碰巧通过"。
-3. 一致或不存在可比 outcome → 按 Final 的 exact-set、status 与 UNKNOWN 解释普通通过/失败。通过 → REPORTING；普通失败 → 证据落点经 P-09 机械归因输出**候选修复集** → 两级路由（见失败处理节）：唯一命中单 Slice 且无强耦合 → owning Slice 定向重生成；守恒辅助后仍多义 / 跨 generation 复发 / 强耦合 → 升级 EXECUTE Supervisor 全局修复先试；全局修复仍失败才 Run 终态。
+3. 一致或不存在可比 outcome → 按 Final 的 exact-set、status 与 UNKNOWN 解释普通通过/失败。通过 → REPORTING；普通失败 → 证据落点经 P-09 机械归因输出**候选修复集 + 归因可靠性分类** → 可靠域直通与其余统一（见失败处理节）：静态唯一命中单 Slice 且无强耦合 → 可靠域直通（owning Slice 定向重生成）；静态多命中 / 动态测试失败 / 守恒辅助后仍多义 / 跨 generation 复发 / 强耦合 → 其余统一升级 EXECUTE Supervisor 全局修复先试；全局修复重试耗尽仍失败才 Run 终态。
 
-最终层定向重生成不改变 RunStatus：状态机不存在 `VERIFYING → EXECUTING` 回边（M-00），重生成 Slice 走完整候选 → 局部验证 → 集成闭环（verified 推进到新 head），随后对新 head 重新执行最终验证；细粒度进度由 `SliceAttemptStatus`（`Regenerating` 等）表达。防无限循环由三条硬边界承担：generation 余额 `0..=2`、每次重生成必须由新的归因证据驱动、fingerprint 漂移短路一切重生成。重生成耗尽 → Slice 终态 → `IndependentSliceTerminalFailure` 判定 → `PARTIALLY_COMPLETED` 或 `VerificationTerminal` 的 `FAILED`。
+最终层定向重生成不改变 RunStatus：状态机不存在 `VERIFYING → EXECUTING` 回边（M-00），重生成 Slice 走完整候选 → 局部验证 → 集成闭环（verified 推进到新 head），随后对新 head 重新执行最终验证；细粒度进度由 `SliceAttemptStatus`（`Regenerating` 等）表达。防无限循环由三条硬边界承担：generation 余额 `0..=2`、每次重生成必须由新的归因证据驱动、fingerprint 漂移短路一切重生成。重生成耗尽 → Slice 终态 → `IndependentSliceTerminalFailure` 判定 → `PARTIALLY_COMPLETED` 或 `VerificationTerminal` 的 `FAILED`。全局修复决策层级另设独立重试上限（与 generation 0-2 同构，数值实施期开放项），每次修复由新证据驱动、Run 预算断路器兜底——全局修复重试耗尽前 Run 不进入终态失败（见"可靠域直通与其余统一"节）。
 
 ```mermaid
 sequenceDiagram
@@ -377,6 +377,12 @@ active key 为 `run_id + canonical(subject identity) + check_id`，每键恰有�
 在 ANALYZE、PLAN 与 EXECUTING 吸收的修正，经 M-16 分类后由 M-07 的 replacement/compensation Slice 再走完整三层验证，旧 receipt 只保留为 Attempt History 证据。最终验证失败的定向重生成是 Harness 归因驱动的内部闭环，不构成接受用户输入回写代码的通道；进入 REPORTING 后本引擎不接受任何修复路径，新输入由 M-16 转为基于当前 verified 的后续 TaskDraft。
 
 任何修正都不能弱化冻结 required checks、Error UNKNOWN 门或 fingerprint 比较。最终报告只把 verified 上的有效事实视为结果，候选、失败与 superseded 尝试只作为审计历史展示；语义等价证据页（通过率、失败清单、flaky 清单、覆盖映射、测试来源标注、等价信心分级双档与验证边界声明）是交付语义等价的正式证据载体。
+
+## V6 可验收增量（fb11 收敛）
+
+- [ ] V6 收敛-001（可靠域直通分界）：静态诊断（编译/lint/类型）经 write scope 查表唯一命中单 Slice 且无强耦合信号时，owning Slice 在其 generation 余额 `0..=2` 内原 Slice 重生（带升级包，零模型判断）；静态多命中 / 全部动态测试失败 / 守恒辅助后仍多义 / 跨 generation 复发 / 强耦合统一唤醒 EXECUTE Supervisor（事件触发式新会话）出修复决策，不再作为严格两级路由分流。
+- [ ] V6 收敛-002（机械归因证据化）：归因输出为候选修复集 + 归因可靠性分类，仅作路由与 Supervisor 决策的输入参考而非最终分流裁决；静态唯一命中零推测（错误位置即证据），动态测试失败本质为推测（栈落点 ≠ 错误根源）。
+- [ ] V6 收敛-003（修复重试上限与 Run 终态边界）：全局修复决策层级设独立重试上限（与 generation 0-2 同构，数值为实施期开放项），每次修复由新证据驱动、Run 预算断路器兜底；全局修复重试耗尽才进入 Run 终态（`VerificationTerminal` → `FAILED` 或 `IndependentSliceTerminalFailure` → `PARTIALLY_COMPLETED`），此前 Run 不进入终态失败。
 
 ## V5 可验收增量
 
