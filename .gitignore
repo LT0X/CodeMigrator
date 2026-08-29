@@ -28,3 +28,4 @@ my_space/model_api_key.json
 .trae/
 ref/test_project/
 ref/harness_dev_progress/
+.codex/

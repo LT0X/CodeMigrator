@@ -11,19 +11,21 @@
 ### 1.1 个人空间 `my_space/`（绝对路径：`/home/dev/project/CodeMigrator/my_space`，已 gitignore，仅本机可见）
 
 > 用途：存放辅助文件、设计文档、进度记录、临时文件。敏感凭证统一存放于此，**不得写入 AGENTS.md**。
+>
+> goal 模式不允许使用提问工具。
 
-| 子目录 | 用途 | 关键约束 |
-| --- | --- | --- |
-| `codemigrator_dev_progress/` | 迭代更新记录，供各 agent 快速了解进度 | 按 §1.3 分类命名；记录内容按 `CodeMigrator迭代记录模板.md` 生成 |
-| `codemigrator_dev_progress/CodeMigrator开发任务规划与进度跟踪.md` | 整体任务规划与进度跟踪主表 | 任务新增/调序先经提问工具与用户确认 |
-| `codemigrator_design_doc/architecture_module_design/` | 整体架构与模块设计文档 | 平铺存放；修改先用提问工具与用户对齐 |
-| `codemigrator_design_doc/detailed_coding_design/` | 详细编码与实现设计文档 | 按 §1.3 分类命名；内容按 `CodeMigrator详细设计模板.md` 生成；更新时同步相关文档与迭代记录 |
-| `codemigrator_design_doc/feedback_doc/` | 历史评审反馈与对齐记录 | 只读，不改写既有内容 |
-| `temp/` | 临时文件、临时代码、环境脚本 | — |
-| `Implementation_plan_doc/` | agent 工作前生成的执行/实施计划文档 | 按 §1.3 分类命名；内容按 `CodeMigrator实施计划模板.md` 生成 |
-| `.env` | 本机环境与基础设施凭证（Docker 服务/DB 等） | 有环境更新须在此记录 |
-| `model_api_key.json` | 可真实调用大模型的 API key | 仅本机使用 |
-| `pr_md/` | PR 说明文档 | 书写前先读 `pr_md/README.md` 规范 |
+| 子目录                                                    | 用途                          | 关键约束                                                      |
+| ------------------------------------------------------ | --------------------------- | --------------------------------------------------------- |
+| `codemigrator_dev_progress/`                           | 迭代更新记录，供各 agent 快速了解进度      | 按 §1.3 分类命名；记录内容按 `CodeMigrator迭代记录模板.md` 生成              |
+| `codemigrator_dev_progress/CodeMigrator开发任务规划与进度跟踪.md` | 整体任务规划与进度跟踪主表               | 任务新增/调序先经提问工具与用户确认                                        |
+| `codemigrator_design_doc/architecture_module_design/`  | 整体架构与模块设计文档                 | 平铺存放；修改先用提问工具与用户对齐                                        |
+| `codemigrator_design_doc/detailed_coding_design/`      | 详细编码与实现设计文档                 | 按 §1.3 分类命名；内容按 `CodeMigrator详细设计模板.md` 生成；更新时同步相关文档与迭代记录 |
+| `codemigrator_design_doc/feedback_doc/`                | 历史评审反馈与对齐记录                 | 只读，不改写既有内容                                                |
+| `temp/`                                                | 临时文件、临时代码、环境脚本              | —                                                         |
+| `Implementation_plan_doc/`                             | agent 工作前生成的执行/实施计划文档       | 按 §1.3 分类命名；内容按 `CodeMigrator实施计划模板.md` 生成                |
+| `.env`                                                 | 本机环境与基础设施凭证（Docker 服务/DB 等） | 有环境更新须在此记录                                                |
+| `model_api_key.json`                                   | 可真实调用大模型的 API key           | 仅本机使用                                                     |
+| `pr_md/`                                               | PR 说明文档                     | 书写前先读 `pr_md/README.md` 规范                                |
 
 ### 1.2 开发环境
 
@@ -36,7 +38,7 @@
 #### 本机环境（WSL2 Ubuntu）
 
 - 环境根目录：`~/env`
-- **安装新环境前**：先检查 `~/env` 下是否已有对应文件夹；无则先创建子文件夹隔离，**禁止在 `~/env` 根目录直接安装**。
+- **安装新环境前**：先检查 `~/env` 下是否已有对应文件夹；无则先创建子文件夹隔离，**禁止在** **`~/env`** **根目录直接安装**。
 
 #### 本机基础设施访问
 
@@ -101,11 +103,11 @@
 
 - 执行任务遇需对齐情况，**随时使用提问工具**对齐，确保任务不偏离（goal 模式下除外）。
 
-
 ### 2.6 编码与设计原则
 
 - 编码和设计**尽可能选择优雅且有效的方案**，避免冗余实现与过度设计。
-- 实现完成度以设计文档中的验收条款（`V-Mxx-V4-xxx`）为准。
+
+  <br />
 
 ### 2.6.1 思想要求：编码优雅与测试完备
 
@@ -115,6 +117,7 @@
 - **真实模型测试必要才做**：仅当需验证 token 计数、provider 行为或端到端模型会话时，才占用真实模型调用；以最小必要调用换取最高信息量，避免高成本低回报。
 
 ### 2.7 Skill 匹配：
+
 - 工作前或工作过程中时，必须先查看 `.dsh/skills` 是否有匹配技能文件；匹配则**必须**调用 skill 完成任务（可能需多个 skill 搭配）。
 
 ***
@@ -125,9 +128,10 @@
 
 1. 查看当前进度：读 `codemigrator_dev_progress/CodeMigrator开发任务规划与进度跟踪.md`（任务规划+进度）及 `codemigrator_dev_progress/` 下任务对应模块的记录文档，可根据文件夹时间排序查看最新记录。
    - **适用场景**：上下文被压缩丢失时恢复上下文；执行任务中缺少项目相关上下文；新 agent 接手时快速了解情况；任务领取前的进度查询。
-2. 在书写任务计划文档时，或者在设计计划阶段和探索对齐阶段时，发现需要在总任务表中新增任务或者修改任务次序，如需调整更新总任务表，用提问工具与用户对齐确认。
-3. 完成任务文档中的任务后：在主表中按既有写法更新记录。
-4. 更新后：查看最新记录中的"后续行动"，判断是否需更新主任务表内容与执行顺序；**如需调整，用提问工具与用户对齐确认**。
+   <br />
+2. 完成任务文档中的任务后：在主表中按既有写法更新记录。
+
+   <br />
 
 ### 3.2 编码任务完成后（迭代记录）
 
@@ -151,12 +155,12 @@
 
 任务成功完成后，须产出以下文档：
 
-| # | 文档 | 位置 | 要求 |
-| --- | --- | --- | --- |
-| 1 | 模块迭代记录 | `codemigrator_dev_progress/<模块分类>/` | 按 §1.3 分类与命名 + 按 `CodeMigrator迭代记录模板.md` 生成 |
-| 2 | 主任务表更新 | `codemigrator_dev_progress/CodeMigrator开发任务规划与进度跟踪.md` | 更新任务记录数据与更新记录 |
-| 3 | 任务设计文档 | `codemigrator_design_doc/detailed_coding_design/<模块分类>/` | 按 §1.3 命名 + 按 `CodeMigrator详细设计模板.md` 生成 |
-| 4 | 任务执行计划 | `Implementation_plan_doc/<模块分类>/` | 按 §1.3 命名 + 按 `CodeMigrator实施计划模板.md` 生成 |
+| # | 文档     | 位置                                                       | 要求                                          |
+| - | ------ | -------------------------------------------------------- | ------------------------------------------- |
+| 1 | 模块迭代记录 | `codemigrator_dev_progress/<模块分类>/`                      | 按 §1.3 分类与命名 + 按 `CodeMigrator迭代记录模板.md` 生成 |
+| 2 | 主任务表更新 | `codemigrator_dev_progress/CodeMigrator开发任务规划与进度跟踪.md`   | 更新任务记录数据与更新记录                               |
+| 3 | 任务设计文档 | `codemigrator_design_doc/detailed_coding_design/<模块分类>/` | 按 §1.3 命名 + 按 `CodeMigrator详细设计模板.md` 生成    |
+| 4 | 任务执行计划 | `Implementation_plan_doc/<模块分类>/`                        | 按 §1.3 命名 + 按 `CodeMigrator实施计划模板.md` 生成    |
 
 > 验证项：
 >
@@ -171,3 +175,4 @@
 
 1. **Skill 匹配**：工作前或工作过程中时，必须先查看 `.trae/skills` 是否有匹配技能文件；匹配则**必须**调用 skill 完成任务（可能需多个 skill 搭配）。
 2. **Spec 模式流程**：使用 spec 模式时，**必须先调用** `.trae\skills\brainstorming` skill 以及提问工具对齐需求，确认无误后再书写 spec 相关文件。
+
