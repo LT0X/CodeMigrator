@@ -11,7 +11,7 @@ def test_core_has_no_internal_package_dependency_in_pyproject_contract() -> None
         for contract in project["tool"]["importlinter"]["contracts"]
         if contract["name"] == "frozen layers"
     )
-    assert layer_contract["layers"][0] == "codemigrator.core"
+    assert layer_contract["layers"][-1] == "codemigrator.core"
 
 
 def test_runtime_is_the_only_declared_application_entrypoint() -> None:

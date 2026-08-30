@@ -67,11 +67,11 @@ root_package = "codemigrator"
 name = "frozen layers"
 type = "layers"
 layers = [
-    "codemigrator.core",
-    "codemigrator.analysis | codemigrator.planning | codemigrator.verification",
-    "codemigrator.sandbox | codemigrator.workspace",
-    "codemigrator.api",
     "codemigrator.runtime",
+    "codemigrator.api",
+    "codemigrator.sandbox | codemigrator.workspace",
+    "codemigrator.analysis | codemigrator.planning | codemigrator.verification",
+    "codemigrator.core",
 ]
 
 [[tool.importlinter.contracts]]
