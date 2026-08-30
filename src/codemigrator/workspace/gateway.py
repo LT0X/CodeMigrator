@@ -6,6 +6,7 @@ import hashlib
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, cast
 
 from pydantic import TypeAdapter, ValidationError
@@ -13,6 +14,7 @@ from pydantic import TypeAdapter, ValidationError
 from codemigrator.core import (
     Phase,
     RepoRelativePath,
+    ResourceDocument,
     SessionKind,
     StableErrorCode,
     WriteScope,
@@ -49,6 +51,13 @@ from .protocol import (
     QuerySourceAstPort,
     ShellRunner,
 )
+
+
+@lru_cache(maxsize=1)
+def _load_phase_policy() -> ResourceDocument:
+    """Load one immutable policy snapshot for all gateways in this process."""
+
+    return load_resource("core://phase-tool-policy/v2")
 
 
 @dataclass(frozen=True)
@@ -97,6 +106,7 @@ class ToolGateway:
         exec_engine: ExecEngine | None = None,
         audit_sink: Callable[[AuditEvent], None] | None = None,
         operation_sink: Callable[[WorkspaceFileOperation], None] | None = None,
+        _policy_document: ResourceDocument | None = None,
     ) -> None:
         self.context = context
         self.roots = roots
@@ -107,7 +117,9 @@ class ToolGateway:
         self.exec_engine = exec_engine
         self.audit_sink = audit_sink
         self.operation_sink = operation_sink
-        self._policy_document = load_resource("core://phase-tool-policy/v2")
+        self._policy_document = _policy_document or _load_phase_policy()
+        if self.context.phase_policy_sha256 != self._policy_document.sha256:
+            raise ValueError("phase policy digest does not match the frozen run context")
         self._policy = {
             phase: frozenset(tools) for phase, tools in self._policy_document.payload.items()
         }
@@ -116,6 +128,7 @@ class ToolGateway:
         self._shell_calls = 0
         self._write_bytes = 0
         self.operations: list[WorkspaceFileOperation] = []
+        self._policy_load_count = 0 if _policy_document is not None else 1
 
     @property
     def policy_sha256(self) -> str:
@@ -123,7 +136,7 @@ class ToolGateway:
 
     @property
     def policy_load_count(self) -> int:
-        return 1
+        return self._policy_load_count
 
     def with_other_write_scopes(self, scopes: Sequence[Mapping[str, object]]) -> ToolGateway:
         parsed: list[WriteScope] = []
@@ -148,6 +161,7 @@ class ToolGateway:
             exec_engine=self.exec_engine,
             audit_sink=self.audit_sink,
             operation_sink=self.operation_sink,
+            _policy_document=self._policy_document,
         )
 
     def dispatch(self, raw_call: object) -> ToolResult:
@@ -471,12 +485,29 @@ class ToolGateway:
             return QuerySourceAstOutput(
                 tool="QuerySourceAst", result=self.query_port.query(call.request)
             )
+        except ValueError as exc:
+            code = self._query_error_code(str(exc))
+            return self._error(
+                code,
+                "source navigation rejected the request",
+            )
         except Exception as exc:  # noqa: BLE001 - port errors become a typed tool result
             return self._error(
-                StableErrorCode.PATH_OUTSIDE_SNAPSHOT,
-                "source navigation rejected the request",
+                StableErrorCode.ANALYSIS_INFRA_ERROR,
+                "source navigation failed without exposing host details",
                 facts=({"exception": type(exc).__name__},),
             )
+
+    @staticmethod
+    def _query_error_code(message: str) -> StableErrorCode:
+        for code in (
+            StableErrorCode.PATH_OUTSIDE_SNAPSHOT,
+            StableErrorCode.QUERY_TIMEOUT,
+            StableErrorCode.TEXT_FALLBACK_UNSUPPORTED,
+        ):
+            if message == code.value or message.startswith(f"{code.value}:"):
+                return code
+        return StableErrorCode.ANALYSIS_INFRA_ERROR
 
     def _shell(self, call: ShellCall) -> ToolResult:
         if self.shell_runner is None:
@@ -495,14 +526,19 @@ class ToolGateway:
                 raise GatewayError(
                     self._error(StableErrorCode.PATH_DENIED, "workdir failed the safety gate")
                 ) from exc
+        effective_call = (
+            call
+            if call.timeout_secs is not None
+            else call.model_copy(update={"timeout_secs": self.MAX_SHELL_TIMEOUT})
+        )
         execution = self.shell_runner.run(
-            call, str(self.roots.workspace.absolute_path(call.workdir))
+            effective_call, str(self.roots.workspace.absolute_path(call.workdir))
         )
         if execution.timed_out:
             return self._error(
                 StableErrorCode.SHELL_TIMEOUT,
                 "Shell command exceeded its bounded wait",
-                facts=({"timeout_secs": call.timeout_secs or self.MAX_SHELL_TIMEOUT},),
+                facts=({"timeout_secs": effective_call.timeout_secs},),
             )
         return ShellOutput(
             tool="Shell",

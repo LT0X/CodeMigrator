@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import ConfigDict, Field
 
+from codemigrator.analysis import SourceAstQuery
 from codemigrator.core._base import CoreModel
 
 from .models import ShellCall, ToolResult
@@ -56,7 +57,8 @@ def parse_action_stream(text: str) -> tuple[dict[str, Any], ...]:
 
     if not isinstance(text, str) or not text.strip():
         raise ActionProtocolError("action output must not be empty")
-    if "[cm:action]" not in text:
+    marked_lines = {"[cm:action]", "[cm:/action]"}
+    if not any(line.strip() in marked_lines for line in text.splitlines()):
         return (_parse_object(text),)
     lines = text.splitlines()
     actions: list[dict[str, Any]] = []
@@ -99,7 +101,7 @@ class InMemoryCasStore:
 
 
 class QuerySourceAstPort(Protocol):
-    def query(self, request: Mapping[str, Any]) -> Any: ...
+    def query(self, request: SourceAstQuery) -> Any: ...
 
 
 class ShellExecution(CoreModel):
