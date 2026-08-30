@@ -1,0 +1,7 @@
+{
+  "flaky_reruns": 2,
+  "majority": {"required": 2, "total": 3},
+  "feedback_repair_limit": 2,
+  "conservation_bandwidth": [0.5, 2.0],
+  "global_repair_attempts": 3
+}

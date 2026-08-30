@@ -1,0 +1,12 @@
+{
+  "ANALYZE_AUXILIARY": {"max_rounds": 30, "eviction_watermark_pct": 80},
+  "PLAN_AUXILIARY": {"max_rounds": 50, "eviction_watermark_pct": 80},
+  "CONTRACT": {"max_rounds": 300, "eviction_watermark_pct": 75},
+  "IMPLEMENTATION": {"max_rounds": 500, "eviction_watermark_pct": 75},
+  "TEST_TRANSLATION": {"max_rounds": 300, "eviction_watermark_pct": 75},
+  "TEST_GENERATION": {"max_rounds": 300, "eviction_watermark_pct": 75},
+  "EXPLORE_COORDINATOR": {"max_rounds": 200, "eviction_watermark_pct": 80},
+  "EXECUTE_SUPERVISOR": {"max_rounds": 30, "eviction_watermark_pct": 80},
+  "REPAIR_SESSION": {"max_rounds": 500, "eviction_watermark_pct": 75},
+  "DRAFTING": {"max_rounds": 200, "eviction_watermark_pct": 80}
+}
