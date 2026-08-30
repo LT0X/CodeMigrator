@@ -22,20 +22,18 @@ rad.json
 #Test results file
 TestResults.xml
 
-my_space/temp/
-my_space/model_api_key.json
-
-# Local-only project design, progress, reference, and staging material.
-# Keep these directories on disk; never re-add them with git add -f.
+# Local-only project design, progress, reference, staging, and credentials.
+# These paths must remain on disk and must never be force-added.
 my_space/
 ref/
 temp_doc/
 AGENTS.md
 .dsh/
 .trae/
+.codex/
+.agents/
 ref/test_project/
 ref/harness_dev_progress/
-.codex/
 
 # Python and local tooling artifacts
 __pycache__/

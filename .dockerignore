@@ -9,6 +9,13 @@ __pycache__
 .env
 *.env
 my_space
+ref
+temp_doc
+AGENTS.md
+.agents
+.codex
+.dsh
+.trae
 tests
 web
 apps
