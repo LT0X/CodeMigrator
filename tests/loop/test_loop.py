@@ -22,7 +22,13 @@ from codemigrator.runtime.loop import (
     AgentLoop,
     CheckpointDecision,
 )
-from codemigrator.runtime.loop_contracts import SessionIdentity, SessionSpec, SessionState
+from codemigrator.runtime.loop_contracts import (
+    SessionExit,
+    SessionIdentity,
+    SessionSpec,
+    SessionState,
+)
+from codemigrator.runtime.memory import ContextManager, FormulaNetInputCap
 from codemigrator.runtime.provider import ProviderRequest, ProviderResponse, TokenUsage
 
 
@@ -80,6 +86,11 @@ def _response(content: str, *, finish_reason: str = "tool_calls") -> ProviderRes
         finish_reason=finish_reason,
         usage=TokenUsage(input_tokens=2, output_tokens=1),
     )
+
+
+class ExactContextCounter:
+    def count(self, messages):
+        return sum(len(message.content) for message in messages)
 
 
 class FakeProvider:
@@ -164,6 +175,23 @@ async def test_loop_runs_in_one_session_task_and_closes_after_checkpoint() -> No
     assert usage.values == [TokenUsage(input_tokens=2, output_tokens=1)] * 2
     assert provider.tasks[0] is not asyncio.current_task()
     assert provider.tasks[0] is provider.tasks[1]
+
+
+@pytest.mark.asyncio
+async def test_loop_uses_injected_exact_context_manager_for_each_request() -> None:
+    provider = FakeProvider([_response('{"completed":true}')])
+    manager = ContextManager(
+        token_counter=ExactContextCounter(), net_input_cap=FormulaNetInputCap()
+    )
+
+    result = await AgentLoop(
+        provider=provider,
+        gateway=FakeGateway(),
+        context_manager=manager,
+    ).run(_spec())
+
+    assert result.exit is SessionExit.Completed
+    assert len(provider.requests) == 1
 
 
 @pytest.mark.asyncio

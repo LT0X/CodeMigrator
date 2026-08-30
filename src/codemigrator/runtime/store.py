@@ -20,6 +20,7 @@ from codemigrator.core import (
 
 from .budget import BudgetUsage
 from .contracts import EventSpec, RunState, RuntimeEvent, RuntimeSnapshot
+from .memory import EvolutionSegment, EvolutionSegmentDraft
 from .schema import RUNTIME_SCHEMA_SQL
 
 
@@ -27,10 +28,22 @@ class RuntimeStore(Protocol):
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         """Load one Run and its append-only events."""
 
-    async def create(self, state: RunState, events: Sequence[EventSpec]) -> RuntimeSnapshot:
+    async def create(
+        self,
+        state: RunState,
+        events: Sequence[EventSpec],
+        *,
+        evolution: EvolutionSegmentDraft | None = None,
+    ) -> RuntimeSnapshot:
         """Insert a new Run atomically with its first events."""
 
-    async def commit(self, state: RunState, events: Sequence[EventSpec]) -> RuntimeSnapshot:
+    async def commit(
+        self,
+        state: RunState,
+        events: Sequence[EventSpec],
+        *,
+        evolution: EvolutionSegmentDraft | None = None,
+    ) -> RuntimeSnapshot:
         """Commit state and events in one transaction."""
 
 
@@ -38,11 +51,47 @@ class StoreCommitError(RuntimeError):
     """Raised when the persistence transaction cannot be committed."""
 
 
+def _validate_evolution_draft(
+    draft: EvolutionSegmentDraft, expected_run_id: object
+) -> None:
+    if draft.run_id != expected_run_id:
+        raise StoreCommitError("context evolution run identity does not match state")
+    if not isinstance(draft.summary_text, str) or not draft.summary_text.strip():
+        raise StoreCommitError("context evolution summary must be non-empty")
+    if len(draft.template_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in draft.template_sha256
+    ):
+        raise StoreCommitError("context evolution template digest is invalid")
+
+
+def _next_in_memory_evolution(
+    draft: EvolutionSegmentDraft | None,
+    run_id: object,
+    entries: Mapping[object, list[EvolutionSegment]],
+) -> EvolutionSegment | None:
+    if draft is None:
+        return None
+    _validate_evolution_draft(draft, run_id)
+    previous = entries.get(run_id, ())
+    if previous and previous[0].template_sha256 != draft.template_sha256:
+        raise StoreCommitError("context evolution template is frozen per Run")
+    if any(entry.slice_id == draft.slice_id for entry in previous):
+        raise StoreCommitError("context evolution slice has already been appended")
+    return EvolutionSegment(
+        run_id=run_id,
+        entry_index=len(previous),
+        slice_id=draft.slice_id,
+        summary_text=draft.summary_text,
+        template_sha256=draft.template_sha256,
+    )
+
+
 class InMemoryRuntimeStore:
     """A transactionally behaving store double for actor and contract tests."""
 
     def __init__(self, *, secret_registry: SecretRegistry | None = None) -> None:
         self._snapshots: dict[RunId, RuntimeSnapshot] = {}
+        self._evolution: dict[object, list[EvolutionSegment]] = {}
         self.commit_count = 0
         self._fail_next = False
         self.secret_registry = secret_registry or SecretRegistry()
@@ -50,15 +99,27 @@ class InMemoryRuntimeStore:
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         return self._snapshots.get(run_id)
 
-    async def create(self, state: RunState, events: Sequence[EventSpec]) -> RuntimeSnapshot:
+    async def create(
+        self,
+        state: RunState,
+        events: Sequence[EventSpec],
+        *,
+        evolution: EvolutionSegmentDraft | None = None,
+    ) -> RuntimeSnapshot:
         if state.run_id in self._snapshots:
             raise StoreCommitError("run already exists")
-        return await self._write(state, events)
+        return await self._write(state, events, evolution=evolution)
 
-    async def commit(self, state: RunState, events: Sequence[EventSpec]) -> RuntimeSnapshot:
+    async def commit(
+        self,
+        state: RunState,
+        events: Sequence[EventSpec],
+        *,
+        evolution: EvolutionSegmentDraft | None = None,
+    ) -> RuntimeSnapshot:
         if state.run_id not in self._snapshots:
             raise StoreCommitError("run does not exist")
-        return await self._write(state, events)
+        return await self._write(state, events, evolution=evolution)
 
     async def snapshot(self, run_id: RunId) -> RuntimeSnapshot:
         snapshot = await self.load(run_id)
@@ -69,7 +130,13 @@ class InMemoryRuntimeStore:
     def fail_next_commit(self) -> None:
         self._fail_next = True
 
-    async def _write(self, state: RunState, events: Sequence[EventSpec]) -> RuntimeSnapshot:
+    async def _write(
+        self,
+        state: RunState,
+        events: Sequence[EventSpec],
+        *,
+        evolution: EvolutionSegmentDraft | None = None,
+    ) -> RuntimeSnapshot:
         if self._fail_next:
             self._fail_next = False
             raise StoreCommitError("injected commit failure")
@@ -86,13 +153,19 @@ class InMemoryRuntimeStore:
             )
         except ValueError as exc:
             raise StoreCommitError("observation rejected") from exc
+        evolution_entry = _next_in_memory_evolution(evolution, state.run_id, self._evolution)
         snapshot = RuntimeSnapshot(
             state=state,
             events=(*previous.events, *materialized) if previous else materialized,
         )
         self._snapshots[state.run_id] = snapshot
+        if evolution_entry is not None:
+            self._evolution.setdefault(state.run_id, []).append(evolution_entry)
         self.commit_count += 1
         return snapshot
+
+    async def evolution_segments(self, *, run_id: object) -> tuple[EvolutionSegment, ...]:
+        return tuple(self._evolution.get(run_id, ()))
 
 
 class PostgreSQLRuntimeStore:
@@ -139,7 +212,13 @@ class PostgreSQLRuntimeStore:
             ),
         )
 
-    async def create(self, state: RunState, events: Sequence[EventSpec]) -> RuntimeSnapshot:
+    async def create(
+        self,
+        state: RunState,
+        events: Sequence[EventSpec],
+        *,
+        evolution: EvolutionSegmentDraft | None = None,
+    ) -> RuntimeSnapshot:
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 try:
@@ -157,14 +236,28 @@ class PostgreSQLRuntimeStore:
                     first_sequence=1,
                     secret_registry=self.secret_registry,
                 )
+                if evolution is not None:
+                    await _append_evolution_with_connection(connection, evolution, state.run_id)
         snapshot = await self.load(state.run_id)
         if snapshot is None:
             raise StoreCommitError("created runtime run disappeared")
         return snapshot
 
-    async def commit(self, state: RunState, events: Sequence[EventSpec]) -> RuntimeSnapshot:
+    async def commit(
+        self,
+        state: RunState,
+        events: Sequence[EventSpec],
+        *,
+        evolution: EvolutionSegmentDraft | None = None,
+    ) -> RuntimeSnapshot:
         async with self.pool.acquire() as connection:
             async with connection.transaction():
+                locked = await connection.fetchrow(
+                    "SELECT run_id FROM runtime_runs WHERE run_id = $1 FOR UPDATE",
+                    state.run_id,
+                )
+                if locked is None:
+                    raise StoreCommitError("runtime run does not exist")
                 row = await connection.fetchrow(
                     """
                     SELECT COALESCE(MAX(sequence), 0) AS last_sequence
@@ -190,10 +283,120 @@ class PostgreSQLRuntimeStore:
                     first_sequence=last_sequence + 1,
                     secret_registry=self.secret_registry,
                 )
+                if evolution is not None:
+                    await _append_evolution_with_connection(connection, evolution, state.run_id)
         snapshot = await self.load(state.run_id)
         if snapshot is None:
             raise StoreCommitError("committed runtime run disappeared")
         return snapshot
+
+    async def append_evolution_segment(
+        self,
+        *,
+        run_id: object,
+        slice_id: object,
+        summary_text: str,
+        template_sha256: str,
+    ) -> EvolutionSegment:
+        """Append one immutable evolution entry in the runtime transaction boundary."""
+
+        if not summary_text.strip():
+            raise ValueError("evolution summary must be non-empty")
+        if len(template_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in template_sha256
+        ):
+            raise ValueError("template digest must be SHA-256")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                locked = await connection.fetchrow(
+                    "SELECT run_id FROM runtime_runs WHERE run_id = $1 FOR UPDATE",
+                    run_id,
+                )
+                if locked is None:
+                    raise StoreCommitError("runtime run does not exist")
+                entry = await _append_evolution_with_connection(
+                    connection,
+                    EvolutionSegmentDraft(run_id, slice_id, summary_text, template_sha256),
+                    run_id,
+                )
+        return entry
+
+    async def evolution_segments(self, *, run_id: object) -> tuple[EvolutionSegment, ...]:
+        """Read an ordered immutable evolution projection for one Run."""
+
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT entry_index, slice_id, summary_text, template_sha256
+                FROM context_evolution_segments
+                WHERE run_id = $1
+                ORDER BY entry_index
+                """,
+                run_id,
+            )
+        return tuple(
+            EvolutionSegment(
+                run_id,
+                int(_row_value(row, "entry_index")),
+                _row_value(row, "slice_id"),
+                str(_row_value(row, "summary_text")),
+                str(_row_value(row, "template_sha256")),
+            )
+            for row in rows
+        )
+
+
+async def _append_evolution_with_connection(
+    connection: Any,
+    draft: EvolutionSegmentDraft,
+    run_id: object,
+) -> EvolutionSegment:
+    _validate_evolution_draft(draft, run_id)
+    row = await connection.fetchrow(
+        """
+        SELECT COALESCE(MAX(entry_index) + 1, 0) AS next_index,
+               MIN(template_sha256) AS frozen_template
+        FROM context_evolution_segments
+        WHERE run_id = $1
+        """,
+        run_id,
+    )
+    if row is None:
+        raise StoreCommitError("unable to read context evolution sequence")
+    frozen_template = _row_value(row, "frozen_template")
+    if frozen_template is not None and str(frozen_template) != draft.template_sha256:
+        raise StoreCommitError("context evolution template is frozen per Run")
+    duplicate = await connection.fetchrow(
+        """
+        SELECT 1
+        FROM context_evolution_segments
+        WHERE run_id = $1 AND slice_id = $2
+        LIMIT 1
+        """,
+        run_id,
+        draft.slice_id,
+    )
+    if duplicate is not None:
+        raise StoreCommitError("context evolution slice has already been appended")
+    entry_index = int(_row_value(row, "next_index"))
+    try:
+        await connection.execute(
+            """
+            INSERT INTO context_evolution_segments(
+                run_id, entry_index, slice_id, summary_text, template_sha256
+            ) VALUES ($1, $2, $3, $4, $5)
+            """,
+            run_id,
+            entry_index,
+            draft.slice_id,
+            draft.summary_text,
+            draft.template_sha256,
+        )
+    except Exception as exc:
+        raise StoreCommitError("unable to append context evolution") from exc
+    return EvolutionSegment(
+        run_id, entry_index, draft.slice_id, draft.summary_text, draft.template_sha256
+    )
 
 
 async def _insert_events(
