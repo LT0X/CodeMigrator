@@ -3,8 +3,8 @@
 > 文档定位：CodeMigrator 代码实现的跨模块任务规划、依赖分析、并行开发路线与总体进度看板（AGENTS.md §1.1 指定的整体任务规划与进度跟踪主表）。
 > 架构基线：**V6（Python 版）**。跨语言代码迁移 Agent；三层架构（权力层 Harness / 判断层常驻主 Agent / 执行层工作会话）；四阶段 Run 状态机；app + PostgreSQL 两服务部署拓扑，8 个 Python 子包 src-layout 单包。
 > 代码范围：`src/codemigrator/`（8 子包）+ `apps/codemigrator-cli` + `web/` + `descriptors/` + `migrations/` + `deploy/` + `tests/` + `pyproject.toml` + `compose.yaml`。
-> 当前阶段：V6 Wave 0；`CM-CORE-001` 已完成审查修订与交付准备，PR #1 按既有结论直接合并后进入 `CM-INFRA-001` 工程基线准备。
-> 总体状态：进行中（18 个任务中 1 个已完成、0 个进行中、17 个未开始）。
+> 当前阶段：V6 Wave 0；`CM-CORE-001` 的 PR #1 已合并，`CM-INFRA-001` 正在进行工程基线实现。
+> 总体状态：进行中（18 个任务中 1 个已完成、1 个进行中、16 个未开始）。
 > 创建日期：2026-08-28（V5 重写版）；2026-08-29 升级为 V6 单基线。最后更新日期：2026-08-30。
 > 维护原则：总体表反映跨模块事实，模块迭代记录保存实现细节；代码、测试和进度记录必须同步更新；每次计划变更必须先与用户对齐（§8）；V6 开放实施项标注"待定"不得臆造为事实。
 
@@ -120,7 +120,7 @@
 | 项目            | 当前状态     | 事实依据                                                                                                                                |
 | ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | V6 设计文档       | 已冻结      | `architecture_module_design/` M-00\~M-16 V6 收敛版 + `feedback_doc/fb10_align_records.md`、fb11\_align\_records.md + 文档迭代记录.md（V6 收敛基线） |
-| 代码实现          | 进行中      | `CM-CORE-001` 已完成审查修订与本地验证，PR #1 待按既有结论直接合并；随后推进其余工程、领域与产品代码                                                                       |
+| 代码实现          | 进行中      | `CM-CORE-001` PR #1 已合并（`683f398`）；`CM-INFRA-001` 正在补齐 Python 工程基线、描述符、Compose、迁移和 CI                                                                       |
 | WSL2 开发环境     | 部分就绪     | Docker CE + compose；**Python 3.12+/uv 环境待建**（V6 为 Python，见其他更新记录与 .env）                                                             |
 | PostgreSQL 部署 | 未建       | 待 CM-INFRA-001 建 compose.yaml（app+PG）后部署并回填 `my_space/.env`                                                                         |
 | 模型 API key    | 已就绪      | `my_space/model_api_key.json`（LLM Planner/Supervisor/修复/多 Agent/Exec 测试用）                                                           |
@@ -373,7 +373,7 @@ flowchart TD
 | 里程碑          | 内容                                          | 对应任务                                      | 状态                |
 | ------------ | ------------------------------------------- | ----------------------------------------- | ----------------- |
 | MS-0 V6 设计定稿 | 17 篇 V6 + fb10/fb11 aligned + 迭代记录冻结        | —                                         | 已完成（2026-08-29 前） |
-| MS-1 工程地基    | 公共契约（V6）+ Python 工程基线（import-linter、app+PG） | CM-CORE、CM-INFRA                          | 进行中（CM-CORE 已完成，CM-INFRA 未开始）               |
+| MS-1 工程地基    | 公共契约（V6）+ Python 工程基线（import-linter、app+PG） | CM-CORE、CM-INFRA                          | 进行中（CM-CORE 已完成，CM-INFRA 进行中）               |
 | MS-2 基础能力    | 图谱前移、Spec、app 内 bwrap、控制面、Web/CLI、观测        | CM-ANALYSIS/SPEC/SANDBOX/API/WEB/OBS      | 未开始               |
 | MS-3 计划与验证   | 起草/计划/工作区/Git/统一上下文；两层修复路由准备                | CM-DRAFT/PLAN/WORKSPACE/GIT/MEMORY/VERIFY | 未开始               |
 | MS-4 运行与修复闭环 | Run actor、判断层 Supervisor、全局修复会话             | CM-RUNTIME/LOOP/SUPERVISOR/REPAIR         | 未开始               |
@@ -381,7 +381,7 @@ flowchart TD
 
 ### 6.2 状态统计
 
-按主任务表 18 个任务计：已完成 1 / 进行中 0 / 未开始 17（完成度约 5.6%，进行中任务不计入完成度）。
+按主任务表 18 个任务计：已完成 1 / 进行中 1 / 未开始 16（完成度约 5.6%，进行中任务不计入完成度）。
 
 > 完成度仅为任务数量比例，不替代各任务质量门（V6 增量/运行性质）；V6 开放实施项细化前不计为验收欠账，单独在 §9 跟踪。
 
@@ -409,8 +409,8 @@ flowchart TD
 
 | 任务ID              | 任务描述                                                                                                                | 状态  | 开始日期 | 实际完成日期 | 备注                           |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------- | --- | ---- | ------ | ---------------------------- |
-| CM-CORE-001       | Python 公共契约层（M-00）：ID/四阶段状态机/枚举/错误码/phase 授权矩阵/V6 契约（Advice/RepairDecision/GlobalRepairSession/DossierInconsistent） | 已完成 | 2026-08-30    | 2026-08-30      | Wave 0；全部子包上游；已对齐：my_space/code_alignment_record/core/CM-CORE-001-对齐记录.md；迭代记录：my_space/codemigrator_dev_progress/core/CM-CORE-001-公共契约层迭代记录.md；PR #1 已完成既有审查反馈的修复与验证，按用户流程不再追加审查，待直接合并；当前验证：`PYTHONPATH=src /tmp/codemigrator-infra/.venv/bin/python -m pytest tests/core tests/contracts -q`（55 passed）、compileall、静态扫描；分支 `feature/core-contracts` |
-| CM-INFRA-001      | 工程基线（M-01）：Python 8 子包/uv/import-linter/descriptors/compose(app+PG)/migrations/tests/CI                             | 未开始 | —    | —      | Wave 0；依赖 CM-CORE；已对齐：my_space/code_alignment_record/infra/CM-INFRA-001-对齐记录.md |
+| CM-CORE-001       | Python 公共契约层（M-00）：ID/四阶段状态机/枚举/错误码/phase 授权矩阵/V6 契约（Advice/RepairDecision/GlobalRepairSession/DossierInconsistent） | 已完成 | 2026-08-30    | 2026-08-30      | Wave 0；全部子包上游；已对齐：my_space/code_alignment_record/core/CM-CORE-001-对齐记录.md；迭代记录：my_space/codemigrator_dev_progress/core/CM-CORE-001-公共契约层迭代记录.md；PR #1 已完成既有审查反馈的修复与验证并合并（`683f398`）；按用户流程不再追加审查；当前验证：`PYTHONPATH=src /tmp/codemigrator-infra/.venv/bin/python -m pytest tests/core tests/contracts -q`（55 passed）、compileall、静态扫描；分支 `feature/core-contracts` |
+| CM-INFRA-001      | 工程基线（M-01）：Python 8 子包/uv/import-linter/descriptors/compose(app+PG)/migrations/tests/CI                             | 进行中 | 2026-08-30    | —      | Wave 0；依赖 CM-CORE（已完成）；已对齐：my_space/code_alignment_record/infra/CM-INFRA-001-对齐记录.md；计划与详细设计已建立，分支 `feature/infra-python-skeleton` |
 | CM-SPEC-001       | Migration Spec 能力门（M-05）：四道门/canonical/不可变/描述符三码拒绝                                                                  | 未开始 | —    | —      | Wave 1；主体沿用 V5；已对齐：my_space/code_alignment_record/spec/CM-SPEC-001-对齐记录.md |
 | CM-ANALYSIS-001   | 源端分析与知识图谱（M-06）：图谱构建前移/F1-F4/PSF/图谱导航/重建投影                                                                          | 未开始 | —    | —      | Wave 1；图谱前移使 ANALYSIS 提前；已对齐：my_space/code_alignment_record/analysis/CM-ANALYSIS-001-对齐记录.md |
 | CM-DRAFT-001      | 起草期多 Agent 理解与四件工件（M-16 起草+M-04+M-14）：图谱域扇出/探索协调者/多轮 AskUser（不限次）/一次确认                                              | 未开始 | —    | —      | Wave 2；Blueprint 字段待定（本任务不臆造，CM-PLAN 对齐收口）；已对齐：my_space/code_alignment_record/draft/CM-DRAFT-001-对齐记录.md |
@@ -525,6 +525,26 @@ flowchart TD
 ## 11. 更新记录
 
 > 每次完成任务或计划变更后在本标题下方置顶追加 CHG 条目（模板见 §8.4）；最新记录在最上方。
+
+### CHG-20260830-06：CM-INFRA-001 唯一审查反馈修复
+
+* 时间：2026-08-30
+* 变更类型：审查修订/验证收口
+* 变更原因：PR #2 唯一一次独立审查在延长等待后完成并返回 `REQUEST_CHANGES`；按用户流程仅修复该次反馈，不重新发起审查。
+* 变更内容：拆分 `api`/`runtime` import-linter 层级；补齐 Compose 的 seccomp、`SYS_ADMIN` 与 cgroup v2 委派目录；为 Python 目标描述符声明最小依赖域白名单；将 target-python 工具版本对齐 `uv.lock`；同步 M-01 目录树并强化描述符与凭据构建边界测试。
+* 影响范围：CM-INFRA-001；仍在 `feature/infra-python-skeleton` 原分支提交，不触及主工作区既有用户修改。
+* 验证：70 passed；import-linter 3 contracts kept；Ruff、mypy、compileall 与 Compose config 通过。target-python 新版本重建因 Docker/PyPI 外部下载无响应中止，现有旧版本本地镜像未作为新版本证据。
+* 后续行动：提交并推送当前分支，直接合并 PR #2；合并后在主工作区拉取 `develop`。联网环境下重建 target/app 镜像并完成 PG 冒烟。
+
+### CHG-20260830-05：CM-CORE-001 合并与 CM-INFRA-001 开工
+
+* 时间：2026-08-30
+* 变更类型：任务切换
+* 变更原因：CM-CORE-001 PR #1 已按既有审查结论合并，主工作区已 fast-forward 同步 `origin/develop`；按串行 Wave 0 依赖关系启动 CM-INFRA-001。
+* 变更内容：基于合并后的 `develop` 创建 `feature/infra-python-skeleton`，恢复并继续既有 infra WIP；读取 M-01 架构、CM-INFRA-001 对齐记录和任务文档，当前已具备工程骨架、描述符、Compose、迁移、部署、CI 与确定性测试。
+* 影响范围：CM-INFRA-001；保留主工作区既有用户未提交修改，不修改 M-01 架构模块设计文档。
+* 验证：初始实现阶段 `uv lock --check`、全量 pytest（70 passed）、compileall、Ruff、mypy、import-linter 通过；目标工具链镜像已构建且 digest 与构建清单一致；app 镜像构建因 Docker 外部网络下载依赖长期无响应，未完成，待记录为环境限制。
+* 后续行动：已完成本 PR 唯一一次独立审查返回的反馈修复；仅在原分支重新验证后直接提交、推送并合并，不追加同一 PR 审查轮次。
 
 ### CHG-20260830-04：CM-CORE-001 审查反馈收口与流程纠偏
 

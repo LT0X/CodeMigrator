@@ -92,7 +92,7 @@ V6 方向协调归属：常驻主 Agent 的协调语义——探索协调者、S
 
 ## 描述符资源目录：语言差异的唯一载体
 
-语言对 = 一份源端描述符 + 一份目标端描述符。目录按 `<language-role>/<language-id>` 组织，每份 `descriptor.json` 覆盖 M-00 对应端（`SourceToolchain` 或 `TargetToolchain`）的全部字段，并附加 `descriptor_version` 与 `language_role` 两个目录元数据字段：
+语言对 = 一份源端描述符 + 一份目标端描述符。目录按 `<language-role>/<language-id>` 组织，每份 `descriptor.json` 覆盖 M-00 对应端（`SourceToolchain` 或 `TargetToolchain`）的全部字段，并附加 `descriptor_version` 与 `language_role` 两个目录元数据字段；目标端描述符另声明 `allowed_domains`，供 Shell 沙箱的受控出口代理注入域名白名单。
 
 ### 描述符定位
 
@@ -180,6 +180,7 @@ descriptors/
     { "pattern": "{docker-compose.yml,Makefile,config.yaml}", "artifact_kind": "DeclarativeConfig" },
     { "pattern": "db/**/*.sql", "artifact_kind": "ResourceFile", "mapping": "copy" }
   ],
+  "allowed_domains": ["files.pythonhosted.org", "pypi.org"],
   "toolchain_image_digest": "sha256:…"
 }
 ```
@@ -306,7 +307,6 @@ codemigrator/
 ├── web/                              # 前端；只消费 REST/SSE，不计入核心子包
 ├── migrations/                       # PostgreSQL schema 演进；owner: runtime
 ├── deploy/                           # Compose、seccomp policy、rootfs/镜像 digest；owner: sandbox + runtime；不含凭据
-├── docs/                             # 本设计文档集（M-00~M-16 与文档迭代记录）
 ├── tests/
 │   ├── contracts/                    # 跨子包公共契约测试
 │   ├── recovery/                     # ledger / Git ref / checkpoint 重建测试
@@ -314,6 +314,8 @@ codemigrator/
 ├── compose.yaml                      # app + PostgreSQL 基线
 └── pyproject.toml                    # 单包 src-layout 清单（uv 管理）
 ```
+
+设计、对齐与迭代文档仅保存在本机 `my_space/` 私有空间，不属于仓库目录树；按 Q-08（D-07）约定，仓库不建立公开 `docs/` 目录。
 
 `src/codemigrator/` 下恰好 8 个固定核心子包，不放任何语言的 grammar、命令模板或镜像定义；语言事实只落在 `descriptors/` 与 `deploy/` 声明的镜像里。每个子包根 README 固定四项：负责、不负责、允许依赖、公共入口——这是防止内部实现被跨模块导入的第一层边界。`runtime` 可以组合全部子包；任何其他子包不能反向依赖 `runtime`，也不能把 `descriptors/*` 当作导入期依赖（描述符只在运行时加载）。
 
