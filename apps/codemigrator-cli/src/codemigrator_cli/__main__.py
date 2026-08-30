@@ -20,7 +20,7 @@ from .exit_codes import ExitCode
 from .http import HttpEventSource
 from .models import RunEvent
 from .projector import project_events, safe_data
-from .renderer import render_human, render_json, render_jsonl
+from .renderer import render_human, render_json, render_jsonl, render_jsonl_event
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -146,16 +146,19 @@ def run_command(
     try:
         events: Iterable[RunEvent] = _observe_events(
             source or _configured_event_source(args),
-            on_event=on_event if args.output == "human" else None,
+            on_event=on_event,
         )
         if args.output == "jsonl":
             event_list = list(events)
             projection = project_events(event_list)
-            return _status_exit(projection.run_status), "\n".join(render_jsonl(event_list)) + "\n"
+            output = "\n".join(render_jsonl(event_list)) + "\n"
+            return _status_exit(projection.run_status), "" if on_event is not None else output
         projection = project_events(events)
         if args.output == "json":
             return _status_exit(projection.run_status), render_json(projection) + "\n"
         return _status_exit(projection.run_status), render_human(projection)
+    except _CancelConfirmed:
+        raise
     except Exception:
         error_payload: dict[str, object] = {"status": "UNKNOWN"}
         if args.command == "run":
@@ -212,8 +215,18 @@ def _request_interrupt_cancel(
             raise ValueError("Run version is invalid")
         payload = control.cancel(run_id, version)
     except StaleVersionError:
-        sys.stderr.write("取消请求使用的 Run 版本已过期，请重新读取版本后再操作。\n")
-        return
+        try:
+            latest = control.show(run_id)
+            latest_version = latest.get("version")
+            if type(latest_version) is not int or latest_version < 0:
+                raise ValueError("Run version is invalid")
+            payload = control.cancel(run_id, latest_version)
+        except StaleVersionError:
+            sys.stderr.write("取消请求的 Run 版本再次过期，取消未确认。\n")
+            return
+        except Exception:
+            sys.stderr.write("无法刷新 Run 版本，取消未确认。\n")
+            return
     except Exception:
         sys.stderr.write("无法提交取消请求；Run 状态保持未知。\n")
         return
@@ -248,14 +261,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         and "--no-follow" not in arguments
     ):
         arguments.append("--no-follow")
+    if is_observer and not sys.stdout.isatty() and "--output" not in arguments:
+        arguments.extend(["--output", "jsonl" if "--follow" in arguments else "json"])
     control = _configured_run_control()
     controller = CancelController()
     run_id = _interrupt_run_id(arguments) if is_observer else None
+    parsed = _parser().parse_args(arguments)
+    event_history: list[RunEvent] = []
+    cancel_requested = False
+
+    def observe_event(event: RunEvent) -> None:
+        event_history.append(event)
+        if parsed.output == "jsonl":
+            sys.stdout.write(render_jsonl_event(event_history) + "\n")
+            sys.stdout.flush()
+        elif parsed.output == "human":
+            _render_process_event(event)
+        status = event.data.get("run_status", event.data.get("status"))
+        cancellation_confirmed = (
+            cancel_requested
+            and status == "CANCELLED"
+            and controller.observe("CANCELLED") is CancelAction.WAIT
+        )
+        if cancellation_confirmed:
+            if controller.confirmed:
+                raise _CancelConfirmed
 
     def handle_interrupt(signum: int, frame: object) -> None:
+        nonlocal cancel_requested
         del signum, frame
         if controller.interrupt() is CancelAction.EXIT:
             raise KeyboardInterrupt
+        cancel_requested = True
         if run_id is None:
             sys.stderr.write("已收到取消请求，但当前命令没有可取消的 Run。\n")
             return
@@ -267,7 +304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         code, output = run_command(
             arguments,
             control=control,
-            on_event=_render_process_event if "--follow" in arguments else None,
+            on_event=observe_event if "--follow" in arguments else None,
         )
     except _CancelConfirmed:
         return int(ExitCode.LOCAL_CANCEL_CONFIRMED)

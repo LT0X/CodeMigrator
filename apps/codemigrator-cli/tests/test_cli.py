@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 
 import pytest
-from codemigrator_cli.__main__ import run_command
+from codemigrator_cli.__main__ import (
+    _CancelConfirmed,
+    _request_interrupt_cancel,
+    run_command,
+)
 from codemigrator_cli.cancel import CancelAction, CancelController
 from codemigrator_cli.client import HttpRunControl, StaleVersionError
 from codemigrator_cli.exit_codes import ExitCode
@@ -171,6 +175,50 @@ def test_run_cancel_does_not_retry_after_stale_if_match() -> None:
     assert json.loads(output) == {"run_id": "run-1", "status": "STALE_VERSION"}
     assert control.cancel_calls == [8]
     assert control.show_calls == 0
+
+
+def test_follow_calls_back_before_the_event_source_finishes() -> None:
+    class FiniteSource:
+        def events(self):
+            yield event(1, "run.status_changed", {"run_status": "EXECUTING"})
+            yield event(2, "run.status_changed", {"run_status": "COMPLETED"})
+
+    observed: list[int] = []
+    code, output = run_command(
+        ["run", "watch", "run-1", "--follow", "--output", "human"],
+        source=FiniteSource(),
+        on_event=lambda item: observed.append(item.sequence),
+    )
+
+    assert code == 0
+    assert observed == [1, 2]
+    assert "sequence 2" in output
+
+
+def test_interrupt_cancel_retries_once_after_stale_version() -> None:
+    class RefreshingControl:
+        def __init__(self) -> None:
+            self.show_calls = 0
+            self.cancel_calls: list[int] = []
+
+        def show(self, run_id: str) -> dict[str, object]:
+            del run_id
+            self.show_calls += 1
+            return {"run_id": "run-1", "status": "EXECUTING", "version": 9}
+
+        def cancel(self, run_id: str, expected_version: int) -> dict[str, object]:
+            del run_id
+            self.cancel_calls.append(expected_version)
+            if len(self.cancel_calls) == 1:
+                raise StaleVersionError("stale")
+            return {"run_id": "run-1", "status": "CANCELLED", "version": 10}
+
+    control = RefreshingControl()
+    with pytest.raises(_CancelConfirmed):
+        _request_interrupt_cancel(control, "run-1", CancelController(), "json")
+
+    assert control.show_calls == 2
+    assert control.cancel_calls == [9, 9]
 
 
 def test_sse_transport_accepts_only_the_versioned_event_shape() -> None:
