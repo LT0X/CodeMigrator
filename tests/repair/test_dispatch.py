@@ -26,7 +26,7 @@ def test_joint_scope_requires_terminal_set_and_no_inflight_overlap():
     assert admitted.session is not None
     assert admitted.session.run_id == run_id
     assert admitted.session.repair_decision_id == decision_id
-    assert admitted.session.joint_write_scope.out.write_paths == ["src/a.py", "src/b.py"]
+    assert admitted.session.joint_write_scope.out.write_paths == ("src/a.py", "src/b.py")
 
 
 def test_nonterminal_repair_member_blocks_dispatch():

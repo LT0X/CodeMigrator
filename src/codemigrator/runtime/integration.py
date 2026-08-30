@@ -15,6 +15,8 @@ class IntegrationItem:
     prospective_checks_passed: bool = False
     repair: bool = False
     repair_decision_id: str | None = None
+    replaces_slice_id: str | None = None
+    original_generation: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +67,10 @@ class IntegrationCoordinator:
 
         if not item.repair:
             raise ValueError("repair integration item must be marked repair")
+        if item.generation is not None:
+            raise ValueError("repair integration item must not have a Slice generation")
+        if not item.repair_decision_id:
+            raise ValueError("repair integration item requires a repair decision identity")
         return self.enqueue(item)
 
     append_repair = enqueue_repair
@@ -83,11 +89,23 @@ class IntegrationCoordinator:
                 prospective_checks_passed=True,
                 repair=item.repair,
                 repair_decision_id=item.repair_decision_id,
+                replaces_slice_id=item.replaces_slice_id,
+                original_generation=item.original_generation,
             )
             for item in self._queue
         )
 
-    def start_next(self, run_id: str, latest_verified_oid: str) -> IntegrationStart | None:
+    def register_verified_head(self, run_id: str, verified_oid: str) -> None:
+        """Register a run's verified head before a new integration chain starts."""
+
+        if not run_id or not verified_oid:
+            raise ValueError("run_id and verified_oid must be non-empty")
+        existing = self._verified_oids.get(run_id)
+        if existing is not None and existing != verified_oid:
+            raise ValueError("verified head may only advance through integration completion")
+        self._verified_oids[run_id] = verified_oid
+
+    def start_next(self, run_id: str, latest_verified_oid: str | None) -> IntegrationStart | None:
         """Start only the queue head after prospective checks have passed."""
 
         if self._active is not None:
@@ -99,9 +117,14 @@ class IntegrationCoordinator:
         item = self._queue[0]
         if not item.prospective_checks_passed:
             return None
+        verified_oid = self._verified_oids.get(run_id)
+        if verified_oid is None:
+            if latest_verified_oid is None:
+                return None
+            self.register_verified_head(run_id, latest_verified_oid)
+            verified_oid = latest_verified_oid
         self._active = item
-        self._verified_oids[run_id] = latest_verified_oid
-        return IntegrationStart(item, latest_verified_oid)
+        return IntegrationStart(item, verified_oid)
 
     def complete(
         self, *, success: bool, new_verified_oid: str | None = None

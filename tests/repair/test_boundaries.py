@@ -72,5 +72,8 @@ def test_assembled_brief_preserves_input_and_internal_repair_has_no_impact_previ
         max_inline_bytes=32,
     )
     assert isinstance(brief, RepairBrief)
-    assert brief.failure_facts.diagnostic_summary["summary"] == "x" * 100
+    assert dict(brief.failure_facts.diagnostic_summary) == {
+        "externalized": True,
+        "cas_refs": ("cas://" + "b" * 64,),
+    }
     assert brief.constraints.impact_preview_required is False

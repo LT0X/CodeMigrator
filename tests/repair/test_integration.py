@@ -49,3 +49,22 @@ def test_active_placeholder_cannot_be_revoked_and_repair_cannot_bypass_prospecti
 
     coordinator.enqueue(item("repair", repair=True, generation=None))
     assert coordinator.start_next("run-1", "verified-0") is None
+
+
+def test_enqueue_repair_requires_decision_identity_and_no_slice_generation():
+    coordinator = IntegrationCoordinator()
+    with pytest.raises(ValueError, match="generation"):
+        coordinator.enqueue_repair(
+            item("repair", repair=True, generation=0, decision_id="decision-1")
+        )
+    with pytest.raises(ValueError, match="decision"):
+        coordinator.enqueue_repair(item("repair", repair=True, generation=None))
+
+
+def test_start_next_uses_registered_verified_head_instead_of_stale_caller_value():
+    coordinator = IntegrationCoordinator()
+    coordinator.register_verified_head("run-1", "verified-2")
+    coordinator.enqueue(item("slice-a", prospective=True))
+    started = coordinator.start_next("run-1", "stale-verified")
+    assert started is not None
+    assert started.base_verified_oid == "verified-2"

@@ -126,6 +126,27 @@ def test_repair_dispatch_binds_joint_scope_to_brief_and_read_scope():
     assert session.impact_preview_required is False
 
 
+def test_joint_scope_is_deeply_frozen_after_admission():
+    value = brief()
+    session = GlobalRepairSession(
+        repair_decision_id=RepairDecisionId(DECISION_ID),
+        run_id=RunId(RUN_ID),
+        joint_write_scope=value.constraints.write_scope,
+    )
+    dispatch = build_repair_session_dispatch(
+        session=session,
+        read_scope=RepairReadScope(
+            source_snapshot_oid="snapshot-1",
+            contract_refs=("contract-1",),
+            domain_workspace_refs=("workspace-1",),
+            verified_head_oid="a" * 40,
+        ),
+        brief=value,
+    )
+    with pytest.raises(AttributeError):
+        dispatch.write_scope.out.write_paths.append("src/other.py")
+
+
 def test_situational_snapshot_is_machine_derived_and_has_no_context_serializer():
     snapshot = SituationalSnapshot(
         slice_states={str(SLICE_A): "INTEGRATED"},
@@ -142,3 +163,8 @@ def test_situational_snapshot_is_machine_derived_and_has_no_context_serializer()
 def test_active_writer_rejects_non_active_status_in_constructor():
     with pytest.raises(ValueError, match="active writer"):
         ActiveWriter("slice-a", "INTEGRATED", scope("src/a.py"))
+
+
+def test_failure_facts_require_test_identity_and_diagnostic_summary():
+    with pytest.raises(ValueError, match="failed_test_refs"):
+        RepairFailureFacts(failed_test_refs=(), diagnostic_summary={})
