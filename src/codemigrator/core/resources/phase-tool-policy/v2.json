@@ -1,0 +1,6 @@
+{
+  "PLAN": ["ReadFile", "QuerySourceAst", "Exec"],
+  "EXECUTE": ["ReadFile", "WriteFile", "EditFile", "QuerySourceAst", "Shell", "Exec"],
+  "VERIFY": [],
+  "REPORT": []
+}
