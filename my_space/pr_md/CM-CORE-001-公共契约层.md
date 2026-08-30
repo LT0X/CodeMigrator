@@ -5,7 +5,7 @@
 - PR 标题：`feat(core): add core contracts`
 - 任务编号：`CM-CORE-001`
 - 任务分支：`feature/core-contracts`
-- 模块迭代记录：`my_space/codemigrator_dev_progress/core/CM-CORE-001-公共契约层迭代记录.md`
+- 模块迭代记录：[CM-CORE-001-公共契约层迭代记录](../codemigrator_dev_progress/core/CM-CORE-001-公共契约层迭代记录.md)
 
 ## 2. 背景
 
@@ -33,6 +33,8 @@
 - 资源摘要采用 `SHA-256(JCS(payload))`；`ToolchainDescriptor.descriptor_version` JSON 输出为 semver 字符串。
 - 补齐 `CONTEXT_BUDGET_EXCEEDED`、`CONTEXT_CAPABILITY_INVALID`、`RECOVERY_LEDGER_INCONSISTENT` 三个跨模块稳定错误码。
 - 进一步补齐 `MODEL_BINDING_INVALID`、`PHASE_STATUS_MISMATCH`、`CANDIDATE_REF_CONFLICT`、`REMOTE_REF_MOVED`、`DEPENDENCY_UNAVAILABLE`；修复 `PlanEdge` 默认 alias、semver JSON round-trip/Schema、路径列表错误语义，并导出 `validate_candidate_generation`。
+- 文档收口：明确 `SourceToolchain.runtime_image_digest` 来自 CM-VERIFY-001 D-06 的跨任务 parity 扩展；当前 M-00/M-01 尚未回填，后续由 CM-VERIFY-001 实施联动负责同步和行为验收。
+- 兼容性：PlanEdge 使用 Pydantic v2 通用 model serializer，不依赖 2.11 才引入的 `serialize_by_alias` 配置；默认 JSON alias 由测试锁定。
 - `uuid-utils`、RFC 8785 等工程依赖仍由 CM-INFRA-001 登记，本 PR 不重复建立工程基线。
 
 ## 5. 风险与回滚

@@ -24,6 +24,8 @@
 
 **依据：** `my_space/codemigrator_design_doc/architecture_module_design/CodeMigrator_垂类设计原则与架构哲学.md` 的公共契约、Phase 工具授权和 V6 收敛章节；`my_space/code_alignment_record/core/CM-CORE-001-对齐记录.md` 全文；`CM-PLAN`、`CM-VERIFY`、`CM-MEMORY`、`CM-WORKSPACE`、`CM-SUPERVISOR`、`CM-REPAIR` 对 core 的联动条款。
 
+**跨任务差异：** `SourceToolchain.runtime_image_digest` 按 `CM-VERIFY-001` D-06 的 parity 源端运行时镜像决策纳入 core；M-00/M-01 架构正文尚未回填，后续由 CM-VERIFY-001 实施联动负责同步和行为验收，本计划不删除该字段。
+
 ## 2. 前置条件
 
 - [x] 工作分支：从已提交 `develop` 切出 `feature/core-contracts`。
@@ -146,7 +148,7 @@
 - 交付：`my_space/codemigrator_dev_progress/core/CM-CORE-001-公共契约层迭代记录.md`、本计划、`my_space/codemigrator_design_doc/detailed_coding_design/core/CM-CORE-001-公共契约层详细设计.md`、主任务表
 
 - [x] 运行 `PYTHONPATH=src /tmp/codemigrator-infra/.venv/bin/python -m pytest tests/core tests/contracts -q`，初始实现 49 passed，第一轮审查修订后 53 passed，第二轮审查修订后 55 passed。
-- [x] 运行 import 编译检查：`PYTHONPATH=src:/tmp/codemigrator-core-venv/lib/python3.12/site-packages python3 -m compileall -q src/codemigrator/core`。
+- [x] 运行 import 编译检查：`PYTHONPATH=src /tmp/codemigrator-infra/.venv/bin/python -m compileall -q src tests`。
 - [x] 做静态审查：core 不导入 `runtime`、不读取环境变量、不创建线程/任务、不定义 API 事件常量；`runtime_image_digest` 命中仅为描述符数据字段，已人工复核不属于运行时依赖。
 - [x] 处理独立审查反馈：CreateRun 分支前缀、RepoRelativePath 模型边界、subject/OID 一致性、公共导出、DossierEntry 锚点规则、JCS 资源摘要、semver JSON round-trip/Schema、PlanEdge 默认 alias、模型边界异常语义和跨模块稳定错误码。
 - [x] 按 core 对齐记录逐条登记验收证据；import-linter/CI 未执行并说明归属 CM-INFRA-001。

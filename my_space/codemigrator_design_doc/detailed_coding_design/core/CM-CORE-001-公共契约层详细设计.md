@@ -110,7 +110,7 @@ BranchPrefix 先做 ASCII 与 UTF-8 字节长度检查，再按 `/` 分段，拒
 - 模型：M-00 公共契约代码块列出的所有模型，以及 Context/RepairEvidence 联动模型。
 - 资源：`load_phase_tool_policy`、`load_verification_policy`、`load_session_budget`、`load_session_templates`。
 
-`PlanEdge` 使用 `from_` 作为 Python 属性、`from` 作为 JSON 属性，并默认按 alias 序列化；`CreateRunSource` 是 `RemoteRepository | RegisteredProject` 判别联合；`DiagnosticTarget` 的 discriminator 是 `kind`，`VerificationSubject` 的 discriminator 也是 `kind`。模型 JSON 输出不携带 Python-only 的别名字段。
+`PlanEdge` 使用 `from_` 作为 Python 属性、`from` 作为 JSON 属性，并通过 Pydantic v2 model serializer 在默认 JSON 输出中保持该 alias；`CreateRunSource` 是 `RemoteRepository | RegisteredProject` 判别联合；`DiagnosticTarget` 的 discriminator 是 `kind`，`VerificationSubject` 的 discriminator 也是 `kind`。模型 JSON 输出不携带 Python-only 的别名字段。
 
 core 不新增数据库表，不定义 REST/SSE DTO，不定义 run_events 事件名，不定义异常层次；这些接口分别由 runtime/api/下游 owner 实现。
 
@@ -157,12 +157,13 @@ core 不新增数据库表，不定义 REST/SSE DTO，不定义 run_events 事�
 
 - **有差异（以最新对齐记录为有效实施契约）**：M-14 架构正文旧代码块仍列 `initial_pack_token_cap` 与 `session_token_cap`，而 CM-MEMORY 最新重对齐已将预算模型改为 `max_rounds` 与 `eviction_watermark_pct`；本任务按最新对齐记录实现，并在实施收尾登记架构文档同步事项。
 - **有差异（机械补全）**：M-14 旧 `SessionKind` 代码块未列 `RepairSession`，但 V6 修复会话和 CM-MEMORY/CM-CORE 变更记录已明确九值；本任务加入 `RepairSession`。
-- **有差异（联动扩容）**：M-00 原始代码块没有后续对齐新增的 PLAN/验证集合错误码、三类静态资源和 `RepairEvidence`；本任务按 CM-CORE 追加变更记录及下游对齐记录实现。
+- **有差异（联动扩容）**：M-00 原始代码块没有后续对齐新增的 PLAN/验证集合错误码、三类新增静态资源（另含既有 phase policy）和 `RepairEvidence`；本任务按 CM-CORE 追加变更记录及下游对齐记录实现。
+- **有差异（跨任务契约扩展）**：`SourceToolchain.runtime_image_digest` 来自 CM-VERIFY-001 D-06 的 parity 源端运行时镜像决策；该可选字段已在 core 实现，但 M-00/M-01 架构正文尚未回填。后续由 CM-VERIFY-001 实施联动负责回填并完成 parity 行为验收；当前以 CM-VERIFY 对齐记录和本条差异登记为有效依据，不删除该字段。
 - 架构模块设计文档的回写需要遵守 AGENTS.md 对架构文档修改的确认流程；当前 goal 模式不另行扩大本任务范围，先以对齐记录和本详细设计保存差异证据。
 
 ## 6. 影响面
 
 - `codemigrator.core` 将成为全部七个下游子包的类型依赖源，任何公共枚举/错误码变更都必须回到 core 并同步契约测试。
 - `uuid-utils` 和 canonical JSON 适配依赖需由 CM-INFRA-001 登记到项目依赖；core 任务不创建第二套工程基线。
-- 三类静态资源随包发布，CM-VERIFY、CM-LOOP、CM-MEMORY、CM-WORKSPACE 在 Run 创建时读取并冻结摘要，运行期不热加载。
+- 四类静态资源随包发布，CM-VERIFY、CM-LOOP、CM-MEMORY、CM-WORKSPACE 在 Run 创建时读取并冻结摘要，运行期不热加载。
 - 资源正文和高层 payload 的未定业务字段保持最小边界，后续任务只能扩充已对齐的契约变更，并需追加记录。

@@ -21,8 +21,8 @@ CodeMigrator V6 代码实现从 Wave 0 启动，需要先建立所有下游子�
 
 ## 3. 自测与验证结果
 
-- 首轮 `PYTHONPATH=src:/tmp/codemigrator-core-venv/lib/python3.12/site-packages python3 -m pytest tests/core tests/contracts -q`：49 passed；第一轮审查修订后 53 passed；第二轮审查修订后的最终基线为 55 passed。
-- `PYTHONPATH=src:/tmp/codemigrator-core-venv/lib/python3.12/site-packages python3 -m compileall -q src/codemigrator/core`：通过。
+- 可复现基线命令 `PYTHONPATH=src /tmp/codemigrator-infra/.venv/bin/python -m pytest tests/core tests/contracts -q`：最终 55 passed（历史首轮 49 passed、第一轮审查修订后 53 passed）。
+- `PYTHONPATH=src /tmp/codemigrator-infra/.venv/bin/python -m compileall -q src tests`：通过。
 - `rg -n "runtime|os\.environ|asyncio\.create_task|threading" src/codemigrator/core`：命中 `runtime_image_digest` 描述符数据字段；经人工复核不是运行时依赖，其余无越界依赖命中。
 - 条款已覆盖：V6 契约新增、V5 四件工件、V-M00-V4-002、V-M00-V4-004、V-M00-V4-008、V-M00-V4-017、BranchPrefix、Phase policy exact-match、判别联合纪律。
 - import-linter/CI 未执行：工程基线与 CI 归 CM-INFRA-001；本任务以 compileall、pytest 和静态扫描替代验证。
@@ -34,6 +34,8 @@ CodeMigrator V6 代码实现从 Wave 0 启动，需要先建立所有下游子�
 - 资源测试不再声称存在独立 manifest 文件：`session-templates/v1.json` 对象本身承载十槽位 manifest，摘要针对解析后的 canonical payload。
 - 工程依赖登记仍由 `CM-INFRA-001` 负责；本任务未在 core 分支新增第二套 `pyproject.toml` 或锁文件。
 - 后续独立审查发现并修复：`PlanEdge` 默认 alias 序列化、semver 字符串输入/JSON Schema、路径列表 malformed container 的 Pydantic 错误语义、`validate_candidate_generation` facade 导出，以及 `MODEL_BINDING_INVALID`、`PHASE_STATUS_MISMATCH`、`CANDIDATE_REF_CONFLICT`、`REMOTE_REF_MOVED`、`DEPENDENCY_UNAVAILABLE` 五个架构引用码。
+- 文档收口补充：`SourceToolchain.runtime_image_digest` 是 CM-VERIFY-001 D-06 已确认的 parity 源端运行时镜像可选字段，属于跨任务契约扩展；M-00/M-01 正文尚未回填，后续由 CM-VERIFY-001 实施联动负责同步与验收，本任务保留字段并登记该差异。
+- Pydantic 兼容性修订：PlanEdge 不依赖 Pydantic 2.11 的 `serialize_by_alias` 配置，改用 v2 通用 model serializer；因此不需在 core 任务额外设定 Pydantic 最低版本，JSON alias 由回归测试锁定。
 
 ## 4. 影响面与风险
 
