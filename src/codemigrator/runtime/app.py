@@ -107,6 +107,7 @@ class AppLifecycle:
     write_count: int = 0
     shutdown_requested: bool = False
     last_error: str | None = None
+    readiness_check: Callable[[], bool] | None = None
 
     @property
     def ready(self) -> bool:
@@ -123,6 +124,19 @@ class AppLifecycle:
         if not acquired:
             self.state = AppState.Exited
             return
+        if self.readiness_check is not None:
+            try:
+                ready = self.readiness_check()
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                self.lock.release()
+                self.state = AppState.Exited
+                return
+            if not ready:
+                self.last_error = "ObservationSentinelFailed"
+                self.lock.release()
+                self.state = AppState.Exited
+                return
         self.write_count += 1
         self.state = AppState.Ready
 
@@ -153,6 +167,7 @@ class AsyncAppLifecycle:
     state: AppState = AppState.NotReady
     shutdown_requested: bool = False
     last_error: str | None = None
+    readiness_check: Callable[[], bool | Awaitable[bool]] | None = None
 
     @property
     def ready(self) -> bool:
@@ -177,6 +192,21 @@ class AsyncAppLifecycle:
             await self.lock.release()
             self.state = AppState.Exited
             return
+        if self.readiness_check is not None:
+            try:
+                ready = self.readiness_check()
+                if isinstance(ready, Awaitable):
+                    ready = await ready
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                await self.lock.release()
+                self.state = AppState.Exited
+                return
+            if not ready:
+                self.last_error = "ObservationSentinelFailed"
+                await self.lock.release()
+                self.state = AppState.Exited
+                return
         self.state = AppState.Ready
 
     async def lock_connection_lost(self) -> None:

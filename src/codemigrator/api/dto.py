@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -12,6 +12,7 @@ from codemigrator.core import (
     CheckAction,
     DeliveryChannelStatus,
     RunStatus,
+    SecretRegistry,
     SliceAttemptStatus,
     SliceKind,
 )
@@ -238,15 +239,19 @@ class MigrationEvent(ApiModel):
         record: object,
         *,
         data: dict[str, object] | None = None,
+        secret_registry: SecretRegistry | None = None,
     ) -> MigrationEvent:
         from .deps import EventRecord
 
         if not isinstance(record, EventRecord):
             raise TypeError("record must use EventRecord")
+        event_data = record.data if data is None else data
+        if secret_registry is not None:
+            event_data = _redact_event_data(event_data, secret_registry)
         return cls(
             schema="migration.event",
             type=record.event_type,
-            data=record.data if data is None else data,
+            data=event_data,
             sequence=record.sequence,
             timestamp_utc=record.timestamp_utc,
         )
@@ -302,53 +307,39 @@ class SessionEvent(ApiModel):
         record: object,
         *,
         data: dict[str, object] | None = None,
+        secret_registry: SecretRegistry | None = None,
     ) -> SessionEvent:
         from .deps import EventRecord
 
         if not isinstance(record, EventRecord):
             raise TypeError("record must use EventRecord")
+        event_data = record.data if data is None else data
+        if secret_registry is not None:
+            event_data = _redact_event_data(event_data, secret_registry)
         return cls(
             schema="migration.session.event",
             type=record.event_type,
-            data=record.data if data is None else data,
+            data=event_data,
             sequence=record.sequence,
             timestamp_utc=record.timestamp_utc,
         )
 
 
-_REDACTION_KEYS = frozenset(
-    {
-        "api_key",
-        "authorization",
-        "content",
-        "cookie",
-        "credential",
-        "database_url",
-        "new_text",
-        "old_text",
-        "password",
-        "path",
-        "private_key",
-        "prompt",
-        "secret",
-        "source",
-        "source_code",
-        "stderr",
-        "stdout",
-        "token",
-    }
-)
+_PUBLIC_REDACTION_REGISTRY = SecretRegistry()
 
 
 def _assert_redacted(value: object) -> None:
-    if isinstance(value, dict):
-        for key, nested in value.items():
-            if str(key).lower() in _REDACTION_KEYS:
-                raise ValueError("event data must be redacted")
-            _assert_redacted(nested)
-    elif isinstance(value, (list, tuple)):
-        for nested in value:
-            _assert_redacted(nested)
+    if not _PUBLIC_REDACTION_REGISTRY.redact(value).accepted:
+        raise ValueError("event data must be redacted")
+
+
+def _redact_event_data(
+    value: dict[str, object], secret_registry: SecretRegistry
+) -> dict[str, object]:
+    result = secret_registry.redact(value)
+    if not result.accepted or not isinstance(result.value, dict):
+        raise ValueError("event data must be redacted")
+    return cast(dict[str, object], result.value)
 
 
 __all__ = [

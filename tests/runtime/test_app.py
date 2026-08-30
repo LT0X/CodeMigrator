@@ -73,6 +73,19 @@ async def test_async_composition_root_recovers_before_readiness():
     await app.stop()
 
 
+@pytest.mark.asyncio
+async def test_async_composition_root_stays_not_ready_when_readiness_check_fails():
+    lock = AsyncLock()
+    app = AsyncAppLifecycle(lock, readiness_check=lambda: False)
+
+    await app.start()
+
+    assert app.ready is False
+    assert app.state is AppState.Exited
+    assert app.last_error == "ObservationSentinelFailed"
+    assert lock.acquired is False
+
+
 def test_entrypoint_requires_environment_dsn(monkeypatch):
     monkeypatch.delenv("CODEMIGRATOR_DATABASE_URL", raising=False)
     assert run_from_environment() == 1

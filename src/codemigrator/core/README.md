@@ -15,3 +15,7 @@
 ## 公共入口
 
 从 `codemigrator.core` 导出公共类型和策略加载器。
+
+## 观测契约
+
+`SecretRegistry` 是跨 API、日志、事件和 exporter 的只写脱敏契约，负责四种编码扫描、敏感字段结构过滤和 fail-closed 结果；它不提供 secret 枚举或读回能力。`CORE_METRIC_DESCRIPTORS` 发布八项固定指标的名称、标签值域、Histogram bucket 和 descriptor hash，诊断指标与核心集合分离，避免运行时装配改变公共契约。

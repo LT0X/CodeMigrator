@@ -58,6 +58,19 @@ from .ids import (
 )
 from .models import *
 from .models import __all__ as _MODEL_EXPORTS
+from .observability import (
+    CORE_METRIC_DESCRIPTOR_HASH,
+    CORE_METRIC_DESCRIPTOR_SET,
+    CORE_METRIC_DESCRIPTORS,
+    DIAGNOSTIC_METRIC_DESCRIPTORS,
+    MetricDescriptor,
+    MetricKind,
+    MetricLabel,
+    canonical_metric_descriptors,
+    descriptor_for,
+    exporter_series_ceiling,
+    logical_labelset_count,
+)
 from .paths import (
     canonical_json_bytes,
     integration_key,
@@ -78,6 +91,7 @@ from .ports import (
     InMemoryDescriptorRegistry,
     SpecRepository,
 )
+from .secrets import FORBIDDEN_FIELDS, RedactionResult, SecretRegistry
 from .spec import (
     InMemorySpecRepository,
     LimitedProblems,
@@ -99,13 +113,18 @@ __all__ = [
     "CheckAction",
     "CheckStatus",
     "CandidateGeneration",
+    "CORE_METRIC_DESCRIPTOR_HASH",
+    "CORE_METRIC_DESCRIPTOR_SET",
+    "CORE_METRIC_DESCRIPTORS",
     "CorrectionIntentStatus",
     "DeliveryChannelStatus",
     "DiagnosticSeverity",
     "DossierBudgetTier",
     "DescriptorRegistry",
     "DescriptorResolution",
+    "DIAGNOSTIC_METRIC_DESCRIPTORS",
     "FailureReason",
+    "FORBIDDEN_FIELDS",
     "InteractionStatus",
     "MigrationSessionStatus",
     "ModelProfile",
@@ -118,6 +137,9 @@ __all__ = [
     "InMemoryDescriptorRegistry",
     "InMemorySpecRepository",
     "LimitedProblems",
+    "MetricDescriptor",
+    "MetricKind",
+    "MetricLabel",
     "SessionKind",
     "SliceAttemptStatus",
     "SliceKind",
@@ -171,6 +193,12 @@ __all__ += [
     "SpecRecord",
     "SpecRepository",
     "SpecValidationResult",
+    "RedactionResult",
+    "SecretRegistry",
+    "canonical_metric_descriptors",
+    "descriptor_for",
+    "exporter_series_ceiling",
+    "logical_labelset_count",
 ]
 
 __all__ += _MODEL_EXPORTS
