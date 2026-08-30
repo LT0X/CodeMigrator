@@ -27,6 +27,18 @@ _TRIGGER_REASONS = {
     SupervisorAdviceKind.RepairDecision: "AMBIGUOUS_ATTRIBUTION_CANDIDATES",
     SupervisorAdviceKind.RouteSuggestion: "SLICE_SESSION_STOPPED",
 }
+_ADOPTION_RESULTS = frozenset(
+    {
+        "AUTO_ADOPTED",
+        "CONFIRMATION_REQUIRED",
+        "DISCARDED",
+        "DUPLICATE",
+        "MECHANICAL_REDUCTION",
+        "REJECTED",
+        "RUN_ID_MISMATCH",
+        "CONFIRMED",
+    }
+)
 
 
 def _text_tuple(value: object, name: str) -> tuple[str, ...]:
@@ -260,8 +272,8 @@ def build_repair_decision_event(advice: Advice) -> EventSpec:
 def build_adopted_event(advice: Advice, adoption_result: str, impact_summary: str) -> EventSpec:
     """Build a redacted actor-owned adoption event; Supervisor never emits it."""
 
-    if not isinstance(adoption_result, str) or not adoption_result.strip():
-        raise ValueError("adoption_result must be non-empty text")
+    if adoption_result not in _ADOPTION_RESULTS:
+        raise ValueError("adoption_result must be a known status")
     if not isinstance(impact_summary, str):
         raise TypeError("impact_summary must be text")
     _require_valid_hash(advice)
@@ -284,13 +296,19 @@ def supervisor_triggers(
     *,
     candidate_slice_ids: frozenset[str],
     session_failed_and_stopped: bool,
+    dynamic_tests_all_failed: bool | None = None,
     trigger_event_refs: tuple[str, ...] = (),
     target_slice_id: str | None = None,
 ) -> tuple[SupervisorTrigger, ...]:
     """Return only the two mechanically defined trigger conditions."""
 
+    if dynamic_tests_all_failed is not None and type(dynamic_tests_all_failed) is not bool:
+        raise TypeError("dynamic_tests_all_failed must be a boolean when supplied")
     triggers: list[SupervisorTrigger] = []
-    if len(candidate_slice_ids) > 1:
+    repair_triggered = len(candidate_slice_ids) > 1 and (
+        dynamic_tests_all_failed is None or dynamic_tests_all_failed
+    )
+    if repair_triggered:
         triggers.append(
             SupervisorTrigger(
                 SupervisorAdviceKind.RepairDecision,

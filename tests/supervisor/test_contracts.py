@@ -29,6 +29,27 @@ def test_only_two_event_trigger_reasons_are_admitted() -> None:
     }
 
 
+def test_repair_trigger_requires_dynamic_tests_to_all_fail_when_supplied() -> None:
+    assert (
+        supervisor_triggers(
+            candidate_slice_ids=frozenset({"a", "b"}),
+            session_failed_and_stopped=False,
+            dynamic_tests_all_failed=False,
+        )
+        == ()
+    )
+    assert (
+        len(
+            supervisor_triggers(
+                candidate_slice_ids=frozenset({"a", "b"}),
+                session_failed_and_stopped=False,
+                dynamic_tests_all_failed=True,
+            )
+        )
+        == 1
+    )
+
+
 def test_trigger_carries_event_refs_and_optional_target_slice() -> None:
     slice_id = str(uuid4())
     trigger = SupervisorTrigger(

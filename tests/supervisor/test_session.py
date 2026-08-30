@@ -12,6 +12,7 @@ from codemigrator.core import (
     RepairEvidence,
     RunStatus,
 )
+from codemigrator.runtime.budget import BudgetLimits, RunWallet
 from codemigrator.runtime.provider import (
     ProviderRequest,
     ProviderResponse,
@@ -64,12 +65,19 @@ def _repair_projection() -> tuple[SupervisorProjection, tuple[object, object]]:
     )
 
 
-def _response(content: str, *, tool_calls=()) -> ProviderResponse:
+def _response(
+    content: str,
+    *,
+    tool_calls=(),
+    finish_reason: str = "stop",
+    input_tokens: int = 2,
+    output_tokens: int = 3,
+) -> ProviderResponse:
     return ProviderResponse(
         content=content,
         tool_calls=tool_calls,
-        finish_reason="stop",
-        usage=TokenUsage(input_tokens=2, output_tokens=3),
+        finish_reason=finish_reason,
+        usage=TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens),
     )
 
 
@@ -106,6 +114,26 @@ class ClosedBudget:
         return False
 
 
+class FlippingCancellation:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def allow(self, _identity: object) -> bool:
+        self.calls += 1
+        return self.calls == 1
+
+
+class BlockingProvider:
+    def __init__(self) -> None:
+        self.request: ProviderRequest | None = None
+
+    async def complete(self, request: ProviderRequest) -> ProviderResponse:
+        self.request = request
+        assert request.cancellation is not None
+        await request.cancellation.wait()
+        raise AssertionError("the Supervisor should cancel the provider task")
+
+
 @pytest.mark.asyncio
 async def test_session_uses_one_execute_supervisor_call_with_no_tools() -> None:
     provider = FakeProvider(
@@ -133,6 +161,56 @@ async def test_session_uses_one_execute_supervisor_call_with_no_tools() -> None:
     assert provider.requests[0].tools == ()
     assert advice_sink.values == [result.advice]
     assert [event.event_type for event in event_sink.values] == ["advice.proposed"]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_is_propagated_to_provider_and_blocks_late_advice() -> None:
+    provider = BlockingProvider()
+    result = await SupervisorSession(provider=provider, cancellation=FlippingCancellation()).run(
+        make_spec(),
+        SupervisorTrigger(
+            SupervisorAdviceKind.RouteSuggestion,
+            "SLICE_SESSION_STOPPED",
+            trigger_event_refs=("event-1",),
+        ),
+        _projection(),
+    )
+
+    assert result.advice is None
+    assert result.fallback == "MECHANICAL_REDUCTION"
+    assert provider.request is not None
+    assert provider.request.cancellation is not None
+    assert provider.request.cancellation.cancelled
+
+
+@pytest.mark.asyncio
+async def test_each_supervisor_call_has_a_unique_budget_receipt_id() -> None:
+    response = _response(
+        '{"trigger_event_refs":["event-1"],"failure_class":"TEST_FAILURE",'
+        '"suggested_route":"clarify","target_slice_id":null,"rationale":"need input"}',
+        input_tokens=1,
+    )
+    provider = FakeProvider(response)
+    wallet = RunWallet(BudgetLimits(input_tokens=3, output_tokens=10, cost_micros=10))
+    session = SupervisorSession(provider=provider, budget=wallet)
+    spec = make_spec()
+    trigger = SupervisorTrigger(
+        SupervisorAdviceKind.RouteSuggestion,
+        "SLICE_SESSION_STOPPED",
+        trigger_event_refs=("event-1",),
+    )
+
+    first = await session.run(spec, trigger, _projection())
+    provider.response = _response(
+        '{"trigger_event_refs":["event-1"],"failure_class":"TEST_FAILURE",'
+        '"suggested_route":"clarify","target_slice_id":null,"rationale":"need input"}',
+        input_tokens=1,
+    )
+    second = await session.run(spec, trigger, _projection())
+
+    assert first.advice is not None and second.advice is not None
+    assert wallet.usage.input_tokens == 2
+    assert len(provider.requests) == 2
 
 
 @pytest.mark.asyncio
@@ -247,6 +325,45 @@ async def test_natural_language_or_native_tool_output_is_rejected() -> None:
     )
     assert native_result.advice is None
     assert native_result.fallback == "MECHANICAL_REDUCTION"
+
+
+@pytest.mark.asyncio
+async def test_truncated_provider_output_is_not_advice() -> None:
+    provider = FakeProvider(
+        _response(
+            '{"trigger_event_refs":["event-1"],"failure_class":"TEST_FAILURE",'
+            '"suggested_route":"clarify","target_slice_id":null,"rationale":"need input"}',
+            finish_reason="length",
+        )
+    )
+    result = await SupervisorSession(provider=provider).run(
+        make_spec(),
+        SupervisorTrigger(
+            SupervisorAdviceKind.RouteSuggestion,
+            "SLICE_SESSION_STOPPED",
+            trigger_event_refs=("event-1",),
+        ),
+        _projection(),
+    )
+    assert result.advice is None
+    assert result.fallback == "MECHANICAL_REDUCTION"
+
+
+@pytest.mark.asyncio
+async def test_route_output_requires_actor_supplied_event_refs() -> None:
+    provider = FakeProvider(
+        _response(
+            '{"trigger_event_refs":["forged-event"],"failure_class":"TEST_FAILURE",'
+            '"suggested_route":"clarify","target_slice_id":null,"rationale":"need input"}'
+        )
+    )
+    result = await SupervisorSession(provider=provider).run(
+        make_spec(),
+        SupervisorTrigger(SupervisorAdviceKind.RouteSuggestion, "SLICE_SESSION_STOPPED"),
+        _projection(),
+    )
+    assert result.advice is None
+    assert result.fallback == "MECHANICAL_REDUCTION"
 
 
 @pytest.mark.asyncio

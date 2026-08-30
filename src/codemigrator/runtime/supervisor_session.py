@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -25,13 +27,21 @@ from .advice import advice_proposal_hash
 from .binding import ContextOverflowError, ensure_context_fits, validate_session_admission
 from .context import prompt_text, render_prompt
 from .contracts import EventSpec
-from .loop import BudgetGate, CancellationGate, CancellationToken, SessionProvenance, UsageSink
+from .loop import (
+    BudgetGate,
+    CancellationGate,
+    CancellationToken,
+    SessionCancelled,
+    SessionProvenance,
+    UsageSink,
+)
 from .loop_contracts import SessionSpec
 from .provider import (
     AsyncProvider,
     ProviderCallIdentity,
     ProviderError,
     ProviderRequest,
+    ProviderResponse,
     UsageReceipt,
 )
 from .supervisor import (
@@ -122,7 +132,9 @@ def _parse_route(data: Mapping[str, object], trigger: SupervisorTrigger) -> Rout
     if set(data) != expected:
         raise _ProtocolError("RouteSuggestion fields are not exact")
     refs = tuple(_string_list(data["trigger_event_refs"], "trigger_event_refs"))
-    if trigger.trigger_event_refs and refs != trigger.trigger_event_refs:
+    if not trigger.trigger_event_refs:
+        raise _ProtocolError("RouteSuggestion trigger has no actor event refs")
+    if refs != trigger.trigger_event_refs:
         raise _ProtocolError("RouteSuggestion event refs do not match trigger")
     target = data["target_slice_id"]
     if target is not None and not isinstance(target, str):
@@ -244,16 +256,20 @@ class SupervisorSession:
             return self._fallback("invalid_identity", failure=self._failure(exc))
 
         token = CancellationToken.create()
-        call_id = f"{spec.identity.run_id}:supervisor"
+        call_id = f"{spec.identity.run_id}:supervisor:{new_uuid7()}"
         try:
-            response = await self.provider.complete(
+            response = await self._provider_call(
                 ProviderRequest(
                     binding=spec.binding,
                     messages=messages,
                     tools=(),
                     cancellation=token,
-                )
+                ),
+                spec,
+                token,
             )
+        except SessionCancelled:
+            return self._fallback("cancelled")
         except ProviderError as exc:
             return self._fallback("cancelled" if exc.cancelled else "provider_error")
         except Exception:
@@ -264,6 +280,12 @@ class SupervisorSession:
             return self._fallback("cancelled")
         if response.tool_calls:
             return self._fallback("protocol_error", failure="native tool calls are forbidden")
+        if response.finish_reason not in {"stop", "end_turn"}:
+            return self._fallback(
+                "protocol_error", failure="Supervisor response did not end normally"
+            )
+        if not await self._allowed(spec):
+            return self._fallback("cancelled")
 
         receipt = UsageReceipt(
             run_id=spec.identity.run_id,
@@ -282,20 +304,28 @@ class SupervisorSession:
                 await self.usage_sink.record(spec.identity.run_id, response.usage, receipt)
             if self.budget is not None and not await self.budget.record(receipt):
                 return self._fallback("budget_closed")
+            if not await self._allowed(spec):
+                return self._fallback("cancelled")
             advice = _parse_advice(response.content, spec, trigger, projection)
         except _ProtocolError as exc:
             return self._fallback("protocol_error", failure=str(exc))
         except Exception as exc:
             return self._fallback("protocol_error", failure=self._failure(exc))
 
+        if not await self._allowed(spec):
+            return self._fallback("cancelled")
         events = [build_proposed_event(advice)]
         if advice.kind is AdviceKind.RepairDecision:
             events.append(build_repair_decision_event(advice))
         try:
             if self.event_sink is not None:
                 for event in events:
+                    if not await self._allowed(spec):
+                        return self._fallback("cancelled")
                     await self.event_sink.append(event)
             if self.advice_sink is not None:
+                if not await self._allowed(spec):
+                    return self._fallback("cancelled")
                 await self.advice_sink.publish(advice)
         except Exception as exc:
             return SupervisorResult(
@@ -305,6 +335,53 @@ class SupervisorSession:
                 failure=f"delivery_error: {self._failure(exc)}",
             )
         return SupervisorResult(advice=advice, events=tuple(events))
+
+    async def _provider_call(
+        self,
+        request: ProviderRequest,
+        spec: SessionSpec,
+        token: CancellationToken,
+    ) -> ProviderResponse:
+        if self.cancellation is None:
+            return await self.provider.complete(request)
+        provider_task = asyncio.create_task(self.provider.complete(request))
+        watch_task = asyncio.create_task(self._watch_cancellation(spec, token))
+        try:
+            done, _ = await asyncio.wait(
+                (provider_task, watch_task), return_when=asyncio.FIRST_COMPLETED
+            )
+            if watch_task in done and provider_task not in done:
+                provider_task.cancel()
+                await asyncio.gather(provider_task, return_exceptions=True)
+                raise SessionCancelled("Supervisor cancellation was requested")
+            return provider_task.result()
+        finally:
+            if not watch_task.done():
+                watch_task.cancel()
+            await asyncio.gather(watch_task, return_exceptions=True)
+
+    async def _watch_cancellation(self, spec: SessionSpec, token: CancellationToken) -> None:
+        if self.cancellation is None:
+            return
+        while not token.cancelled:
+            if not await self.cancellation.allow(spec.identity):
+                token.cancel()
+                await self._notify_cancel(spec)
+                return
+            await asyncio.sleep(0.01)
+
+    async def _notify_cancel(self, spec: SessionSpec) -> None:
+        if self.cancellation is None:
+            return
+        cancel = getattr(self.cancellation, "cancel", None)
+        if cancel is None:
+            return
+        result = cancel(spec.identity)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _allowed(self, spec: SessionSpec) -> bool:
+        return True if self.cancellation is None else await self.cancellation.allow(spec.identity)
 
     @staticmethod
     def _validate_supervisor_identity(spec: SessionSpec) -> None:

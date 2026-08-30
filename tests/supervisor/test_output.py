@@ -98,3 +98,13 @@ def test_event_helper_rejects_tampered_proposal_hash() -> None:
     tampered = advice.model_copy(update={"proposal_hash": "f" * 64})
     with pytest.raises(ValueError, match="proposal_hash"):
         build_proposed_event(tampered)
+
+
+def test_adopted_event_rejects_free_form_result_that_could_contain_secret_text() -> None:
+    advice = _advice(
+        RouteSuggestion(
+            ("event-1",), "TEST_FAILURE", SuggestedRoute.Clarify, None, "need input"
+        ).to_payload()
+    )
+    with pytest.raises(ValueError, match="adoption_result"):
+        build_adopted_event(advice, "secret=/workspace/private.py", "impact")
