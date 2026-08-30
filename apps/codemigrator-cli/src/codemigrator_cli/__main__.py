@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
+from .cancel import CancelAction, CancelController
 from .client import (
     EventSource,
     HttpRunControl,
@@ -17,7 +19,7 @@ from .client import (
 from .exit_codes import ExitCode
 from .http import HttpEventSource
 from .models import RunEvent
-from .projector import project_events
+from .projector import project_events, safe_data
 from .renderer import render_human, render_json, render_jsonl
 
 
@@ -26,7 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     migrate = subparsers.add_parser("migrate", help="迁移操作")
     migrate_sub = migrate.add_subparsers(dest="migrate_command", required=True)
-    start = migrate_sub.add_parser("start", help="创建并观察一个 mock Run")
+    start = migrate_sub.add_parser("start", help="运行本地确定性迁移演示")
     start.add_argument("spec")
     _add_output_flags(start)
     run = subparsers.add_parser("run", help="Run 操作")
@@ -113,7 +115,11 @@ def _status_exit(status: object) -> int:
 
 
 def run_command(
-    argv: Sequence[str], *, source: EventSource | None = None, control: RunControl | None = None
+    argv: Sequence[str],
+    *,
+    source: EventSource | None = None,
+    control: RunControl | None = None,
+    on_event: Callable[[RunEvent], None] | None = None,
 ) -> tuple[int, str]:
     args = _parser().parse_args(list(argv))
     run_control = control or _configured_run_control()
@@ -129,14 +135,7 @@ def run_command(
         try:
             cancel_payload = run_control.cancel(args.run_id, args.if_match)
         except StaleVersionError:
-            try:
-                latest = run_control.show(args.run_id)
-                latest_version = latest.get("version")
-                if type(latest_version) is not int:
-                    raise ValueError("latest Run version is invalid")
-                cancel_payload = run_control.cancel(args.run_id, latest_version)
-            except Exception:
-                cancel_payload = {"run_id": args.run_id, "status": "UNKNOWN"}
+            cancel_payload = {"run_id": args.run_id, "status": "STALE_VERSION"}
         except Exception:
             cancel_payload = {"run_id": args.run_id, "status": "UNKNOWN"}
         return _status_exit(cancel_payload.get("status")), _render_payload(
@@ -145,7 +144,10 @@ def run_command(
     if args.no_follow and args.command == "migrate":
         return int(ExitCode.COMPLETED), _render_start(args.output)
     try:
-        events: Iterable[RunEvent] = (source or _configured_event_source(args)).events()
+        events: Iterable[RunEvent] = _observe_events(
+            source or _configured_event_source(args),
+            on_event=on_event if args.output == "human" else None,
+        )
         if args.output == "jsonl":
             event_list = list(events)
             projection = project_events(event_list)
@@ -159,6 +161,15 @@ def run_command(
         if args.command == "run":
             error_payload["run_id"] = args.run_id
         return int(ExitCode.UNKNOWN), _render_payload(error_payload, args.output)
+
+
+def _observe_events(
+    source: EventSource, *, on_event: Callable[[RunEvent], None] | None
+) -> Iterable[RunEvent]:
+    for event in source.events():
+        if on_event is not None:
+            on_event(event)
+        yield event
 
 
 def _configured_run_control() -> RunControl:
@@ -177,6 +188,53 @@ def _configured_event_source(args: argparse.Namespace) -> EventSource:
     return MockEventSource()
 
 
+class _CancelConfirmed(Exception):
+    """Stop an interactive watch after the API persisted cancellation."""
+
+
+def _interrupt_run_id(arguments: Sequence[str]) -> str | None:
+    parsed = _parser().parse_args(list(arguments))
+    if parsed.command == "run" and parsed.run_command == "watch":
+        run_id = parsed.run_id
+        return run_id if isinstance(run_id, str) else None
+    if parsed.command == "migrate" and parsed.migrate_command == "start":
+        return "mock-run-001"
+    return None
+
+
+def _request_interrupt_cancel(
+    control: RunControl, run_id: str, controller: CancelController, output: str
+) -> None:
+    try:
+        current = control.show(run_id)
+        version = current.get("version")
+        if type(version) is not int or version < 0:
+            raise ValueError("Run version is invalid")
+        payload = control.cancel(run_id, version)
+    except StaleVersionError:
+        sys.stderr.write("取消请求使用的 Run 版本已过期，请重新读取版本后再操作。\n")
+        return
+    except Exception:
+        sys.stderr.write("无法提交取消请求；Run 状态保持未知。\n")
+        return
+    status = payload.get("status")
+    if isinstance(status, str):
+        controller.observe(status)
+    if controller.confirmed:
+        sys.stdout.write(_render_payload(payload, output))
+        sys.stdout.flush()
+        raise _CancelConfirmed
+    sys.stderr.write("取消请求已提交，正在等待 Run actor 的持久化确认。\n")
+
+
+def _render_process_event(event: RunEvent) -> None:
+    data = safe_data(event.data)
+    target = data.get("slice_id", data.get("sliceId"))
+    suffix = f" · {target}" if isinstance(target, str) else ""
+    sys.stdout.write(f"#{event.sequence} {event.type}{suffix}\n")
+    sys.stdout.flush()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(argv if argv is not None else sys.argv[1:])
     is_observer = len(arguments) >= 2 and tuple(arguments[:2]) in {
@@ -190,7 +248,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         and "--no-follow" not in arguments
     ):
         arguments.append("--no-follow")
-    code, output = run_command(arguments)
+    control = _configured_run_control()
+    controller = CancelController()
+    run_id = _interrupt_run_id(arguments) if is_observer else None
+
+    def handle_interrupt(signum: int, frame: object) -> None:
+        del signum, frame
+        if controller.interrupt() is CancelAction.EXIT:
+            raise KeyboardInterrupt
+        if run_id is None:
+            sys.stderr.write("已收到取消请求，但当前命令没有可取消的 Run。\n")
+            return
+        _request_interrupt_cancel(control, run_id, controller, "human")
+
+    previous_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, handle_interrupt)
+    try:
+        code, output = run_command(
+            arguments,
+            control=control,
+            on_event=_render_process_event if "--follow" in arguments else None,
+        )
+    except _CancelConfirmed:
+        return int(ExitCode.LOCAL_CANCEL_CONFIRMED)
+    except KeyboardInterrupt:
+        return int(ExitCode.LOCAL_CANCEL_CONFIRMED if controller.confirmed else ExitCode.UNKNOWN)
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
     sys.stdout.write(output)
     return code
 

@@ -42,6 +42,10 @@ function DemoWorkspace() {
   );
 }
 
+function RouteNotFound() {
+  return <main className="app-shell"><section className="page-panel page-diagnostic" role="status"><span className="eyebrow">404 / 页面不存在</span><h1>没有可展示的运行事实</h1><p className="diagnostic">请检查地址，或从 Run 首页进入已提交的运行投影。</p><a href="/">返回 Run 首页</a></section></main>;
+}
+
 export function App() {
   const path = window.location.pathname;
   const client = useMemo(() => createApiClient(), []);
@@ -57,5 +61,5 @@ export function App() {
   const runMatch = path.match(/^\/runs\/([^/]+)$/);
   if (runMatch) return <LiveRunView client={client} runId={runMatch[1]} />;
   if (path.startsWith("/sessions/")) return <SessionInputView sessionId={path.split("/").at(-1) ?? "new"} client={client} />;
-  return <DemoWorkspace />;
+  return <RouteNotFound />;
 }

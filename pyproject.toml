@@ -41,7 +41,7 @@ dev = [
 packages = ["src/codemigrator"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "apps/codemigrator-cli/tests"]
 addopts = "-ra"
 
 [tool.ruff]

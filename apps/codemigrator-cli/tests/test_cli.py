@@ -5,7 +5,7 @@ import json
 import pytest
 from codemigrator_cli.__main__ import run_command
 from codemigrator_cli.cancel import CancelAction, CancelController
-from codemigrator_cli.client import HttpRunControl
+from codemigrator_cli.client import HttpRunControl, StaleVersionError
 from codemigrator_cli.exit_codes import ExitCode
 from codemigrator_cli.http import HttpEventSource, _event_from_lines
 from codemigrator_cli.models import RunEvent
@@ -143,6 +143,34 @@ def test_run_cancel_uses_if_match_and_returns_cancel_exit_code() -> None:
     code, output = run_command(["run", "cancel", "run-1", "--if-match", "8", "--output", "json"])
     assert code == 4
     assert json.loads(output) == {"run_id": "run-1", "status": "CANCELLED", "version": 9}
+
+
+def test_run_cancel_does_not_retry_after_stale_if_match() -> None:
+    class StaleControl:
+        def __init__(self) -> None:
+            self.show_calls = 0
+            self.cancel_calls: list[int] = []
+
+        def show(self, run_id: str) -> dict[str, object]:
+            del run_id
+            self.show_calls += 1
+            return {"run_id": "run-1", "status": "EXECUTING", "version": 9}
+
+        def cancel(self, run_id: str, expected_version: int) -> dict[str, object]:
+            del run_id
+            self.cancel_calls.append(expected_version)
+            raise StaleVersionError("stale")
+
+    control = StaleControl()
+    code, output = run_command(
+        ["run", "cancel", "run-1", "--if-match", "8", "--output", "json"],
+        control=control,
+    )
+
+    assert code == int(ExitCode.UNKNOWN)
+    assert json.loads(output) == {"run_id": "run-1", "status": "STALE_VERSION"}
+    assert control.cancel_calls == [8]
+    assert control.show_calls == 0
 
 
 def test_sse_transport_accepts_only_the_versioned_event_shape() -> None:
