@@ -151,6 +151,14 @@ SSE 从已提交事件账本读取数据，`Last-Event-ID` 只作为严格的回
 - PostgreSQL 保存控制面事实；大对象通过受控 ArtifactRef 引用，不能凭任意引用读取正文。
 - 内部设计资料、对齐记录、凭证、参考工程和临时资料不属于发布内容。
 
+## 可观测性与运行证据
+
+CodeMigrator 的观测链路以“可重建关键事实、不给敏感正文增加泄漏面”为边界。事件、日志、SSE、问题详情、工具输出摘要、报告引用和指标 exemplar 在进入出口前统一经过只写入的 `SecretRegistry`：注册值及其 JSON 转义、Base64、百分号编码均会被扫描，敏感字段结构也会被拒绝。脱敏失败采用 fail-closed 策略，原始 payload 不进入任何 sink。
+
+默认运行不依赖 Prometheus、Grafana、Jaeger 或对象存储等外部观测服务。进程内提供八项固定核心指标、60 秒 JSON 快照、结构化 JSONL 日志和固定的迁移 Run/Phase/Slice trace 语义；本地日志按 64 MiB 分段并写入 SHA-256 校验旁车文件，单条事件超过 64 KiB 时仅保留受控 ArtifactRef、摘要哈希和大小。可选 exporter 使用有界队列，积压或故障只丢弃观测投影，不阻塞领域事务、不改变迁移终态。
+
+指标采用静态名称和有限标签值域，核心 descriptor 集合、哈希、71 个 logical labelset 及 251 条 exporter series 上限保持稳定；运行 ID、Slice ID、路径、OID、URL、源码正文、完整提示词和凭据不进入指标标签。应用启动前和运行期间按出口执行脱敏哨兵检查，留存清理遵循执行工件、AST 派生索引及孤儿记录的既定时间边界。
+
 ## 运行环境
 
 - Python 3.12 或更高版本。

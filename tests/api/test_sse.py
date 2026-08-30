@@ -14,6 +14,7 @@ from codemigrator.api.sse import (
     SseQueueOverflowError,
     sse_events,
 )
+from codemigrator.core import SecretRegistry
 
 from .conftest import FakeBackend, event
 
@@ -125,4 +126,30 @@ async def test_session_sse_uses_session_event_envelope() -> None:
     encoded = first.encode().decode()
     assert "event: migration.session.event" in encoded
     assert '"schema":"migration.session.event"' in encoded
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sse_applies_the_runtime_secret_registry_before_projection() -> None:
+    backend = FakeBackend()
+    run_id = uuid4()
+    backend.events = [event(run_id, 1)]
+    registry = SecretRegistry()
+    registry.register("runtime-secret")
+    backend.events[0] = EventRecord(
+        run_id=run_id,
+        sequence=1,
+        event_type="tool.call.post",
+        data={"summary": "runtime-secret"},
+        timestamp_utc=datetime.now(UTC),
+    )
+    stream = sse_events(
+        backend,
+        run_id,
+        after_sequence=0,
+        secret_registry=registry,
+    )
+
+    with pytest.raises(ValueError, match="redacted"):
+        await anext(stream)
     await stream.aclose()

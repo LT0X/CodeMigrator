@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
 import asyncpg  # type: ignore[import-untyped]
+
+from codemigrator.core import SecretRegistry
+
+from .observability import DEFAULT_SENTINEL_SINKS, SentinelSuite
 
 
 class PostgreSQLUnavailable(ConnectionError):
@@ -107,6 +111,7 @@ class AppLifecycle:
     write_count: int = 0
     shutdown_requested: bool = False
     last_error: str | None = None
+    readiness_check: Callable[[], bool] | None = None
 
     @property
     def ready(self) -> bool:
@@ -123,6 +128,19 @@ class AppLifecycle:
         if not acquired:
             self.state = AppState.Exited
             return
+        if self.readiness_check is not None:
+            try:
+                ready = self.readiness_check()
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                self.lock.release()
+                self.state = AppState.Exited
+                return
+            if not ready:
+                self.last_error = "ObservationSentinelFailed"
+                self.lock.release()
+                self.state = AppState.Exited
+                return
         self.write_count += 1
         self.state = AppState.Ready
 
@@ -153,6 +171,7 @@ class AsyncAppLifecycle:
     state: AppState = AppState.NotReady
     shutdown_requested: bool = False
     last_error: str | None = None
+    readiness_check: Callable[[], bool | Awaitable[bool]] | None = None
 
     @property
     def ready(self) -> bool:
@@ -177,6 +196,21 @@ class AsyncAppLifecycle:
             await self.lock.release()
             self.state = AppState.Exited
             return
+        if self.readiness_check is not None:
+            try:
+                ready = self.readiness_check()
+                if isinstance(ready, Awaitable):
+                    ready = await ready
+            except Exception as exc:
+                self.last_error = type(exc).__name__
+                await self.lock.release()
+                self.state = AppState.Exited
+                return
+            if not ready:
+                self.last_error = "ObservationSentinelFailed"
+                await self.lock.release()
+                self.state = AppState.Exited
+                return
         self.state = AppState.Ready
 
     async def lock_connection_lost(self) -> None:
@@ -203,8 +237,30 @@ class RuntimeApplication:
     lifecycle: AsyncAppLifecycle
 
     @classmethod
-    def from_dsn(cls, dsn: str) -> RuntimeApplication:
-        return cls(AsyncAppLifecycle(PostgreSQLAdvisoryLock(dsn)))
+    def from_dsn(
+        cls,
+        dsn: str,
+        *,
+        secret_registry: SecretRegistry | None = None,
+        sentinel_outputs: Mapping[str, object] | None = None,
+    ) -> RuntimeApplication:
+        registry = secret_registry or SecretRegistry()
+        sentinel = SentinelSuite(registry)
+        outputs = (
+            dict(sentinel_outputs)
+            if sentinel_outputs is not None
+            else {sink: {} for sink in DEFAULT_SENTINEL_SINKS}
+        )
+
+        def readiness_check() -> bool:
+            return sentinel.run(outputs).passed
+
+        return cls(
+            AsyncAppLifecycle(
+                PostgreSQLAdvisoryLock(dsn),
+                readiness_check=readiness_check,
+            )
+        )
 
     async def run(self) -> int:
         await self.lifecycle.start()

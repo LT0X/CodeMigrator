@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import pytest
 
+from codemigrator.core import SecretRegistry
 from codemigrator.runtime.app import (
     AppLifecycle,
     AppState,
     AsyncAppLifecycle,
     InMemoryAdvisoryLock,
     PostgreSQLUnavailable,
+    RuntimeApplication,
     run_from_environment,
 )
 
@@ -71,6 +73,32 @@ async def test_async_composition_root_recovers_before_readiness():
     assert app.ready is True
     assert order == ["recovery"]
     await app.stop()
+
+
+@pytest.mark.asyncio
+async def test_async_composition_root_stays_not_ready_when_readiness_check_fails():
+    lock = AsyncLock()
+    app = AsyncAppLifecycle(lock, readiness_check=lambda: False)
+
+    await app.start()
+
+    assert app.ready is False
+    assert app.state is AppState.Exited
+    assert app.last_error == "ObservationSentinelFailed"
+    assert lock.acquired is False
+
+
+def test_production_composition_root_always_binds_observation_readiness():
+    registry = SecretRegistry()
+    registry.register("sentinel-secret")
+    application = RuntimeApplication.from_dsn(
+        "postgresql://localhost/codemigrator",
+        secret_registry=registry,
+        sentinel_outputs={"stdout": "sentinel-secret"},
+    )
+
+    assert application.lifecycle.readiness_check is not None
+    assert application.lifecycle.readiness_check() is False
 
 
 def test_entrypoint_requires_environment_dsn(monkeypatch):

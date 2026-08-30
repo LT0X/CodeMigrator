@@ -18,6 +18,7 @@ from codemigrator.core import (
     CreateRun,
     MigrationSpec,
     RemoteRepository,
+    SecretRegistry,
     canonical_json_bytes,
 )
 
@@ -105,15 +106,18 @@ def create_app(
     *,
     config: ApiConfig,
     connections: SseConnectionManager | None = None,
+    secret_registry: SecretRegistry | None = None,
 ) -> FastAPI:
     """Build an API app from runtime-owned ports and deployment configuration."""
 
     connection_manager = connections or SseConnectionManager(
         limit=config.max_sse_connections, queue_size=config.sse_queue_size
     )
+    redaction_registry = secret_registry or SecretRegistry()
     app = FastAPI(title="CodeMigrator API", version="1")
     app.state.backend = backend
     app.state.config = config
+    app.state.secret_registry = redaction_registry
 
     @app.middleware("http")
     async def enforce_body_limit(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -198,6 +202,7 @@ def create_app(
             payload=payload,
             body=body,
             status_code=201,
+            secret_registry=redaction_registry,
         )
 
     @app.post("/api/v1/migrations", status_code=201)
@@ -213,6 +218,7 @@ def create_app(
             payload=payload,
             body=_canonical_body(payload),
             status_code=201,
+            secret_registry=redaction_registry,
         )
 
     @app.delete("/api/v1/migrations/{run_id}")
@@ -233,6 +239,7 @@ def create_app(
             resource_id=run_id,
             expected_version=expected_version,
             require_key=False,
+            secret_registry=redaction_registry,
         )
 
     @app.get("/api/v1/migrations")
@@ -249,15 +256,28 @@ def create_app(
             "list_migrations",
             principal_id,
             query={"limit": str(limit), "cursor": cursor or ""},
+            secret_registry=redaction_registry,
         )
 
     @app.get("/api/v1/migrations/{run_id}")
     async def get_migration(run_id: UUID, principal_id: str = Depends(authenticate)) -> object:
-        return await _read(backend, "get_migration", principal_id, resource_id=run_id)
+        return await _read(
+            backend,
+            "get_migration",
+            principal_id,
+            resource_id=run_id,
+            secret_registry=redaction_registry,
+        )
 
     @app.get("/api/v1/migrations/{run_id}/workspace")
     async def get_workspace(run_id: UUID, principal_id: str = Depends(authenticate)) -> object:
-        return await _read(backend, "get_workspace", principal_id, resource_id=run_id)
+        return await _read(
+            backend,
+            "get_workspace",
+            principal_id,
+            resource_id=run_id,
+            secret_registry=redaction_registry,
+        )
 
     @app.get("/api/v1/migrations/{run_id}/events")
     async def migration_events(
@@ -282,6 +302,7 @@ def create_app(
                     after_sequence=after_sequence,
                     heartbeat_seconds=config.heartbeat_seconds,
                     queue_size=connection_manager.queue_size,
+                    secret_registry=redaction_registry,
                 ):
                     yield item
             finally:
@@ -291,7 +312,13 @@ def create_app(
 
     @app.get("/api/v1/migrations/{run_id}/report")
     async def get_report(run_id: UUID, principal_id: str = Depends(authenticate)) -> object:
-        return await _read(backend, "get_report", principal_id, resource_id=run_id)
+        return await _read(
+            backend,
+            "get_report",
+            principal_id,
+            resource_id=run_id,
+            secret_registry=redaction_registry,
+        )
 
     @app.get("/api/v1/migrations/{run_id}/evidence/{receipt_id}")
     async def get_evidence(
@@ -303,15 +330,26 @@ def create_app(
             principal_id,
             resource_id=run_id,
             query={"receipt_id": str(receipt_id)},
+            secret_registry=redaction_registry,
         )
 
     @app.get("/api/v1/descriptors")
     async def get_descriptors(principal_id: str = Depends(authenticate)) -> object:
-        return await _read(backend, "list_descriptors", principal_id)
+        return await _read(
+            backend,
+            "list_descriptors",
+            principal_id,
+            secret_registry=redaction_registry,
+        )
 
     @app.get("/api/v1/system/health")
     async def get_health(principal_id: str = Depends(authenticate)) -> object:
-        return await _read(backend, "health", principal_id)
+        return await _read(
+            backend,
+            "health",
+            principal_id,
+            secret_registry=redaction_registry,
+        )
 
     @app.post("/api/v1/projects/register", status_code=201)
     async def register_project(
@@ -327,11 +365,17 @@ def create_app(
             payload=payload,
             body=_canonical_body(payload),
             status_code=201,
+            secret_registry=redaction_registry,
         )
 
     @app.get("/api/v1/projects")
     async def list_projects(principal_id: str = Depends(authenticate)) -> object:
-        return await _read(backend, "list_projects", principal_id)
+        return await _read(
+            backend,
+            "list_projects",
+            principal_id,
+            secret_registry=redaction_registry,
+        )
 
     @app.post("/api/v1/sessions", status_code=201)
     async def create_session(
@@ -347,6 +391,7 @@ def create_app(
             payload=payload,
             body=_canonical_body(payload),
             status_code=201,
+            secret_registry=redaction_registry,
         )
 
     @app.post("/api/v1/sessions/{session_id}/messages")
@@ -365,6 +410,7 @@ def create_app(
             body=_canonical_body(payload),
             status_code=200,
             resource_id=session_id,
+            secret_registry=redaction_registry,
         )
 
     @app.post("/api/v1/sessions/{session_id}/answers")
@@ -383,6 +429,7 @@ def create_app(
             body=_canonical_body(payload),
             status_code=200,
             resource_id=session_id,
+            secret_registry=redaction_registry,
         )
 
     @app.post("/api/v1/sessions/{session_id}/confirm")
@@ -401,6 +448,7 @@ def create_app(
             body=_canonical_body(payload),
             status_code=200,
             resource_id=session_id,
+            secret_registry=redaction_registry,
         )
 
     @app.post("/api/v1/sessions/{session_id}/corrections/{correction_id}/confirm")
@@ -421,6 +469,7 @@ def create_app(
             status_code=200,
             resource_id=session_id,
             query={"correction_id": str(correction_id)},
+            secret_registry=redaction_registry,
         )
 
     @app.get("/api/v1/sessions/{session_id}/events")
@@ -448,6 +497,7 @@ def create_app(
                     queue_size=connection_manager.queue_size,
                     event_name="migration.session.event",
                     envelope_type=SessionEvent,
+                    secret_registry=redaction_registry,
                 ):
                     yield item
             finally:
@@ -457,15 +507,32 @@ def create_app(
 
     @app.get("/api/v1/migrations/{run_id}/changes")
     async def get_changes(run_id: UUID, principal_id: str = Depends(authenticate)) -> object:
-        return await _read(backend, "get_changes", principal_id, resource_id=run_id)
+        return await _read(
+            backend,
+            "get_changes",
+            principal_id,
+            resource_id=run_id,
+            secret_registry=redaction_registry,
+        )
 
     @app.get("/api/v1/migrations/{run_id}/output")
     async def get_output(run_id: UUID, principal_id: str = Depends(authenticate)) -> object:
-        return await _read(backend, "get_output", principal_id, resource_id=run_id)
+        return await _read(
+            backend,
+            "get_output",
+            principal_id,
+            resource_id=run_id,
+            secret_registry=redaction_registry,
+        )
 
     @app.get("/api/v1/skills")
     async def get_skills(principal_id: str = Depends(authenticate)) -> object:
-        return await _read(backend, "list_skills", principal_id)
+        return await _read(
+            backend,
+            "list_skills",
+            principal_id,
+            secret_registry=redaction_registry,
+        )
 
     return app
 
@@ -477,6 +544,7 @@ async def _read(
     *,
     resource_id: UUID | None = None,
     query: Mapping[str, str] | None = None,
+    secret_registry: SecretRegistry,
 ) -> object:
     try:
         result = await backend.execute(
@@ -491,7 +559,7 @@ async def _read(
         raise
     except KeyError as exc:
         raise ApiError(404, "resource not found", "NOT_FOUND") from exc
-    return _project(operation, result)
+    return _project(operation, result, secret_registry=secret_registry)
 
 
 async def _write(
@@ -507,6 +575,7 @@ async def _write(
     expected_version: int | None = None,
     query: Mapping[str, str] | None = None,
     require_key: bool = True,
+    secret_registry: SecretRegistry,
 ) -> JSONResponse:
     route = request.url.path
     key = request.headers.get("idempotency-key")
@@ -535,7 +604,7 @@ async def _write(
         raise
     except KeyError as exc:
         raise ApiError(404, "resource not found", "NOT_FOUND") from exc
-    serialized = _project(operation, result)
+    serialized = _project(operation, result, secret_registry=secret_registry)
     return JSONResponse(status_code=status_code, content=serialized)
 
 
@@ -545,7 +614,12 @@ def _canonical_body(value: object) -> bytes:
     return canonical_json_bytes(value)
 
 
-def _project(operation: str, value: object) -> object:
+def _project(
+    operation: str,
+    value: object,
+    *,
+    secret_registry: SecretRegistry,
+) -> object:
     model = _PROJECTION_MODELS.get(operation)
     if model is None:
         raise ApiError(500, "backend returned an unsupported projection", "INVALID_PROJECTION")
@@ -561,39 +635,9 @@ def _project(operation: str, value: object) -> object:
     except ValidationError as exc:
         raise ApiError(500, "backend returned an invalid projection", "INVALID_PROJECTION") from exc
     serialized = projection.model_dump(mode="json", by_alias=True)
-    _assert_public_projection(serialized)
+    if not secret_registry.redact(serialized).accepted:
+        raise ApiError(500, "backend returned an unsafe projection", "INVALID_PROJECTION")
     return serialized
-
-
-def _assert_public_projection(value: object) -> None:
-    forbidden = {
-        "api_key",
-        "authorization",
-        "content",
-        "cookie",
-        "credential",
-        "database_url",
-        "new_text",
-        "old_text",
-        "password",
-        "path",
-        "private_key",
-        "prompt",
-        "secret",
-        "source",
-        "source_code",
-        "stderr",
-        "stdout",
-        "token",
-    }
-    if isinstance(value, Mapping):
-        for key, nested in value.items():
-            if str(key).lower() in forbidden:
-                raise ApiError(500, "backend returned an unsafe projection", "INVALID_PROJECTION")
-            _assert_public_projection(nested)
-    elif isinstance(value, (list, tuple)):
-        for nested in value:
-            _assert_public_projection(nested)
 
 
 def _parse_if_match(value: str | None) -> int:
