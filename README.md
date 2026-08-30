@@ -142,7 +142,7 @@ SSE 从已提交事件账本读取数据，`Last-Event-ID` 只作为严格的回
 
 ## 产品入口
 
-CodeMigrator 提供两个互补的产品入口：命令行负责发起和控制迁移，Web 工作台负责
+CodeMigrator 提供两个互补的产品入口：命令行负责本地演示、Run 查询与受保护的取消操作，Web 工作台负责
 观察运行事实、理解验证证据和提交受限会话输入。两者消费同一套版本化 REST/SSE
 投影，不各自维护一套运行状态。
 
@@ -154,16 +154,18 @@ CLI 适合自动化脚本、持续集成和需要明确退出码的终端操作�
 # 安装 CLI 应用
 uv pip install -e apps/codemigrator-cli
 
-# 创建迁移并进入过程观察
+# 运行本地确定性迁移演示并进入过程观察
 codemigrator migrate start path/to/migration-spec.json --follow
 
-# 只创建并输出 Run 标识与 Web 深链接
+# 只输出本地演示 Run 标识与 Web 深链接
 codemigrator migrate start path/to/migration-spec.json --no-follow --output json
 
 # 继续观察既有 Run
 codemigrator run watch <run_id> --follow --output human
 ```
 
+`migrate start` 是不依赖服务的本地确定性演示入口；它不会读取或上传 spec，也不会创建后端 Run。
+配置 API 后，`run watch`、`run show` 与 `run cancel` 才会访问受认证保护的 REST/SSE 投影。
 输出格式由 `--output human|json|jsonl` 选择。`human` 面向交互式终端，展示 Header、
 关键事实过程流和活动摘要；`json` 输出一个稳定的最终对象；`jsonl` 按事件输出稳定
 摘要，适合管道和日志处理。`human`、`json` 与 `jsonl` 共享同一事件归约和安全边界，

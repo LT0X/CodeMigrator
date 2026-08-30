@@ -114,6 +114,10 @@ def create_app(
         limit=config.max_sse_connections, queue_size=config.sse_queue_size
     )
     redaction_registry = secret_registry or SecretRegistry()
+    # Authentication material is itself untrusted projection input. Register it
+    # even when callers provide a shared registry, so accidental backend echoing
+    # cannot turn a valid bearer token into public response data.
+    redaction_registry.register(config.token)
     app = FastAPI(title="CodeMigrator API", version="1")
     app.state.backend = backend
     app.state.config = config

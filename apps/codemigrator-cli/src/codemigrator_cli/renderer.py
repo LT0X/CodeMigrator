@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from io import StringIO
 from typing import Any
 
@@ -67,20 +67,29 @@ def render_jsonl(events: Iterable[RunEvent]) -> Iterator[str]:
     history: list[RunEvent] = []
     for event in events:
         history.append(event)
-        projection = project_events(history, memory_gib=8, cpu_cores=4)
-        slice_id = event.data.get("slice_id", event.data.get("sliceId"))
-        slice_projection = projection.slices.get(slice_id) if isinstance(slice_id, str) else None
-        yield json.dumps(
-            {
-                "sequence": event.sequence,
-                "type": event.type,
-                "connection": projection.connection,
-                "action": slice_projection.action if slice_projection else None,
-                "status": slice_projection.status if slice_projection else None,
-                "generation": slice_projection.generation if slice_projection else None,
-                "data": safe_data(event.data),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        yield render_jsonl_event(history)
+
+
+def render_jsonl_event(events: Sequence[RunEvent]) -> str:
+    """Render the newest event from a history without waiting for stream end."""
+
+    if not events:
+        raise ValueError("events must not be empty")
+    event = events[-1]
+    projection = project_events(events, memory_gib=8, cpu_cores=4)
+    slice_id = event.data.get("slice_id", event.data.get("sliceId"))
+    slice_projection = projection.slices.get(slice_id) if isinstance(slice_id, str) else None
+    return json.dumps(
+        {
+            "sequence": event.sequence,
+            "type": event.type,
+            "connection": projection.connection,
+            "action": slice_projection.action if slice_projection else None,
+            "status": slice_projection.status if slice_projection else None,
+            "generation": slice_projection.generation if slice_projection else None,
+            "data": safe_data(event.data),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )

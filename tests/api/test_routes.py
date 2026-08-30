@@ -71,6 +71,34 @@ async def test_rest_projection_uses_the_injected_secret_registry(backend) -> Non
 
 
 @pytest.mark.asyncio
+async def test_rest_projection_registers_api_token_in_default_registry(backend) -> None:  # type: ignore[no-untyped-def]
+    async def unsafe(request):  # type: ignore[no-untyped-def]
+        del request
+        return {
+            "run_id": str(uuid4()),
+            "status": "PLANNING",
+            "version": 1,
+            "verification_outcome": {"summary": "api-token"},
+        }
+
+    backend.execute = unsafe
+    app = create_app(backend, config=ApiConfig(token="api-token"))
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://127.0.0.1",
+    )
+
+    async with client:
+        response = await client.get(
+            f"/api/v1/migrations/{uuid4()}",
+            headers={"Authorization": "Bearer api-token"},
+        )
+
+    assert response.status_code == 500
+    assert "api-token" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_sse_route_uses_the_injected_secret_registry(backend) -> None:  # type: ignore[no-untyped-def]
     run_id = uuid4()
     registry = SecretRegistry()

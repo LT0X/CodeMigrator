@@ -16,10 +16,24 @@ jobs:
         with:
           version: "0.12.7"
       - run: uv sync --frozen --dev
+      - run: uv pip install -e apps/codemigrator-cli
       - run: uv run pytest -q
       - run: uv run lint-imports
       - run: uv run ruff check .
-      - run: uv run mypy src
+      - run: uv run mypy src apps/codemigrator-cli/src
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: web
+      - run: npm run typecheck
+        working-directory: web
+      - run: npm test -- --run
+        working-directory: web
+      - run: npm run build
+        working-directory: web
       - name: Reject runtime-outside environment reads
         run: |
           # The scan rejects os.environ/os.getenv and equivalent environment access.
