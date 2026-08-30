@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import uuid
@@ -7,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from codemigrator.core import CandidateGeneration, GitOid, SliceCandidate, StableErrorCode
+from codemigrator.core import (
+    CandidateGeneration,
+    GitOid,
+    SliceCandidate,
+    StableErrorCode,
+    canonical_json_bytes,
+)
 from codemigrator.workspace import WorkspaceFileFact, WorkspaceHandle, WorkspaceState
 from codemigrator.workspace.checkpoint import CheckpointManifest
 from codemigrator.workspace.git import (
@@ -46,8 +53,6 @@ def _handle(run_id: uuid.UUID, slice_id: uuid.UUID, path: Path, base_oid: str) -
 
 
 def _fact(path: str, data: bytes, *, symlink_target: str | None = None) -> WorkspaceFileFact:
-    import hashlib
-
     encoded = symlink_target.encode() if symlink_target is not None else data
     return WorkspaceFileFact(
         path=path,
@@ -60,6 +65,14 @@ def _fact(path: str, data: bytes, *, symlink_target: str | None = None) -> Works
 def _manifest(
     handle: WorkspaceHandle, candidate_oid: str, files: list[WorkspaceFileFact]
 ) -> CheckpointManifest:
+    file_map = {
+        file.path: {
+            "sha256": file.sha256,
+            "size": file.size,
+            "symlink_target": file.symlink_target,
+        }
+        for file in files
+    }
     return CheckpointManifest(
         slice_candidate=SliceCandidate(
             run_id=handle.run_id,
@@ -70,7 +83,7 @@ def _manifest(
         ),
         file_count=len(files),
         total_bytes=sum(item.size for item in files),
-        file_set_digest="a" * 64,
+        file_set_digest=hashlib.sha256(canonical_json_bytes(file_map)).hexdigest(),
         scope_check_passed=True,
     )
 
@@ -99,6 +112,7 @@ def test_run_initializes_empty_output_history_and_external_worktree(tmp_path: Pa
     repo.materialize(base_oid, workspace)
     assert workspace.is_dir()
     assert not (workspace / ".git").exists()
+    assert not (repo.path / "index").exists()
 
 
 def test_source_fetch_is_a_read_only_snapshot(tmp_path: Path) -> None:
@@ -116,6 +130,17 @@ def test_source_fetch_is_a_read_only_snapshot(tmp_path: Path) -> None:
     repo.initialize()
     assert repo.fetch_source(str(source), "HEAD") == source_head
     assert (source / ".git").stat().st_mtime_ns == source_stat.st_mtime_ns
+    restarted = GitRunRepository(repo.path, repo.run_id)
+    assert restarted.fetch_source(str(source), "HEAD") == source_head
+
+
+def test_source_fetch_rejects_embedded_credentials_and_unsafe_refs(tmp_path: Path) -> None:
+    repo = GitRunRepository(tmp_path / "run.git", _run_id())
+    repo.initialize()
+    with pytest.raises(ValueError):
+        repo.fetch_source("https://alice:secret@example.test/repo", "main")
+    with pytest.raises(ValueError):
+        repo.fetch_source("https://example.test/repo", "--upload-pack=evil")
 
 
 def test_candidate_checkpoint_writes_exact_files_and_uses_cas(tmp_path: Path) -> None:
@@ -143,7 +168,11 @@ def test_candidate_checkpoint_writes_exact_files_and_uses_cas(tmp_path: Path) ->
     other = repo.create_commit(repo.empty_tree, parent=base_oid, message="other")
     repo.update_ref(repo.refs.candidate(slice_id, 0), other, commit)
     with pytest.raises(Exception) as raised:
-        store.advance_candidate_ref(handle, commit, GitOid("f" * 40))
+        store.advance_candidate_ref(handle, commit, other)
+    assert raised.type.__name__ == "CandidateRefConflict"
+
+    with pytest.raises(Exception) as raised:
+        store.advance_candidate_ref(handle, GitOid(base_oid), GitOid(base_oid))
     assert raised.type.__name__ == "CandidateRefConflict"
 
 
@@ -168,6 +197,27 @@ def test_candidate_rejects_file_fact_drift_without_creating_commit(tmp_path: Pat
     assert store.current_candidate_oid(handle) == base_oid
 
 
+def test_candidate_rejects_forged_manifest_without_creating_commit(tmp_path: Path) -> None:
+    run_id, slice_id = _run_id(), uuid.uuid4()
+    repo = GitRunRepository(tmp_path / "run.git", run_id)
+    refs = repo.initialize()
+    workspace = tmp_path / "candidate"
+    workspace.mkdir()
+    (workspace / "a.py").write_bytes(b"actual")
+    base_oid = repo.resolve(refs.base)
+    handle = _handle(run_id, slice_id, workspace, base_oid)
+    repo.create_candidate_ref(handle, base_oid)
+    store = GitCandidateRefStore(repo)
+    files = [_fact("a.py", b"actual")]
+    forged = _manifest(handle, base_oid, files).model_copy(
+        update={"file_count": 99, "scope_check_passed": False}
+    )
+
+    with pytest.raises(GitIntegrityError):
+        store.create_checkpoint(handle, forged, files)
+    assert store.current_candidate_oid(handle) == base_oid
+
+
 def test_file_set_application_is_exact_and_utf8_sorted(tmp_path: Path) -> None:
     run_id, slice_id = _run_id(), uuid.uuid4()
     repo = GitRunRepository(tmp_path / "run.git", run_id)
@@ -183,8 +233,15 @@ def test_file_set_application_is_exact_and_utf8_sorted(tmp_path: Path) -> None:
     candidate = GitCandidateRefStore(repo).create_checkpoint(
         handle, _manifest(handle, base_oid, files), files
     )
+    GitCandidateRefStore(repo).advance_candidate_ref(handle, GitOid(base_oid), candidate)
 
-    application = repo.apply_file_set(candidate, base_oid, slice_id, 0)
+    application = repo.apply_file_set(
+        candidate,
+        base_oid,
+        slice_id,
+        0,
+        base_verified_oid=base_oid,
+    )
     assert isinstance(application, FileSetApplication)
     assert application.applied_paths == ["z.txt", "é.txt"]
     assert [entry.path for entry in repo.list_tree(application.prospective_commit_oid)] == [
@@ -195,32 +252,80 @@ def test_file_set_application_is_exact_and_utf8_sorted(tmp_path: Path) -> None:
 
 
 def test_file_set_application_preserves_deletion_as_an_exact_change(tmp_path: Path) -> None:
+    run_id, first_slice_id = _run_id(), uuid.uuid4()
+    repo = GitRunRepository(tmp_path / "run.git", run_id)
+    refs = repo.initialize()
+    base_oid = repo.resolve(refs.base)
+    seed_workspace = tmp_path / "seed"
+    seed_workspace.mkdir()
+    (seed_workspace / "remove.txt").write_bytes(b"remove")
+    seed_handle = _handle(run_id, first_slice_id, seed_workspace, base_oid)
+    repo.create_candidate_ref(seed_handle, base_oid)
+    store = GitCandidateRefStore(repo)
+    seed_files = [_fact("remove.txt", b"remove")]
+    seed = store.create_checkpoint(
+        seed_handle,
+        _manifest(seed_handle, base_oid, seed_files),
+        seed_files,
+    )
+    store.advance_candidate_ref(seed_handle, GitOid(base_oid), seed)
+    repo.update_ref(refs.verified, seed, base_oid)
+
+    slice_id = uuid.uuid4()
+    workspace = tmp_path / "candidate"
+    workspace.mkdir()
+    (workspace / "keep.txt").write_bytes(b"keep")
+    handle = _handle(run_id, slice_id, workspace, seed)
+    repo.create_candidate_ref(handle, seed)
+    files = [_fact("keep.txt", b"keep")]
+    candidate = store.create_checkpoint(handle, _manifest(handle, seed, files), files)
+    store.advance_candidate_ref(handle, seed, candidate)
+    application = repo.apply_file_set(
+        candidate,
+        seed,
+        slice_id,
+        0,
+        base_verified_oid=seed,
+    )
+
+    assert application.applied_paths == ["keep.txt", "remove.txt"]
+    assert [entry.path for entry in repo.list_tree(application.prospective_commit_oid)] == [
+        "keep.txt"
+    ]
+
+
+def test_later_checkpoint_applies_unchanged_files_from_frozen_base(tmp_path: Path) -> None:
     run_id, slice_id = _run_id(), uuid.uuid4()
     repo = GitRunRepository(tmp_path / "run.git", run_id)
     refs = repo.initialize()
     base_oid = repo.resolve(refs.base)
     workspace = tmp_path / "candidate"
     workspace.mkdir()
-    (workspace / "keep.txt").write_bytes(b"keep")
-    (workspace / "remove.txt").write_bytes(b"remove")
+    (workspace / "a.txt").write_bytes(b"a")
+    (workspace / "b.txt").write_bytes(b"b1")
     handle = _handle(run_id, slice_id, workspace, base_oid)
     repo.create_candidate_ref(handle, base_oid)
     store = GitCandidateRefStore(repo)
-    first_files = [_fact("keep.txt", b"keep"), _fact("remove.txt", b"remove")]
+    first_files = [_fact("a.txt", b"a"), _fact("b.txt", b"b1")]
     first = store.create_checkpoint(handle, _manifest(handle, base_oid, first_files), first_files)
     store.advance_candidate_ref(handle, GitOid(base_oid), first)
-    first_application = repo.apply_file_set(first, base_oid, slice_id, 0)
-    repo.delete_ref(repo.refs.integration(slice_id, 0), first_application.prospective_commit_oid)
 
-    (workspace / "remove.txt").unlink()
-    second_files = [_fact("keep.txt", b"keep")]
-    second_manifest = _manifest(handle, first, second_files)
-    second = store.create_checkpoint(handle, second_manifest, second_files)
-    application = repo.apply_file_set(second, first_application.prospective_commit_oid, slice_id, 0)
+    (workspace / "b.txt").write_bytes(b"b2")
+    second_files = [_fact("a.txt", b"a"), _fact("b.txt", b"b2")]
+    second = store.create_checkpoint(handle, _manifest(handle, first, second_files), second_files)
+    store.advance_candidate_ref(handle, first, second)
+    application = repo.apply_file_set(
+        second,
+        base_oid,
+        slice_id,
+        0,
+        base_verified_oid=base_oid,
+    )
 
-    assert application.applied_paths == ["remove.txt"]
+    assert application.applied_paths == ["a.txt", "b.txt"]
     assert [entry.path for entry in repo.list_tree(application.prospective_commit_oid)] == [
-        "keep.txt"
+        "a.txt",
+        "b.txt",
     ]
 
 
@@ -260,9 +365,10 @@ def test_repair_refs_are_separate_and_fifo(tmp_path: Path) -> None:
     first = queue.enqueue(uuid.uuid4(), 0, base_oid)
     second = queue.enqueue(uuid.uuid4(), 0, base_oid)
 
-    assert queue.dequeue() == first
-    assert queue.dequeue() == second
-    assert queue.dequeue() is None
+    restarted = RepairRefQueue(repo)
+    assert restarted.dequeue() == first
+    assert restarted.dequeue() == second
+    assert restarted.dequeue() is None
     assert "/repairs/" in first
     evidence = repo.preserve_candidate_evidence("failed", uuid.uuid4(), 2, base_oid)
     assert evidence.startswith("refs/codemigrator/failed/")
@@ -285,6 +391,23 @@ class _PushCli:
         return b""
 
 
+class _RacePushCli(_PushCli):
+    def __init__(self, observed_after_failure: str) -> None:
+        super().__init__()
+        self.observed_after_failure = observed_after_failure
+        self._observe_count = 0
+
+    def run(self, *args: str, **kwargs: object) -> bytes:
+        if args[0] == "ls-remote":
+            self._observe_count += 1
+            if self._observe_count == 1:
+                return b""
+            return f"{self.observed_after_failure}\trefs/heads/x\n".encode()
+        if args[0] == "push":
+            raise GitCommandError(args, 1, "non-fast-forward")
+        return super().run(*args, **kwargs)
+
+
 def test_push_guard_requires_stable_remote_and_never_force_pushes(tmp_path: Path) -> None:
     run_id = _run_id()
     repo = GitRunRepository(tmp_path / "run.git", run_id)
@@ -305,6 +428,10 @@ def test_push_guard_requires_stable_remote_and_never_force_pushes(tmp_path: Path
 
     failed = PushGuard(repo, "codemigrator", cli=_PushCli(fail_push=True))
     assert failed.publish("origin", oid) == "DELIVERY_FAILED"
+
+    raced = PushGuard(repo, "codemigrator", cli=_RacePushCli("e" * 40))
+    with pytest.raises(RemoteRefMoved):
+        raced.publish("origin", oid)
 
 
 def test_push_guard_delivers_to_a_real_local_remote(tmp_path: Path) -> None:
@@ -335,6 +462,7 @@ def test_export_verified_is_atomic_and_does_not_create_git_metadata(tmp_path: Pa
     candidate = GitCandidateRefStore(repo).create_checkpoint(
         handle, _manifest(handle, base_oid, files), files
     )
+    repo.update_ref(refs.verified, candidate, base_oid)
     destination = tmp_path / "export"
 
     repo.export_verified(candidate, destination)

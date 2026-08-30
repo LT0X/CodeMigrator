@@ -7,6 +7,7 @@ repository objects, refs, and their safety invariants.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
@@ -21,6 +22,7 @@ from enum import Enum
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from pydantic import ConfigDict, field_validator
 
@@ -33,6 +35,7 @@ from codemigrator.core import (
     RunId,
     SliceId,
     StableErrorCode,
+    canonical_json_bytes,
     validate_branch_prefix,
     validate_candidate_generation,
 )
@@ -73,6 +76,27 @@ def _validate_ref_name(ref: str) -> str:
     ):
         raise ValueError("unsafe Git ref name")
     return ref
+
+
+def _validate_source_inputs(source_url: str, base_ref: str) -> None:
+    if (
+        not source_url
+        or not base_ref
+        or "\x00" in source_url
+        or "\x00" in base_ref
+        or any(char.isspace() for char in source_url)
+        or any(char.isspace() for char in base_ref)
+        or base_ref.startswith("-")
+        or ".." in base_ref
+    ):
+        raise ValueError("source URL and base ref contain unsafe characters")
+    parsed = urlsplit(source_url)
+    if parsed.scheme and parsed.scheme not in {"file", "git", "https", "ssh"}:
+        raise ValueError("source URL scheme is not supported")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("source URL must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("source URL must not contain query or fragment data")
 
 
 class GitCommandError(RuntimeError):
@@ -175,11 +199,18 @@ class GitRefLayout:
     def verified(self) -> str:
         return f"refs/codemigrator/runs/{self._run}/verified"
 
+    @property
+    def source(self) -> str:
+        return f"refs/codemigrator/runs/{self._run}/source"
+
     def candidate(self, slice_id: SliceId | uuid.UUID | str, generation: int) -> str:
         return self._slice_ref("candidates", slice_id, generation)
 
     def integration(self, slice_id: SliceId | uuid.UUID | str, generation: int) -> str:
-        return self._slice_ref("integration", slice_id, generation)
+        return (
+            f"refs/codemigrator/runs/{self._run}/integration/"
+            f"{self._slice(slice_id)}/{self._generation(generation)}"
+        )
 
     def failed(self, slice_id: SliceId | uuid.UUID | str, generation: int) -> str:
         return (
@@ -202,6 +233,19 @@ class GitRefLayout:
             raise ValueError("repair candidate number must be non-negative")
         session = str(uuid.UUID(str(repair_session_id)))
         return f"refs/codemigrator/runs/{self._run}/repairs/{session}/candidates/{number}"
+
+    def repair_queue(
+        self, repair_session_id: uuid.UUID | str, number: int, sequence: int
+    ) -> str:
+        if type(number) is not int or number < 0:
+            raise ValueError("repair candidate number must be non-negative")
+        if type(sequence) is not int or sequence < 0:
+            raise ValueError("repair queue sequence must be non-negative")
+        session = str(uuid.UUID(str(repair_session_id)))
+        return (
+            f"refs/codemigrator/runs/{self._run}/repairs/queue/"
+            f"{sequence:020d}/{session}/{number}"
+        )
 
     def _slice_ref(self, family: str, slice_id: SliceId | uuid.UUID | str, generation: int) -> str:
         return (
@@ -255,6 +299,7 @@ class GitRunRepository:
         cli: GitCommandPort | None = None,
         user_name: str = "CodeMigrator",
         user_email: str = "codemigrator@localhost",
+        credential_helper: Path | str | None = None,
     ) -> None:
         self.path = Path(path)
         self.run_id = uuid.UUID(str(run_id))
@@ -262,6 +307,9 @@ class GitRunRepository:
         self.cli = cli or GitCli()
         self.user_name = user_name
         self.user_email = user_email
+        self.credential_helper = (
+            validate_credential_helper(credential_helper) if credential_helper is not None else None
+        )
         self._source_snapshot_oid: GitOid | None = None
 
     @property
@@ -270,6 +318,8 @@ class GitRunRepository:
 
     def _env(self, **extra: str) -> dict[str, str]:
         result = {"GIT_DIR": str(self.path)}
+        if self.credential_helper is not None:
+            result.update(GitCli.credential_helper_env(self.credential_helper))
         result.update(extra)
         return result
 
@@ -324,10 +374,25 @@ class GitRunRepository:
         oid = output.decode("ascii").strip()
         return GitOid(_validate_oid(oid, allow_zero=False))
 
+    def _assert_commit(self, object_oid: GitOid | str) -> GitOid:
+        oid = GitOid(_validate_oid(str(object_oid), allow_zero=False))
+        resolved = (
+            self.cli.run(
+                "rev-parse", "--verify", f"{oid}^{{commit}}", env=self._env()
+            )
+            .decode("ascii")
+            .strip()
+        )
+        if resolved != oid:
+            raise GitIntegrityError("Git ref target is not the expected commit")
+        return oid
+
     def update_ref(self, ref: str, new_oid: GitOid, expected_oid: GitOid) -> None:
         _validate_ref_name(ref)
-        _validate_oid(str(new_oid), allow_zero=False)
-        _validate_oid(str(expected_oid))
+        self._assert_commit(new_oid)
+        expected = _validate_oid(str(expected_oid))
+        if expected != ZERO_OID:
+            self._assert_commit(expected)
         try:
             self.cli.run("update-ref", ref, str(new_oid), str(expected_oid), env=self._env())
         except GitCommandError as exc:
@@ -335,9 +400,9 @@ class GitRunRepository:
 
     def delete_ref(self, ref: str, expected_oid: GitOid) -> None:
         _validate_ref_name(ref)
-        _validate_oid(str(expected_oid), allow_zero=False)
+        expected = self._assert_commit(expected_oid)
         try:
-            self.cli.run("update-ref", "-d", ref, str(expected_oid), env=self._env())
+            self.cli.run("update-ref", "-d", ref, str(expected), env=self._env())
         except GitCommandError as exc:
             raise CandidateRefConflict(f"Git ref delete CAS failed: {ref}") from exc
 
@@ -375,6 +440,13 @@ class GitRunRepository:
             )
         return tuple(sorted(entries, key=lambda item: str(item.path).encode("utf-8")))
 
+    def list_refs(self, prefix: str) -> tuple[str, ...]:
+        _validate_ref_name(prefix)
+        output = self.cli.run(
+            "for-each-ref", "--format=%(refname)", prefix, env=self._env()
+        )
+        return tuple(line for line in output.decode("utf-8").splitlines() if line)
+
     def read_blob(self, object_oid: GitOid | str) -> bytes:
         oid = _validate_oid(str(object_oid), allow_zero=False)
         return self.cli.run("cat-file", "blob", oid, env=self._env())
@@ -409,27 +481,41 @@ class GitRunRepository:
     def materialize(self, commit_oid: GitOid | str, workspace: Path | str) -> None:
         destination = Path(workspace)
         destination.mkdir(parents=True, exist_ok=True)
-        self.cli.run(
-            "read-tree",
-            "--reset",
-            "-u",
-            _validate_oid(str(commit_oid), allow_zero=False),
-            env=self._env(GIT_WORK_TREE=str(destination)),
-        )
+        with tempfile.TemporaryDirectory(prefix=".codemigrator-materialize-") as index_root:
+            self.cli.run(
+                "read-tree",
+                "--reset",
+                "-u",
+                _validate_oid(str(commit_oid), allow_zero=False),
+                env=self._env(
+                    GIT_INDEX_FILE=str(Path(index_root) / "index"),
+                    GIT_WORK_TREE=str(destination),
+                ),
+            )
 
     def fetch_source(self, source_url: str, base_ref: str) -> GitOid:
+        _validate_source_inputs(source_url, base_ref)
         if self._source_snapshot_oid is not None:
             return self._source_snapshot_oid
-        if not source_url or not base_ref or "\x00" in source_url or "\x00" in base_ref:
-            raise ValueError("source URL and base ref must be non-empty")
-        self.cli.run("fetch", "--no-tags", source_url, base_ref, env=self._env())
+        try:
+            snapshot = self.resolve(self.refs.source)
+        except GitCommandError:
+            snapshot = None
+        if snapshot is not None:
+            self._source_snapshot_oid = snapshot
+            return snapshot
+        self.cli.run("fetch", "--no-tags", "--", source_url, base_ref, env=self._env())
         snapshot = self.resolve("FETCH_HEAD")
+        self._create_immutable_ref(self.refs.source, snapshot)
         self._source_snapshot_oid = snapshot
         return snapshot
 
     def create_candidate_ref(self, handle: WorkspaceHandle, initial_oid: GitOid | str) -> str:
         ref = self.refs.candidate(handle.slice_id, handle.generation)
-        self.update_ref(ref, GitOid(str(initial_oid)), GitOid(ZERO_OID))
+        initial = self._assert_commit(initial_oid)
+        if self.resolve(self.refs.verified) != initial:
+            raise GitIntegrityError("candidate must start at the current verified commit")
+        self.update_ref(ref, initial, GitOid(ZERO_OID))
         return ref
 
     def candidate_ref(self, handle: WorkspaceHandle) -> str:
@@ -523,15 +609,34 @@ class GitRunRepository:
         expected_verified_oid: GitOid | str,
         slice_id: SliceId | uuid.UUID | str,
         generation: int,
+        *,
+        base_verified_oid: GitOid | str,
     ) -> FileSetApplication:
         source = GitOid(_validate_oid(str(source_candidate_oid), allow_zero=False))
         expected = GitOid(_validate_oid(str(expected_verified_oid), allow_zero=False))
         slice_uuid = uuid.UUID(str(slice_id))
         generation_value = validate_candidate_generation(generation)
+        candidate_ref = self.refs.candidate(slice_uuid, generation_value)
+        try:
+            if self.resolve(candidate_ref) != source:
+                raise GitIntegrityError("source candidate is not the current candidate ref")
+        except GitCommandError as exc:
+            raise GitIntegrityError("candidate ref does not exist") from exc
         source_parents = self.parents(source)
         if len(source_parents) != 1:
             raise GitIntegrityError("candidate checkpoint must have exactly one parent")
-        before = {str(item.path): item for item in self.list_tree(source_parents[0])}
+        baseline = GitOid(_validate_oid(str(base_verified_oid), allow_zero=False))
+        try:
+            self.cli.run(
+                "merge-base",
+                "--is-ancestor",
+                str(baseline),
+                str(source),
+                env=self._env(),
+            )
+        except GitCommandError as exc:
+            raise GitIntegrityError("candidate does not descend from its frozen base") from exc
+        before = {str(item.path): item for item in self.list_tree(baseline)}
         after = {str(item.path): item for item in self.list_tree(source)}
         changes = [path for path in set(before) | set(after) if before.get(path) != after.get(path)]
         applied_paths = sorted(changes, key=lambda item: item.encode("utf-8"))
@@ -580,6 +685,8 @@ class GitRunRepository:
 
     def export_verified(self, verified_oid: GitOid | str, destination: Path | str) -> None:
         oid = _validate_oid(str(verified_oid), allow_zero=False)
+        if self.resolve(self.refs.verified) != oid:
+            raise GitIntegrityError("only the current verified head may be exported")
         target = Path(destination)
         if os.path.lexists(target):
             raise FileExistsError(target)
@@ -635,6 +742,24 @@ class GitCandidateRefStore:
             raise GitIntegrityError("checkpoint generation does not match workspace")
         if candidate.base_verified_oid != handle.base_verified_oid:
             raise GitIntegrityError("checkpoint base verified OID does not match workspace")
+        if not manifest.scope_check_passed:
+            raise GitIntegrityError("checkpoint scope check did not pass")
+        paths = [str(file.path) for file in files]
+        if manifest.file_count != len(paths):
+            raise GitIntegrityError("checkpoint file count does not match file facts")
+        if manifest.total_bytes != sum(file.size for file in files):
+            raise GitIntegrityError("checkpoint byte count does not match file facts")
+        file_map = {
+            path: {
+                "sha256": file.sha256,
+                "size": file.size,
+                "symlink_target": file.symlink_target,
+            }
+            for path, file in zip(paths, files, strict=True)
+        }
+        digest = hashlib.sha256(canonical_json_bytes(file_map)).hexdigest()
+        if manifest.file_set_digest != digest:
+            raise GitIntegrityError("checkpoint file-set digest does not match file facts")
         expected = GitOid(str(candidate.candidate_commit_oid))
         if self.current_candidate_oid(handle) != expected:
             raise CandidateRefConflict("candidate ref moved before checkpoint")
@@ -648,8 +773,12 @@ class GitCandidateRefStore:
     def advance_candidate_ref(
         self, handle: WorkspaceHandle, expected_oid: GitOid, new_oid: GitOid
     ) -> None:
+        if self.current_candidate_oid(handle) != expected_oid:
+            raise CandidateRefConflict("candidate ref does not match the expected OID")
         if str(expected_oid) == str(new_oid):
             return
+        if self.repository.parents(new_oid) != (expected_oid,):
+            raise GitIntegrityError("candidate ref may only advance by one checkpoint commit")
         try:
             self.repository.update_ref(self.repository.candidate_ref(handle), new_oid, expected_oid)
         except CandidateRefConflict as exc:
@@ -698,18 +827,44 @@ class RepairRefQueue:
 
     def __init__(self, repository: GitRunRepository) -> None:
         self.repository = repository
-        self._pending: deque[str] = deque()
+        self._pending: deque[tuple[str, str]] = deque()
+        self._next_sequence = 0
+        prefix = f"refs/codemigrator/runs/{repository.run_id}/repairs/queue"
+        for queue_ref in repository.list_refs(prefix):
+            parts = queue_ref.split("/")
+            if len(parts) != 9:
+                raise GitIntegrityError("repair queue ref has an invalid shape")
+            try:
+                sequence = int(parts[-3])
+                session_id = uuid.UUID(parts[-2])
+                number = int(parts[-1])
+            except ValueError as exc:
+                raise GitIntegrityError("repair queue ref has an invalid identity") from exc
+            repair_ref = repository.refs.repair_candidate(session_id, number)
+            repository._assert_commit(repository.resolve(queue_ref))
+            self._pending.append((queue_ref, repair_ref))
+            self._next_sequence = max(self._next_sequence, sequence + 1)
 
     def enqueue(
         self, repair_session_id: uuid.UUID | str, number: int, candidate_oid: GitOid
     ) -> str:
         ref = self.repository.refs.repair_candidate(repair_session_id, number)
         self.repository._create_immutable_ref(ref, candidate_oid)
-        self._pending.append(ref)
+        queue_ref = self.repository.refs.repair_queue(
+            repair_session_id, number, self._next_sequence
+        )
+        self.repository._create_immutable_ref(queue_ref, candidate_oid)
+        self._pending.append((queue_ref, ref))
+        self._next_sequence += 1
         return ref
 
     def dequeue(self) -> str | None:
-        return self._pending.popleft() if self._pending else None
+        if not self._pending:
+            return None
+        queue_ref, repair_ref = self._pending.popleft()
+        candidate_oid = self.repository.resolve(queue_ref)
+        self.repository.delete_ref(queue_ref, candidate_oid)
+        return repair_ref
 
 
 class PushGuard:
@@ -727,7 +882,9 @@ class PushGuard:
         self.cli = cli or repository.cli
 
     def observe(self, remote: str) -> GitOid | None:
-        output = self.cli.run("ls-remote", "--heads", "--", remote, self.branch)
+        output = self.cli.run(
+            "ls-remote", "--heads", "--", remote, self.branch, env=self.repository._env()
+        )
         line = output.decode("utf-8", errors="strict").strip()
         if not line:
             return None
@@ -764,6 +921,12 @@ class PushGuard:
         try:
             self.cli.run("push", "--", remote, refspec, env=self.repository._env())
         except GitCommandError:
+            try:
+                latest = self.observe(remote)
+            except GitCommandError:
+                return DeliveryChannelStatus.DeliveryFailed
+            if latest != observed:
+                raise RemoteRefMoved("delivery remote ref moved during push")
             return DeliveryChannelStatus.DeliveryFailed
         return DeliveryChannelStatus.Ready
 
