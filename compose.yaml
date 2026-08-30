@@ -1,0 +1,25 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "--no-dev", "python", "-c", "import codemigrator"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: codemigrator
+      POSTGRES_USER: codemigrator
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be supplied by the environment or --env-file}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codemigrator -d codemigrator"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
