@@ -199,7 +199,9 @@ def test_import_contracts_cover_the_frozen_dependency_layers() -> None:
         "codemigrator.runtime",
         "codemigrator.api",
         "codemigrator.sandbox | codemigrator.workspace",
-        "codemigrator.analysis | codemigrator.planning | codemigrator.verification",
+        "codemigrator.verification",
+        "codemigrator.planning",
+        "codemigrator.analysis",
         "codemigrator.core",
     ]
 
