@@ -26,7 +26,16 @@ from .app import (
     RuntimeApplication,
     run_from_environment,
 )
-from .budget import BudgetEvaluation, BudgetLimits, BudgetUsage, evaluate_budget
+from .binding import (
+    BindingError,
+    ContextOverflowError,
+    LockedModelBinding,
+    ensure_context_fits,
+    estimate_net_input_tokens,
+    validate_session_admission,
+)
+from .budget import BudgetEvaluation, BudgetLimits, BudgetUsage, RunWallet, evaluate_budget
+from .context import ContextEnvelope, ContextSegment, PromptMessage, prompt_text, render_prompt
 from .contracts import (
     AdviceMessage,
     ApiCommand,
@@ -49,6 +58,38 @@ from .integration import (
     IntegrationStart,
     RepairRetryBudget,
 )
+from .loop import (
+    AgentLoop,
+    BudgetGate,
+    CancellationGate,
+    CancellationToken,
+    CheckpointDecision,
+    CheckpointPort,
+    SessionCancelled,
+    SessionProvenance,
+    SessionResult,
+    ToolGatewayPort,
+    ToolObservation,
+    UsageSink,
+)
+from .loop_contracts import SessionExit, SessionIdentity, SessionSpec, SessionState
+from .normalizer import ModelAction, NormalizationError, NormalizedTurn, normalize_response
+from .provider import (
+    DEFAULT_TOOL_DEFINITIONS,
+    AnthropicProvider,
+    AsyncProvider,
+    OpenAICompatibleProvider,
+    ProviderCallIdentity,
+    ProviderError,
+    ProviderRegistry,
+    ProviderRequest,
+    ProviderResponse,
+    ProviderToolCall,
+    TokenUsage,
+    ToolDefinition,
+    UsageReceipt,
+    retry_delay_for_attempt,
+)
 from .recovery import (
     ActorCheckpoint,
     CheckpointPolicy,
@@ -62,6 +103,7 @@ from .report import build_report
 from .scheduler import FairScheduler, ReadySlice, ResourcePool
 from .store import InMemoryRuntimeStore, PostgreSQLRuntimeStore, RuntimeStore, StoreCommitError
 from .supervisor import SupervisorAdviceKind, SupervisorTrigger, supervisor_triggers
+from .templates import CatalogError, StaticTemplateCatalog
 
 
 def main() -> None:
@@ -73,6 +115,7 @@ def main() -> None:
 
 
 __all__ = [
+    "AgentLoop",
     "ActorRegistry",
     "ActorCheckpoint",
     "ArchivePort",
@@ -80,6 +123,8 @@ __all__ = [
     "AdviceDisposition",
     "AdviceValidationContext",
     "AdviceValidationResult",
+    "AnthropicProvider",
+    "AsyncProvider",
     "AsyncAdvisoryLockPort",
     "AsyncAppLifecycle",
     "ApiCommand",
@@ -87,15 +132,26 @@ __all__ = [
     "AdvisoryLockPort",
     "AppLifecycle",
     "AppState",
+    "BindingError",
     "BudgetEvaluation",
+    "BudgetGate",
     "BudgetEventMessage",
     "BudgetLimits",
     "BudgetUsage",
+    "RunWallet",
     "CancelCommand",
     "CheckpointRestore",
     "CheckpointPolicy",
     "CheckpointWriter",
+    "CheckpointDecision",
+    "CheckpointPort",
     "CancellationPort",
+    "CancellationGate",
+    "CancellationToken",
+    "CatalogError",
+    "ContextEnvelope",
+    "ContextOverflowError",
+    "ContextSegment",
     "CreateRunCommand",
     "ContinuationPort",
     "EventSpec",
@@ -106,6 +162,19 @@ __all__ = [
     "IntegrationCoordinator",
     "IntegrationItem",
     "IntegrationStart",
+    "LockedModelBinding",
+    "ModelAction",
+    "NormalizationError",
+    "NormalizedTurn",
+    "OpenAICompatibleProvider",
+    "PromptMessage",
+    "ProviderError",
+    "ProviderCallIdentity",
+    "ProviderRegistry",
+    "ProviderRequest",
+    "ProviderResponse",
+    "ProviderToolCall",
+    "ToolDefinition",
     "ReadySlice",
     "RecoveryCoordinator",
     "RecoveryCommandMessage",
@@ -122,16 +191,37 @@ __all__ = [
     "RuntimeStore",
     "PostgreSQLRuntimeStore",
     "SessionInputCommand",
+    "SessionCancelled",
+    "SessionExit",
+    "SessionIdentity",
+    "SessionResult",
+    "SessionProvenance",
+    "SessionSpec",
+    "SessionState",
+    "StaticTemplateCatalog",
     "StoreCommitError",
     "SupervisorAdviceKind",
     "SupervisorTrigger",
+    "TokenUsage",
+    "ToolGatewayPort",
+    "ToolObservation",
+    "UsageSink",
+    "UsageReceipt",
+    "DEFAULT_TOOL_DEFINITIONS",
     "advice_proposal_hash",
     "build_report",
     "evaluate_advice",
     "evaluate_budget",
+    "ensure_context_fits",
+    "estimate_net_input_tokens",
     "main",
     "restore_checkpoint",
     "PostgreSQLAdvisoryLock",
     "run_from_environment",
+    "normalize_response",
+    "render_prompt",
+    "prompt_text",
+    "retry_delay_for_attempt",
     "supervisor_triggers",
+    "validate_session_admission",
 ]
