@@ -18,6 +18,7 @@ class NormalizationError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ModelAction:
     payload: dict[str, object]
+    call_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,7 +38,7 @@ def normalize_response(response: ProviderResponse) -> NormalizedTurn:
                 payload = {"tool": call.name, **payload}
             elif payload["tool"] != call.name:
                 raise NormalizationError("provider tool name does not match action payload")
-            actions.append(ModelAction(payload))
+            actions.append(ModelAction(payload, call_id=call.call_id or None))
     elif "[cm:action]" in response.content or "[cm:/action]" in response.content:
         for payload in _parse_marked(response.content):
             if payload.get("completed") is True:

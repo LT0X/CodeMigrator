@@ -164,11 +164,25 @@ class ToolGateway:
             _policy_document=self._policy_document,
         )
 
-    def dispatch(self, raw_call: object) -> ToolResult:
+    def dispatch(
+        self,
+        raw_call: object,
+        *,
+        cancellation_token: object | None = None,
+    ) -> ToolResult:
         tool_name = raw_call.get("tool") if isinstance(raw_call, Mapping) else None
         parameter_sha256 = self._parameter_sha256(raw_call)
         started = time.monotonic()
         parsed: ToolCall | None = None
+        if cancellation_token is not None and getattr(cancellation_token, "cancelled", False):
+            cancelled_result = self._error(
+                StableErrorCode.STALE_DISPATCH_RESULT,
+                "tool call was cancelled before execution",
+                retryable=False,
+            )
+            self._emit_pre(tool_name, parameter_sha256)
+            self._emit_post(tool_name, parameter_sha256, cancelled_result, started, call=None)
+            return cancelled_result
         if not isinstance(tool_name, str) or tool_name not in {
             "ReadFile",
             "WriteFile",

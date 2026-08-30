@@ -29,6 +29,8 @@ class LockedModelBinding:
     config_revision: str
     context_window: int
     output_cap: int
+    input_cost_micros_per_1k: int = 0
+    output_cost_micros_per_1k: int = 0
 
     def __post_init__(self) -> None:
         if not self.provider_id or not self.model_id or not self.config_revision:
@@ -37,6 +39,8 @@ class LockedModelBinding:
             raise ValueError("context window and output cap must be positive")
         if self.output_cap >= self.context_window:
             raise ValueError("output cap must leave room for input")
+        if self.input_cost_micros_per_1k < 0 or self.output_cost_micros_per_1k < 0:
+            raise ValueError("pricing values must not be negative")
 
     @property
     def digest(self) -> str:
@@ -47,6 +51,8 @@ class LockedModelBinding:
             "config_revision": self.config_revision,
             "context_window": self.context_window,
             "output_cap": self.output_cap,
+            "input_cost_micros_per_1k": self.input_cost_micros_per_1k,
+            "output_cost_micros_per_1k": self.output_cost_micros_per_1k,
         }
         return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
@@ -68,6 +74,8 @@ def validate_session_admission(spec: SessionSpec) -> None:
         raise BindingError("phase and run status do not match")
     if spec.binding.profile is not expected_profile:
         raise BindingError("phase requires a different model profile")
+    if getattr(spec.state, "value", None) != "CREATED":
+        raise BindingError("session can only be admitted from CREATED")
     if phase is Phase.Plan and spec.identity.session_kind is not SessionKind.PlanAuxiliary:
         raise BindingError("session kind is not admitted in PLAN")
     if phase is Phase.Execute and spec.identity.session_kind.value in {

@@ -99,7 +99,14 @@ class FakeGateway:
         self.calls: list[dict[str, object]] = []
         self.results = list(results or [])
 
-    def dispatch(self, raw_call: dict[str, object]) -> object:
+    def dispatch(
+        self,
+        raw_call: dict[str, object],
+        *,
+        cancellation_token: object | None = None,
+    ) -> object:
+        if cancellation_token is not None and getattr(cancellation_token, "cancelled", False):
+            raise RuntimeError("cancelled")
         self.calls.append(raw_call)
         return self.results.pop(0) if self.results else {"ok": True}
 
@@ -140,7 +147,7 @@ async def test_loop_runs_in_one_session_task_and_closes_after_checkpoint() -> No
         ]
     )
     gateway = FakeGateway()
-    checkpoint = FakeCheckpoint([CheckpointDecision(accepted=True)])
+    checkpoint = FakeCheckpoint([CheckpointDecision(accepted=True, committed=True)])
     usage = FakeUsageSink()
 
     result = await AgentLoop(
@@ -179,7 +186,7 @@ async def test_one_failed_action_does_not_swallow_later_action() -> None:
         ]
     )
     gateway = FakeGateway([RuntimeError("tool failure"), {"ok": True}])
-    checkpoint = FakeCheckpoint([CheckpointDecision(accepted=True)])
+    checkpoint = FakeCheckpoint([CheckpointDecision(accepted=True, committed=True)])
 
     result = await AgentLoop(provider=provider, gateway=gateway, checkpoint=checkpoint).run(_spec())
 
@@ -195,7 +202,7 @@ async def test_checkpoint_rejection_is_data_and_allows_one_self_correction() -> 
     checkpoint = FakeCheckpoint(
         [
             CheckpointDecision(accepted=False, rejection_reasons=("scope",)),
-            CheckpointDecision(accepted=True),
+            CheckpointDecision(accepted=True, committed=True),
         ]
     )
 

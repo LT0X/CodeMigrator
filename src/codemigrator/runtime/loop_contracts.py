@@ -32,6 +32,7 @@ class SessionState(str, Enum):
 class SessionExit(str, Enum):
     Completed = "COMPLETED"
     Failed = "FAILED"
+    BudgetExhausted = "BUDGET_EXHAUSTED"
     SegmentStopped = "SEGMENT_STOPPED"
     Invalidated = "INVALIDATED"
 

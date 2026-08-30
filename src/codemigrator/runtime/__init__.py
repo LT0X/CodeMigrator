@@ -34,8 +34,8 @@ from .binding import (
     estimate_net_input_tokens,
     validate_session_admission,
 )
-from .budget import BudgetEvaluation, BudgetLimits, BudgetUsage, evaluate_budget
-from .context import ContextEnvelope, ContextSegment, PromptMessage, render_prompt
+from .budget import BudgetEvaluation, BudgetLimits, BudgetUsage, RunWallet, evaluate_budget
+from .context import ContextEnvelope, ContextSegment, PromptMessage, prompt_text, render_prompt
 from .contracts import (
     AdviceMessage,
     ApiCommand,
@@ -60,10 +60,13 @@ from .integration import (
 )
 from .loop import (
     AgentLoop,
+    BudgetGate,
     CancellationGate,
+    CancellationToken,
     CheckpointDecision,
     CheckpointPort,
     SessionCancelled,
+    SessionProvenance,
     SessionResult,
     ToolGatewayPort,
     ToolObservation,
@@ -72,15 +75,19 @@ from .loop import (
 from .loop_contracts import SessionExit, SessionIdentity, SessionSpec, SessionState
 from .normalizer import ModelAction, NormalizationError, NormalizedTurn, normalize_response
 from .provider import (
+    DEFAULT_TOOL_DEFINITIONS,
     AnthropicProvider,
     AsyncProvider,
     OpenAICompatibleProvider,
+    ProviderCallIdentity,
     ProviderError,
     ProviderRegistry,
     ProviderRequest,
     ProviderResponse,
     ProviderToolCall,
     TokenUsage,
+    ToolDefinition,
+    UsageReceipt,
     retry_delay_for_attempt,
 )
 from .recovery import (
@@ -127,9 +134,11 @@ __all__ = [
     "AppState",
     "BindingError",
     "BudgetEvaluation",
+    "BudgetGate",
     "BudgetEventMessage",
     "BudgetLimits",
     "BudgetUsage",
+    "RunWallet",
     "CancelCommand",
     "CheckpointRestore",
     "CheckpointPolicy",
@@ -138,6 +147,7 @@ __all__ = [
     "CheckpointPort",
     "CancellationPort",
     "CancellationGate",
+    "CancellationToken",
     "CatalogError",
     "ContextEnvelope",
     "ContextOverflowError",
@@ -159,10 +169,12 @@ __all__ = [
     "OpenAICompatibleProvider",
     "PromptMessage",
     "ProviderError",
+    "ProviderCallIdentity",
     "ProviderRegistry",
     "ProviderRequest",
     "ProviderResponse",
     "ProviderToolCall",
+    "ToolDefinition",
     "ReadySlice",
     "RecoveryCoordinator",
     "RecoveryCommandMessage",
@@ -183,6 +195,7 @@ __all__ = [
     "SessionExit",
     "SessionIdentity",
     "SessionResult",
+    "SessionProvenance",
     "SessionSpec",
     "SessionState",
     "StaticTemplateCatalog",
@@ -193,6 +206,8 @@ __all__ = [
     "ToolGatewayPort",
     "ToolObservation",
     "UsageSink",
+    "UsageReceipt",
+    "DEFAULT_TOOL_DEFINITIONS",
     "advice_proposal_hash",
     "build_report",
     "evaluate_advice",
@@ -205,6 +220,7 @@ __all__ = [
     "run_from_environment",
     "normalize_response",
     "render_prompt",
+    "prompt_text",
     "retry_delay_for_attempt",
     "supervisor_triggers",
     "validate_session_admission",

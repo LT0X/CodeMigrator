@@ -77,6 +77,8 @@ async def test_openai_compatible_provider_maps_request_and_usage() -> None:
         return httpx.Response(
             200,
             json={
+                "id": "resp-1",
+                "model": "test-model",
                 "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 12, "completion_tokens": 4},
             },
@@ -96,6 +98,17 @@ async def test_openai_compatible_provider_maps_request_and_usage() -> None:
     assert seen["payload"] == {
         "model": "test-model",
         "messages": [{"role": "system", "content": "role"}, {"role": "user", "content": "data"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"Invoke the closed CodeMigrator {name} tool.",
+                    "parameters": {"type": "object", "additionalProperties": True},
+                },
+            }
+            for name in ("ReadFile", "WriteFile", "EditFile", "QuerySourceAst", "Shell", "Exec")
+        ],
         "max_tokens": 200,
     }
 
@@ -118,6 +131,8 @@ async def test_anthropic_provider_keeps_system_separate_and_maps_usage() -> None
         return httpx.Response(
             200,
             json={
+                "id": "msg-1",
+                "model": "claude-test",
                 "content": [{"type": "text", "text": "answer"}],
                 "stop_reason": "end_turn",
                 "usage": {"input_tokens": 8, "output_tokens": 3},
@@ -135,7 +150,9 @@ async def test_anthropic_provider_keeps_system_separate_and_maps_usage() -> None
 
     payload = seen["payload"]
     assert isinstance(payload, dict)
-    assert payload["system"] == "role"
+    assert payload["system"] == [
+        {"type": "text", "text": "role", "cache_control": {"type": "ephemeral"}}
+    ]
     assert payload["messages"] == [{"role": "user", "content": "data"}]
     assert response.content == "answer"
     assert response.usage.input_tokens == 8
