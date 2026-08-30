@@ -1,8 +1,8 @@
 # 项目规则 (AGENTS.md)
 
 > 角色：负责 CodeMigrator（跨语言代码迁移 Agent 系统）的实现。
-> 核心工作目录：`crates/codemigrator-*`（核心代码，见 M-01）、`descriptors/`（双工具链声明式资源）、`apps/codemigrator-cli` 与 `web/`（产品入口）、`migrations/`（PostgreSQL schema）。
-> 契约真相：`my_space/codemigrator_design_doc/architecture_module_design/`（M-00～M-16）。设计文档可能演进，一切实现与解释以文档当前版本为准。
+> 核心工作目录：`src/codemigrator/`（Python 单包 src-layout，恰 8 个子包 core/analysis/planning/workspace/verification/sandbox/runtime/api，见 M-01）、`descriptors/`（双工具链声明式资源）、`apps/codemigrator-cli` 与 `web/`（产品入口）、`migrations/`（PostgreSQL schema）、`tests/` 与 `deploy/`。
+> 契约真相：`my_space/codemigrator_design_doc/architecture_module_design/`（M-00～M-16，定义目标行为与验收语义）+ `my_space/code_alignment_record/`（逐任务编码前对齐记录，固化该任务的用户确认实现决策——见 §3.0 编码开始规范）。设计文档可能演进，一切实现与解释以文档当前版本为准；两者冲突时以对齐记录最新决策为准，并按 §3.4 同步设计文档。
 
 ***
 
@@ -12,18 +12,19 @@
 
 > 用途：存放辅助文件、设计文档、进度记录、临时文件。敏感凭证统一存放于此，**不得写入 AGENTS.md**。
 
-| 子目录                                                    | 用途                          | 关键约束                                                      |
-| ------------------------------------------------------ | --------------------------- | --------------------------------------------------------- |
-| `codemigrator_dev_progress/`                           | 迭代更新记录，供各 agent 快速了解进度      | 按 §1.3 分类命名；记录内容按 `CodeMigrator迭代记录模板.md` 生成              |
-| `codemigrator_dev_progress/CodeMigrator开发任务规划与进度跟踪.md` | 整体任务规划与进度跟踪主表               | 任务新增/调序先经提问工具与用户确认                                        |
-| `codemigrator_design_doc/architecture_module_design/`  | 整体架构与模块设计文档                 | 平铺存放；修改先用提问工具与用户对齐                                        |
-| `codemigrator_design_doc/detailed_coding_design/`      | 详细编码与实现设计文档                 | 按 §1.3 分类命名；内容按 `CodeMigrator详细设计模板.md` 生成；更新时同步相关文档与迭代记录 |
-| `codemigrator_design_doc/feedback_doc/`                | 历史评审反馈与对齐记录                 | 只读，不改写既有内容                                                |
-| `temp/`                                                | 临时文件、临时代码、环境脚本              | —                                                         |
-| `Implementation_plan_doc/`                             | agent 工作前生成的执行/实施计划文档       | 按 §1.3 分类命名；内容按 `CodeMigrator实施计划模板.md` 生成                |
-| `.env`                                                 | 本机环境与基础设施凭证（Docker 服务/DB 等） | 有环境更新须在此记录                                                |
-| `model_api_key.json`                                   | 可真实调用大模型的 API key           | 仅本机使用                                                     |
-| `pr_md/`                                               | PR 说明文档                     | 书写前先读 `pr_md/README.md` 规范                                |
+| 子目录                                                    | 用途                                                              | 关键约束                                                                                          |
+| ------------------------------------------------------ | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `codemigrator_dev_progress/`                           | 迭代更新记录，供各 agent 快速了解进度                                          | 按 §1.3 分类命名；记录内容按 `CodeMigrator迭代记录模板.md` 生成                                                  |
+| `codemigrator_dev_progress/CodeMigrator开发任务规划与进度跟踪.md` | 整体任务规划与进度跟踪主表                                                   | 任务新增/调序先经提问工具与用户确认                                                                            |
+| `codemigrator_design_doc/architecture_module_design/`  | 整体架构与模块设计文档                                                     | 平铺存放；修改先用提问工具与用户对齐                                                                            |
+| `codemigrator_design_doc/detailed_coding_design/`      | 详细编码与实现设计文档                                                     | 按 §1.3 分类命名；内容按 `CodeMigrator详细设计模板.md` 生成；更新时同步相关文档与迭代记录                                     |
+| `codemigrator_design_doc/feedback_doc/`                | 历史评审反馈与对齐记录                                                     | 只读，不改写既有内容                                                                                    |
+| `temp/`                                                | 临时文件、临时代码、环境脚本                                                  | —                                                                                             |
+| `code_alignment_record/`                               | 逐任务编码前对齐记录——goal 模式实现的编码契约：任务范围/边界、用户确认决策（含开放项收口）、验收条款映射、跨任务协调点 | 按任务模块缩写建子目录，每任务一份 `CM-<模块缩写>-001-对齐记录.md`；**编码开始前必读**（§3.0）；既有决策仅可追加变更行修订（append-only），不得改写正文 |
+| `Implementation_plan_doc/`                             | agent 工作前生成的执行/实施计划文档                                           | 按 §1.3 分类命名；内容按 `CodeMigrator实施计划模板.md` 生成                                                    |
+| `.env`                                                 | 本机环境与基础设施凭证（Docker 服务/DB 等）                                     | 有环境更新须在此记录                                                                                    |
+| `model_api_key.json`                                   | 可真实调用大模型的 API key                                               | 仅本机使用                                                                                         |
+| `pr_md/`                                               | PR 说明文档                                                         | 书写前先读 `pr_md/README.md` 规范                                                                    |
 
 ### 1.2 开发环境
 
@@ -87,7 +88,7 @@
 
 ### 2.2 文档更新边界
 
-* **允许更新**：`my_space/` 与 `crates/`、`apps/`、`web/`、`descriptors/` 下的文档。
+* **允许更新**：`my_space/` 与 `src/`、`apps/`、`web/`、`descriptors/` 下的文档。
 
 * **禁止更新**：其他合作者的文档。
 
@@ -143,9 +144,17 @@
 
 ## 3. 任务执行工作流(必须遵守)
 
+### 3.0 编码开始规范（对齐记录必读，先于一切编码动作）
+
+1. **必读契约**：领取编码任务后、写第一行代码前，必须完整阅读该任务的对齐记录 `my_space/code_alignment_record/<模块缩写>/CM-<模块缩写>-001-对齐记录.md`（定位指针：主任务表 §7.3 备注列「已对齐：<记录路径>」）；记录不存在时**不得开工**，先与用户补齐对齐再动。
+2. **契约双源**：设计文档（M-00～M-16）定义「是什么/为什么」——目标行为与验收语义；对齐记录定义「该任务怎么做」——用户确认的实现决策（含 V6 开放项收口结论与文档偏差登记）。实现必须两者同时满足；冲突时以对齐记录最新决策为准，并按 §3.4 同步设计文档。
+3. **推荐采纳项纪律**：对齐记录中标「推荐采纳（用户跳过逐项确认）」的决策，实施中如发现依据不足或与实际冲突，必须先用提问工具与用户复核，确认后才可偏离；不得静默变更。
+4. **硬边界**：记录「任务理解」的范围/边界（做什么/不做什么）与「风险与注意点」中的跨任务协调点（依赖登记、接口先行冻结、契约扩容联动等）是实现与验收的硬边界；DoD 按记录「验收条款映射」逐条核验。
+5. **修订纪律**：实施中需推翻既有对齐决策时，先经提问工具与用户确认，再在记录内**追加变更行**（append-only）登记；禁止改写记录正文，禁止绕过记录直接实现冲突方案。
+
 ### 3.1 任务领取与进度查询
 
-1. 查看当前进度：读 `codemigrator_dev_progress/CodeMigrator开发任务规划与进度跟踪.md`（任务规划+进度）及 `codemigrator_dev_progress/` 下任务对应模块的记录文档，可根据文件夹时间排序查看最新记录。
+1. 查看当前进度：读 `codemigrator_dev_progress/CodeMigrator开发任务规划与进度跟踪.md`（任务规划+进度）及 `codemigrator_dev_progress/` 下任务对应模块的记录文档，可根据文件夹时间排序查看最新记录；编码类任务同时读该任务对齐记录（§3.0 编码开始规范）。
 
    * **适用场景**：上下文被压缩丢失时恢复上下文；执行任务中缺少项目相关上下文；新 agent 接手时快速了解情况；任务领取前的进度查询。
 2. 在书写任务计划文档时，或者在设计计划阶段和探索对齐阶段时，发现需要在总任务表中新增任务或者修改任务次序，如需调整更新总任务表，用提问工具与用户对齐确认。
