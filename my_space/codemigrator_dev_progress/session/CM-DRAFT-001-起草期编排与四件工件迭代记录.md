@@ -13,7 +13,7 @@ CM-DRAFT-001 是 CM-ANALYSIS 与 CM-CORE 合入后的 Wave 2 起草期任务，�
 
 ## 2. 变更内容
 
-- **当前状态**：已完成唯一审查反馈的一次性修复，待提交、推送和直接合并；已从合并后的 `develop` 创建 `feature/draft-orchestration`，按 TDD 完成 runtime 起草闭环。
+- **当前状态**：已完成唯一审查反馈的一次性修复并直接合并 PR #6；主工作区已拉取合并后的 `develop`，任务闭环完成。
 - **已建立文档**：`my_space/Implementation_plan_doc/session/CM-DRAFT-001-起草期编排与四件工件实施计划.md`、`my_space/codemigrator_design_doc/detailed_coding_design/session/CM-DRAFT-001-起草期编排与四件工件详细设计.md`。
 - **代码变更**：新增 `src/codemigrator/runtime/draft_models.py`、`draft_validation.py`、`draft.py`；新增 `tests/draft/` 契约测试；唯一审查修复补齐报告归并/骨架复核、SpecArtifact canonical 边界、工件深拷贝、封闭 Exec 请求、Code profile 和重复覆盖保留。
 - **关键实现决策**：遵循对齐记录 D-01～D-06；runtime 只保存四件 core 工件的内容摘要、revision 和问答指针，不复制公共工件定义；试译使用内存结果，零落盘/零 Run 副作用；不实现模型调用。
@@ -39,4 +39,4 @@ CM-DRAFT-001 是 CM-ANALYSIS 与 CM-CORE 合入后的 Wave 2 起草期任务，�
 
 - [x] 先编写起草契约、验证、账本和副作用测试并确认失败。
 - [x] 实现 runtime 起草最小闭环并完成规则验证。
-- [ ] 提交、推送并创建 PR；仅进行一次审查并等待终态，按结论一次性修复后直接合并，再拉取 `develop`。
+- [x] 提交、推送并创建 PR；仅进行一次审查并等待终态，按结论一次性修复后直接合并，再拉取 `develop`。

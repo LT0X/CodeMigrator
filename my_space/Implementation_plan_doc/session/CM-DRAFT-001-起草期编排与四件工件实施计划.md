@@ -29,7 +29,7 @@
 5. - [x] 实现 Harness 域骨架复核、归并/AskUser 阶段顺序和只读 Exec 请求授权，接入探索报告归并/切域建议记录及 Code profile 试译校准（`src/codemigrator/runtime/draft.py`、`tests/draft/test_flow.py` → V-M16-V4-012/D-03/D-04）。
 6. - [x] 用零副作用计数替身验证未确认草稿不创建 Run、事件、Slice、candidate 或托管输出，并验证确认只返回冻结事实（`tests/draft/test_side_effects.py` → V-M16-V4-013/V-M16-V4-014）。
 7. - [x] 同步迭代记录、主任务表和任务设计文档，执行 runtime/draft 专项、全量 pytest、Ruff、mypy、import-linter、compileall、diff check（`my_space/`、`tests/` → §4）。
-8. - [ ] 从当前分支提交并推送，创建 PR；仅启动一次审查并等待子 agent 终态，按该次结论一次性修复后直接合并，不对同一 PR 发起第二次审查。
+8. - [x] 从当前分支提交并推送，创建 PR；仅启动一次审查并等待子 agent 终态，按该次结论一次性修复后直接合并，不对同一 PR 发起第二次审查。
 
 ## 4. 验证计划
 
