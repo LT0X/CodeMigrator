@@ -10,7 +10,7 @@ from uuid import UUID
 
 from sse_starlette import ServerSentEvent
 
-from codemigrator.core import RunStatus
+from codemigrator.core import RunStatus, SecretRegistry
 
 from .deps import ApiBackend
 from .dto import MigrationEvent, SessionEvent
@@ -70,6 +70,7 @@ async def sse_events(
     queue_size: int = 64,
     event_name: str = "migration.event",
     envelope_type: EventEnvelope = MigrationEvent,
+    secret_registry: SecretRegistry | None = None,
 ) -> AsyncIterator[ServerSentEvent]:
     """Replay committed events through a bounded queue with heartbeat fallback."""
 
@@ -79,6 +80,7 @@ async def sse_events(
         raise ValueError("heartbeat_seconds must be positive")
 
     queue: asyncio.Queue[ServerSentEvent] = asyncio.Queue(maxsize=queue_size)
+    pending_item: asyncio.Task[ServerSentEvent] | None = None
     producer = asyncio.create_task(
         _produce_events(
             backend,
@@ -88,11 +90,13 @@ async def sse_events(
             queue=queue,
             event_name=event_name,
             envelope_type=envelope_type,
+            secret_registry=secret_registry,
         )
     )
     try:
         while True:
             item = asyncio.create_task(queue.get())
+            pending_item = item
             done, _ = await asyncio.wait(
                 {item, producer}, return_when=asyncio.FIRST_COMPLETED
             )
@@ -103,8 +107,12 @@ async def sse_events(
                     await asyncio.gather(item, return_exceptions=True)
                     return
             if item in done:
+                pending_item = None
                 yield item.result()
     finally:
+        if pending_item is not None:
+            pending_item.cancel()
+            await asyncio.gather(pending_item, return_exceptions=True)
         producer.cancel()
         await asyncio.gather(producer, return_exceptions=True)
 
@@ -118,6 +126,7 @@ async def _produce_events(
     queue: asyncio.Queue[ServerSentEvent],
     event_name: str,
     envelope_type: EventEnvelope,
+    secret_registry: SecretRegistry | None,
 ) -> None:
     cursor = after_sequence
     while True:
@@ -126,7 +135,7 @@ async def _produce_events(
         for record in sorted(records, key=lambda item: item.sequence):
             if record.sequence <= cursor:
                 continue
-            envelope = envelope_type.from_record(record)
+            envelope = envelope_type.from_record(record, secret_registry=secret_registry)
             _enqueue(
                 queue,
                 ServerSentEvent(

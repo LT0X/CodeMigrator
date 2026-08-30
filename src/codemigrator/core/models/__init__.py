@@ -14,7 +14,16 @@ from .common import (
     TargetProjectBlueprint,
     UnderstandingDossier,
 )
-from .context import ContextPack, ContextPackIdentity, SessionBudgetProfile, SliceGenerationRef
+from .context import (
+    CheckFeedbackSummary,
+    CheckpointSummary,
+    ContextPack,
+    ContextPackIdentity,
+    RecoveryBrief,
+    SegmentProgressSummary,
+    SessionBudgetProfile,
+    SliceGenerationRef,
+)
 from .descriptor import (
     CheckCommandTemplate,
     ContractArtifact,
@@ -76,6 +85,10 @@ __all__ = [
     "CodeAnchor",
     "ContextPack",
     "ContextPackIdentity",
+    "CheckFeedbackSummary",
+    "CheckpointSummary",
+    "RecoveryBrief",
+    "SegmentProgressSummary",
     "ContractArtifact",
     "CreateRun",
     "CreateRunSource",

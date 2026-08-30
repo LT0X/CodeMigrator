@@ -6,6 +6,7 @@ import pytest
 
 from codemigrator.api.dto import MigrationEvent, SpecView
 from codemigrator.api.events import RunEventType
+from codemigrator.core import SecretRegistry
 
 from .conftest import event
 
@@ -41,4 +42,24 @@ def test_event_data_rejects_secrets_and_full_text() -> None:
         MigrationEvent.from_record(
             event(uuid4(), 1),
             data={"token": "secret"},
+        )
+
+
+def test_event_data_rejects_credential_aliases_through_the_shared_redaction_boundary() -> None:
+    with pytest.raises(ValueError, match="redacted"):
+        MigrationEvent.from_record(
+            event(uuid4(), 1),
+            data={"credential": "secret"},
+        )
+
+
+def test_event_record_can_use_the_runtime_secret_registry() -> None:
+    registry = SecretRegistry()
+    registry.register("runtime-secret")
+
+    with pytest.raises(ValueError, match="redacted"):
+        MigrationEvent.from_record(
+            event(uuid4(), 1),
+            data={"summary": "runtime-secret"},
+            secret_registry=registry,
         )
