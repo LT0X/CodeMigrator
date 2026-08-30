@@ -33,7 +33,10 @@ class RepairDecision(CoreModel):
     def domain_paths_are_safe(cls, value: object) -> object:
         if not isinstance(value, dict):
             return value
-        return {key: normalize_repo_relative_paths(paths) for key, paths in value.items()}
+        try:
+            return {key: normalize_repo_relative_paths(paths) for key, paths in value.items()}
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class GlobalRepairSession(CoreModel):

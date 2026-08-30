@@ -2,13 +2,26 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 import semver
-from pydantic import field_serializer, field_validator
+from pydantic import WithJsonSchema, field_serializer, field_validator
 
 from .._base import CoreModel
 from ..enums import CheckAction, ModuleBoundaryStrategy
 from ..ids import CheckId, LanguageId, ProjectModuleId, RepoRelativePath, Sha256
 from ..paths import _validate_repo_relative_path, normalize_repo_relative_paths
+
+_SEMVER_PATTERN = (
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+_DescriptorVersion = Annotated[
+    semver.Version,
+    WithJsonSchema({"type": "string", "pattern": _SEMVER_PATTERN}, mode="validation"),
+    WithJsonSchema({"type": "string", "pattern": _SEMVER_PATTERN}, mode="serialization"),
+]
 
 
 class TreeSitterGrammarRef(CoreModel):
@@ -51,14 +64,29 @@ class TargetToolchain(CoreModel):
     @field_validator("build_excludes", mode="before")
     @classmethod
     def build_excludes_are_safe(cls, value: object) -> list[str]:
-        return normalize_repo_relative_paths(value)  # type: ignore[arg-type]
+        try:
+            return normalize_repo_relative_paths(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class ToolchainDescriptor(CoreModel):
-    descriptor_version: semver.Version
+    descriptor_version: _DescriptorVersion
     descriptor_sha256: Sha256
     source: SourceToolchain
     target: TargetToolchain
+
+    @field_validator("descriptor_version", mode="before")
+    @classmethod
+    def parse_descriptor_version(cls, value: object) -> semver.Version:
+        if isinstance(value, semver.Version):
+            return value
+        if isinstance(value, str):
+            try:
+                return semver.Version.parse(value)
+            except ValueError as exc:
+                raise ValueError("descriptor_version must be valid semver") from exc
+        raise ValueError("descriptor_version must be a semver string")
 
     @field_serializer("descriptor_version")
     def serialize_descriptor_version(self, value: semver.Version) -> str:

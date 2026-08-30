@@ -105,12 +105,12 @@ BranchPrefix 先做 ASCII 与 UTF-8 字节长度检查，再按 `/` 分段，拒
 
 对外公共接口集中从 `codemigrator.core` 导出：
 
-- 身份：全部 ID NewType、`new_uuid7`、generation/path/canonical 纯函数。
+- 身份：全部 ID NewType、`new_uuid7`、generation/path/canonical 纯函数（包括 `validate_candidate_generation`）。
 - 枚举：M-00 全量枚举、`SessionKind` 和验证可靠性枚举。
 - 模型：M-00 公共契约代码块列出的所有模型，以及 Context/RepairEvidence 联动模型。
 - 资源：`load_phase_tool_policy`、`load_verification_policy`、`load_session_budget`、`load_session_templates`。
 
-`PlanEdge` 使用 `from_` 作为 Python 属性、`from` 作为 JSON 属性；`CreateRunSource` 是 `RemoteRepository | RegisteredProject` 判别联合；`DiagnosticTarget` 的 discriminator 是 `kind`，`VerificationSubject` 的 discriminator 也是 `kind`。模型 JSON 输出不携带 Python-only 的别名字段。
+`PlanEdge` 使用 `from_` 作为 Python 属性、`from` 作为 JSON 属性，并默认按 alias 序列化；`CreateRunSource` 是 `RemoteRepository | RegisteredProject` 判别联合；`DiagnosticTarget` 的 discriminator 是 `kind`，`VerificationSubject` 的 discriminator 也是 `kind`。模型 JSON 输出不携带 Python-only 的别名字段。
 
 core 不新增数据库表，不定义 REST/SSE DTO，不定义 run_events 事件名，不定义异常层次；这些接口分别由 runtime/api/下游 owner 实现。
 
@@ -123,7 +123,7 @@ core 不新增数据库表，不定义 REST/SSE DTO，不定义 run_events 事�
 - Spec/描述符：`SPEC_TOO_LARGE`、`SPEC_JSON_INVALID`、`SPEC_DUPLICATE_KEY`、`SPEC_DEPTH_EXCEEDED`、`SPEC_SCHEMA_UNSUPPORTED`、`SPEC_SCHEMA_INVALID`、`CHECK_ACTION_UNSUPPORTED`、`CHECK_SET_INCOMPLETE`、`DESCRIPTOR_NOT_FOUND`、`DESCRIPTOR_DIGEST_MISMATCH`、`TOOLCHAIN_IMAGE_UNAVAILABLE`、`SPEC_IN_USE`。
 - Planner：`PLAN_CYCLE`、`PLAN_SCOPE_CONFLICT`、`PLAN_BLUEPRINT_VIOLATION`、`PLAN_COVERAGE_INVALID`、`PLAN_SIZE_EXCEEDED`、`PLAN_EDGE_INVALID`、`PLAN_RANK_INCONSISTENT`、`PLAN_PROPOSAL_INVALID`。
 - 验证集合：`CHECK_MISSING`、`CHECK_DUPLICATE`、`CHECK_UNEXPECTED`、`INVOCATION_HASH_MISMATCH`。
-- 上下文与恢复：`CONTEXT_BUDGET_EXCEEDED`、`CONTEXT_CAPABILITY_INVALID`、`RECOVERY_LEDGER_INCONSISTENT`。
+- 上下文、绑定与恢复：`CONTEXT_BUDGET_EXCEEDED`、`CONTEXT_CAPABILITY_INVALID`、`MODEL_BINDING_INVALID`、`PHASE_STATUS_MISMATCH`、`CANDIDATE_REF_CONFLICT`、`REMOTE_REF_MOVED`、`DEPENDENCY_UNAVAILABLE`、`RECOVERY_LEDGER_INCONSISTENT`。
 
 `FailureReason` 单独承载 `ANALYSIS_FAILED`、`DOSSIER_INCONSISTENT`、`PLAN_FAILED`、`EXECUTION_FAILED`、`VERIFICATION_TERMINAL`、`REPORT_GENERATION_FAILED`、`BUDGET_EXHAUSTED`、`RESOURCE_EXHAUSTED`、`OUTPUT_LIMIT_EXCEEDED`、`SLICE_REGENERATION_EXHAUSTED`、`NONDETERMINISTIC_VERIFICATION` 等 Run 终态原因；禁止以稳定错误码替代它。
 
@@ -137,7 +137,7 @@ core 不新增数据库表，不定义 REST/SSE DTO，不定义 run_events 事�
 - `tests/core/test_policy.py`：资源加载、URI、版本和 `SHA-256(JCS(payload))` 摘要。
 - `tests/contracts/test_core_contracts.py`：核心公共导出和跨域模型字段。
 - `tests/contracts/test_policy_resources.py`：Phase exact-match、十槽位模板、十档预算资源。
-- `tests/core/test_models.py`：模型边界路径/subject 约束与 `semver.Version` JSON/canonical 序列化。
+- `tests/core/test_models.py`：模型边界路径/subject 约束、默认 PlanEdge alias 与 `semver.Version` JSON/canonical round-trip/Schema。
 
 | 验收条款 | 用例名 |
 | --- | --- |

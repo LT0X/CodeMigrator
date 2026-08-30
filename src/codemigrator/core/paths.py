@@ -37,10 +37,10 @@ def _repo_path_key(value: str) -> bytes:
     return value.encode("utf-8")
 
 
-def normalize_repo_relative_paths(paths: Sequence[object]) -> list[str]:
+def normalize_repo_relative_paths(paths: object) -> list[str]:
     """Validate, deduplicate, and UTF-8-byte-sort repository-relative paths."""
 
-    if isinstance(paths, (str, bytes)):
+    if isinstance(paths, (str, bytes)) or not isinstance(paths, Sequence):
         raise TypeError("repository paths must be a sequence of paths")
     normalized: set[str] = set()
     for path in paths:

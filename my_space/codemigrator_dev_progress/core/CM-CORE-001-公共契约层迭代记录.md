@@ -33,6 +33,7 @@ CodeMigrator V6 代码实现从 Wave 0 启动，需要先建立所有下游子�
 - 第二轮审查新增问题已核实并修复：资源摘要改为 `SHA-256(JCS(payload))`；`ToolchainDescriptor.descriptor_version` 通过 serializer 稳定输出 semver 字符串；中心错误码补齐 `CONTEXT_BUDGET_EXCEEDED`、`CONTEXT_CAPABILITY_INVALID`、`RECOVERY_LEDGER_INCONSISTENT`。
 - 资源测试不再声称存在独立 manifest 文件：`session-templates/v1.json` 对象本身承载十槽位 manifest，摘要针对解析后的 canonical payload。
 - 工程依赖登记仍由 `CM-INFRA-001` 负责；本任务未在 core 分支新增第二套 `pyproject.toml` 或锁文件。
+- 后续独立审查发现并修复：`PlanEdge` 默认 alias 序列化、semver 字符串输入/JSON Schema、路径列表 malformed container 的 Pydantic 错误语义、`validate_candidate_generation` facade 导出，以及 `MODEL_BINDING_INVALID`、`PHASE_STATUS_MISMATCH`、`CANDIDATE_REF_CONFLICT`、`REMOTE_REF_MOVED`、`DEPENDENCY_UNAVAILABLE` 五个架构引用码。
 
 ## 4. 影响面与风险
 

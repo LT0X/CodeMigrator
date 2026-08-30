@@ -526,12 +526,12 @@ flowchart TD
 
 > 每次完成任务或计划变更后在本标题下方置顶追加 CHG 条目（模板见 §8.4）；最新记录在最上方。
 
-### CHG-20260830-02：CM-CORE-001 独立审查修订
+### CHG-20260830-03：CM-CORE-001 独立审查修订
 
 * 时间：2026-08-30
 * 变更类型：审查修订（任务保持进行中）
-* 变更原因：两份延长等待后的独立审查均返回有效 `REQUEST_CHANGES`，指出模型边界、JCS 摘要、semver 序列化、跨模块错误码和文档事实口径问题。
-* 变更内容：补充失败测试并修复 CreateRun/路径/subject/dossier 约束、公共 facade 导出、`SHA-256(JCS(payload))` 资源摘要、semver JSON 序列化和 `CONTEXT_BUDGET_EXCEEDED`/`CONTEXT_CAPABILITY_INVALID`/`RECOVERY_LEDGER_INCONSISTENT` 错误码；同步对齐记录、详细设计、实施计划、迭代记录和 PR 说明。
+* 变更原因：两份延长等待后的独立审查均返回有效 `REQUEST_CHANGES`，指出模型边界、JCS 摘要、semver JSON round-trip、PlanEdge alias、跨模块错误码和文档事实口径问题。
+* 变更内容：补充失败测试并修复 CreateRun/路径/subject/dossier 约束、公共 facade 导出、`SHA-256(JCS(payload))` 资源摘要、PlanEdge 默认 alias、semver JSON round-trip/Schema、模型边界错误语义和跨模块稳定错误码；同步对齐记录、详细设计、实施计划、迭代记录和 PR 说明。
 * 影响范围：CM-CORE-001；工程依赖登记仍归 CM-INFRA-001；未修改架构模块设计文档。
 * 验证：新增回归后 `tests/core tests/contracts` 共 55 passed；审查通过与 PR 合并尚未完成。
 * 后续行动：清理工作树并提交审查修订，推送 PR #1；取得有效独立 `APPROVE` 后合并，再在主工作区拉取 `develop`。

@@ -30,7 +30,10 @@ class WriteScopeOut(CoreModel):
     @field_validator("write_paths", "create_roots", mode="before")
     @classmethod
     def paths_are_safe(cls, value: object) -> list[str]:
-        return normalize_repo_relative_paths(value)  # type: ignore[arg-type]
+        try:
+            return normalize_repo_relative_paths(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class WriteScope(CoreModel):

@@ -55,6 +55,11 @@ def test_stable_error_codes_are_single_string_enum() -> None:
         "CONTEXT_BUDGET_EXCEEDED",
         "CONTEXT_CAPABILITY_INVALID",
         "RECOVERY_LEDGER_INCONSISTENT",
+        "MODEL_BINDING_INVALID",
+        "PHASE_STATUS_MISMATCH",
+        "CANDIDATE_REF_CONFLICT",
+        "REMOTE_REF_MOVED",
+        "DEPENDENCY_UNAVAILABLE",
     }
     assert {code.value for code in StableErrorCode} == expected
     assert StableErrorCode.WRITE_SCOPE_VIOLATION.value == "WRITE_SCOPE_VIOLATION"

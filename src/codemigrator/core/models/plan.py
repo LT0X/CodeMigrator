@@ -27,7 +27,12 @@ class PlanValidation(CoreModel):
 
 
 class PlanEdge(CoreModel):
-    model_config = ConfigDict(extra="forbid", populate_by_name=True, arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        serialize_by_alias=True,
+        arbitrary_types_allowed=True,
+    )
 
     from_: SliceId = Field(alias="from")
     to: SliceId

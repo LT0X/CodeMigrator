@@ -88,7 +88,7 @@
 - 实现 M-00 的 `MigrationSessionStatus`、`InteractionStatus`、`CorrectionIntentStatus`、`SliceKind`、`ArtifactKind`、`DossierBudgetTier`、`SliceAttemptStatus`、`PlanEdgeKind`、`RunStatus`、`FailureReason`、`DeliveryChannelStatus`、`ModelProfile`、`Phase`、`ResidentRole`、`AdviceKind`、`ModuleBoundaryStrategy`、`CheckAction`、`DiagnosticSeverity`、`CheckStatus`。
 - 实现跨任务收口的 `SessionKind` 九值：`ANALYZE_AUXILIARY`、`PLAN_AUXILIARY`、`CONTRACT`、`IMPLEMENTATION`、`TEST_TRANSLATION`、`TEST_GENERATION`、`EXPLORE_COORDINATOR`、`EXECUTE_SUPERVISOR`、`REPAIR_SESSION`；`Drafting` 作为模板资源的第十槽位，不伪造为 Run 内 SessionKind。
 - 实现验证可靠性三值 `RELIABLE`、`UNCERTAIN`、`DYNAMIC`。
-- `StableErrorCode` 集中包含 M-00/M-02/M-05/M-07/M-10/M-11/M-12/M-14 已登记的稳定码，包括工具/路径/读写/查询/Shell/Exec、Spec/descriptor、PLAN 八码、验证集合四码、上下文能力码、恢复账本码及 API 幂等码；不把 `FailureReason` 成员并入其中。
+- `StableErrorCode` 集中包含 M-00/M-02/M-05/M-07/M-10/M-11/M-12/M-14 已登记的稳定码，包括工具/路径/读写/查询/Shell/Exec、Spec/descriptor、PLAN 八码、验证集合四码、上下文能力码、模型绑定/阶段一致性/候选与远端 ref/依赖能力码、恢复账本码及 API 幂等码；不把 `FailureReason` 成员并入其中。
 
 - [x] 以设计文档和所有已对齐记录中的值表建立 exact-match 期望集合。
 - [x] 编写每个枚举的名称、值、字符串 JSON 序列化和错误族隔离测试。
@@ -134,6 +134,7 @@
 - [x] 编写 URI 可寻址、JSON UTF-8、资源版本、SHA-256(JCS(payload)) 和 missing resource 拒绝测试。
 - [x] 编写 Phase policy exact-match 测试，确认 VERIFY/REPORT 为空列表而不是缺键。
 - [x] 编写十槽位会话模板 manifest 和十档预算 profile 的覆盖测试。
+- [x] 编写资源 JCS 摘要、描述符 semver JSON round-trip/Schema 和默认 `PlanEdge` alias 输出测试。
 - [x] 运行资源测试通过。
 
 ### 3.6 任务 5：集成验证和收尾文档
@@ -147,7 +148,7 @@
 - [x] 运行 `PYTHONPATH=src /tmp/codemigrator-infra/.venv/bin/python -m pytest tests/core tests/contracts -q`，初始实现 49 passed，第一轮审查修订后 53 passed，第二轮审查修订后 55 passed。
 - [x] 运行 import 编译检查：`PYTHONPATH=src:/tmp/codemigrator-core-venv/lib/python3.12/site-packages python3 -m compileall -q src/codemigrator/core`。
 - [x] 做静态审查：core 不导入 `runtime`、不读取环境变量、不创建线程/任务、不定义 API 事件常量；`runtime_image_digest` 命中仅为描述符数据字段，已人工复核不属于运行时依赖。
-- [x] 处理独立审查反馈：CreateRun 分支前缀、RepoRelativePath 模型边界、subject/OID 一致性、公共导出、DossierEntry 锚点规则、JCS 资源摘要、semver JSON 序列化和跨模块稳定错误码。
+- [x] 处理独立审查反馈：CreateRun 分支前缀、RepoRelativePath 模型边界、subject/OID 一致性、公共导出、DossierEntry 锚点规则、JCS 资源摘要、semver JSON round-trip/Schema、PlanEdge 默认 alias、模型边界异常语义和跨模块稳定错误码。
 - [x] 按 core 对齐记录逐条登记验收证据；import-linter/CI 未执行并说明归属 CM-INFRA-001。
 - [x] 更新模块迭代记录、主任务表状态/日期/证据指针和 §6/§11 统计。
 - [ ] 核对工作树仅包含本任务范围，完成后按用户授权提交分支并记录提交证据。

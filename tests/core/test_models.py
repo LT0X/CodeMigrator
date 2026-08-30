@@ -101,6 +101,9 @@ def test_plan_edge_uses_from_alias_in_json() -> None:
     assert "from" in edge.model_dump(by_alias=True)
     assert "from_" not in edge.model_dump(by_alias=True)
     assert PlanEdge.model_validate(edge.model_dump(by_alias=True)) == edge
+    assert '"from":' in edge.model_dump_json()
+    assert '"from_":' not in edge.model_dump_json()
+    assert PlanEdge.model_validate_json(edge.model_dump_json()) == edge
 
 
 def test_create_run_source_union_is_closed() -> None:
@@ -152,6 +155,9 @@ def test_repo_paths_are_validated_and_normalized_at_model_boundaries() -> None:
 
     with pytest.raises(ValidationError):
         FileLine(kind="FILE_LINE", file_path="../outside", line=1)
+
+    with pytest.raises(ValidationError):
+        WriteScopeOut(write_paths="src/main.py", create_roots=["src"])
 
 
 def test_discriminated_targets_reject_unknown_variants_and_extra_fields() -> None:
@@ -271,6 +277,11 @@ def test_descriptor_and_plan_contracts_are_constructible() -> None:
         target=target,
     )
     assert descriptor.descriptor_version == semver.Version.parse("1.0.0")
+    assert ToolchainDescriptor.model_validate_json(descriptor.model_dump_json()) == descriptor
+    assert (
+        ToolchainDescriptor.model_json_schema()["properties"]["descriptor_version"]["type"]
+        == "string"
+    )
     proposal = PlanProposal(slices=[], edges=[], integration_ranks={}, planner_rationale=[])
     validation = PlanValidation(
         accepted=True,
@@ -340,6 +351,15 @@ def test_context_advice_repair_and_slice_contracts() -> None:
     assert advice.payload["suggested_route"] == "delegate_regen"
     assert decision.domain_split[slice_id] == ["src/main.py"]
     assert evidence.reliability is AttributionReliability.Reliable
+
+    with pytest.raises(ValidationError):
+        RepairDecision(
+            decision_id=RepairDecisionId(uid()),
+            run_id=run_id,
+            repair_set=[slice_id],
+            domain_split={slice_id: "src/main.py"},
+            brief_refs=[ref()],
+        )
 
 
 def test_toolchain_descriptor_serializes_semver_as_json_string() -> None:

@@ -104,6 +104,7 @@ __all__ = [
     "integration_key",
     "new_uuid7",
     "normalize_repo_relative_paths",
+    "validate_candidate_generation",
     "validate_branch_prefix",
     "load_phase_tool_policy",
     "load_resource",

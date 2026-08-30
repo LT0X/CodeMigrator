@@ -13,5 +13,6 @@ def test_core_public_exports_include_contract_primitives() -> None:
         "RequestId",
         "ToolchainDescriptor",
         "VerificationOutcome",
+        "validate_candidate_generation",
     ):
         assert hasattr(core, name)

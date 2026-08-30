@@ -32,6 +32,7 @@
 - 在 CreateRun、路径、验证 subject/file line、descriptor 排除路径、contract artifact 和 dossier entry 模型边界落实语义校验，并补公共 facade 导出。
 - 资源摘要采用 `SHA-256(JCS(payload))`；`ToolchainDescriptor.descriptor_version` JSON 输出为 semver 字符串。
 - 补齐 `CONTEXT_BUDGET_EXCEEDED`、`CONTEXT_CAPABILITY_INVALID`、`RECOVERY_LEDGER_INCONSISTENT` 三个跨模块稳定错误码。
+- 进一步补齐 `MODEL_BINDING_INVALID`、`PHASE_STATUS_MISMATCH`、`CANDIDATE_REF_CONFLICT`、`REMOTE_REF_MOVED`、`DEPENDENCY_UNAVAILABLE`；修复 `PlanEdge` 默认 alias、semver JSON round-trip/Schema、路径列表错误语义，并导出 `validate_candidate_generation`。
 - `uuid-utils`、RFC 8785 等工程依赖仍由 CM-INFRA-001 登记，本 PR 不重复建立工程基线。
 
 ## 5. 风险与回滚
