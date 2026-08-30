@@ -100,6 +100,12 @@ def serialize_observation(
     if artifact_ref is None:
         raise ObservationSerializationError("event exceeds 64 KiB")
     digest = hashlib.sha256(encoded).hexdigest()
+    try:
+        locator = artifact_ref(encoded)
+    except Exception as exc:
+        raise ObservationSerializationError("artifact reference unavailable") from exc
+    if not isinstance(locator, str) or not locator:
+        raise ObservationSerializationError("artifact reference unavailable")
     reference = {
         "schema": "codemigrator.observation.event",
         "version": 1,
@@ -107,7 +113,7 @@ def serialize_observation(
         "sequence": payload.get("sequence", 1),
         "timestamp_utc": payload.get("timestamp_utc", ""),
         "payload_ref": {
-            "locator": artifact_ref(encoded),
+            "locator": locator,
             "sha256": digest,
             "size": len(encoded),
         },
@@ -386,6 +392,11 @@ class MetricRegistry:
     def dropped_count(self, sink: str) -> int:
         return self._dropped.get(sink, 0)
 
+    def record_drop(self, sink: str) -> None:
+        """Record a failed projection for an injected sink callback."""
+
+        self._record_drop(sink)
+
     def _descriptor(self, name: str) -> MetricDescriptor:
         try:
             return self._descriptors[name]
@@ -411,7 +422,11 @@ class MetricRegistry:
             pass
         dropped = self._metrics.get("codemigrator_observation_dropped_total")
         if dropped is not None:
-            sink_value = "metric_exemplar" if sink == "metrics" else sink
+            sink_value = (
+                "metric_exemplar"
+                if sink in {"metrics", "exporter"}
+                else sink
+            )
             allowed = next(
                 label.values
                 for descriptor in CORE_METRIC_DESCRIPTORS
@@ -479,12 +494,22 @@ class BoundedExporter:
         capacity: int = EXPORTER_QUEUE_CAPACITY,
         on_drop: Callable[[str], object] | None = None,
         send: Callable[[bytes], object] | None = None,
+        drop_sink: str = "metric_exemplar",
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be positive")
         self.capacity = capacity
         self.on_drop = on_drop or (lambda sink: None)
         self.send = send
+        allowed_sinks = next(
+            label.values
+            for descriptor in CORE_METRIC_DESCRIPTORS
+            if descriptor.name == "codemigrator_observation_dropped_total"
+            for label in descriptor.labels
+        )
+        if drop_sink not in allowed_sinks:
+            raise ValueError("drop_sink must use the observation dropped sink allowlist")
+        self.drop_sink = drop_sink
         self._queue: deque[bytes] = deque(maxlen=capacity)
 
     @property
@@ -510,7 +535,7 @@ class BoundedExporter:
 
     def _drop(self) -> None:
         try:
-            self.on_drop("exporter")
+            self.on_drop(self.drop_sink)
         except Exception:
             pass
 
@@ -530,6 +555,7 @@ class ObservationPipeline:
         enabled_sinks: Sequence[str] = ("run_events",),
         sentinel_interval_events: int = SENTINEL_INTERVAL_EVENTS,
         sentinel_outputs: Callable[[bytes], Mapping[str, object]] | None = None,
+        run_events: Callable[[bytes], object] | None = None,
     ) -> None:
         if sentinel_interval_events < 1:
             raise ValueError("sentinel_interval_events must be positive")
@@ -542,6 +568,7 @@ class ObservationPipeline:
         self.enabled_sinks = tuple(enabled_sinks)
         self.sentinel_interval_events = sentinel_interval_events
         self.sentinel_outputs = sentinel_outputs
+        self.run_events = run_events
         self._event_count = 0
 
     def emit(self, event: ObservationEvent | Mapping[str, object]) -> bool:
@@ -569,11 +596,22 @@ class ObservationPipeline:
             if not self.sentinel.run(outputs).passed:
                 self._drop("run_events")
                 return False
-        delivered = True
+        delivered = False
+        if self.run_events is not None:
+            try:
+                result = self.run_events(payload)
+            except Exception:
+                self._drop("run_events")
+                return False
+            if result is False:
+                self._drop("run_events")
+                return False
+            delivered = True
         if self.jsonl is not None:
-            delivered = self.jsonl._write_serialized(payload) and delivered
+            delivered = self.jsonl._write_serialized(payload) or delivered
         for exporter in self.exporters:
             exporter.publish(payload)
+        delivered = bool(self.exporters) or delivered
         return delivered
 
     def _drop(self, sink: str) -> None:
@@ -675,6 +713,7 @@ class RetentionRecord:
     kind: str
     created_at: datetime
     referenced: bool = False
+    terminal: bool = True
 
     def __post_init__(self) -> None:
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
@@ -701,7 +740,7 @@ class RetentionCleaner:
         current = (now or datetime.now(UTC)).astimezone(UTC)
         selected: list[RetentionRecord] = []
         for record in records:
-            if record.referenced:
+            if record.referenced or not record.terminal:
                 continue
             retention = self.RETENTION.get(record.kind)
             if retention is None:

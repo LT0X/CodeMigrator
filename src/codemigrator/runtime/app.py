@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
 
 import asyncpg  # type: ignore[import-untyped]
+
+from codemigrator.core import SecretRegistry
+
+from .observability import DEFAULT_SENTINEL_SINKS, SentinelSuite
 
 
 class PostgreSQLUnavailable(ConnectionError):
@@ -233,8 +237,30 @@ class RuntimeApplication:
     lifecycle: AsyncAppLifecycle
 
     @classmethod
-    def from_dsn(cls, dsn: str) -> RuntimeApplication:
-        return cls(AsyncAppLifecycle(PostgreSQLAdvisoryLock(dsn)))
+    def from_dsn(
+        cls,
+        dsn: str,
+        *,
+        secret_registry: SecretRegistry | None = None,
+        sentinel_outputs: Mapping[str, object] | None = None,
+    ) -> RuntimeApplication:
+        registry = secret_registry or SecretRegistry()
+        sentinel = SentinelSuite(registry)
+        outputs = (
+            dict(sentinel_outputs)
+            if sentinel_outputs is not None
+            else {sink: {} for sink in DEFAULT_SENTINEL_SINKS}
+        )
+
+        def readiness_check() -> bool:
+            return sentinel.run(outputs).passed
+
+        return cls(
+            AsyncAppLifecycle(
+                PostgreSQLAdvisoryLock(dsn),
+                readiness_check=readiness_check,
+            )
+        )
 
     async def run(self) -> int:
         await self.lifecycle.start()

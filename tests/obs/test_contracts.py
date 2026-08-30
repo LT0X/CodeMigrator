@@ -26,7 +26,7 @@ def test_observation_contract_does_not_reintroduce_retired_v3_metric_names() -> 
 
 
 def test_run_event_sources_share_one_redaction_pipeline() -> None:
-    pipeline = ObservationPipeline(SecretRegistry())
+    pipeline = ObservationPipeline(SecretRegistry(), run_events=lambda payload: True)
     event_types = (
         RunEventType.ToolCallPre.value,
         RunEventType.ToolCallPost.value,

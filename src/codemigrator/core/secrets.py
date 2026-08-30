@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -60,20 +61,22 @@ class SecretRegistry:
     """A write-only registry whose values can only be used for safety scanning."""
 
     def __init__(self) -> None:
-        self._variants: tuple[str, ...] = ()
+        self._fingerprints: tuple[tuple[int, bytes], ...] = ()
 
     def register(self, secret: str) -> None:
         """Register one secret without exposing it to callers."""
 
         if not isinstance(secret, str) or not secret:
             raise ValueError("secret must be a non-empty string")
-        variants = _encoded_variants(secret)
-        self._variants = tuple(dict.fromkeys((*self._variants, *variants)))
+        fingerprints = _fingerprints(_encoded_variants(secret))
+        self._fingerprints = tuple(
+            dict.fromkeys((*self._fingerprints, *fingerprints))
+        )
 
     def redact(self, value: object) -> RedactionResult:
         """Copy a safe JSON-like value or reject the complete payload."""
 
-        result = _scan_value(value, self._variants)
+        result = _scan_value(value, self._fingerprints)
         if result is _BLOCKED_SECRET:
             return RedactionResult(False, None, "secret_match")
         if result is _BLOCKED_FIELD:
@@ -95,9 +98,9 @@ def _encoded_variants(secret: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys((secret, escaped, encoded, percent_encoded)))
 
 
-def _scan_value(value: object, variants: Sequence[str]) -> object:
+def _scan_value(value: object, fingerprints: Sequence[tuple[int, bytes]]) -> object:
     if isinstance(value, str):
-        return _BLOCKED_SECRET if _contains_secret(value, variants) else value
+        return _BLOCKED_SECRET if _contains_secret(value, fingerprints) else value
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, Mapping):
@@ -107,7 +110,7 @@ def _scan_value(value: object, variants: Sequence[str]) -> object:
                 return _BLOCKED_TYPE
             if key.casefold() in FORBIDDEN_FIELDS:
                 return _BLOCKED_FIELD
-            scanned = _scan_value(nested, variants)
+            scanned = _scan_value(nested, fingerprints)
             if scanned is _BLOCKED_SECRET or scanned is _BLOCKED_FIELD or scanned is _BLOCKED_TYPE:
                 return scanned
             copied[key] = scanned
@@ -115,7 +118,7 @@ def _scan_value(value: object, variants: Sequence[str]) -> object:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         copied_items: list[object] = []
         for nested in value:
-            scanned = _scan_value(nested, variants)
+            scanned = _scan_value(nested, fingerprints)
             if scanned is _BLOCKED_SECRET or scanned is _BLOCKED_FIELD or scanned is _BLOCKED_TYPE:
                 return scanned
             copied_items.append(scanned)
@@ -123,8 +126,25 @@ def _scan_value(value: object, variants: Sequence[str]) -> object:
     return _BLOCKED_TYPE
 
 
-def _contains_secret(value: str, variants: Sequence[str]) -> bool:
-    return any(variant and variant in value for variant in variants)
+def _fingerprints(variants: Sequence[str]) -> tuple[tuple[int, bytes], ...]:
+    return tuple(
+        dict.fromkeys(
+            (len(variant), hashlib.sha256(variant.encode("utf-8")).digest())
+            for variant in variants
+            if variant
+        )
+    )
+
+
+def _contains_secret(value: str, fingerprints: Sequence[tuple[int, bytes]]) -> bool:
+    for length, expected in fingerprints:
+        if length > len(value):
+            continue
+        for start in range(len(value) - length + 1):
+            candidate = value[start : start + length].encode("utf-8")
+            if hashlib.sha256(candidate).digest() == expected:
+                return True
+    return False
 
 
 __all__ = ["FORBIDDEN_FIELDS", "RedactionResult", "SecretRegistry"]

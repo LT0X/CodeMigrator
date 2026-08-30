@@ -10,7 +10,13 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
-from codemigrator.core import ActiveDispatch, FailureReason, RunId, RunStatus
+from codemigrator.core import (
+    ActiveDispatch,
+    FailureReason,
+    RunId,
+    RunStatus,
+    SecretRegistry,
+)
 
 from .budget import BudgetUsage
 from .contracts import EventSpec, RunState, RuntimeEvent, RuntimeSnapshot
@@ -35,10 +41,11 @@ class StoreCommitError(RuntimeError):
 class InMemoryRuntimeStore:
     """A transactionally behaving store double for actor and contract tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, secret_registry: SecretRegistry | None = None) -> None:
         self._snapshots: dict[RunId, RuntimeSnapshot] = {}
         self.commit_count = 0
         self._fail_next = False
+        self.secret_registry = secret_registry or SecretRegistry()
 
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         return self._snapshots.get(run_id)
@@ -68,14 +75,17 @@ class InMemoryRuntimeStore:
             raise StoreCommitError("injected commit failure")
         previous = self._snapshots.get(state.run_id)
         first_sequence = len(previous.events) + 1 if previous is not None else 1
-        materialized = tuple(
-            RuntimeEvent(
-                sequence=first_sequence + index,
-                event_type=event.event_type,
-                data=event.data,
+        try:
+            materialized = tuple(
+                RuntimeEvent(
+                    sequence=first_sequence + index,
+                    event_type=event.event_type,
+                    data=_redact_event_data(event.data, self.secret_registry),
+                )
+                for index, event in enumerate(events)
             )
-            for index, event in enumerate(events)
-        )
+        except ValueError as exc:
+            raise StoreCommitError("observation rejected") from exc
         snapshot = RuntimeSnapshot(
             state=state,
             events=(*previous.events, *materialized) if previous else materialized,
@@ -92,8 +102,9 @@ class PostgreSQLRuntimeStore:
     runtime logic never imports or manages a database connection directly.
     """
 
-    def __init__(self, pool: Any) -> None:
+    def __init__(self, pool: Any, *, secret_registry: SecretRegistry | None = None) -> None:
         self.pool = pool
+        self.secret_registry = secret_registry or SecretRegistry()
 
     async def initialize(self) -> None:
         async with self.pool.acquire() as connection:
@@ -139,7 +150,13 @@ class PostgreSQLRuntimeStore:
                     )
                 except Exception as exc:
                     raise StoreCommitError("unable to create runtime run") from exc
-                await _insert_events(connection, state.run_id, events, first_sequence=1)
+                await _insert_events(
+                    connection,
+                    state.run_id,
+                    events,
+                    first_sequence=1,
+                    secret_registry=self.secret_registry,
+                )
         snapshot = await self.load(state.run_id)
         if snapshot is None:
             raise StoreCommitError("created runtime run disappeared")
@@ -167,7 +184,11 @@ class PostgreSQLRuntimeStore:
                 if updated.split()[-1] != "1":
                     raise StoreCommitError("runtime run does not exist")
                 await _insert_events(
-                    connection, state.run_id, events, first_sequence=last_sequence + 1
+                    connection,
+                    state.run_id,
+                    events,
+                    first_sequence=last_sequence + 1,
+                    secret_registry=self.secret_registry,
                 )
         snapshot = await self.load(state.run_id)
         if snapshot is None:
@@ -176,9 +197,18 @@ class PostgreSQLRuntimeStore:
 
 
 async def _insert_events(
-    connection: Any, run_id: RunId, events: Sequence[EventSpec], *, first_sequence: int
+    connection: Any,
+    run_id: RunId,
+    events: Sequence[EventSpec],
+    *,
+    first_sequence: int,
+    secret_registry: SecretRegistry,
 ) -> None:
     for index, event in enumerate(events, start=first_sequence):
+        try:
+            data = _redact_event_data(event.data, secret_registry)
+        except ValueError as exc:
+            raise StoreCommitError("observation rejected") from exc
         await connection.execute(
             """
             INSERT INTO runtime_events(run_id, sequence, event_type, data)
@@ -187,8 +217,15 @@ async def _insert_events(
             run_id,
             index,
             event.event_type,
-            json.dumps(event.data, sort_keys=True, separators=(",", ":")),
+            json.dumps(data, sort_keys=True, separators=(",", ":")),
         )
+
+
+def _redact_event_data(value: dict[str, object], registry: SecretRegistry) -> dict[str, object]:
+    result = registry.redact(value)
+    if not result.accepted or not isinstance(result.value, dict):
+        raise ValueError("observation rejected")
+    return cast(dict[str, object], result.value)
 
 
 def _row_value(row: Any, key: str) -> Any:

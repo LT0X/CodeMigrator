@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import httpx
 import pytest
 
 from codemigrator.api import ApiConfig, create_app, route_surface
+from codemigrator.api.deps import EventRecord
+from codemigrator.core import SecretRegistry
 
 from .conftest import FakeBackend, create_run_payload
 
@@ -30,6 +33,75 @@ def test_declared_route_surface_matches_fastapi_routes() -> None:
         if route.path.startswith("/api/")
     }
     assert actual == set(route_surface())
+
+
+@pytest.mark.asyncio
+async def test_rest_projection_uses_the_injected_secret_registry(backend) -> None:  # type: ignore[no-untyped-def]
+    registry = SecretRegistry()
+    registry.register("runtime-secret")
+
+    async def unsafe(request):  # type: ignore[no-untyped-def]
+        del request
+        return {
+            "run_id": str(uuid4()),
+            "status": "PLANNING",
+            "version": 1,
+            "verification_outcome": {"summary": "runtime-secret"},
+        }
+
+    backend.execute = unsafe
+    app = create_app(
+        backend,
+        config=ApiConfig(token="secret"),
+        secret_registry=registry,
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://127.0.0.1",
+    )
+
+    async with client:
+        response = await client.get(
+            f"/api/v1/migrations/{uuid4()}",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 500
+    assert "runtime-secret" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_sse_route_uses_the_injected_secret_registry(backend) -> None:  # type: ignore[no-untyped-def]
+    run_id = uuid4()
+    registry = SecretRegistry()
+    registry.register("runtime-secret")
+    backend.events = [
+        EventRecord(
+            run_id=run_id,
+            sequence=1,
+            event_type="run.status_changed",
+            data={"status": "COMPLETED", "summary": "runtime-secret"},
+            timestamp_utc=datetime.now(UTC),
+        )
+    ]
+    app = create_app(
+        backend,
+        config=ApiConfig(token="secret"),
+        secret_registry=registry,
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://127.0.0.1",
+    )
+
+    async with client:
+        response = await client.get(
+            f"/api/v1/migrations/{run_id}/events",
+            headers={"Authorization": "Bearer secret"},
+        )
+
+    assert response.status_code == 200
+    assert "runtime-secret" not in response.text
 
 
 @pytest.mark.asyncio

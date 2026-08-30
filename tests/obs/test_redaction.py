@@ -51,6 +51,14 @@ def test_safe_payload_is_copied_and_secret_registry_is_write_only() -> None:
     assert "secrets" not in dir(registry)
 
 
+def test_secret_registry_state_does_not_contain_registered_secret_text() -> None:
+    registry = SecretRegistry()
+    registry.register("write-only-secret")
+
+    assert "write-only-secret" not in repr(vars(registry))
+    assert "write-only-secret" not in repr(registry)
+
+
 def test_forbidden_field_set_contains_the_designated_log_sensitive_keys() -> None:
     expected = {"content", "prompt", "authorization", "database_url", "private_key"}
 

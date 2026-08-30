@@ -135,6 +135,23 @@ def test_oversized_event_uses_only_a_controlled_artifact_reference() -> None:
     assert b"x" * 100 not in encoded
 
 
+def test_artifact_reference_failure_is_a_dropped_observation() -> None:
+    dropped: list[str] = []
+
+    def unavailable(payload: bytes) -> str:
+        del payload
+        raise RuntimeError("private storage detail")
+
+    pipeline = ObservationPipeline(
+        SecretRegistry(),
+        on_drop=dropped.append,
+        artifact_ref=unavailable,
+    )
+
+    assert pipeline.emit({"type": "large", "data": {"summary": "x" * 70_000}}) is False
+    assert dropped == ["run_events"]
+
+
 def test_pipeline_can_externalize_an_oversized_event_before_fanning_out(tmp_path: Path) -> None:
     output: list[str] = []
     exporter = BoundedExporter()
@@ -163,6 +180,7 @@ def test_pipeline_rechecks_enabled_sinks_at_the_sentinel_interval() -> None:
     sentinel = SentinelSuite(registry, sinks=("run_events",))
     pipeline = ObservationPipeline(
         registry,
+        run_events=lambda payload: True,
         on_drop=dropped.append,
         sentinel=sentinel,
         sentinel_interval_events=2,
@@ -183,7 +201,19 @@ def test_bounded_exporter_drops_oldest_item_and_reports_the_drop() -> None:
     exporter.publish(b"three")
 
     assert exporter.drain() == [b"two", b"three"]
-    assert dropped == ["exporter"]
+    assert dropped == ["metric_exemplar"]
+
+
+def test_exporter_drop_can_update_the_core_dropped_metric() -> None:
+    registry = MetricRegistry()
+    exporter = BoundedExporter(capacity=1, on_drop=registry.record_drop)
+
+    exporter.publish(b"one")
+    exporter.publish(b"two")
+
+    snapshot = registry.snapshot()["metrics"]["codemigrator_observation_dropped_total"]
+    assert snapshot[0]["labels"] == {"sink": "metric_exemplar"}
+    assert snapshot[0]["value"] == 1.0
 
 
 def test_sentinel_suite_fails_closed_for_every_registered_output() -> None:
@@ -250,3 +280,18 @@ def test_retention_cleaner_deletes_at_most_one_thousand_selected_records() -> No
 
     assert len(result) == 1_000
     assert len(deleted) == 1_000
+
+
+def test_retention_cleaner_keeps_non_terminal_run_artifacts() -> None:
+    now = datetime(2026, 1, 31, tzinfo=UTC)
+    cleaner = RetentionCleaner()
+    records = (
+        RetentionRecord(
+            "active-artifact",
+            "execution_artifact",
+            now - timedelta(days=31),
+            terminal=False,
+        ),
+    )
+
+    assert cleaner.eligible(records, now=now) == ()
