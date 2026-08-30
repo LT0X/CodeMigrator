@@ -9,6 +9,7 @@ from codemigrator.sandbox import (
     TerminationCause,
     calculate_pool_capacity,
     reduce_termination,
+    validation_directory_exceeds_quota,
 )
 
 
@@ -18,6 +19,12 @@ def test_pool_capacity_uses_the_frozen_three_pool_formula() -> None:
     assert DEFAULT_RESOURCE_LIMITS.memory_bytes == 4 * 1024**3
     assert DEFAULT_RESOURCE_LIMITS.cpu_cores == 2
     assert DEFAULT_RESOURCE_LIMITS.disk_bytes == 10 * 1024**3
+
+
+def test_validation_quota_detects_file_and_aggregate_limits(tmp_path) -> None:
+    (tmp_path / "large.bin").write_bytes(b"12345")
+    limits = DEFAULT_RESOURCE_LIMITS.model_copy(update={"file_bytes": 4})
+    assert validation_directory_exceeds_quota(tmp_path, limits)
 
 
 @pytest.mark.asyncio

@@ -19,14 +19,16 @@ def test_proxy_allows_exact_domains_and_subdomains_only() -> None:
 
 
 def test_proxy_environment_is_explicit_and_connection_audit_is_structured() -> None:
-    environment = proxy_environment("127.0.0.1", 3128)
+    environment = proxy_environment("10.0.0.2", 3128)
     event = ProxyAuditEvent(host="pypi.org", port=443, allowed=True)
 
     assert environment == {
-        "HTTP_PROXY": "http://127.0.0.1:3128",
-        "HTTPS_PROXY": "http://127.0.0.1:3128",
+        "HTTP_PROXY": "http://10.0.0.2:3128",
+        "HTTPS_PROXY": "http://10.0.0.2:3128",
     }
     assert event.allowed is True
+    with pytest.raises(ValueError, match="veth"):
+        proxy_environment("127.0.0.1", 3128)
 
 
 @pytest.mark.asyncio
@@ -41,7 +43,11 @@ async def test_async_proxy_forwards_allowed_http_and_audits_destination() -> Non
     upstream_server = await asyncio.start_server(upstream, "127.0.0.1", 0)
     upstream_port = int(upstream_server.sockets[0].getsockname()[1])
     events: list[ProxyAuditEvent] = []
-    proxy = AsyncForwardProxy(DomainAllowlist(("127.0.0.1",)), audit_sink=events.append)
+    proxy = AsyncForwardProxy(
+        DomainAllowlist(("127.0.0.1",)),
+        audit_sink=events.append,
+        allow_private_addresses=True,
+    )
     proxy_host, proxy_port = await proxy.start()
     try:
         reader, writer = await asyncio.open_connection(proxy_host, proxy_port)

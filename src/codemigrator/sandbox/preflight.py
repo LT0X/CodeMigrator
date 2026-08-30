@@ -20,6 +20,7 @@ class PreflightFacts(CoreModel):
     cgroup_v2: bool
     bubblewrap_version: str
     user_namespace: bool
+    disk_quota: bool = False
     architecture: str
     disk_free_bytes: int = Field(ge=0)
     toolchain_image_digest: str
@@ -47,6 +48,7 @@ class PreflightRequirements(CoreModel):
     min_bubblewrap: str = "0.8"
     architecture: str = "x86_64"
     min_disk_free_bytes: int = Field(default=10 * 1024**3, ge=0)
+    require_disk_quota: bool = True
     toolchain_image_digest: str
     seccomp_sha256: str
 
@@ -70,6 +72,8 @@ class PreflightResult(CoreModel):
 
     ready: bool
     reasons: tuple[str, ...] = ()
+    toolchain_image_digest: str | None = None
+    seccomp_sha256: str | None = None
 
 
 def _version(value: str) -> tuple[int, ...]:
@@ -95,11 +99,18 @@ def check_preflight(facts: PreflightFacts, requirements: PreflightRequirements) 
         reasons.append("architecture")
     if facts.disk_free_bytes < requirements.min_disk_free_bytes:
         reasons.append("disk_free_bytes")
+    if requirements.require_disk_quota and not facts.disk_quota:
+        reasons.append("disk_quota")
     if facts.toolchain_image_digest != requirements.toolchain_image_digest:
         reasons.append("toolchain_image_digest")
     if facts.seccomp_sha256 != requirements.seccomp_sha256:
         reasons.append("seccomp_sha256")
-    return PreflightResult(ready=not reasons, reasons=tuple(reasons))
+    return PreflightResult(
+        ready=not reasons,
+        reasons=tuple(reasons),
+        toolchain_image_digest=facts.toolchain_image_digest,
+        seccomp_sha256=facts.seccomp_sha256,
+    )
 
 
 def read_preflight_facts(
@@ -128,6 +139,7 @@ def read_preflight_facts(
     return PreflightFacts(
         kernel_release=platform.release(),
         cgroup_v2=cgroup,
+        disk_quota=False,
         bubblewrap_version=bwrap.removeprefix("bubblewrap "),
         user_namespace=user_namespace,
         architecture=platform.machine(),

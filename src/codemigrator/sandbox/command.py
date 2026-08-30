@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Mapping
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from codemigrator.core import CheckAction, CheckCommandTemplate
 from codemigrator.core._base import CoreModel
+from codemigrator.core.paths import canonical_json_bytes
 
 _HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
@@ -77,6 +81,19 @@ class FrozenCommand(CoreModel):
             raise ValueError("toolchain_image_digest must be a sha256 digest")
         return value.lower()
 
+    @model_validator(mode="after")
+    def template_digest_matches_payload(self) -> FrozenCommand:
+        payload = {
+            "action": self.action.value,
+            "program": self.program,
+            "argv": list(self.argv),
+            "timeout_secs": self.timeout_secs,
+        }
+        expected = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+        if self.template_sha256 != expected:
+            raise ValueError("template_sha256 does not match the frozen command payload")
+        return self
+
 
 class ShellCommand(CoreModel):
     """Free Shell/Exec feedback command, deliberately separate from FrozenCommand."""
@@ -106,11 +123,13 @@ class BwrapPolicy(CoreModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    executable: str = "/usr/bin/bwrap"
+    executable: Literal["/usr/bin/bwrap"] = "/usr/bin/bwrap"
     rootfs: str
     validation_dir: str
+    toolchain_image_digest: str
     cache_dir: str | None = None
-    seccomp_fd: int | None = Field(default=None, ge=0)
+    seccomp_fd: int = Field(ge=0)
+    seccomp_sha256: str
     network_mode: NetworkMode = NetworkMode.Deny
     proxy_url: str | None = None
     environment: Mapping[str, str] = Field(default_factory=dict)
@@ -141,35 +160,91 @@ class BwrapPolicy(CoreModel):
                 raise ValueError("mount paths must be private absolute paths without traversal")
             if source in _FORBIDDEN_MOUNT_NAMES or target in _FORBIDDEN_MOUNT_NAMES:
                 raise ValueError("forbidden mount exposes a host control socket")
-            if target in _PROTECTED_MOUNT_TARGETS:
+            if target in _PROTECTED_MOUNT_TARGETS or any(
+                target.startswith(protected + "/") for protected in _PROTECTED_MOUNT_TARGETS
+            ):
                 raise ValueError("forbidden mount shadows a sandbox-managed path")
+            if not (
+                _is_managed_path(source, ("/opt/toolchain", "/opt/toolchains", "/opt/cache"))
+            ):
+                raise ValueError("forbidden mount source is outside managed roots")
+            if target.startswith("/workspace/"):
+                raise ValueError("forbidden mount target shadows validation contents")
             if "\x00" in source or "\x00" in target:
                 raise ValueError("mount paths must not contain NUL bytes")
         return value
 
     @model_validator(mode="after")
     def network_policy_is_explicit(self) -> BwrapPolicy:
+        if not _is_managed_path(self.rootfs, ("/opt/toolchain", "/opt/toolchains")):
+            raise ValueError("rootfs must be under the managed toolchain root")
+        if not _is_validation_path(self.validation_dir):
+            raise ValueError("validation_dir must be an app-managed validation path")
+        if self.cache_dir is not None and not _is_managed_path(self.cache_dir, ("/opt/cache",)):
+            raise ValueError("cache_dir must be under the managed dependency cache root")
         if self.network_mode is NetworkMode.Deny and self.proxy_url is not None:
             raise ValueError("proxy_url is only valid for shell network mode")
         if self.network_mode is NetworkMode.Shell and not self.proxy_url:
             raise ValueError("shell network mode requires an explicit proxy_url")
+        if self.proxy_url is not None:
+            parsed = urlsplit(self.proxy_url)
+            try:
+                parsed_port = parsed.port
+            except ValueError as exc:
+                raise ValueError("proxy_url must contain a valid port") from exc
+            if (
+                parsed.scheme != "http"
+                or not parsed.hostname
+                or parsed_port is None
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("proxy_url must be an explicit HTTP endpoint")
+            if parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+                raise ValueError("proxy_url must address the veth proxy endpoint")
+            if any(
+                self.environment.get(name) not in {None, self.proxy_url}
+                for name in ("HTTP_PROXY", "HTTPS_PROXY")
+            ):
+                raise ValueError("proxy environment must point to proxy_url")
         return self
+
+    @field_validator("toolchain_image_digest")
+    @classmethod
+    def image_digest_is_sha256(cls, value: str) -> str:
+        if not _DIGEST.fullmatch(value):
+            raise ValueError("toolchain_image_digest must be a sha256 digest")
+        return value.lower()
+
+    @field_validator("seccomp_sha256")
+    @classmethod
+    def seccomp_digest_is_sha256(cls, value: str) -> str:
+        if not _HEX_64.fullmatch(value):
+            raise ValueError("seccomp_sha256 must be 64 hexadecimal characters")
+        return value.lower()
 
 
 def freeze_check_command(
     template: CheckCommandTemplate,
     *,
-    template_sha256: str,
+    template_sha256: str | None = None,
     toolchain_image_digest: str,
 ) -> FrozenCommand:
-    """Copy a descriptor template into the only command shape the executor accepts."""
+    """Hash the descriptor template and copy it into the executor command shape."""
+
+    computed_hash = hashlib.sha256(canonical_json_bytes(template)).hexdigest()
+    if template_sha256 is not None and template_sha256.lower() != computed_hash:
+        raise ValueError("template_sha256 does not match the canonical command template")
 
     return FrozenCommand(
         action=template.action,
         program=template.program,
         argv=tuple(template.argv),
         timeout_secs=template.timeout_secs,
-        template_sha256=template_sha256,
+        template_sha256=computed_hash,
         toolchain_image_digest=toolchain_image_digest,
     )
 
@@ -177,6 +252,8 @@ def freeze_check_command(
 def build_bwrap_argv(policy: BwrapPolicy, command: FrozenCommand) -> list[str]:
     """Build a deterministic, non-shell bubblewrap invocation."""
 
+    if command.toolchain_image_digest != policy.toolchain_image_digest:
+        raise ValueError("command image digest does not match the policy rootfs digest")
     argv = _build_bwrap_prefix(policy)
     environment = _build_environment(policy)
     for name, value in sorted(environment.items()):
@@ -223,8 +300,7 @@ def _build_bwrap_prefix(policy: BwrapPolicy) -> list[str]:
         argv.extend(("--ro-bind", policy.cache_dir, "/cache"))
     for source, target in policy.extra_read_only_mounts:
         argv.extend(("--ro-bind", source, target))
-    if policy.seccomp_fd is not None:
-        argv.extend(("--seccomp", str(policy.seccomp_fd)))
+    argv.extend(("--seccomp", str(policy.seccomp_fd)))
     return argv
 
 
@@ -240,4 +316,32 @@ def is_safe_workspace_path(path: str) -> bool:
     """Return whether a path is a non-root absolute path without traversal."""
 
     pure = PurePosixPath(path)
-    return path.startswith("/") and ".." not in pure.parts and path != "/"
+    return (
+        path.startswith("/")
+        and ".." not in pure.parts
+        and path != "/"
+        and "\\" not in path
+        and all(ord(char) >= 0x20 for char in path)
+    )
+
+
+def _is_under(path: str, roots: tuple[str, ...]) -> bool:
+    return any(path == root or path.startswith(root + "/") for root in roots)
+
+
+def _is_managed_path(path: str, roots: tuple[str, ...]) -> bool:
+    try:
+        resolved = str(Path(path).resolve(strict=False))
+    except OSError:
+        return False
+    return _is_under(resolved, roots)
+
+
+def _is_validation_path(path: str) -> bool:
+    try:
+        resolved = str(Path(path).resolve(strict=False))
+    except OSError:
+        return False
+    return resolved == "/tmp/validation" or resolved.startswith(
+        ("/tmp/validation-", "/tmp/codemigrator-validation-")
+    )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import socket
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -63,11 +64,16 @@ def proxy_environment(host: str, port: int) -> dict[str, str]:
 
     if not host or not 1 <= port <= 65535:
         raise ValueError("proxy host and port are invalid")
+    if host.strip().lower() == "localhost":
+        raise ValueError("proxy host must address the veth endpoint")
     try:
         address = ipaddress.ip_address(host)
-        formatted_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
     except ValueError:
         formatted_host = host
+    else:
+        if address.is_loopback or address.is_unspecified:
+            raise ValueError("proxy host must address the veth endpoint")
+        formatted_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
     endpoint = f"http://{formatted_host}:{port}"
     return {"HTTP_PROXY": endpoint, "HTTPS_PROXY": endpoint}
 
@@ -90,10 +96,13 @@ class AsyncForwardProxy:
         allowlist: DomainAllowlist,
         *,
         audit_sink: Callable[[ProxyAuditEvent], Awaitable[None] | None] | None = None,
+        allow_private_addresses: bool = False,
     ) -> None:
         self._allowlist = allowlist
         self._audit_sink = audit_sink
+        self._allow_private_addresses = allow_private_addresses
         self._server: asyncio.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
 
     async def start(self, host: str = "127.0.0.1", port: int = 0) -> tuple[str, int]:
         if self._server is not None:
@@ -110,6 +119,12 @@ class AsyncForwardProxy:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        writers = tuple(self._writers)
+        for writer in writers:
+            writer.close()
+        if writers:
+            await asyncio.gather(*(writer.wait_closed() for writer in writers))
+        self._writers.clear()
 
     async def _audit(self, event: ProxyAuditEvent) -> None:
         if self._audit_sink is None:
@@ -121,6 +136,7 @@ class AsyncForwardProxy:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        self._writers.add(writer)
         upstream_reader: asyncio.StreamReader | None = None
         upstream_writer: asyncio.StreamWriter | None = None
         try:
@@ -140,9 +156,7 @@ class AsyncForwardProxy:
                 await writer.drain()
                 return
 
-            upstream_reader, upstream_writer = await asyncio.open_connection(
-                parsed.host, parsed.port
-            )
+            upstream_reader, upstream_writer = await self._open_upstream(parsed)
             if method.upper() == "CONNECT":
                 writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 await writer.drain()
@@ -173,6 +187,29 @@ class AsyncForwardProxy:
                 await upstream_writer.wait_closed()
             writer.close()
             await writer.wait_closed()
+            self._writers.discard(writer)
+
+    async def _open_upstream(
+        self, target: _ProxyTarget
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            target.host, target.port, family=socket.AF_INET, type=socket.SOCK_STREAM
+        )
+        for _, _, _, _, sockaddr in infos:
+            address = ipaddress.ip_address(sockaddr[0])
+            if not self._allow_private_addresses and (
+                address.is_private
+                or address.is_loopback
+                or address.is_link_local
+                or address.is_reserved
+                or address.is_unspecified
+            ):
+                continue
+            try:
+                return await asyncio.open_connection(sockaddr[0], target.port)
+            except OSError:
+                continue
+        raise OSError("destination has no permitted reachable IPv4 address")
 
     @staticmethod
     def _parse_target(method: str, target: str) -> _ProxyTarget:
