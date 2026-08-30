@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import os
 import shutil
@@ -40,11 +41,14 @@ def pdeathsig_preexec() -> None:
 
     if os.name != "posix":
         return
+    original_parent = os.getppid()
     libc = ctypes.CDLL(None, use_errno=True)
     pr_set_pdeathsig = 1
     if libc.prctl(pr_set_pdeathsig, signal.SIGKILL, 0, 0, 0) != 0:
         error = ctypes.get_errno()
         raise OSError(error, "prctl(PR_SET_PDEATHSIG) failed")
+    if os.getppid() != original_parent:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def terminate_process_group(process: object) -> None:
@@ -99,6 +103,9 @@ class CgroupProcessDomain:
                 return True
             time.sleep(0.01)
         return not procs.exists() or not procs.read_text(encoding="ascii").strip()
+
+    async def wait_empty_async(self, timeout: float = 5.0) -> bool:
+        return await asyncio.to_thread(self.wait_empty, timeout)
 
     def remove(self) -> None:
         self.path.rmdir()

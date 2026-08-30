@@ -19,13 +19,13 @@ CM-ANALYSIS-001 已合并。下一项为 M-09 app 内 bwrap 执行适配，必�
 - 按 D-01 使用 V5 验收条款；compose/deploy 根目录变更明确交接 CM-INFRA，本任务不直接修改。
 - 按 TDD 红-绿循环实现 `command.py`、`preflight.py`、`lifecycle.py`、`limits.py`、`pool.py`、`termination.py`、`executor.py` 与 `proxy.py`；新增 sandbox/security 确定性规则测试。
 - `FrozenCommand` 与 `ShellCommand` 分离；bwrap argv 固定 namespace、rootfs/cache 挂载、临时验证目录、seccomp、环境与 argv 顺序；摘要 mismatch 在 cgroup/子进程创建前 fail-closed。
-- 执行回执覆盖输出流上限、模板超时、进程组回收、取消终止回执与可选委派 cgroup；Shell 代理支持严格域/子域白名单、连接审计和 HTTP 转发。
+- 执行回执覆盖输出流上限、模板超时、验证目录配额、进程组回收、取消终止回执与必需委派 cgroup；Shell 代理支持严格域/子域白名单、私有地址过滤、连接审计和 HTTP 转发，并要求 veth attachment。
 
 ## 3. 自测与验证结果
 
-- 当前阶段：代码与测试完成，进入最终质量门、PR 唯一审查和直接合并流程。
-- 基线：全量 pytest `151 passed`。
-- Sandbox/security：`16 passed`；其中含本地 asyncio 代理转发回归。
+- 当前阶段：唯一 PR 审查已完成，反馈已在原分支一次性修复，进入最终质量门与直接合并流程。
+- 基线：全量 pytest `171 passed`。
+- Sandbox/security：`20 passed`；其中含本地 asyncio 代理转发与 cgroup 清理回归。
 - 真实模型测试：不需要；sandbox 规则和安全测试优先。
 
 ## 4. 影响面与风险
@@ -37,7 +37,7 @@ CM-ANALYSIS-001 已合并。下一项为 M-09 app 内 bwrap 执行适配，必�
 
 - [x] 先写并确认冻结命令、argv 安全边界与预检的失败测试。
 - [x] 实现执行生命周期、资源池、终止归约和 Shell 代理端口。
-- [x] 完成四份文档与质量门；PR #5 已创建，待唯一一次审查、反馈一次修复、直接合并与主工作区拉取。
+- [x] 完成四份文档与质量门；PR #5 已完成唯一一次审查及一次反馈修复，待直接合并与主工作区拉取。
 
 ## 6. 附录
 

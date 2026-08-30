@@ -10,7 +10,7 @@
 
 ## 1. 冻结命令与 bwrap argv
 
-`FrozenCommand` 从 `CheckCommandTemplate` 实例化，要求调用方提供已核验的模板摘要与镜像摘要，并拒绝 program/argv/timeout/env 的额外注入。`BwrapPolicy` 仅允许受信侧构造挂载和环境；`ShellCommand` 是独立的自由反馈命令类型，不可转换为裁决命令：
+`FrozenCommand` 从 `CheckCommandTemplate` 实例化，由适配层重算 canonical 模板摘要；调用方若携带摘要则必须完全匹配，并同时提供镜像摘要。它拒绝 program/argv/timeout/env 的额外注入。`BwrapPolicy` 仅允许受信侧构造挂载和环境；`ShellCommand` 是独立的自由反馈命令类型，不可转换为裁决命令：
 
 1. 固定 bwrap executable；
 2. `--unshare-all`；
@@ -27,13 +27,13 @@
 
 ## 2. 启动、生命周期与执行事实
 
-`Preflight` 只读核验 kernel、cgroup v2、bwrap 版本、user namespace、架构、磁盘和镜像/seccomp 摘要；任一不符返回拒绝事实，不启动 cgroup、不创建验证目录。启动前使用 `prctl(PR_SET_PDEATHSIG, SIGKILL)`，并可将 bwrap 进程组放入显式委派的专属 cgroup；app 退出时内核回收，清理窗口为 5 秒。未提供委派 cgroup 时不伪造 cgroup receipt，部署组合由 CM-INFRA 交接。
+`Preflight` 只读核验 kernel、cgroup v2、bwrap 版本、user namespace、架构、磁盘 quota 和镜像/seccomp 摘要；任一不符返回拒绝事实，不启动 cgroup、不创建验证目录。启动前使用 `prctl(PR_SET_PDEATHSIG, SIGKILL)`，并将 bwrap 进程组放入显式委派的专属 cgroup；app 退出时内核回收，清理窗口为 5 秒。委派 cgroup 不可用时 fail-closed，部署组合由 CM-INFRA 交接。
 
 每次裁决执行创建独立临时验证目录，源内容由上游物化；执行完成、超时、取消或基础设施失败均按“先清空进程组、再移除目录”收口，构建输出不回流 tested commit。长驻 Slice 卷只由 M-08 管理，本层只提供执行绑定描述。
 
 ## 3. 资源、池与终止归约
 
-裁决实例固定 4 GiB memory、2 CPU、10 GiB writable disk；stdout/stderr 每流 256 MiB，验证目录单文件 64 MiB，模板 timeout 是唯一超时来源。`ResourceLimits` 保存这些上限，不复制 core 的 timeout 契约；cgroup/filesystem quota receipt 由执行部署接入。执行池容量为：
+裁决实例固定 4 GiB memory、2 CPU、10 GiB writable disk；stdout/stderr 每流 256 MiB，验证目录单文件 64 MiB，模板 timeout 是唯一超时来源。`ResourceLimits` 保存这些上限，不复制 core 的 timeout 契约；执行器通过委派 cgroup 和验证目录 quota 监控落实资源边界，并将清理/配额事实纳入回执。执行池容量为：
 
 `max(1, min(4, floor(host_memory_gib / 4), floor(host_cpu_cores / 2)))`。
 
@@ -41,7 +41,7 @@
 
 ## 4. Shell 受控网络档
 
-Shell 命令直接在 Slice 长驻卷执行，不进入冻结检查命令和 active-attempt gate。需要外联时只允许 AF_INET 经 veth 到 app 内 asyncio forward proxy；代理以声明式域白名单拒绝未知目标，拒绝结果只保留脱敏连接审计摘要。裁决与 Scaffold 档仍使用 default-deny seccomp；代理配置只注入 `HTTP_PROXY`/`HTTPS_PROXY`，禁止把宿主凭据和控制面 socket 带入沙箱。
+Shell 命令直接在 Slice 长驻卷执行，不进入冻结检查命令和 active-attempt gate。需要外联时必须提供 veth attachment，只允许 AF_INET 经 veth 到 app 内 asyncio forward proxy；代理以声明式域白名单拒绝未知目标，并过滤私有/回环/保留地址以阻断 DNS rebinding，拒绝结果只保留脱敏连接审计摘要。裁决与 Scaffold 档仍使用 default-deny seccomp；代理配置只注入 `HTTP_PROXY`/`HTTPS_PROXY`，禁止把宿主凭据和控制面 socket 带入沙箱。
 
 ## 5. 测试与交接
 

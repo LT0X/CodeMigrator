@@ -12,7 +12,7 @@
 
 ## 1. 目标与范围
 
-- **完成定义（DoD）**：提供不可注入的冻结命令实例化、默认拒绝网络/受控 Shell 网络档 bwrap argv 构造、启动预检、PDEATHSIG/cgroup/进程组治理抽象、4 GiB/2 CPU/10 GiB/256 MiB/64 MiB 资源策略、三池容量公式、验证临时目录生命周期、终止事实唯一归约与 asyncio 代理白名单端口；规则测试、安全 argv 快照测试、全量测试、Ruff、mypy、import-linter、compileall 通过。
+- **完成定义（DoD）**：提供不可注入的冻结命令实例化、默认拒绝网络/受控 Shell 网络档 bwrap argv 构造、启动预检、PDEATHSIG/必需 cgroup/进程组治理、4 GiB/2 CPU/10 GiB/256 MiB/64 MiB 资源策略、三池容量公式、验证临时目录生命周期、目录配额监控、终止事实唯一归约与 asyncio 代理白名单端口；规则测试、安全 argv 快照测试、全量测试、Ruff、mypy、import-linter、compileall 通过。
 - **范围排除项**：不修改 `compose.yaml`、`deploy/`、`migrations/`；不实现 PostgreSQL/Git/Run actor/CheckResult 接纳/verification fingerprint；不提供 M-12 Shell/Exec 工具 frame；不接入真实工具链镜像或真实代理部署。
 
 ## 2. 前置条件
@@ -27,8 +27,8 @@
 1. - [x] 先写失败测试：冻结命令、镜像摘要、路径/环境/argv 注入拒绝与十类 bwrap 参数快照（源码与测试 → V-M09-V5-002/003/010）。
 2. - [x] 实现命令实例化与 argv builder：固定可执行入口、`--unshare-all`、`--new-session`、`--die-with-parent`、`--clearenv`、`--cap-drop ALL`、只读 rootfs/cache、最小 `/dev`/受控 `/proc`、tmpfs `/tmp`、seccomp 与白名单环境；Shell 自由命令使用独立 `ShellCommand`（`command.py` → V-M09-V5-002/010/017）。
 3. - [x] 先写失败测试并实现启动预检、PDEATHSIG/cgroup/进程组治理和临时验证目录 owned lifecycle（`preflight.py`、`lifecycle.py` → V-M09-V5-003/005/007/008）。
-4. - [x] 先写失败测试并实现资源策略、三池公式、输出上限与唯一终止事实归约；超时仍只取冻结模板字段，文件上限作为配额策略字段保留给挂载/配额实现（`limits.py`、`termination.py`、`pool.py` → V-M09-V5-006/011/012/013）。
-5. - [x] 先写失败测试并实现 app 直接执行适配：固定 argv 通过 subprocess、PDEATHSIG pre-exec 注入、输出流上限、超时/取消清理、可选 cgroup 和结构化执行事实（`executor.py` → V-M09-V5-004/006/014/016）。
+4. - [x] 先写失败测试并实现资源策略、三池公式、输出上限、验证目录配额监控与唯一终止事实归约；超时仍只取冻结模板字段（`limits.py`、`termination.py`、`pool.py` → V-M09-V5-006/011/012/013）。
+5. - [x] 先写失败测试并实现 app 直接执行适配：固定 argv 通过 subprocess、PDEATHSIG pre-exec 注入、输出流上限、超时/取消清理、必需 cgroup、Shell veth attachment 与结构化执行事实（`executor.py` → V-M09-V5-004/006/014/016）。
 6. - [x] 先写失败测试并实现 asyncio 前向代理的域白名单解析/连接拒绝/审计摘要及 Shell 网络档配置（`proxy.py` → V-M09-V5-017）。
 7. - [x] 更新四份交付文档与主任务表，记录 compose/deploy 联动留给 CM-INFRA；完成质量门与 PR 说明（`my_space/`、`tests/sandbox/`、`tests/security/` → V-M09-V5-001～017）。
 
@@ -56,4 +56,4 @@
 - [x] 主任务表 `CodeMigrator开发任务规划与进度跟踪.md` 已更新
 - [x] 详细设计文档已保存于 `detailed_coding_design/sandbox/`
 - [x] 本实施计划已保存于 `Implementation_plan_doc/sandbox/`
-- [x] 若设计与架构文档有差异：本任务不修改架构模块设计；compose/deploy 联动事项已明确交接 CM-INFRA
+- [x] 已按对齐记录 D-01 将 V5 验收矩阵回填 M-09 架构文档；compose/deploy 物理联动事项已明确交接 CM-INFRA

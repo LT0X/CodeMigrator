@@ -7,6 +7,7 @@ def facts(**overrides: object) -> PreflightFacts:
     values: dict[str, object] = {
         "kernel_release": "6.1.0",
         "cgroup_v2": True,
+        "disk_quota": True,
         "bubblewrap_version": "0.8.0",
         "user_namespace": True,
         "architecture": "x86_64",

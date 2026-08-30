@@ -12,6 +12,15 @@ from codemigrator.sandbox import (
     TerminationCause,
     freeze_check_command,
 )
+from codemigrator.sandbox.preflight import PreflightResult
+
+
+def ready_preflight() -> PreflightResult:
+    return PreflightResult(
+        ready=True,
+        toolchain_image_digest="sha256:" + "b" * 64,
+        seccomp_sha256="c" * 64,
+    )
 
 
 def command(timeout_secs: int = 120):
@@ -22,7 +31,6 @@ def command(timeout_secs: int = 120):
             argv=["-c", "print('ok')"],
             timeout_secs=timeout_secs,
         ),
-        template_sha256="a" * 64,
         toolchain_image_digest="sha256:" + "b" * 64,
     )
 
@@ -31,6 +39,9 @@ def policy() -> BwrapPolicy:
     return BwrapPolicy(
         rootfs="/opt/toolchain",
         validation_dir="/tmp/validation",
+        toolchain_image_digest="sha256:" + "b" * 64,
+        seccomp_fd=7,
+        seccomp_sha256="c" * 64,
         environment={"PATH": "/usr/bin"},
     )
 
@@ -50,6 +61,34 @@ class FakeProcess:
         return self.returncode
 
 
+class FakeCgroup:
+    def __init__(self, *, cleanup_complete: bool = True) -> None:
+        self.cleanup_complete = cleanup_complete
+        self.created = False
+        self.attached_pid: int | None = None
+        self.killed = False
+        self.removed = False
+
+    def create(self) -> None:
+        self.created = True
+
+    def attach(self, pid: int) -> None:
+        self.attached_pid = pid
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def wait_empty_async(self) -> bool:
+        return self.cleanup_complete
+
+    def remove(self) -> None:
+        self.removed = True
+
+
+def cgroup() -> FakeCgroup:
+    return FakeCgroup()
+
+
 @pytest.mark.asyncio
 async def test_executor_uses_fixed_argv_and_returns_process_facts(
     monkeypatch: pytest.MonkeyPatch,
@@ -62,7 +101,9 @@ async def test_executor_uses_fixed_argv_and_returns_process_facts(
         return process
 
     monkeypatch.setattr("codemigrator.sandbox.executor.asyncio.create_subprocess_exec", create)
-    receipt = await SandboxExecutor(policy()).execute(command())
+    receipt = await SandboxExecutor(
+        policy(), preflight=ready_preflight(), cgroup=cgroup()
+    ).execute(command())
 
     assert receipt.status is CheckStatus.Passed
     assert receipt.cause is TerminationCause.ProcessExit
@@ -83,7 +124,10 @@ async def test_executor_rejects_image_mismatch_before_subprocess(
 
     monkeypatch.setattr("codemigrator.sandbox.executor.asyncio.create_subprocess_exec", create)
     receipt = await SandboxExecutor(
-        policy(), expected_toolchain_image_digest="sha256:" + "c" * 64
+        policy(),
+        preflight=ready_preflight(),
+        cgroup=cgroup(),
+        expected_toolchain_image_digest="sha256:" + "c" * 64,
     ).execute(command())
 
     assert receipt.status is CheckStatus.InfrastructureError
@@ -113,8 +157,63 @@ async def test_executor_reduces_output_limit_and_kills_process_group(
     }
     from codemigrator.sandbox import ResourceLimits
 
-    receipt = await SandboxExecutor(policy(), limits=ResourceLimits(**limits)).execute(command())
+    receipt = await SandboxExecutor(
+        policy(), preflight=ready_preflight(), cgroup=cgroup(), limits=ResourceLimits(**limits)
+    ).execute(command())
 
     assert receipt.status is CheckStatus.OutputLimitExceeded
     assert receipt.cause is TerminationCause.OutputLimit
     assert killed is True
+
+
+@pytest.mark.asyncio
+async def test_executor_rejects_command_image_mismatch_before_cgroup_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    async def create(*args: Any, **kwargs: Any) -> FakeProcess:
+        nonlocal called
+        called = True
+        return FakeProcess()
+
+    monkeypatch.setattr("codemigrator.sandbox.executor.asyncio.create_subprocess_exec", create)
+    domain = cgroup()
+    mismatched = freeze_check_command(
+        CheckCommandTemplate(
+            action=CheckAction.Test,
+            program="python",
+            argv=["-c", "print('ok')"],
+            timeout_secs=120,
+        ),
+        toolchain_image_digest="sha256:" + "d" * 64,
+    )
+
+    receipt = await SandboxExecutor(
+        policy(), preflight=ready_preflight(), cgroup=domain
+    ).execute(mismatched)
+
+    assert receipt.status is CheckStatus.InfrastructureError
+    assert domain.created is False
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_executor_maps_incomplete_cgroup_cleanup_to_infrastructure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeProcess(stdout=b"ok\n")
+
+    async def create(*args: Any, **kwargs: Any) -> FakeProcess:
+        return process
+
+    monkeypatch.setattr("codemigrator.sandbox.executor.asyncio.create_subprocess_exec", create)
+    domain = FakeCgroup(cleanup_complete=False)
+
+    receipt = await SandboxExecutor(
+        policy(), preflight=ready_preflight(), cgroup=domain
+    ).execute(command())
+
+    assert receipt.status is CheckStatus.InfrastructureError
+    assert receipt.cause is TerminationCause.Infrastructure
+    assert receipt.termination_receipt.cleanup_complete is False

@@ -9,14 +9,19 @@ from .command import (
     build_shell_bwrap_argv,
     freeze_check_command,
 )
-from .executor import ExecutionReceipt, SandboxExecutor, TerminationReceipt
+from .executor import ExecutionReceipt, NetworkAttachment, SandboxExecutor, TerminationReceipt
 from .lifecycle import (
     CgroupProcessDomain,
     TemporaryValidationDirectory,
     pdeathsig_preexec,
     terminate_process_group,
 )
-from .limits import DEFAULT_RESOURCE_LIMITS, ResourceLimits, calculate_pool_capacity
+from .limits import (
+    DEFAULT_RESOURCE_LIMITS,
+    ResourceLimits,
+    calculate_pool_capacity,
+    validation_directory_exceeds_quota,
+)
 from .pool import SandboxExecutionPool
 from .preflight import PreflightFacts, PreflightRequirements, PreflightResult, check_preflight
 from .proxy import AsyncForwardProxy, DomainAllowlist, ProxyAuditEvent, proxy_environment
@@ -31,6 +36,7 @@ __all__ = [
     "ExecutionReceipt",
     "FrozenCommand",
     "NetworkMode",
+    "NetworkAttachment",
     "PreflightFacts",
     "PreflightRequirements",
     "PreflightResult",
@@ -52,4 +58,5 @@ __all__ = [
     "proxy_environment",
     "reduce_termination",
     "terminate_process_group",
+    "validation_directory_exceeds_quota",
 ]
