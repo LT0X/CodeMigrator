@@ -26,7 +26,16 @@ from .app import (
     RuntimeApplication,
     run_from_environment,
 )
+from .binding import (
+    BindingError,
+    ContextOverflowError,
+    LockedModelBinding,
+    ensure_context_fits,
+    estimate_net_input_tokens,
+    validate_session_admission,
+)
 from .budget import BudgetEvaluation, BudgetLimits, BudgetUsage, evaluate_budget
+from .context import ContextEnvelope, ContextSegment, PromptMessage, render_prompt
 from .contracts import (
     AdviceMessage,
     ApiCommand,
@@ -49,6 +58,31 @@ from .integration import (
     IntegrationStart,
     RepairRetryBudget,
 )
+from .loop import (
+    AgentLoop,
+    CancellationGate,
+    CheckpointDecision,
+    CheckpointPort,
+    SessionCancelled,
+    SessionResult,
+    ToolGatewayPort,
+    ToolObservation,
+    UsageSink,
+)
+from .loop_contracts import SessionExit, SessionIdentity, SessionSpec, SessionState
+from .normalizer import ModelAction, NormalizationError, NormalizedTurn, normalize_response
+from .provider import (
+    AnthropicProvider,
+    AsyncProvider,
+    OpenAICompatibleProvider,
+    ProviderError,
+    ProviderRegistry,
+    ProviderRequest,
+    ProviderResponse,
+    ProviderToolCall,
+    TokenUsage,
+    retry_delay_for_attempt,
+)
 from .recovery import (
     ActorCheckpoint,
     CheckpointPolicy,
@@ -62,6 +96,7 @@ from .report import build_report
 from .scheduler import FairScheduler, ReadySlice, ResourcePool
 from .store import InMemoryRuntimeStore, PostgreSQLRuntimeStore, RuntimeStore, StoreCommitError
 from .supervisor import SupervisorAdviceKind, SupervisorTrigger, supervisor_triggers
+from .templates import CatalogError, StaticTemplateCatalog
 
 
 def main() -> None:
@@ -73,6 +108,7 @@ def main() -> None:
 
 
 __all__ = [
+    "AgentLoop",
     "ActorRegistry",
     "ActorCheckpoint",
     "ArchivePort",
@@ -80,6 +116,8 @@ __all__ = [
     "AdviceDisposition",
     "AdviceValidationContext",
     "AdviceValidationResult",
+    "AnthropicProvider",
+    "AsyncProvider",
     "AsyncAdvisoryLockPort",
     "AsyncAppLifecycle",
     "ApiCommand",
@@ -87,6 +125,7 @@ __all__ = [
     "AdvisoryLockPort",
     "AppLifecycle",
     "AppState",
+    "BindingError",
     "BudgetEvaluation",
     "BudgetEventMessage",
     "BudgetLimits",
@@ -95,7 +134,14 @@ __all__ = [
     "CheckpointRestore",
     "CheckpointPolicy",
     "CheckpointWriter",
+    "CheckpointDecision",
+    "CheckpointPort",
     "CancellationPort",
+    "CancellationGate",
+    "CatalogError",
+    "ContextEnvelope",
+    "ContextOverflowError",
+    "ContextSegment",
     "CreateRunCommand",
     "ContinuationPort",
     "EventSpec",
@@ -106,6 +152,17 @@ __all__ = [
     "IntegrationCoordinator",
     "IntegrationItem",
     "IntegrationStart",
+    "LockedModelBinding",
+    "ModelAction",
+    "NormalizationError",
+    "NormalizedTurn",
+    "OpenAICompatibleProvider",
+    "PromptMessage",
+    "ProviderError",
+    "ProviderRegistry",
+    "ProviderRequest",
+    "ProviderResponse",
+    "ProviderToolCall",
     "ReadySlice",
     "RecoveryCoordinator",
     "RecoveryCommandMessage",
@@ -122,16 +179,33 @@ __all__ = [
     "RuntimeStore",
     "PostgreSQLRuntimeStore",
     "SessionInputCommand",
+    "SessionCancelled",
+    "SessionExit",
+    "SessionIdentity",
+    "SessionResult",
+    "SessionSpec",
+    "SessionState",
+    "StaticTemplateCatalog",
     "StoreCommitError",
     "SupervisorAdviceKind",
     "SupervisorTrigger",
+    "TokenUsage",
+    "ToolGatewayPort",
+    "ToolObservation",
+    "UsageSink",
     "advice_proposal_hash",
     "build_report",
     "evaluate_advice",
     "evaluate_budget",
+    "ensure_context_fits",
+    "estimate_net_input_tokens",
     "main",
     "restore_checkpoint",
     "PostgreSQLAdvisoryLock",
     "run_from_environment",
+    "normalize_response",
+    "render_prompt",
+    "retry_delay_for_attempt",
     "supervisor_triggers",
+    "validate_session_admission",
 ]
