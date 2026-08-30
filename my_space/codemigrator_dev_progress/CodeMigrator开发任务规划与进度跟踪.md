@@ -533,8 +533,8 @@ flowchart TD
 * 变更原因：Wave 1 的 M-09 沙箱执行底座需要在后续 Workspace、Verify、Runtime 接入前冻结命令、隔离、资源和终止事实边界。
 * 变更内容：基于已合并 `develop` 创建 `feature/sandbox-bwrap`；完成 app 内 bwrap argv 构造、FrozenCommand/ShellCommand 分离、预检、PDEATHSIG/cgroup/进程组治理、临时验证目录、资源池、终止归约、执行回执和 asyncio 代理白名单；同步实施计划、详细设计、迭代记录与主表。
 * 影响范围：`src/codemigrator/sandbox/`、`tests/sandbox/`、`tests/security/` 与本任务 `my_space/` 收口文档；不修改 `compose.yaml`、`deploy/`、migrations、M-09 架构文档，基础设施联动留给 CM-INFRA。
-* 验证：sandbox/security `16 passed`；Ruff、mypy、import-linter、compileall 与 diff check 待最终质量门统一复核；不进行真实模型调用。
-* 后续行动：提交并推送 `feature/sandbox-bwrap`，创建 PR；只启动一次审查并等待其终态，按反馈一次性修复后直接合并，再拉取 `develop`。
+* 验证：sandbox/security `16 passed`；全量 pytest `167 passed`；Ruff、mypy、import-linter（3 kept/0 broken）、compileall、bwrap/cgroup 只读探测与 diff check 通过；不进行真实模型调用。
+* 后续行动：PR #5（`https://github.com/LT0X/CodeMigrator/pull/5`）已创建；只启动一次审查并等待其终态，按反馈一次性修复后直接合并，再拉取 `develop`。
 
 ### CHG-20260830-08：CM-SPEC-001 合并与 CM-ANALYSIS-001 开工
 
