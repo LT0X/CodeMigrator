@@ -22,16 +22,24 @@ rad.json
 #Test results file
 TestResults.xml
 
-
-
-.dsh/
-.trae/
-ref/test_project/
-my_space/temp/
-my_space/pr_md/
-my_space/model_api_key.json
+# Local-only project design, progress, reference, staging, and credentials.
+# These paths must remain on disk and must never be force-added.
 my_space/
 ref/
 temp_doc/
 AGENTS.md
+.dsh/
+.trae/
+.codex/
+ref/test_project/
 ref/harness_dev_progress/
+
+# Python and local tooling artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.import_linter_cache/
+.venv/
+*.egg-info/

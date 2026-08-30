@@ -1,0 +1,16 @@
+{
+  "descriptor_version": "1.0.0",
+  "language_role": "source",
+  "language_id": "go",
+  "extensions": [".go"],
+  "parser": {
+    "grammar_id": "tree-sitter-go",
+    "grammar_carrier": "shared-library",
+    "grammar_path": "grammar/tree-sitter-go.so",
+    "grammar_sha256": "0284aef514071ab7296d63121c78667172a0485e1d133eb6432522656e8e7edd"
+  },
+  "manifest_parsers": [
+    {"manifest_kind": "go.mod", "parser_id": "go-mod"}
+  ],
+  "module_boundary_strategy": "SINGLE_MANIFEST_DIRECTORY_CONVENTION"
+}
