@@ -33,7 +33,7 @@
 - `pyproject.toml` 是唯一项目元数据与依赖声明；`uv.lock` 是解析后的安装事实；只暴露 `codemigrator-app`，指向 runtime 的可启动 stub，后续由 CM-RUNTIME-001 替换实现。
 - `src/codemigrator/` 保留 core 已实现内容，并补齐 analysis、planning、workspace、verification、sandbox、runtime、api 七个空业务骨架。每个子包含 `__init__.py` 和 README，README 固定声明负责、不负责、允许依赖、公共入口。
 - `descriptors/` 以 source/target + language-id 分目录；Go grammar 使用真实 shared-library 制品和同文件摘要，描述符中 `language_role`/grammar 载体等目录元数据由未来 registry 读取，不变成 Python import。
-- target descriptor 的 `build_excludes` 使用 core `RepoRelativePath` 可接受的规范化路径（例如 `.venv`、`__pycache__`、`.pytest_cache`，不带尾斜杠）；消费方按目录/模式语义解释这些排除项，避免把空路径段写入公共契约。
+- target descriptor 的 `build_excludes` 使用 core `RepoRelativePath` 可接受的规范化路径（例如 `.venv`、`__pycache__`、`.pytest_cache`，不带尾斜杠）；消费方按目录/模式语义解释这些排除项，避免把空路径段写入公共契约。`allowed_domains` 声明 Python 依赖安装代理允许访问的最小域名集合。
 - `migrations/` 只放顺序命名 SQL；第一份迁移只建立迁移版本表，具体领域表由 runtime/各任务按对齐记录追加。
 - `deploy/` 放 app Dockerfile、target-python Dockerfile、seccomp 声明与镜像构建清单；不放凭据、不挂载 UDS/Docker socket。
 - `.github/workflows/ci.yml` 执行锁定安装、pytest、import-linter、ruff/mypy 和 runtime 之外环境读取静态检查；CI 不实现运行时语义。
@@ -51,12 +51,12 @@ core
 
 实际允许边：analysis→core；planning→analysis/core；verification→core；sandbox→core；workspace→sandbox/core；runtime→全部下游；api→core。层内禁止互依，core 不反向导入任何业务包。`descriptors/` 和 `deploy/` 是运行期/部署期资源，不进入 import 图。
 
-Compose 只启动 `app` 与 `postgres` 两服务：PG 使用 `postgres:17`，app 使用 `deploy/Dockerfile`；PG 密码由 Compose 进程环境或调用方显式提供的 `--env-file` 注入，Compose 文件只引用必需变量，不存放值，也不把本机说明性文件作为镜像构建输入。健康检查只报告服务可用，不提前承诺 advisory lock 或领域 API。
+Compose 只启动 `app` 与 `postgres` 两服务：PG 使用 `postgres:17`，app 使用 `deploy/Dockerfile`；app 的沙箱前置配置固定声明 `seccomp=unconfined`、`SYS_ADMIN` 和可写的 cgroup v2 委派目录挂载，委派目录由 `CODEMIGRATOR_CGROUP_DELEGATED_DIR` 外部注入。PG 密码由 Compose 进程环境或调用方显式提供的 `--env-file` 注入，Compose 文件只引用必需变量，不存放值，也不把本机说明性文件作为镜像构建输入。健康检查只报告服务可用，不提前承诺 advisory lock 或领域 API。
 
 ### 3.3 数据与接口
 
 - pyproject 的运行时依赖覆盖 core 当前实际使用的 pydantic、uuid-utils、rfc8785、semver，并登记 M-01 技术栈映射所需 FastAPI、SQLAlchemy async/asyncpg、tree-sitter、structlog、OpenTelemetry、httpx；测试/质量工具放 optional `dev` 组。
-- 源端 descriptor 包含 M-00 `SourceToolchain` 字段和 `runtime_image_digest` 可选字段；target descriptor 包含 M-00 `TargetToolchain` 字段及 M-01 的 `artifact_rules`/`toolchain_image_digest`/`build_excludes` 声明。grammar 摘要文件与 descriptor 的 `parser.grammar_sha256` 必须一致。
+- 源端 descriptor 包含 M-00 `SourceToolchain` 字段和 `runtime_image_digest` 可选字段；target descriptor 包含 M-00 `TargetToolchain` 字段及 M-01 的 `artifact_rules`/`allowed_domains`/`toolchain_image_digest`/`build_excludes` 声明。grammar 摘要文件与 descriptor 的 `parser.grammar_sha256` 必须一致。
 - `migrations/0001_schema_migrations.sql` 仅建立 `schema_migrations(version primary key, applied_at)`；顺序执行、事务和失败恢复归 runtime，不在本任务添加执行 Python API。
 - app 入口 stub 只负责返回可用于容器启动的状态；不读取环境、不获取锁、不创建 actor，避免提前越界实现。
 
@@ -84,7 +84,7 @@ Compose 只启动 `app` 与 `postgres` 两服务：PG 使用 `postgres:17`，app
 
 ## 5. 与架构文档的差异记录
 
-- **有差异**：M-01 目录树仍列 `docs/`，但对齐 D-07 明确不建公开 `docs/`；本设计与实现遵循已确认对齐结论，并登记为待按 AGENTS.md §3.4 回写的文档差异。
+- **已同步**：M-01 目录树已按对齐 Q-08（D-07）移除公开 `docs/` 条目，并明确设计、对齐与迭代文档仅保存在 `my_space/` 私有空间。
 - **有差异**：M-01 历史 V4 条款仍提及 `codemigrator-sandbox-worker`，V6 对齐 D-06/主任务表已确定 sandbox 为 app 内部适配；实现只保留 `codemigrator-app`，在测试中防止 sandbox-worker entry point 残留。
 
 ## 6. 影响面

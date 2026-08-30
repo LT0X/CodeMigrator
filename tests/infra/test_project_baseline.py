@@ -112,8 +112,21 @@ def test_descriptor_payloads_match_core_toolchain_contracts() -> None:
         key: source["parser"][key] for key in TreeSitterGrammarRef.model_fields
     }
     SourceToolchain.model_validate(source_payload)
+    assert source["parser"]["grammar_carrier"] == "shared-library"
+    assert source["parser"]["grammar_path"] == "grammar/tree-sitter-go.so"
     TargetToolchain.model_validate(
         {key: target[key] for key in TargetToolchain.model_fields if key in target}
+    )
+    assert target["allowed_domains"] == ["files.pythonhosted.org", "pypi.org"]
+    assert all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", domain)
+        for domain in target["allowed_domains"]
+    )
+    assert all(
+        isinstance(rule, dict)
+        and isinstance(rule.get("pattern"), str)
+        and isinstance(rule.get("artifact_kind"), str)
+        for rule in target["artifact_rules"]
     )
 
 
@@ -178,8 +191,14 @@ def test_import_contracts_cover_the_frozen_dependency_layers() -> None:
     contracts = project["tool"]["importlinter"]["contracts"]
     names = {contract["name"] for contract in contracts}
     assert names == {"frozen layers", "forbidden product imports", "independent domain packages"}
-    assert "codemigrator.core" in str(contracts)
-    assert "codemigrator.runtime" in str(contracts)
+    layer_contract = next(contract for contract in contracts if contract["name"] == "frozen layers")
+    assert layer_contract["layers"] == [
+        "codemigrator.core",
+        "codemigrator.analysis | codemigrator.planning | codemigrator.verification",
+        "codemigrator.sandbox | codemigrator.workspace",
+        "codemigrator.api",
+        "codemigrator.runtime",
+    ]
 
 
 def test_ci_runs_locked_quality_gates() -> None:
@@ -207,9 +226,15 @@ def test_deploy_files_contain_no_credentials_or_host_sockets() -> None:
     assert "env_file:" not in compose
     assert "POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?" in compose
     assert "my_space/.env" not in compose
+    assert "seccomp=unconfined" in compose
+    assert "SYS_ADMIN" in compose
+    assert "CODEMIGRATOR_CGROUP_DELEGATED_DIR:?" in compose
+    assert "target: /sys/fs/cgroup" in compose
     dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
     assert "my_space" in dockerignore
     assert "tests" in dockerignore
+    assert ".env" in dockerignore
+    assert "*.env" in dockerignore
     dockerfile = (ROOT / "deploy/Dockerfile").read_text(encoding="utf-8")
     assert "python:3.12-slim" in dockerfile
     assert "COPY pyproject.toml uv.lock README.md ./" in dockerfile
@@ -224,3 +249,9 @@ def test_deploy_files_contain_no_credentials_or_host_sockets() -> None:
     )
     for tool in ("uv", "pytest", "ruff", "mypy"):
         assert tool in target_dockerfile
+    assert '"pytest==${PYTEST_VERSION}"' in target_dockerfile
+    assert '"ruff==${RUFF_VERSION}"' in target_dockerfile
+    assert '"mypy==${MYPY_VERSION}"' in target_dockerfile
+    assert "ARG PYTEST_VERSION=8.4.2" in target_dockerfile
+    assert "ARG RUFF_VERSION=0.16.5" in target_dockerfile
+    assert "ARG MYPY_VERSION=1.20.2" in target_dockerfile

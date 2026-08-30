@@ -4,6 +4,6 @@
     "image": "codemigrator/target-python",
     "tag": "0.1.0",
     "digest": "sha256:0d10938113bc70448b81f08680d1e82e33394e1911be2e8c97cd5a7a09d37fa3",
-    "status": "built-local"
+    "status": "rebuild-required"
   }
 }

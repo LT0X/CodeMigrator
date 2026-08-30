@@ -526,6 +526,16 @@ flowchart TD
 
 > 每次完成任务或计划变更后在本标题下方置顶追加 CHG 条目（模板见 §8.4）；最新记录在最上方。
 
+### CHG-20260830-06：CM-INFRA-001 唯一审查反馈修复
+
+* 时间：2026-08-30
+* 变更类型：审查修订/验证收口
+* 变更原因：PR #2 唯一一次独立审查在延长等待后完成并返回 `REQUEST_CHANGES`；按用户流程仅修复该次反馈，不重新发起审查。
+* 变更内容：拆分 `api`/`runtime` import-linter 层级；补齐 Compose 的 seccomp、`SYS_ADMIN` 与 cgroup v2 委派目录；为 Python 目标描述符声明最小依赖域白名单；将 target-python 工具版本对齐 `uv.lock`；同步 M-01 目录树并强化描述符与凭据构建边界测试。
+* 影响范围：CM-INFRA-001；仍在 `feature/infra-python-skeleton` 原分支提交，不触及主工作区既有用户修改。
+* 验证：70 passed；import-linter 3 contracts kept；Ruff、mypy、compileall 与 Compose config 通过。target-python 新版本重建因 Docker/PyPI 外部下载无响应中止，现有旧版本本地镜像未作为新版本证据。
+* 后续行动：提交并推送当前分支，直接合并 PR #2；合并后在主工作区拉取 `develop`。联网环境下重建 target/app 镜像并完成 PG 冒烟。
+
 ### CHG-20260830-05：CM-CORE-001 合并与 CM-INFRA-001 开工
 
 * 时间：2026-08-30
@@ -533,8 +543,8 @@ flowchart TD
 * 变更原因：CM-CORE-001 PR #1 已按既有审查结论合并，主工作区已 fast-forward 同步 `origin/develop`；按串行 Wave 0 依赖关系启动 CM-INFRA-001。
 * 变更内容：基于合并后的 `develop` 创建 `feature/infra-python-skeleton`，恢复并继续既有 infra WIP；读取 M-01 架构、CM-INFRA-001 对齐记录和任务文档，当前已具备工程骨架、描述符、Compose、迁移、部署、CI 与确定性测试。
 * 影响范围：CM-INFRA-001；保留主工作区既有用户未提交修改，不修改 M-01 架构模块设计文档。
-* 验证：当前分支 `uv lock --check`、全量 pytest（69 passed）、compileall、Ruff、mypy、import-linter 通过；目标工具链镜像已构建且 digest 与构建清单一致；app 镜像构建因 Docker 外部网络下载依赖长期无响应，未完成，待记录为环境限制。
-* 后续行动：收口 Compose/镜像验证和四件文档，完成一次独立审查后只修复一次并直接合并本任务 PR；不追加同一 PR 审查轮次。
+* 验证：初始实现阶段 `uv lock --check`、全量 pytest（70 passed）、compileall、Ruff、mypy、import-linter 通过；目标工具链镜像已构建且 digest 与构建清单一致；app 镜像构建因 Docker 外部网络下载依赖长期无响应，未完成，待记录为环境限制。
+* 后续行动：已完成本 PR 唯一一次独立审查返回的反馈修复；仅在原分支重新验证后直接提交、推送并合并，不追加同一 PR 审查轮次。
 
 ### CHG-20260830-04：CM-CORE-001 审查反馈收口与流程纠偏
 

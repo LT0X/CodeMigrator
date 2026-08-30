@@ -3,6 +3,15 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile
+    security_opt:
+      - seccomp=unconfined
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      - type: bind
+        source: ${CODEMIGRATOR_CGROUP_DELEGATED_DIR:?CODEMIGRATOR_CGROUP_DELEGATED_DIR must point to a delegated cgroup v2 directory}
+        target: /sys/fs/cgroup
+        read_only: false
     depends_on:
       postgres:
         condition: service_healthy

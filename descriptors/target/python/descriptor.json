@@ -21,6 +21,7 @@
     {"pattern": "{docker-compose.yml,Makefile,config.yaml}", "artifact_kind": "DECLARATIVE_CONFIG"},
     {"pattern": "db/**/*.sql", "artifact_kind": "RESOURCE_FILE", "mapping": "copy"}
   ],
+  "allowed_domains": ["files.pythonhosted.org", "pypi.org"],
   "toolchain_image_digest": "sha256:0d10938113bc70448b81f08680d1e82e33394e1911be2e8c97cd5a7a09d37fa3",
   "build_excludes": [".venv", "__pycache__", ".pytest_cache"]
 }

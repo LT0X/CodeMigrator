@@ -70,7 +70,8 @@ layers = [
     "codemigrator.core",
     "codemigrator.analysis | codemigrator.planning | codemigrator.verification",
     "codemigrator.sandbox | codemigrator.workspace",
-    "codemigrator.api | codemigrator.runtime",
+    "codemigrator.api",
+    "codemigrator.runtime",
 ]
 
 [[tool.importlinter.contracts]]

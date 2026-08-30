@@ -32,7 +32,7 @@
 6. - [x] 添加 PostgreSQL 17 的 app+PG Compose 健康检查、最小版本化 SQL schema 和 app Dockerfile（→ V5 增量、D-04、D-05）。
 7. - [x] 添加 `tests/contracts`、`tests/recovery`、`tests/security` 与各子包测试目录，补根 README 与工程使用说明（→ D-07、D-08）。
 8. - [x] 运行 uv lock/install、pytest、import-linter、ruff、mypy、compileall、docker compose config；记录无法运行的镜像/服务验证项及原因（→ §4 验证矩阵）。
-9. - [ ] 更新迭代记录、主任务表 §6/§7.3/§11，执行完成前复核分支范围并提交、推送本任务分支。
+9. - [x] 更新迭代记录、主任务表 §6/§7.3/§11，按一次审查反馈完成原分支修复，复核分支范围并提交、推送本任务分支。
 
 ## 4. 验证计划
 
@@ -59,4 +59,4 @@
 - [x] 主任务表 `CodeMigrator开发任务规划与进度跟踪.md` 已更新
 - [x] 详细设计文档已保存于 `my_space/codemigrator_design_doc/detailed_coding_design/infra/`
 - [x] 本实施计划已保存于 `my_space/Implementation_plan_doc/infra/`
-- [ ] 若设计与架构文档有差异：已按确认流程完成回写；当前仅登记 D-07 偏差，不直接修改架构文档
+- [x] 若设计与架构文档有差异：已按已确认对齐 Q-08（D-07）同步回写 M-01 目录树，并在详细设计登记结果
