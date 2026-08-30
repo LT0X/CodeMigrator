@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 from .._base import CoreModel
 from ..enums import SliceKind
@@ -17,14 +17,20 @@ from ..ids import (
     SliceId,
     validate_candidate_generation,
 )
-from .descriptor import RequiredCheck
-from .verification import ExecutionSubject
+from ..paths import normalize_repo_relative_paths
 from .common import ArtifactRef
+from .descriptor import RequiredCheck
+from .verification import ExecutionSubject, _subject_commit_oid
 
 
 class WriteScopeOut(CoreModel):
     write_paths: list[RepoRelativePath]
     create_roots: list[RepoRelativePath]
+
+    @field_validator("write_paths", "create_roots", mode="before")
+    @classmethod
+    def paths_are_safe(cls, value: object) -> list[str]:
+        return normalize_repo_relative_paths(value)  # type: ignore[arg-type]
 
 
 class WriteScope(CoreModel):
@@ -59,3 +65,9 @@ class ActiveDispatch(CoreModel):
     subject: ExecutionSubject
     check_id: CheckId
     tested_commit_oid: GitOid
+
+    @model_validator(mode="after")
+    def tested_commit_matches_subject(self) -> ActiveDispatch:
+        if self.tested_commit_oid != _subject_commit_oid(self.subject):
+            raise ValueError("tested commit must match the dispatch subject")
+        return self

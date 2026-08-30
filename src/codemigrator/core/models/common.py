@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import NewType
 
+from pydantic import model_validator
+
 from .._base import CoreModel
 from ..enums import DossierBudgetTier
 from ..ids import Sha256
@@ -28,6 +30,12 @@ class DossierEntry(CoreModel):
     content: str
     anchors: list[CodeAnchor]
     advisory: bool
+
+    @model_validator(mode="after")
+    def unanchored_entries_are_advisory(self) -> DossierEntry:
+        if not self.anchors and not self.advisory:
+            raise ValueError("unanchored dossier entries must be advisory")
+        return self
 
 
 class UnderstandingDossier(CoreModel):
@@ -55,7 +63,7 @@ class MigrationRulebook(CoreModel):
 
 
 class TargetProjectBlueprint(CoreModel):
-    module_boundaries: list[dict]
+    module_boundaries: list[dict[str, object]]
     granularity_principles: list[str]
     target_layout_principles: list[str]
     parallelism_rules: list[str]

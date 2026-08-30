@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import semver
+from pydantic import field_serializer, field_validator
 
 from .._base import CoreModel
 from ..enums import CheckAction, ModuleBoundaryStrategy
 from ..ids import CheckId, LanguageId, ProjectModuleId, RepoRelativePath, Sha256
+from ..paths import _validate_repo_relative_path, normalize_repo_relative_paths
 
 
 class TreeSitterGrammarRef(CoreModel):
@@ -46,12 +48,21 @@ class TargetToolchain(CoreModel):
     toolchain_image_digest: str
     build_excludes: list[RepoRelativePath]
 
+    @field_validator("build_excludes", mode="before")
+    @classmethod
+    def build_excludes_are_safe(cls, value: object) -> list[str]:
+        return normalize_repo_relative_paths(value)  # type: ignore[arg-type]
+
 
 class ToolchainDescriptor(CoreModel):
     descriptor_version: semver.Version
     descriptor_sha256: Sha256
     source: SourceToolchain
     target: TargetToolchain
+
+    @field_serializer("descriptor_version")
+    def serialize_descriptor_version(self, value: semver.Version) -> str:
+        return str(value)
 
 
 class RequiredCheck(CoreModel):
@@ -65,3 +76,8 @@ class ContractArtifact(CoreModel):
     target_module_path: RepoRelativePath
     public_signatures: list[str]
     types_hash: Sha256
+
+    @field_validator("target_module_path", mode="before")
+    @classmethod
+    def target_module_path_is_safe(cls, value: object) -> str:
+        return _validate_repo_relative_path(value)

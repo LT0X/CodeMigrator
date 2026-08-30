@@ -1,36 +1,5 @@
 """Stable, side-effect-free CodeMigrator contracts."""
 
-from .ids import (
-    AdviceId,
-    BranchPrefix,
-    CandidateGeneration,
-    CheckId,
-    CorrectionIntentId,
-    DispatchAttemptId,
-    GitOid,
-    GitRefName,
-    LanguageId,
-    MessageId,
-    OutputWorkspaceId,
-    PlanRevisionId,
-    ProjectId,
-    ProjectModuleId,
-    ProjectSnapshotId,
-    QuestionId,
-    ReceiptId,
-    RepairDecisionId,
-    RepoRelativePath,
-    RepositoryUrl,
-    RunId,
-    SessionId,
-    Sha256,
-    SliceId,
-    SpecId,
-    TaskDraftRevisionId,
-    TaskId,
-    new_uuid7,
-    validate_candidate_generation,
-)
 from .enums import (
     AdviceKind,
     ArtifactKind,
@@ -55,8 +24,46 @@ from .enums import (
     SliceKind,
 )
 from .errors import StableErrorCode
+from .ids import (
+    AdviceId,
+    BranchPrefix,
+    CandidateGeneration,
+    CheckId,
+    CorrectionIntentId,
+    DispatchAttemptId,
+    GitOid,
+    GitRefName,
+    LanguageId,
+    MessageId,
+    OutputWorkspaceId,
+    PlanRevisionId,
+    ProjectId,
+    ProjectModuleId,
+    ProjectSnapshotId,
+    QuestionId,
+    ReceiptId,
+    RepairDecisionId,
+    RepoRelativePath,
+    RepositoryUrl,
+    RequestId,
+    RunId,
+    SessionId,
+    Sha256,
+    SliceId,
+    SpecId,
+    TaskDraftRevisionId,
+    TaskId,
+    new_uuid7,
+    validate_candidate_generation,
+)
 from .models import *
 from .models import __all__ as _MODEL_EXPORTS
+from .paths import (
+    canonical_json_bytes,
+    integration_key,
+    normalize_repo_relative_paths,
+    validate_branch_prefix,
+)
 from .policy import (
     ResourceDocument,
     load_phase_tool_policy,
@@ -64,12 +71,6 @@ from .policy import (
     load_session_budget,
     load_session_templates,
     load_verification_policy,
-)
-from .paths import (
-    canonical_json_bytes,
-    integration_key,
-    normalize_repo_relative_paths,
-    validate_branch_prefix,
 )
 
 __all__ = [
@@ -128,6 +129,7 @@ __all__ += [
     "QuestionId",
     "ReceiptId",
     "RepairDecisionId",
+    "RequestId",
     "RepoRelativePath",
     "RepositoryUrl",
     "SessionId",

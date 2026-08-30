@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from importlib import resources
 from typing import Any
 
+from .paths import canonical_json_bytes
 
 _RESOURCE_PATHS = {
     "core://phase-tool-policy/v2": ("phase-tool-policy/v2.json", 2),
@@ -20,7 +21,7 @@ _RESOURCE_PATHS = {
 
 @dataclass(frozen=True)
 class ResourceDocument:
-    """A parsed resource plus the bytes used to derive its digest."""
+    """A parsed resource with its canonical-payload digest and raw bytes."""
 
     uri: str
     version: int
@@ -49,7 +50,7 @@ def load_resource(uri: str) -> ResourceDocument:
     return ResourceDocument(
         uri=uri,
         version=version,
-        sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        sha256=hashlib.sha256(canonical_json_bytes(decoded)).hexdigest(),
         raw_bytes=raw_bytes,
         payload=copy.deepcopy(decoded),
     )

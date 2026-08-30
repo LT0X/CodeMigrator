@@ -19,7 +19,18 @@ def test_branch_prefix_accepts_valid_ascii_segments(value: str) -> None:
 
 @pytest.mark.parametrize(
     "value",
-    ["", "x" * 33, "/feature", "feature/", "feature//x", "feature/.", "feature/..", "feature/.git", "Feature/x", "feature_1"],
+    [
+        "",
+        "x" * 33,
+        "/feature",
+        "feature/",
+        "feature//x",
+        "feature/.",
+        "feature/..",
+        "feature/.git",
+        "Feature/x",
+        "feature_1",
+    ],
 )
 def test_branch_prefix_rejects_invalid_segments(value: str) -> None:
     with pytest.raises(ValueError):

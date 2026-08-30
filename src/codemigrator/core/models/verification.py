@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, TypeAlias
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from .._base import CoreModel
 from ..enums import AttributionReliability, CheckStatus, DiagnosticSeverity
@@ -19,6 +19,7 @@ from ..ids import (
     SliceId,
     validate_candidate_generation,
 )
+from ..paths import _validate_repo_relative_path
 from .common import ArtifactRef
 
 
@@ -26,6 +27,11 @@ class FileLine(CoreModel):
     kind: Literal["FILE_LINE"]
     file_path: RepoRelativePath
     line: int
+
+    @field_validator("file_path", mode="before")
+    @classmethod
+    def file_path_is_safe(cls, value: object) -> str:
+        return _validate_repo_relative_path(value)
 
 
 class TestIdentity(CoreModel):
@@ -37,7 +43,10 @@ class Unknown(CoreModel):
     kind: Literal["UNKNOWN"]
 
 
-DiagnosticTarget: TypeAlias = Annotated[FileLine | TestIdentity | Unknown, Field(discriminator="kind")]
+DiagnosticTarget: TypeAlias = Annotated[
+    FileLine | TestIdentity | Unknown,
+    Field(discriminator="kind"),
+]
 
 
 class DiagnosticMapping(CoreModel):
@@ -94,6 +103,14 @@ VerificationSubject: TypeAlias = Annotated[
 ExecutionSubject: TypeAlias = VerificationSubject
 
 
+def _subject_commit_oid(subject: VerificationSubject) -> GitOid:
+    if isinstance(subject, LocalCandidate):
+        return subject.candidate_commit_oid
+    if isinstance(subject, ProspectiveIntegration):
+        return subject.prospective_commit_oid
+    return subject.verified_commit_oid
+
+
 class VerificationOutcome(CoreModel):
     run_id: RunId
     subject: VerificationSubject
@@ -101,6 +118,12 @@ class VerificationOutcome(CoreModel):
     frozen_required_checks_sha256: Sha256
     check_results: list[CheckResult]
     verification_fingerprint: Sha256
+
+    @model_validator(mode="after")
+    def tested_commit_matches_subject(self) -> VerificationOutcome:
+        if self.tested_commit_oid != _subject_commit_oid(self.subject):
+            raise ValueError("tested commit must match the verification subject")
+        return self
 
 
 class DerivedVerificationGuard(CoreModel):

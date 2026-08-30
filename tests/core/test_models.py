@@ -18,9 +18,7 @@ from codemigrator.core.enums import (
 from codemigrator.core.ids import (
     AdviceId,
     CheckId,
-    CorrectionIntentId,
     GitOid,
-    PlanRevisionId,
     ProjectId,
     ProjectModuleId,
     ProjectSnapshotId,
@@ -58,20 +56,29 @@ from codemigrator.core.models.run import (
     RegisteredProject,
     RemoteRepository,
 )
-from codemigrator.core.models.slice import ActiveDispatch, MigrationSlice, SliceCandidate, WriteScope, WriteScopeOut
+from codemigrator.core.models.slice import (
+    ActiveDispatch,
+    MigrationSlice,
+    SliceCandidate,
+    WriteScope,
+    WriteScopeOut,
+)
 from codemigrator.core.models.verification import (
     CheckResult,
-    DiagnosticMapping,
     DerivedVerificationGuard,
+    DiagnosticMapping,
     FileLine,
     FinalVerified,
     IntegrationIntent,
     LocalCandidate,
     ProspectiveIntegration,
     RepairEvidence,
-    TestIdentity as DiagnosticTestIdentity,
     VerificationOutcome,
 )
+from codemigrator.core.models.verification import (
+    TestIdentity as DiagnosticTestIdentity,
+)
+from codemigrator.core.paths import canonical_json_bytes
 
 
 def uid() -> uuid.UUID:
@@ -116,6 +123,35 @@ def test_create_run_source_union_is_closed() -> None:
     assert isinstance(remote.source, RemoteRepository)
     assert isinstance(registered.source, RegisteredProject)
     assert "target_branch" not in remote.model_dump()
+
+
+def test_create_run_rejects_invalid_branch_prefix() -> None:
+    artifacts = FrozenArtifactBundle(
+        spec=ref(),
+        understanding_dossier=ref(),
+        target_project_blueprint=ref(),
+        migration_rulebook=ref(),
+    )
+
+    with pytest.raises(ValidationError):
+        CreateRun(
+            source=RemoteRepository(
+                repository_url="https://example.test/repo.git", base_ref="main"
+            ),
+            branch_prefix="Feature/unsafe",
+            frozen_artifacts=artifacts,
+        )
+
+
+def test_repo_paths_are_validated_and_normalized_at_model_boundaries() -> None:
+    scope = WriteScopeOut(write_paths=["z.py", "a.py", "z.py"], create_roots=["src"])
+    assert scope.write_paths == ["a.py", "z.py"]
+
+    with pytest.raises(ValidationError):
+        WriteScopeOut(write_paths=["../outside"], create_roots=["src"])
+
+    with pytest.raises(ValidationError):
+        FileLine(kind="FILE_LINE", file_path="../outside", line=1)
 
 
 def test_discriminated_targets_reject_unknown_variants_and_extra_fields() -> None:
@@ -182,6 +218,25 @@ def test_verification_subject_variants_and_extra_fields() -> None:
         )
 
 
+def test_verification_outcome_rejects_subject_commit_mismatch() -> None:
+    subject = LocalCandidate(
+        kind="LOCAL_CANDIDATE",
+        slice_id=SliceId(uid()),
+        generation=0,
+        candidate_commit_oid="1" * 40,
+    )
+
+    with pytest.raises(ValidationError):
+        VerificationOutcome(
+            run_id=RunId(uid()),
+            subject=subject,
+            tested_commit_oid="9" * 40,
+            frozen_required_checks_sha256="a" * 64,
+            check_results=[],
+            verification_fingerprint="b" * 64,
+        )
+
+
 def test_descriptor_and_plan_contracts_are_constructible() -> None:
     parser = ManifestParserRef(manifest_kind="package.json", parser_id="npm-v1")
     grammar = TreeSitterGrammarRef(grammar_id="typescript", grammar_sha256="d" * 64)
@@ -192,7 +247,12 @@ def test_descriptor_and_plan_contracts_are_constructible() -> None:
         manifest_parsers=[parser],
         module_boundary_strategy="MANIFEST_PER_MODULE",
     )
-    command = CheckCommandTemplate(action=CheckAction.Compile, program="python", argv=["-m", "compileall"], timeout_secs=300)
+    command = CheckCommandTemplate(
+        action=CheckAction.Compile,
+        program="python",
+        argv=["-m", "compileall"],
+        timeout_secs=300,
+    )
     target = TargetToolchain(
         language_id="python",
         package_manager="uv",
@@ -247,7 +307,11 @@ def test_context_advice_repair_and_slice_contracts() -> None:
         phase_policy_sha256="3" * 64,
         contract_refs_sha256="4" * 64,
     )
-    budget = SessionBudgetProfile(session=SessionKind.Implementation, max_rounds=500, eviction_watermark_pct=75)
+    budget = SessionBudgetProfile(
+        session=SessionKind.Implementation,
+        max_rounds=500,
+        eviction_watermark_pct=75,
+    )
     pack = ContextPack(identity=identity, budget=budget, assembled_tokens=100)
     advice = Advice(
         advice_id=AdviceId(uid()),
@@ -276,6 +340,34 @@ def test_context_advice_repair_and_slice_contracts() -> None:
     assert advice.payload["suggested_route"] == "delegate_regen"
     assert decision.domain_split[slice_id] == ["src/main.py"]
     assert evidence.reliability is AttributionReliability.Reliable
+
+
+def test_toolchain_descriptor_serializes_semver_as_json_string() -> None:
+    descriptor = ToolchainDescriptor(
+        descriptor_version=semver.Version.parse("1.0.0"),
+        descriptor_sha256="f" * 64,
+        source=SourceToolchain(
+            language_id="typescript",
+            extensions=[".ts"],
+            parser=TreeSitterGrammarRef(grammar_id="typescript", grammar_sha256="d" * 64),
+            manifest_parsers=[],
+            module_boundary_strategy="MANIFEST_PER_MODULE",
+        ),
+        target=TargetToolchain(
+            language_id="python",
+            package_manager="uv",
+            scaffold=[],
+            build=[],
+            test=[],
+            lint=[],
+            typecheck=[],
+            toolchain_image_digest="e" * 64,
+            build_excludes=[".venv"],
+        ),
+    )
+
+    assert '"descriptor_version":"1.0.0"' in descriptor.model_dump_json()
+    assert b'"descriptor_version":"1.0.0"' in canonical_json_bytes(descriptor)
 
 
 def test_remaining_m00_models_have_closed_shapes() -> None:
@@ -385,3 +477,8 @@ def test_remaining_m00_models_have_closed_shapes() -> None:
     assert git_refs.verified_commit_oid == "1" * 40
     assert contract.module_id == module_id
     assert session.joint_write_scope.out.create_roots == ["src"]
+
+
+def test_dossier_entry_requires_advisory_for_missing_anchors() -> None:
+    with pytest.raises(ValidationError):
+        DossierEntry(kind="architecture", content="unanchored", anchors=[], advisory=False)

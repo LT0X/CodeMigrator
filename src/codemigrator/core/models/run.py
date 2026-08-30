@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TypeAlias
 
+from pydantic import field_validator
+
 from .._base import CoreModel
 from ..ids import (
     BranchPrefix,
@@ -13,6 +15,7 @@ from ..ids import (
     ProjectSnapshotId,
     RepositoryUrl,
 )
+from ..paths import validate_branch_prefix
 from .common import ArtifactRef
 
 
@@ -45,3 +48,8 @@ class CreateRun(CoreModel):
     source: CreateRunSource
     branch_prefix: BranchPrefix
     frozen_artifacts: FrozenArtifactBundle
+
+    @field_validator("branch_prefix", mode="before")
+    @classmethod
+    def branch_prefix_is_safe(cls, value: object) -> str:
+        return validate_branch_prefix(value)

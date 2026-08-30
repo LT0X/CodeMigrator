@@ -6,8 +6,11 @@ def test_core_public_exports_include_contract_primitives() -> None:
         "ArtifactRef",
         "Advice",
         "CreateRun",
+        "DerivedVerificationGuard",
+        "IntegrationIntent",
         "PlanEdge",
         "RepairDecision",
+        "RequestId",
         "ToolchainDescriptor",
         "VerificationOutcome",
     ):

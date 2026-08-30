@@ -97,7 +97,13 @@ def test_m00_enum_values_are_exact() -> None:
         ],
         CheckAction: ["SCAFFOLD", "COMPILE", "TEST", "LINT", "TYPE_CHECK"],
         DiagnosticSeverity: ["Error", "Warning"],
-        CheckStatus: ["PASSED", "FAILED", "TIMED_OUT", "OUTPUT_LIMIT_EXCEEDED", "INFRASTRUCTURE_ERROR"],
+        CheckStatus: [
+            "PASSED",
+            "FAILED",
+            "TIMED_OUT",
+            "OUTPUT_LIMIT_EXCEEDED",
+            "INFRASTRUCTURE_ERROR",
+        ],
         SessionKind: [
             "ANALYZE_AUXILIARY",
             "PLAN_AUXILIARY",

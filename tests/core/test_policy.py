@@ -21,7 +21,16 @@ def test_phase_policy_is_exact_and_versioned() -> None:
     document = load_resource("core://phase-tool-policy/v2")
     assert document.uri == "core://phase-tool-policy/v2"
     assert document.version == 2
-    assert document.sha256 == hashlib.sha256(document.raw_bytes).hexdigest()
+    assert document.sha256 == "ed92ba9a5ac7610ed480b2fa2266f6f490e209a51790c1e2dcbfa7b4e19c0391"
+
+
+def test_resource_digest_is_sha256_of_canonical_payload() -> None:
+    document = load_resource("core://phase-tool-policy/v2")
+    canonical_payload = (
+        b'{"EXECUTE":["ReadFile","WriteFile","EditFile","QuerySourceAst","Shell","Exec"],'
+        b'"PLAN":["ReadFile","QuerySourceAst","Exec"],"REPORT":[],"VERIFY":[]}'
+    )
+    assert document.sha256 == hashlib.sha256(canonical_payload).hexdigest()
 
 
 def test_versioned_resources_cover_verification_and_ten_template_slots() -> None:

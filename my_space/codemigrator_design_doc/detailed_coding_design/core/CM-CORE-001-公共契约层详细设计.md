@@ -34,7 +34,7 @@
 | Phase 工具矩阵 | M-00 + CM-CORE D-04 | 包内 JSON，通过 `importlib.resources` 加载 |
 | `SessionKind`、结构性 SessionBudgetProfile | CM-MEMORY D-01/变更记录 | core 枚举、模型与 `session-budget/v1` 资源 |
 | 验证集合错误码和验证策略资源 | CM-VERIFY D-04 | core 错误码与 `verification-policy/v1` 资源 |
-| 静态模板资源地址 | CM-WORKSPACE D-02 / CM-LOOP D-03 | `session-templates/v1` 资源 manifest；正文由会话任务填充 |
+| 静态模板资源地址 | CM-WORKSPACE D-02 / CM-LOOP D-03 | `session-templates/v1` JSON 对象本身作为十槽位资源 manifest；正文由会话任务填充 |
 | 事件名词汇 | M-02、CM-CORE D-05 | 不在 core 定义，保留给 `codemigrator.api` |
 
 ## 3. 详细设计
@@ -68,7 +68,7 @@ codemigrator.core
 
 `CoreModel` 只设置公共 Pydantic 配置。模型字段依赖 core 中的 NewType/枚举，不在模型文件重新声明枚举或错误码。模型按域拆分仅改变文件组织，不改变 JSON 字段名和公共身份。
 
-Primitive 字符串事实（`Sha256`、`GitOid`、`LanguageId`、`RepositoryUrl`、`GitRefName`、`RepoRelativePath`）使用单一类型别名；语义验证集中在 `paths.py` 或对应模型的 field validator，避免每个下游复制路径规则。对于 M-00 尚未定稿的高层 payload，保留文档指定的 `dict`/`list[dict]`，不加入推测字段。
+Primitive 字符串事实（`Sha256`、`GitOid`、`LanguageId`、`RepositoryUrl`、`GitRefName`、`RepoRelativePath`）使用单一类型别名；语义验证集中在 `paths.py` 或对应模型的 field validator，避免每个下游复制路径规则。`CreateRun`、写作用域、验证 subject/file line、descriptor 排除路径、contract artifact 和 dossier entry 在模型边界执行同一语义校验；`tested_commit_oid` 与 subject OID 不一致、非 advisory 的空 anchors 均拒绝。对于 M-00 尚未定稿的高层 payload，保留文档指定的 `dict`/`list[dict]`，不加入推测字段。
 
 ### 3.2 关键机制
 
@@ -88,7 +88,7 @@ BranchPrefix 先做 ASCII 与 UTF-8 字节长度检查，再按 `/` 分段，拒
 
 #### Phase policy 和版本化资源
 
-资源路径以 `importlib.resources.files("codemigrator.core.resources")` 为根，资源加载器只允许内置相对资源名，读取 bytes、计算 SHA-256、解析 JSON 并返回不可变副本。Phase policy 的内容必须是：
+资源路径以 `importlib.resources.files("codemigrator.core.resources")` 为根，资源加载器只允许内置相对资源名，读取 raw bytes、解析 JSON，并对解析后的 payload 做 RFC 8785 JCS 后计算 `SHA-256(JCS(payload))`；返回值保留 raw bytes 和独立 payload 副本。`session-templates/v1` 的 JSON 对象即十槽位 manifest，不额外假定同目录存在第二个 manifest 文件。Phase policy 的内容必须是：
 
 ```json
 {
@@ -99,7 +99,7 @@ BranchPrefix 先做 ASCII 与 UTF-8 字节长度检查，再按 `/` 分段，拒
 }
 ```
 
-`verification-policy/v1`、`session-budget/v1` 和 `session-templates/v1` 采用相同的版本化/摘要/只读加载机制。预算资源使用最新结构性轮数表：AnalyzeAuxiliary 30、PlanAuxiliary 50、Contract 300、Implementation 500、TestTranslation 300、TestGeneration 300、ExploreCoordinator 200、ExecuteSupervisor 30、RepairSession 500；水位分别按对齐记录的 75%/80% 值存储。`Drafting` 是模板资源第十槽位，不改九值 SessionKind。
+`verification-policy/v1`、`session-budget/v1` 和 `session-templates/v1` 采用相同的版本化/摘要/只读加载机制。预算资源使用最新结构性轮数表：AnalyzeAuxiliary 30、PlanAuxiliary 50、Contract 300、Implementation 500、TestTranslation 300、TestGeneration 300、ExploreCoordinator 200、ExecuteSupervisor 30、RepairSession 500；水位分别按对齐记录的 75%/80% 值存储。`Drafting` 是模板资源第十槽位，不改九值 SessionKind。`ToolchainDescriptor.descriptor_version` 内部保持 `semver.Version`，经 Pydantic field serializer 作为 JSON 字符串输出，确保 canonical JSON 可序列化。
 
 ### 3.3 数据与接口
 
@@ -123,6 +123,7 @@ core 不新增数据库表，不定义 REST/SSE DTO，不定义 run_events 事�
 - Spec/描述符：`SPEC_TOO_LARGE`、`SPEC_JSON_INVALID`、`SPEC_DUPLICATE_KEY`、`SPEC_DEPTH_EXCEEDED`、`SPEC_SCHEMA_UNSUPPORTED`、`SPEC_SCHEMA_INVALID`、`CHECK_ACTION_UNSUPPORTED`、`CHECK_SET_INCOMPLETE`、`DESCRIPTOR_NOT_FOUND`、`DESCRIPTOR_DIGEST_MISMATCH`、`TOOLCHAIN_IMAGE_UNAVAILABLE`、`SPEC_IN_USE`。
 - Planner：`PLAN_CYCLE`、`PLAN_SCOPE_CONFLICT`、`PLAN_BLUEPRINT_VIOLATION`、`PLAN_COVERAGE_INVALID`、`PLAN_SIZE_EXCEEDED`、`PLAN_EDGE_INVALID`、`PLAN_RANK_INCONSISTENT`、`PLAN_PROPOSAL_INVALID`。
 - 验证集合：`CHECK_MISSING`、`CHECK_DUPLICATE`、`CHECK_UNEXPECTED`、`INVOCATION_HASH_MISMATCH`。
+- 上下文与恢复：`CONTEXT_BUDGET_EXCEEDED`、`CONTEXT_CAPABILITY_INVALID`、`RECOVERY_LEDGER_INCONSISTENT`。
 
 `FailureReason` 单独承载 `ANALYSIS_FAILED`、`DOSSIER_INCONSISTENT`、`PLAN_FAILED`、`EXECUTION_FAILED`、`VERIFICATION_TERMINAL`、`REPORT_GENERATION_FAILED`、`BUDGET_EXHAUSTED`、`RESOURCE_EXHAUSTED`、`OUTPUT_LIMIT_EXCEEDED`、`SLICE_REGENERATION_EXHAUSTED`、`NONDETERMINISTIC_VERIFICATION` 等 Run 终态原因；禁止以稳定错误码替代它。
 
@@ -133,9 +134,10 @@ core 不新增数据库表，不定义 REST/SSE DTO，不定义 run_events 事�
 - `tests/core/test_enums.py`：枚举 exact-match、大小写和值稳定性。
 - `tests/core/test_errors.py`：StableErrorCode/FailureReason 分族与字符串值。
 - `tests/core/test_models.py`：模型构造、round-trip、别名、extra forbid、判别联合。
-- `tests/core/test_policy.py`：资源加载、URI、版本和摘要。
+- `tests/core/test_policy.py`：资源加载、URI、版本和 `SHA-256(JCS(payload))` 摘要。
 - `tests/contracts/test_core_contracts.py`：核心公共导出和跨域模型字段。
 - `tests/contracts/test_policy_resources.py`：Phase exact-match、十槽位模板、十档预算资源。
+- `tests/core/test_models.py`：模型边界路径/subject 约束与 `semver.Version` JSON/canonical 序列化。
 
 | 验收条款 | 用例名 |
 | --- | --- |

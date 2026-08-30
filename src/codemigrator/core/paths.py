@@ -14,7 +14,11 @@ from pydantic import BaseModel
 def validate_branch_prefix(value: object) -> str:
     """Validate a safe slash-separated branch prefix."""
 
-    if not isinstance(value, str) or not value or len(value.encode("ascii", errors="ignore")) != len(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("ascii", errors="ignore")) != len(value)
+    ):
         raise ValueError("branch prefix must contain ASCII characters")
     encoded = value.encode("ascii")
     if not 1 <= len(encoded) <= 32:
@@ -33,9 +37,11 @@ def _repo_path_key(value: str) -> bytes:
     return value.encode("utf-8")
 
 
-def normalize_repo_relative_paths(paths: Sequence[str]) -> list[str]:
+def normalize_repo_relative_paths(paths: Sequence[object]) -> list[str]:
     """Validate, deduplicate, and UTF-8-byte-sort repository-relative paths."""
 
+    if isinstance(paths, (str, bytes)):
+        raise TypeError("repository paths must be a sequence of paths")
     normalized: set[str] = set()
     for path in paths:
         if not isinstance(path, str) or not path or "\x00" in path:
@@ -47,6 +53,12 @@ def normalize_repo_relative_paths(paths: Sequence[str]) -> list[str]:
             raise ValueError("repository path contains an unsafe segment")
         normalized.add(path)
     return sorted(normalized, key=_repo_path_key)
+
+
+def _validate_repo_relative_path(value: object) -> str:
+    """Validate one repository-relative path at a model boundary."""
+
+    return normalize_repo_relative_paths([value])[0]
 
 
 def integration_key(integration_rank: int, slice_id: uuid.UUID) -> tuple[int, bytes]:

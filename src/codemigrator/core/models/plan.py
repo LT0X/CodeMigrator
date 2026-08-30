@@ -6,20 +6,20 @@ from pydantic import ConfigDict, Field
 
 from .._base import CoreModel
 from ..enums import PlanEdgeKind
-from ..ids import Sha256, SliceId
+from ..ids import SliceId
 from .common import DossierEntry
 
 
 class PlanProposal(CoreModel):
-    slices: list[dict]
-    edges: list[dict]
+    slices: list[dict[str, object]]
+    edges: list[dict[str, object]]
     integration_ranks: dict[str, int]
     planner_rationale: list[DossierEntry]
 
 
 class PlanValidation(CoreModel):
     accepted: bool
-    violations: list[dict]
+    violations: list[dict[str, object]]
     source_coverage: dict[str, str]
     checked_scope_pairs: int
     cycle_check: str

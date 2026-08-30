@@ -21,11 +21,18 @@
 
 ## 4. 自测证据
 
-- [x] `PYTHONPATH=src python -m pytest -q tests/core tests/contracts`：49 passed。
+- [x] `PYTHONPATH=src python -m pytest -q tests/core tests/contracts`：审查修订后 55 passed。
 - [x] `PYTHONPATH=src python -m compileall -q src tests`：通过。
 - [x] `git diff --check`：通过。
 - [x] 核对 `feature/core-contracts` 相对 `develop` 的差异，仅包含 CM-CORE-001 范围及其交付文档。
 - [x] 未执行真实模型测试：本任务只包含确定性公共契约与资源校验，不需要 provider/会话行为验证。
+
+审查修订补充：
+
+- 在 CreateRun、路径、验证 subject/file line、descriptor 排除路径、contract artifact 和 dossier entry 模型边界落实语义校验，并补公共 facade 导出。
+- 资源摘要采用 `SHA-256(JCS(payload))`；`ToolchainDescriptor.descriptor_version` JSON 输出为 semver 字符串。
+- 补齐 `CONTEXT_BUDGET_EXCEEDED`、`CONTEXT_CAPABILITY_INVALID`、`RECOVERY_LEDGER_INCONSISTENT` 三个跨模块稳定错误码。
+- `uuid-utils`、RFC 8785 等工程依赖仍由 CM-INFRA-001 登记，本 PR 不重复建立工程基线。
 
 ## 5. 风险与回滚
 
