@@ -1,31 +1,23 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from typing import Any, cast
 
 from .models import Projection, RunEvent, SliceProjection
 from .sequence import SequenceCursor
 
-_SENSITIVE_KEYS = frozenset(
+_PUBLIC_KEYS = frozenset(
     {
-        "prompt",
-        "source",
-        "source_body",
-        "body",
-        "log",
-        "logs",
-        "stdout",
-        "stderr",
-        "token",
-        "tokens",
-        "credential",
-        "credentials",
-        "password",
-        "artifact_ref",
-        "artifact_refs",
-        "host_path",
-        "path",
+        "slice_id", "sliceid", "generation", "status", "run_status", "outcome", "local",
+        "integration_rank", "commit_oid", "summary", "decision", "route", "session_kind",
+        "error_code", "warning_code", "check_id", "test", "module", "count", "total",
+        "passed", "failed", "phase", "kind",
     }
+)
+_SENSITIVE_TEXT = re.compile(
+    r"(?:bearer\s|api[_-]?key|authorization|private[_-]?key|password|secret|token=|ghp_|-----begin|/(?:home|root|tmp)/)",
+    re.IGNORECASE,
 )
 
 _PLACEMENT: dict[str, tuple[str, str]] = {
@@ -42,15 +34,18 @@ _PLACEMENT: dict[str, tuple[str, str]] = {
 
 def _safe_value(value: Any) -> Any:
     if isinstance(value, dict):
-        return {
-            str(key): _safe_value(item)
-            for key, item in value.items()
-            if str(key).lower() not in _SENSITIVE_KEYS
-        }
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key).lower() not in _PUBLIC_KEYS:
+                continue
+            sanitized = _safe_value(item)
+            if sanitized is not None:
+                safe[str(key)] = sanitized
+        return safe
     if isinstance(value, list):
         return [_safe_value(item) for item in value[:20]]
     if isinstance(value, str):
-        return value[:240]
+        return None if _SENSITIVE_TEXT.search(value) else value[:240]
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return str(value)[:240]
@@ -77,6 +72,9 @@ def _slice_for(
     if slice_id is None:
         return None
     current = projection.slices.get(slice_id)
+    generation = _generation(event.data, current.generation if current else 0)
+    if current and generation < current.generation:
+        return None
     next_status = status or (
         str(event.data.get("status"))
         if event.data.get("status")
@@ -84,7 +82,6 @@ def _slice_for(
         if current
         else "RUNNING"
     )
-    generation = _generation(event.data, current.generation if current else 0)
     zone, action = _PLACEMENT.get(
         next_status,
         (current.zone if current else "work", current.action if current else "run"),
@@ -140,9 +137,20 @@ def _apply(projection: Projection, event: RunEvent) -> None:
     }:
         _slice_for(projection, event, "REGENERATING")
     elif event.type == "integration.completed":
-        _slice_for(projection, event, "INTEGRATION_QUEUED")
+        current = _slice_for(projection, event, "INTEGRATION_QUEUED")
+        if current:
+            key = f"{current.slice_id}:{current.generation}"
+            projection.completed_integrations.add(key)
+            if key in projection.advanced_verifications:
+                _integrate(projection, current.slice_id, current.generation)
     elif event.type == "verified.advanced" and slice_id in projection.slices:
-        _slice_for(projection, event, "INTEGRATED")
+        current = projection.slices[slice_id]
+        generation = _generation(event.data, current.generation)
+        if generation == current.generation:
+            key = f"{slice_id}:{generation}"
+            projection.advanced_verifications.add(key)
+            if key in projection.completed_integrations:
+                _integrate(projection, slice_id, generation)
     elif event.type.startswith(("advice.", "repair.")):
         projection.notices.append(
             {
@@ -153,6 +161,21 @@ def _apply(projection: Projection, event: RunEvent) -> None:
         )
         del projection.notices[:-40]
     _timeline(projection, event, labels.get(event.type, "事件事实"), slice_id)
+
+
+def _integrate(projection: Projection, slice_id: str, generation: int) -> None:
+    current = projection.slices.get(slice_id)
+    if current is None or current.generation != generation:
+        return
+    projection.slices[slice_id] = SliceProjection(
+        slice_id,
+        "INTEGRATED",
+        generation,
+        "verified",
+        "confluence",
+        current.integration_rank,
+    )
+    projection.celebrations.add(f"{slice_id}:{generation}")
 
 
 def _refresh_activity(projection: Projection, memory_gib: int, cpu_cores: int) -> None:

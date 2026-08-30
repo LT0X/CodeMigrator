@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from codemigrator_cli.__main__ import run_command
 from codemigrator_cli.cancel import CancelAction, CancelController
+from codemigrator_cli.client import HttpRunControl
 from codemigrator_cli.exit_codes import ExitCode
-from codemigrator_cli.http import _event_from_lines
+from codemigrator_cli.http import HttpEventSource, _event_from_lines
 from codemigrator_cli.models import RunEvent
 from codemigrator_cli.projector import project_events
 from codemigrator_cli.renderer import render_human, render_json, render_jsonl
@@ -57,6 +59,37 @@ def test_projector_marks_gap_and_caps_visible_activity() -> None:
     assert gap.cursor == 1
 
 
+def test_projector_requires_matching_generation_and_verified_pair() -> None:
+    events = [
+        event(1, "candidate.generation_started", {"slice_id": "slice-a", "generation": 1}),
+        event(2, "verified.advanced", {"slice_id": "slice-a", "generation": 0}),
+        event(3, "integration.completed", {"slice_id": "slice-a", "generation": 0}),
+    ]
+    projection = project_events(events)
+    assert projection.slices["slice-a"].generation == 1
+    assert projection.slices["slice-a"].status == "REGENERATING"
+    assert not projection.celebrations
+
+
+def test_safe_jsonl_projection_is_whitelist_and_secret_resistant() -> None:
+    projection = project_events(
+        [
+            event(
+                1,
+                "dispatch.started",
+                {
+                    "slice_id": "slice-a",
+                    "api_key": "hidden",
+                    "authorization": "Bearer hidden",
+                    "summary": "private_key=hidden",
+                },
+            )
+        ]
+    )
+    rendered = render_json(projection)
+    assert "hidden" not in rendered
+
+
 def test_exit_codes_are_stable() -> None:
     assert ExitCode.COMPLETED == 0
     assert ExitCode.PARTIALLY_COMPLETED == 2
@@ -77,6 +110,26 @@ def test_no_follow_returns_only_creation_projection() -> None:
     }
 
 
+def test_run_watch_no_follow_projects_current_events() -> None:
+    code, output = run_command(["run", "watch", "run-1", "--no-follow", "--output", "json"])
+    assert code == 0
+    assert json.loads(output)["cursor"] == 13
+
+
+def test_transport_failure_returns_bounded_unknown_result() -> None:
+    class BrokenSource:
+        def events(self):
+            raise ValueError("private path /home/secret")
+
+    code, output = run_command(
+        ["run", "watch", "run-1", "--follow", "--output", "json"],
+        source=BrokenSource(),
+    )
+    assert code == int(ExitCode.UNKNOWN)
+    assert json.loads(output) == {"run_id": "run-1", "status": "UNKNOWN"}
+    assert "secret" not in output
+
+
 def test_cancel_controller_waits_for_persisted_confirmation() -> None:
     controller = CancelController()
     assert controller.interrupt() is CancelAction.REQUEST
@@ -93,7 +146,89 @@ def test_run_cancel_uses_if_match_and_returns_cancel_exit_code() -> None:
 
 
 def test_sse_transport_accepts_only_the_versioned_event_shape() -> None:
-    parsed = _event_from_lines(['{"type":"dispatch.started","sequence":3,"data":{"slice_id":"a"}}'])
+    parsed = _event_from_lines(
+        ['{"schema":"migration.event","version":1,"type":"dispatch.started","sequence":3,"data":{"slice_id":"a"}}']
+    )
     assert parsed is not None
     assert parsed.sequence == 3
     assert parsed.type == "dispatch.started"
+
+
+def test_sse_transport_rejects_wrong_schema_and_id() -> None:
+    with pytest.raises(ValueError, match="envelope"):
+        _event_from_lines(
+            ['{"schema":"other.event","version":1,"type":"x","sequence":3,"data":{}}']
+        )
+    with pytest.raises(ValueError, match="id"):
+        _event_from_lines(
+            ['{"schema":"migration.event","version":1,"type":"x","sequence":3,"data":{}}'],
+            event_id="4",
+        )
+
+
+def test_http_event_source_sends_auth_and_replays_from_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[object] = []
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def __iter__(self):
+            return iter(
+                [
+                    b"id: 3\n",
+                    b'data: {"schema":"migration.event","version":1,"type":"x",'
+                    b'"sequence":3,"data":{}}\n',
+                    b"\n",
+                ]
+            )
+
+    def open_url(request: object, *, timeout: int) -> Response:
+        del timeout
+        requests.append(request)
+        return Response()
+
+    monkeypatch.setattr("codemigrator_cli.http.urlopen", open_url)
+    source = HttpEventSource(
+        "https://api.example.test/api/v1",
+        "run/1",
+        after_sequence=2,
+        token="secret",
+    )
+    events = list(source.events())
+    request = requests[0]
+    assert events[0].sequence == 3
+    assert request.full_url == "https://api.example.test/api/v1/migrations/run%2F1/events"
+    assert request.get_header("Authorization") == "Bearer secret"
+    assert request.get_header("Last-event-id") == "2"
+
+
+def test_http_run_control_sends_quoted_if_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: list[object] = []
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"run_id":"run-1","status":"CANCELLED","version":9}'
+
+    def open_url(request: object, *, timeout: int) -> Response:
+        del timeout
+        requests.append(request)
+        return Response()
+
+    monkeypatch.setattr("codemigrator_cli.client.urlopen", open_url)
+    payload = HttpRunControl("https://api.example.test/api/v1", token="secret").cancel(
+        "run-1", 8
+    )
+    assert payload["status"] == "CANCELLED"
+    assert requests[0].get_header("If-match") == '"8"'

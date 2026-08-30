@@ -30,5 +30,8 @@ class Projection:
     slices: dict[str, SliceProjection] = field(default_factory=dict)
     timeline: list[dict[str, Any]] = field(default_factory=list)
     notices: list[dict[str, Any]] = field(default_factory=list)
+    completed_integrations: set[str] = field(default_factory=set)
+    advanced_verifications: set[str] = field(default_factory=set)
+    celebrations: set[str] = field(default_factory=set)
     active_slices: list[SliceProjection] = field(default_factory=list)
     overflow_active: int = 0

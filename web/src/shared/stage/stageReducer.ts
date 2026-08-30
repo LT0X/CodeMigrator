@@ -9,6 +9,12 @@ import type {
   StageZone,
 } from "./types";
 
+export interface StageSnapshot {
+  readonly latest_sequence: number;
+  readonly run_status?: string;
+  readonly slices: readonly { slice_id: string; kind: string; status: string; generation: number; integration_rank?: number }[];
+}
+
 const STATUS_PLACEMENT: Readonly<Record<string, { zone: StageZone; action: StageAction; persona: boolean }>> = {
   RUNNING: { zone: "work", action: "run", persona: true },
   LOCAL_VERIFYING: { zone: "work", action: "run", persona: true },
@@ -18,6 +24,7 @@ const STATUS_PLACEMENT: Readonly<Record<string, { zone: StageZone; action: Stage
   REGENERATING: { zone: "regeneration", action: "error", persona: true },
   INTEGRATED: { zone: "confluence", action: "verified", persona: false },
   TERMINAL_FAILED: { zone: "regeneration", action: "error", persona: false },
+  READY: { zone: "waiting", action: "wait", persona: false },
   CONTRACT_BLOCKED: { zone: "waiting", action: "wait", persona: false },
   CANCELLED: { zone: "waiting", action: "wait", persona: false },
 };
@@ -117,6 +124,7 @@ const reduceAcceptedEvent = (state: StageState, event: RunEvent): StageState => 
     next = withSlice(next, event, "INTEGRATION_QUEUED");
     if (id) {
       const generation = number(event.data.generation, next.slices[id]?.generation ?? 0);
+      if (next.slices[id]?.generation !== generation) return withTimeline(next, event, mapping.label, id);
       const key = keyOf(id, generation);
       const completed = next.completedIntegrations.includes(key)
         ? next.completedIntegrations
@@ -127,6 +135,7 @@ const reduceAcceptedEvent = (state: StageState, event: RunEvent): StageState => 
   } else if (event.type === "verified.advanced") {
     if (id) {
       const generation = number(event.data.generation, next.slices[id]?.generation ?? 0);
+      if (next.slices[id]?.generation !== generation) return withTimeline(next, event, mapping.label, id);
       const key = keyOf(id, generation);
       const advanced = next.advancedVerifications.includes(key)
         ? next.advancedVerifications
@@ -146,7 +155,11 @@ const reduceAcceptedEvent = (state: StageState, event: RunEvent): StageState => 
     next = { ...next, connection: "terminal" };
   }
   if (id && state.lockedId === id && JSON.stringify(state.slices[id]) !== JSON.stringify(next.slices[id])) {
-    next = { ...next, pulseIds: clearPulseFor(next, id) };
+    next = {
+      ...next,
+      pulseIds: clearPulseFor(next, id),
+      pulseVersion: { ...next.pulseVersion, [id]: (next.pulseVersion[id] ?? 0) + 1 },
+    };
   }
   if (!state.lockedId && id && next.slices[id]) next = { ...next, focusedId: id };
   const timelineLabel = mapping.label;
@@ -157,7 +170,7 @@ const celebrate = (state: StageState, event: RunEvent, id: string, generation: n
   const key = keyOf(id, generation);
   if (state.celebrations.some((item) => item.key === key)) return state;
   const existing = state.slices[id];
-  if (!existing) return state;
+  if (!existing || existing.generation !== generation) return state;
   return {
     ...state,
     slices: { ...state.slices, [id]: { ...existing, status: "INTEGRATED", zone: "confluence", action: "verified", persona: false, commitOid: text(event.data.commit_oid, existing.commitOid ?? "") || null } },
@@ -177,8 +190,27 @@ export const createInitialStageState = (latestSequence = 0): StageState => ({
   focusedId: null,
   lockedId: null,
   pulseIds: [],
+  pulseVersion: {},
   notices: [],
 });
+
+export const hydrateStage = (snapshot: StageSnapshot): StageState => {
+  let state = createInitialStageState(snapshot.latest_sequence);
+  for (const item of snapshot.slices) {
+    const event: RunEvent = {
+      schema: "migration.event",
+      version: 1,
+      type: "slice.status_changed",
+      sequence: snapshot.latest_sequence || 1,
+      data: { slice_id: item.slice_id, kind: item.kind, status: item.status, generation: item.generation, integration_rank: item.integration_rank },
+      timestamp_utc: "",
+    };
+    const existing = state.slices[item.slice_id];
+    const hydrated = makeSlice(item.slice_id, event.data, event.sequence, existing);
+    state = { ...state, slices: { ...state.slices, [item.slice_id]: hydrated } };
+  }
+  return { ...state, runStatus: snapshot.run_status ?? "UNKNOWN", connection: "connected" };
+};
 
 export const reduceStage = (state: StageState, event: RunEvent): StageState => {
   const cursor = new SequenceCursor(state.cursor);

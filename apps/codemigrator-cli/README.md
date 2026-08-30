@@ -14,8 +14,9 @@ codemigrator run show <run_id> --output json
 codemigrator run cancel <run_id> --if-match <version>
 ```
 
-当前包内置确定性的 mock source，便于在后端投影尚未连接时执行规则测试；真实 REST/SSE
-客户端应实现同一 `EventSource` 边界。输出不包含模型推理、提示词、源码正文、完整日志、
+无服务配置时，CLI 使用确定性的本地 source 进行规则验证；配置
+`CODEMIGRATOR_API_URL` 与 `CODEMIGRATOR_API_TOKEN` 后，`run watch`、`run show` 和
+`run cancel` 使用认证 REST/SSE 适配器。两种 source 共用同一 `EventSource` 边界。输出不包含模型推理、提示词、源码正文、完整日志、
 宿主路径、ArtifactRef 或凭据。
 
 取消命令只提交带 `If-Match` 版本的取消请求并等待 Run actor 的持久化确认；它不会在本地

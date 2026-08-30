@@ -18,6 +18,6 @@ npm run typecheck
 npm run build
 ```
 
-当前入口包含确定性的 mock 事件源，用于验证 sequence cursor、重复/缺口事件处理、四场
-动作归约、聚焦锁定和 verified 一次性庆祝。真实 REST/SSE 接入应替换 `shared/api` 的
-transport 边界，不应在组件中创建第二套运行状态。
+入口通过 `shared/api` 消费 REST/SSE 运行投影；`/demo` 提供确定性的本地演示事件源，
+用于验证 sequence cursor、重复/缺口事件处理、四场动作归约、聚焦锁定和 verified 一次性
+庆祝。组件不创建第二套运行状态，也不把演示数据当作服务端结论。

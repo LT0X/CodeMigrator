@@ -9,6 +9,8 @@ import {
 import type { RunEvent } from "./types";
 
 const event = (sequence: number, type: string, data: Record<string, unknown>): RunEvent => ({
+  schema: "migration.event",
+  version: 1,
   sequence,
   type,
   data,
@@ -74,5 +76,15 @@ describe("stage reducer", () => {
     state = reduceStage(state, event(2, "dispatch.started", { slice_id: "slice-a", generation: 0 }));
     expect(state.slices["slice-a"].generation).toBe(1);
     expect(state.slices["slice-a"].zone).toBe("regeneration");
+  });
+
+  it("does not pair an older generation with the current verified candidate", () => {
+    let state = createInitialStageState();
+    state = reduceStage(state, event(1, "candidate.generation_started", { slice_id: "slice-a", generation: 1 }));
+    state = reduceStage(state, event(2, "integration.completed", { slice_id: "slice-a", generation: 0 }));
+    state = reduceStage(state, event(3, "verified.advanced", { slice_id: "slice-a", generation: 0 }));
+    expect(state.slices["slice-a"].generation).toBe(1);
+    expect(state.slices["slice-a"].status).toBe("REGENERATING");
+    expect(state.celebrations).toHaveLength(0);
   });
 });

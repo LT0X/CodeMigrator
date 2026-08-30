@@ -1,10 +1,13 @@
 export type EventData = Record<string, unknown>;
 
 export interface RunEvent {
+  readonly schema: "migration.event";
+  readonly version: 1;
   readonly type: string;
   readonly data: EventData;
   readonly sequence: number;
   readonly timestamp_utc: string;
+  readonly sse_id?: string;
 }
 
 export type StageZone = "work" | "waiting" | "regeneration" | "confluence";
@@ -63,5 +66,6 @@ export interface StageState {
   readonly focusedId: string | null;
   readonly lockedId: string | null;
   readonly pulseIds: readonly string[];
+  readonly pulseVersion: Readonly<Record<string, number>>;
   readonly notices: readonly SessionNotice[];
 }

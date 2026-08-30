@@ -1,6 +1,8 @@
 import type { RunEvent } from "./types";
 
 const make = (sequence: number, type: string, data: Record<string, unknown>): RunEvent => ({
+  schema: "migration.event",
+  version: 1,
   sequence,
   type,
   data,
