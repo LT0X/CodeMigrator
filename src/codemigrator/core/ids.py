@@ -51,4 +51,3 @@ def validate_candidate_generation(value: object) -> int:
     if type(value) is not int or value not in (0, 1, 2):
         raise ValueError("candidate generation must be one of 0, 1, or 2")
     return value
-

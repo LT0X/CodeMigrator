@@ -64,4 +64,3 @@ def test_loaded_resource_is_a_fresh_copy() -> None:
     first = load_phase_tool_policy()
     first["PLAN"].append("Shell")
     assert load_phase_tool_policy()["PLAN"] == ["ReadFile", "QuerySourceAst", "Exec"]
-

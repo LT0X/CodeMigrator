@@ -12,4 +12,3 @@ def test_core_public_exports_include_contract_primitives() -> None:
         "VerificationOutcome",
     ):
         assert hasattr(core, name)
-

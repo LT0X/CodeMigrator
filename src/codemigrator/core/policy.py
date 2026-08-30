@@ -73,4 +73,3 @@ def load_session_budget() -> dict[str, dict[str, int]]:
 
 def load_session_templates() -> dict[str, str]:
     return _payload("core://session-templates/v1")
-

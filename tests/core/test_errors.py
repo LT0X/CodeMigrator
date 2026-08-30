@@ -56,4 +56,3 @@ def test_stable_error_codes_are_single_string_enum() -> None:
     assert {code.value for code in StableErrorCode} == expected
     assert StableErrorCode.WRITE_SCOPE_VIOLATION.value == "WRITE_SCOPE_VIOLATION"
     assert all(isinstance(code.value, str) for code in StableErrorCode)
-

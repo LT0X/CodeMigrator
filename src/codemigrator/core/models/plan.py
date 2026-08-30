@@ -32,4 +32,3 @@ class PlanEdge(CoreModel):
     from_: SliceId = Field(alias="from")
     to: SliceId
     kind: PlanEdgeKind
-

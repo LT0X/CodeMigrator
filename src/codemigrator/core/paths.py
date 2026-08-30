@@ -72,4 +72,3 @@ def canonical_json_bytes(value: Any) -> bytes:
         return rfc8785.dumps(value)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("value is not canonicalizable JSON") from exc
-

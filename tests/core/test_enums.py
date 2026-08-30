@@ -113,4 +113,3 @@ def test_m00_enum_values_are_exact() -> None:
     for enum_type, values in expected.items():
         assert enum_values(enum_type) == values
         assert all(isinstance(member, str) for member in enum_type)
-

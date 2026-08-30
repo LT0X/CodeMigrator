@@ -11,4 +11,3 @@ def test_policy_resources_keep_empty_phases_and_drafting_out_of_session_kind() -
     assert len(budget) == len(templates) == 10
     assert "DRAFTING" in templates
     assert "DRAFTING" not in {member.value for member in __import__("codemigrator.core.enums", fromlist=["SessionKind"]).SessionKind}
-

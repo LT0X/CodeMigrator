@@ -45,4 +45,3 @@ class CreateRun(CoreModel):
     source: CreateRunSource
     branch_prefix: BranchPrefix
     frozen_artifacts: FrozenArtifactBundle
-
