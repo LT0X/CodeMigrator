@@ -31,14 +31,14 @@
 5. - [x] 实现相对种子基线的 diff 变更集、build excludes、write scope 双轨校验、checkpoint manifest/receipt、CAS 与恢复窗口端口（`checkpoint.py` → V-M08-V4-006~010、V-M12-V4-010/013）。
 6. - [x] 实现 `[cm:*]` 分段动作与严格 JSON 回退、生成代码从源头执行的 action 端口和 Exec 工具桥回执序（`protocol.py`、`generated.py` → V-M08-V4-016、V-M12-V4-014~017）。
 7. - [x] 以测试先行补齐路径攻击、授权矩阵、原子写/编辑匹配、账本脱敏、双轨越界、幂等/CAS/恢复、动作解析和桥接回执测试（`tests/workspace/`、`tests/security/`）。
-8. - [ ] 同步三份收口文档与主任务表，执行专项/全量测试及质量门；提交、推送并创建唯一 PR，完整等待一次审查终态后一次性修复并直接合并。
+8. - [x] 同步三份收口文档与主任务表，执行专项/全量测试及质量门；提交、推送并创建唯一 PR，完整等待一次审查终态后一次性修复并直接合并。
 
 ## 4. 验证计划
 
 | 验证项 | 命令 | 通过标准 | 关联条款 |
 | --- | --- | --- | --- |
-| 专项测试 | `/home/xtc/env/codemigrator-plan/bin/pytest -q tests/workspace tests/security` | 全部通过 | V-M08/V-M12 全部可施工条款 |
-| 全量测试 | `/home/xtc/env/codemigrator-plan/bin/pytest -q` | 零失败 | 回归 |
+| 专项测试 | `/home/xtc/env/codemigrator-plan/bin/pytest -q tests/workspace tests/security` | 48 passed | V-M08/V-M12 全部可施工条款 |
+| 全量测试 | `/home/xtc/env/codemigrator-plan/bin/pytest -q` | 285 passed | 回归 |
 | 静态检查 | `/home/xtc/env/codemigrator-plan/bin/ruff check src tests` | `All checks passed!` | — |
 | 类型检查 | `/home/xtc/env/codemigrator-plan/bin/mypy src` | `Success: no issues found` | — |
 | 依赖边界 | `/home/xtc/env/codemigrator-plan/bin/lint-imports --config pyproject.toml` | 所有 contracts kept、0 broken | M-01 |
@@ -54,7 +54,7 @@
 ## 6. 收尾清单（对应 AGENTS.md §4 四件套）
 
 - [x] 模块迭代记录已按模板生成于 `codemigrator_dev_progress/workspace/`。
-- [ ] 主任务表 `CodeMigrator开发任务规划与进度跟踪.md` 已更新。
+- [x] 主任务表 `CodeMigrator开发任务规划与进度跟踪.md` 已更新。
 - [ ] 详细设计文档已保存于 `detailed_coding_design/workspace/`。
 - [x] 本实施计划已保存于 `Implementation_plan_doc/workspace/`。
 - [x] 本任务不修改架构模块设计文档，无架构差异回写项。

@@ -17,12 +17,13 @@
 - 新增候选工作区生命周期、结构化写账本 sink、checkpoint diff/scope 双轨、幂等 receipt、CAS 冲突和 pending commit 恢复。
 - 新增 `[cm:action]` 多段动作协议、严格 JSON 回退、受限 Exec bridge 和 GeneratedCode scaffold action。
 - 新增 workspace/security 规则测试；同步实施计划、详细设计、迭代记录、主任务表和 workspace README。
+- 根据 PR #8 唯一审查报告一次性补齐：闭合 M-06 查询 schema/错误码透传、policy 摘要冻结、symlink 双路径 scope、pending 内容复核、CAS 分叉冻结、intent/receipt 与工作区重启恢复、幂等清理、FIFO 非阻塞、Shell 默认超时、行级 marker 和 UTF-8 字节限制；checkpoint port 接收受信不可变文件清单。
 - **BREAKING**：无；不修改 `codemigrator.core` 公共契约、数据库 schema、API 或架构模块设计文档。
 
 ## 自测证据
 
-- `PYTHONPATH=src /home/xtc/env/codemigrator-plan/bin/pytest -q tests/workspace tests/security/test_workspace_gateway.py`：37 passed。
-- `PYTHONPATH=src /home/xtc/env/codemigrator-plan/bin/pytest -q`：274 passed。
+- `PYTHONPATH=src /home/xtc/env/codemigrator-plan/bin/pytest -q tests/workspace tests/security/test_workspace_gateway.py`：48 passed。
+- `PYTHONPATH=src /home/xtc/env/codemigrator-plan/bin/pytest -q`：285 passed。
 - `ruff check src tests`：通过。
 - `mypy src`：61 个源文件无问题。
 - `lint-imports --config pyproject.toml`：3 contracts kept、0 broken。
@@ -34,3 +35,8 @@
 - 真实 bwrap/quiesce、Git ref/CAS、PSF、QuickJS 与 PostgreSQL adapter 尚未在本任务接入；Protocol 边界已冻结，后续 owner 可替换内存替身。
 - Shell 非零退出仍作为正常反馈；越界写在 checkpoint 拒绝且不推进 candidate/verified。
 - 若合并后发现回归，使用 GitHub revert 本 PR；不 force-push 主干。
+
+## 审查流程
+
+- PR #8 仅启动 Galileo 一次审查，并完整等待最终结论。
+- 审查反馈在原分支一次性修复、重新验证并提交；不再对同一 PR 启动第二次审查，随后直接合并。

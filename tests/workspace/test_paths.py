@@ -56,3 +56,17 @@ def test_directory_is_not_a_readable_or_writable_file(tmp_path: Path) -> None:
     with pytest.raises(PathSecurityError):
         root.write_atomic("directory", b"content")
     root.close()
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "mkfifo"), reason="FIFO is unavailable")
+def test_fifo_is_rejected_without_blocking(tmp_path: Path) -> None:
+    import os
+
+    os.mkfifo(tmp_path / "pipe")
+    root = SecureRoot("workspace", tmp_path)
+
+    with pytest.raises(PathSecurityError):
+        root.read_bytes("pipe")
+    with pytest.raises(PathSecurityError):
+        root.write_atomic("pipe", b"content")
+    root.close()

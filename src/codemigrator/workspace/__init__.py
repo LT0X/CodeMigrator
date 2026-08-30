@@ -3,12 +3,15 @@
 from .checkpoint import (
     CandidateRefConflict,
     CandidateRefPort,
+    CheckpointIntent,
     CheckpointManifest,
     CheckpointReceipt,
     CheckpointRejection,
     CheckpointService,
+    CheckpointStore,
     DirectoryDiffProvider,
     InMemoryCandidateRefStore,
+    JsonCheckpointStore,
     WorkspaceChange,
     WorkspaceDiff,
     WorkspaceDiffPort,
@@ -23,9 +26,12 @@ from .generated import (
 )
 from .lifecycle import (
     InMemorySandboxVolume,
+    JsonWorkspaceStateStore,
     SandboxVolumePort,
     WorkspaceManager,
     WorkspaceStateError,
+    WorkspaceStateRecord,
+    WorkspaceStateStore,
 )
 from .models import (
     AuditEvent,
@@ -72,6 +78,7 @@ __all__ = [
     "CandidateRefConflict",
     "CandidateRefPort",
     "CasStore",
+    "CheckpointIntent",
     "CheckpointManifest",
     "CheckpointReceipt",
     "CheckpointRejection",
@@ -87,6 +94,8 @@ __all__ = [
     "InMemoryCasStore",
     "InMemoryCandidateRefStore",
     "InMemorySandboxVolume",
+    "JsonCheckpointStore",
+    "JsonWorkspaceStateStore",
     "PathNotFound",
     "PathSecurityError",
     "QuerySourceAstPort",
@@ -102,6 +111,8 @@ __all__ = [
     "WorkspaceFileFact",
     "WorkspaceManager",
     "WorkspaceStateError",
+    "WorkspaceStateRecord",
+    "WorkspaceStateStore",
     "AuditEvent",
     "EditFileCall",
     "EditFileOutput",
@@ -125,6 +136,7 @@ __all__ = [
     "WriteFileCall",
     "WriteFileOutput",
     "parse_action_stream",
+    "CheckpointStore",
     "sha256_bytes",
     "validate_relative_path",
 ]

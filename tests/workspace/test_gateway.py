@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 
-from codemigrator.core import Phase, SessionKind, StableErrorCode
+import pytest
+
+from codemigrator.core import Phase, SessionKind, StableErrorCode, load_resource
 from codemigrator.workspace import (
     EditFileOutput,
     ReadFileOutput,
@@ -102,3 +104,23 @@ def test_read_phase_only_uses_snapshot(roots, execute_context, write_scope) -> N
     denied = gateway.dispatch({"tool": "ReadFile", "path": "src/out.py"})
     assert isinstance(denied, ToolError)
     assert denied.code is StableErrorCode.READ_OUT_OF_SCOPE
+
+
+def test_gateway_rejects_policy_digest_mismatch_before_ready(
+    roots, execute_context, write_scope
+) -> None:
+    context = execute_context.model_copy(update={"phase_policy_sha256": "0" * 64})
+
+    with pytest.raises(ValueError, match="policy digest"):
+        ToolGateway(context=context, roots=roots, write_scope=write_scope)
+
+
+def test_gateway_clones_reuse_the_frozen_policy_document(
+    roots, execute_context, write_scope
+) -> None:
+    gateway = ToolGateway(context=execute_context, roots=roots, write_scope=write_scope)
+    clone = gateway.with_other_write_scopes([])
+
+    assert gateway.policy_sha256 == load_resource("core://phase-tool-policy/v2").sha256
+    assert gateway.policy_load_count == 1
+    assert clone.policy_load_count == 0

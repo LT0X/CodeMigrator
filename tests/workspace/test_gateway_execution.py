@@ -17,13 +17,13 @@ from codemigrator.workspace import (
 
 class Query:
     def query(self, request):
-        return {"echo": request["kind"]}
+        return {"echo": request.kind}
 
 
 class Shell:
     def run(self, call, workspace_root):
         assert workspace_root.endswith("workspace")
-        assert call.timeout_secs is None
+        assert call.timeout_secs == 600
         return ShellExecution(exit_code=7, stdout="diagnostic", stderr="")
 
 
@@ -33,7 +33,12 @@ def test_query_shell_and_exec_are_ports_and_exec_calls_return_through_gateway(
     events = []
 
     def execute(script, bridge):
-        result = bridge.call({"tool": "QuerySourceAst", "request": {"kind": "FIND_SYMBOL"}})
+        result = bridge.call(
+            {
+                "tool": "QuerySourceAst",
+                "request": {"kind": "FIND_SYMBOL", "symbol": "name"},
+            }
+        )
         assert isinstance(result, QuerySourceAstOutput)
         return ExecExecution(result='{"ok":true}', step_count=1)
 
@@ -46,7 +51,12 @@ def test_query_shell_and_exec_are_ports_and_exec_calls_return_through_gateway(
         exec_engine=CallbackExecEngine(execute),
         audit_sink=events.append,
     )
-    query = gateway.dispatch({"tool": "QuerySourceAst", "request": {"kind": "FIND_SYMBOL"}})
+    query = gateway.dispatch(
+        {
+            "tool": "QuerySourceAst",
+            "request": {"kind": "FIND_SYMBOL", "symbol": "name"},
+        }
+    )
     shell = gateway.dispatch({"tool": "Shell", "command": "pytest -q"})
     execution = gateway.dispatch({"tool": "Exec", "script": "tools.query_source_ast()"})
 
@@ -63,6 +73,29 @@ def test_query_shell_and_exec_are_ports_and_exec_calls_return_through_gateway(
     assert events[3].exit_code == 7
     exec_post = next(event for event in events if event.tool == "Exec" and event.step_count == 1)
     assert exec_post.step_count == 1
+
+
+def test_query_port_error_codes_are_preserved(roots, execute_context, write_scope) -> None:
+    class TimedQuery:
+        def query(self, request):
+            raise ValueError("QUERY_TIMEOUT: query exceeded timeout")
+
+    gateway = ToolGateway(
+        context=execute_context,
+        roots=roots,
+        write_scope=write_scope,
+        query_port=TimedQuery(),
+    )
+
+    result = gateway.dispatch(
+        {
+            "tool": "QuerySourceAst",
+            "request": {"kind": "SEARCH_CONTEXT", "query": "needle"},
+        }
+    )
+
+    assert isinstance(result, ToolError)
+    assert result.code is StableErrorCode.QUERY_TIMEOUT
 
 
 def test_exec_timeout_and_shell_timeout_are_typed_failures(

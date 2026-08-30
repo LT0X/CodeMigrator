@@ -28,16 +28,22 @@
   - 文件内容不进入审计账本；Exec 脚本按 M-12 契约保留全文并同时记录哈希，Shell 仅记录命令/输出摘要（V-M08-V4-004、V-M12-V4-012）。
   - 结构化写入走逐笔 scope 门；Shell 的最终写效果由 checkpoint diff 批量校验，CAS 推进禁止 force update（V-M08-V4-007~010、V-M12-V4-010/013）。
 
+### 2.1 唯一审查反馈的一次性修复
+
+- Galileo 完整完成 PR #8 的唯一一次审查；审查期间未改文件、未提交、未合并，也未启动第二次审查。
+- 按该报告一次性修复：M-06 `SourceAstQuery` 闭合 schema 与错误码透传；Run 冻结的 policy 摘要校验和进程级不可变快照；symlink 自身/有效目标双 scope 校验；pending 内容摘要复核；CAS 分叉冻结；JSON intent/receipt 与工作区/账本重启恢复；幂等清理；FIFO 非阻塞拒绝；Shell 600 秒默认值；行级 action marker；UTF-8 字节上限；checkpoint 受信文件清单端口。
+- 未修改架构模块设计文档；未改变对齐决策，仅落实既有验收条款。
+
 ## 3. 自测与验证结果
 
-- `PYTHONPATH=src /home/xtc/env/codemigrator-plan/bin/pytest -q tests/workspace tests/security/test_workspace_gateway.py`：`37 passed`。
-- `PYTHONPATH=src /home/xtc/env/codemigrator-plan/bin/pytest -q`：`274 passed`。
+- `PYTHONPATH=src /home/xtc/env/codemigrator-plan/bin/pytest -q tests/workspace tests/security/test_workspace_gateway.py`：`48 passed`。
+- `PYTHONPATH=src /home/xtc/env/codemigrator-plan/bin/pytest -q`：`285 passed`。
 - `ruff check src tests`：通过。
 - `mypy src`：`Success: no issues found in 61 source files`。
 - `lint-imports --config pyproject.toml`：3 contracts kept、0 broken。
 - `python -m compileall -q src tests`、`git diff --check`：通过。
 - 对照验收条款：
-  - `V-M12-V4-001/002/003/005/006/011/012/014/015/016/017 ✓`：网关、路径、协议、安全和审计测试覆盖。
+  - `V-M12-V4-001/002/003/005/006/007/011/012/014/015/016/017/018 ✓`：网关、路径、协议、安全和审计测试覆盖。
   - `V-M08-V4-001/002/003/004/005/006/007/008/009/010/011/012/015/016 ✓`：生命周期、账本、checkpoint、CAS/pending、生成 action 测试覆盖。
   - `V-M12-V4-007/009/018`、真实 `bwrap`/Git/QuickJS/PG 联调：未在本任务伪造完成；通过 Query/Shell/Exec/CandidateRef/Sandbox 协议与确定性替身验证，分别由 CM-ANALYSIS、CM-SANDBOX、CM-GIT、CM-INFRA、CM-LOOP/RUNTIME/API 后续接入。
 
@@ -49,11 +55,12 @@
 
 ## 5. 后续行动
 
-- [ ] 完成提交前最终验证，创建本任务唯一 PR。
-- [ ] 启动一次审查 agent 并等待其最终终态；按该次反馈在原分支一次性修复后直接合并，不追加同一 PR 审查。
-- [ ] 合并后在主工作区 `develop` 执行 `git pull --ff-only origin develop`，再按主任务表领取下一项任务。
+- [x] 完成提交前最终验证，创建本任务唯一 PR（#8）。
+- [x] 仅启动一次审查 agent Galileo 并等待其最终终态；按该次反馈在原分支一次性修复，未追加同一 PR 审查。
+- [x] 修复提交推送后直接合并 PR #8；在主工作区 `develop` 执行 `git pull --ff-only origin develop`，再按主任务表领取下一项任务。
 
 ## 6. 附录（可选）
 
 - 分支：`feature/workspace-gateway`。
+- PR：`https://github.com/LT0X/CodeMigrator/pull/8`；流程：一次审查 → 一次修复提交 → 直接合并。
 - 本任务不进行真实模型测试；以规则测试、端口替身、路径攻击和恢复窗口测试为主。

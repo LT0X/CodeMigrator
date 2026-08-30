@@ -3,8 +3,8 @@
 > 文档定位：CodeMigrator 代码实现的跨模块任务规划、依赖分析、并行开发路线与总体进度看板（AGENTS.md §1.1 指定的整体任务规划与进度跟踪主表）。
 > 架构基线：**V6（Python 版）**。跨语言代码迁移 Agent；三层架构（权力层 Harness / 判断层常驻主 Agent / 执行层工作会话）；四阶段 Run 状态机；app + PostgreSQL 两服务部署拓扑，8 个 Python 子包 src-layout 单包。
 > 代码范围：`src/codemigrator/`（8 子包）+ `apps/codemigrator-cli` + `web/` + `descriptors/` + `migrations/` + `deploy/` + `tests/` + `pyproject.toml` + `compose.yaml`。
-> 当前阶段：V6 Wave 2；`CM-CORE-001` 的 PR #1、`CM-INFRA-001` 的 PR #2、`CM-SPEC-001` 的 PR #3、`CM-ANALYSIS-001` 的 PR #4、`CM-SANDBOX-001` 的 PR #5、`CM-DRAFT-001` 的 PR #6、`CM-PLAN-001` 的 PR #7 均已按“一次审查、一次修复、直接合并”闭环，当前正在开发 `CM-WORKSPACE-001`。
-> 总体状态：进行中（18 个任务中 7 个已完成、1 个进行中、10 个未开始；7 个已合并）。
+> 当前阶段：V6 Wave 2；`CM-CORE-001` 的 PR #1、`CM-INFRA-001` 的 PR #2、`CM-SPEC-001` 的 PR #3、`CM-ANALYSIS-001` 的 PR #4、`CM-SANDBOX-001` 的 PR #5、`CM-DRAFT-001` 的 PR #6、`CM-PLAN-001` 的 PR #7 与 `CM-WORKSPACE-001` 的 PR #8 均按“一次审查、一次修复、直接合并”闭环，下一项为 `CM-GIT-001`。
+> 总体状态：进行中（18 个任务中 8 个已完成、10 个未开始；8 个已合并）。
 > 创建日期：2026-08-28（V5 重写版）；2026-08-29 升级为 V6 单基线。最后更新日期：2026-08-30。
 > 维护原则：总体表反映跨模块事实，模块迭代记录保存实现细节；代码、测试和进度记录必须同步更新；每次计划变更必须先与用户对齐（§8）；V6 开放实施项标注"待定"不得臆造为事实。
 
@@ -120,7 +120,7 @@
 | 项目            | 当前状态     | 事实依据                                                                                                                                |
 | ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | V6 设计文档       | 已冻结      | `architecture_module_design/` M-00\~M-16 V6 收敛版 + `feedback_doc/fb10_align_records.md`、fb11\_align\_records.md + 文档迭代记录.md（V6 收敛基线） |
-| 代码实现          | 进行中      | `CM-CORE-001`、`CM-INFRA-001`、`CM-SPEC-001`、`CM-ANALYSIS-001`、`CM-SANDBOX-001`、`CM-DRAFT-001`、`CM-PLAN-001` PR #1～#7 已按唯一审查闭环合并（最新 `bdf4958`）；主工作区已拉取合并后的 develop |
+| 代码实现          | 进行中      | `CM-CORE-001`、`CM-INFRA-001`、`CM-SPEC-001`、`CM-ANALYSIS-001`、`CM-SANDBOX-001`、`CM-DRAFT-001`、`CM-PLAN-001`、`CM-WORKSPACE-001` PR #1～#8 已按唯一审查闭环合并；主工作区已拉取合并后的 develop |
 | WSL2 开发环境     | 部分就绪     | Docker CE + compose；**Python 3.12+/uv 环境待建**（V6 为 Python，见其他更新记录与 .env）                                                             |
 | PostgreSQL 部署 | 未建       | 待 CM-INFRA-001 建 compose.yaml（app+PG）后部署并回填 `my_space/.env`                                                                         |
 | 模型 API key    | 已就绪      | `my_space/model_api_key.json`（LLM Planner/Supervisor/修复/多 Agent/Exec 测试用）                                                           |
@@ -415,7 +415,7 @@ flowchart TD
 | CM-ANALYSIS-001   | 源端分析与知识图谱（M-06）：图谱构建前移/F1-F4/PSF/图谱导航/重建投影                                                                          | 已完成 | 2026-08-30 | 2026-08-30 | Wave 1；依赖 CM-CORE/CM-SPEC（均已完成）；已对齐：my_space/code_alignment_record/analysis/CM-ANALYSIS-001-对齐记录.md；四份收口文档、AST/PSF-2/3、投影重建、查询边界、审计终态、click-video fixture 已完成；唯一一次审查反馈已在原分支修复；151 passed、import-linter/Ruff/mypy/compileall/diff 通过；PR #4 已直接合并（`360a1e8`）；分支 `feature/analysis-graph` |
 | CM-DRAFT-001      | 起草期多 Agent 理解与四件工件（M-16 起草+M-04+M-14）：图谱域扇出/探索协调者/多轮 AskUser（不限次）/一次确认                                              | 已完成 | 2026-08-30 | 2026-08-30 | Wave 2；已对齐：my_space/code_alignment_record/draft/CM-DRAFT-001-对齐记录.md；runtime 起草契约、确定性切域与 D-01 核对、SpecArtifact/FrozenArtifactBundle、双轨问答账本、只读 Exec、Code 试译已完成；唯一一次审查反馈已在原分支一次性修复，未启动第二次审查；PR #6 已直接合并（`7d9dfae`）；专项 25 passed、全量 196 passed、Ruff/mypy/import-linter/compileall/diff 通过；分支 `feature/draft-orchestration`；计划/详细设计/迭代记录见 `my_space/Implementation_plan_doc/session/CM-DRAFT-001-起草期编排与四件工件实施计划.md`、`my_space/codemigrator_design_doc/detailed_coding_design/session/CM-DRAFT-001-起草期编排与四件工件详细设计.md`、`my_space/codemigrator_dev_progress/session/CM-DRAFT-001-起草期编排与四件工件迭代记录.md` |
 | CM-PLAN-001       | LLM Planner+机器校验器（M-07）：PlanProposal/DAG 冻结/四重护栏/条件化联合域/涟漪                                                          | 已完成 | 2026-08-30 | 2026-08-30 | Wave 2；分支 `feature/plan-validator`；校验拒绝码已对齐定稿（八码）；已对齐：my_space/code_alignment_record/plan/CM-PLAN-001-对齐记录.md；四份收口文档与 planning 代码已完成；专项 41 passed、全量 237 passed、Ruff/mypy/import-linter/compileall/diff 通过；唯一一次审查已完整等待终态，反馈在原分支一次性修复并直接合并 PR #7（`bdf4958`） |
-| CM-WORKSPACE-001  | 候选工作区与工具网关（M-08+M-12 执行面）：沙箱卷生命周期/六工具/checkpoint/审计账本                                                               | 进行中 | 2026-08-30 | —    | Wave 2；分支 `feature/workspace-gateway`；已对齐：my_space/code_alignment_record/workspace/CM-WORKSPACE-001-对齐记录.md；已阅读 M-08/M-12 设计；实施计划与详细设计已建立 |
+| CM-WORKSPACE-001  | 候选工作区与工具网关（M-08+M-12 执行面）：沙箱卷生命周期/六工具/checkpoint/审计账本                                                               | 已完成 | 2026-08-30 | 2026-08-30 | Wave 2；分支 `feature/workspace-gateway`；已对齐：my_space/code_alignment_record/workspace/CM-WORKSPACE-001-对齐记录.md；实施计划/详细设计/迭代记录已同步；唯一审查 agent Galileo 已完整返回终态，反馈一次性修复；专项 48 passed、全量 285 passed、Ruff/mypy/import-linter/compileall/diff 通过；PR #8 已直接合并 |
 | CM-SANDBOX-001    | 内联 bwrap 沙箱适配（M-09）：PDEATHSIG/cgroup/命名空间/长期卷/临时物化/三池                                                               | 已完成 | 2026-08-30 | 2026-08-30 | Wave 1；已对齐：my_space/code_alignment_record/sandbox/CM-SANDBOX-001-对齐记录.md；实施计划/详细设计/迭代记录已同步；`command.py`/`preflight.py`/`lifecycle.py`/`limits.py`/`pool.py`/`termination.py`/`executor.py`/`proxy.py` 与 sandbox/security 规则测试完成，20 passed；唯一审查反馈已在原分支一次性修复；真实 bwrap/cgroup/compose/deploy 由 CM-INFRA 联动；分支 `feature/sandbox-bwrap`，PR #5 已直接合并（`c540dbb`），主工作区已拉取 |
 | CM-GIT-001        | 工作空间与 Git 集成（M-11）：refs/CAS 单写者集成/修复 FIFO/non-force 交付                                                              | 未开始 | —    | —      | Wave 2；已对齐：my_space/code_alignment_record/git/CM-GIT-001-对齐记录.md |
 | CM-VERIFY-001     | 验证引擎（M-10）：三层 Oracle/两级修复路由（可靠域直通+其余统一）/fingerprint/flaky/守恒/parity                                                 | 未开始 | —    | —      | Wave 3；V6 收敛-001/002/003；已对齐（推荐方案采纳）：my_space/code_alignment_record/verify/CM-VERIFY-001-对齐记录.md |
@@ -525,6 +525,16 @@ flowchart TD
 ## 11. 更新记录
 
 > 每次完成任务或计划变更后在本标题下方置顶追加 CHG 条目（模板见 §8.4）；最新记录在最上方。
+
+### CHG-20260830-18：CM-WORKSPACE-001 唯一审查修复与 PR #8 收口
+
+* 时间：2026-08-30
+* 变更类型：任务完成/审查闭环/流程同步
+* 变更原因：CM-WORKSPACE-001 已完成 Galileo 唯一审查；报告指出查询 schema、策略冻结、symlink scope、checkpoint 恢复与多项边界安全问题，须在合并前一次性修复。
+* 变更内容：在原 `feature/workspace-gateway` 分支集中修复全部 P1/P2 反馈，补齐闭合查询联合类型、policy 摘要校验/快照、双路径 symlink 校验、内容摘要复核、CAS 分叉冻结、持久化 intent/receipt 与工作区恢复、幂等清理、FIFO 非阻塞、Shell 默认超时、行级 marker 和 UTF-8 字节限制；PR #8 仅执行一次审查、一次修复提交后直接合并。
+* 影响范围：workspace 执行面、确定性测试、四份任务收口文档与主任务表；未修改架构模块设计文档、公共 core 契约和主工作区既有未提交文件。
+* 验证：workspace/security 专项 48 passed、全量 285 passed；Ruff、mypy、import-linter、compileall、diff check 通过；主工作区随后快进拉取 PR #8 合并后的 `develop`。
+* 后续行动：按 Wave 2 依赖关系领取 CM-GIT-001；继续执行每个 PR 仅一次审查、完整等待终态、一次性修复后直接合并。
 
 ### CHG-20260830-16：CM-PLAN-001 开工与唯一审查闭环规则重申
 

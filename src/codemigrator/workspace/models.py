@@ -8,9 +8,10 @@ from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import ConfigDict, Field, StrictInt, field_validator, model_validator
 
+from codemigrator.analysis import SourceAstQuery
 from codemigrator.core import Phase, SessionKind, StableErrorCode
 from codemigrator.core._base import CoreModel
-from codemigrator.core.ids import RunId, SliceId
+from codemigrator.core.ids import RunId, Sha256, SliceId
 
 
 class LineRange(CoreModel):
@@ -55,6 +56,13 @@ class WriteFileCall(CoreModel):
     path: str
     content: str = Field(max_length=64 * 1024**2)
 
+    @field_validator("content")
+    @classmethod
+    def content_is_within_byte_limit(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 64 * 1024**2:
+            raise ValueError("content exceeds 64 MiB UTF-8 bytes")
+        return value
+
 
 class EditFileCall(CoreModel):
     model_config = ConfigDict(frozen=True)
@@ -65,12 +73,19 @@ class EditFileCall(CoreModel):
     new_text: str = Field(max_length=1024**2)
     occur: StrictInt | None = Field(default=None, ge=1)
 
+    @field_validator("old_text", "new_text")
+    @classmethod
+    def edit_text_is_within_byte_limit(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 1024**2:
+            raise ValueError("edit text exceeds 1 MiB UTF-8 bytes")
+        return value
+
 
 class QuerySourceAstCall(CoreModel):
     model_config = ConfigDict(frozen=True)
 
     tool: Literal["QuerySourceAst"]
-    request: dict[str, Any]
+    request: SourceAstQuery
 
 
 class ShellCall(CoreModel):
@@ -81,6 +96,13 @@ class ShellCall(CoreModel):
     workdir: str | None = None
     timeout_secs: StrictInt | None = Field(default=None, gt=0, le=600)
 
+    @field_validator("command")
+    @classmethod
+    def command_is_within_byte_limit(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 1024**2:
+            raise ValueError("command exceeds 1 MiB UTF-8 bytes")
+        return value
+
 
 class ExecCall(CoreModel):
     model_config = ConfigDict(frozen=True)
@@ -88,6 +110,13 @@ class ExecCall(CoreModel):
     tool: Literal["Exec"]
     script: str = Field(min_length=1, max_length=1024**2)
     timeout_secs: StrictInt | None = Field(default=None, gt=0, le=60)
+
+    @field_validator("script")
+    @classmethod
+    def script_is_within_byte_limit(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 1024**2:
+            raise ValueError("script exceeds 1 MiB UTF-8 bytes")
+        return value
 
 
 ToolCall: TypeAlias = Annotated[
@@ -228,6 +257,7 @@ class GatewayContext(CoreModel):
     model_config = ConfigDict(frozen=True)
 
     run_id: RunId
+    phase_policy_sha256: Sha256 = Field(pattern=r"^[0-9a-f]{64}$")
     phase: Phase
     session_kind: SessionKind
     slice_id: SliceId | None = None

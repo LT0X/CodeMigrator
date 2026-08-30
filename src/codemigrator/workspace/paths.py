@@ -199,7 +199,10 @@ class SecureRoot:
         try:
             fd = os.open(
                 leaf,
-                flags | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+                flags
+                | os.O_CLOEXEC
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
                 dir_fd=parent_fd,
             )
         except OSError as exc:

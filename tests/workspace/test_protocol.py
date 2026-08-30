@@ -29,3 +29,9 @@ def test_strict_json_rejects_duplicate_keys_and_non_finite_numbers() -> None:
         parse_action_stream('{"tool":"ReadFile","tool":"Exec"}')
     with pytest.raises(ActionProtocolError, match="non-finite"):
         parse_action_stream('{"tool":"QuerySourceAst","request":{"score":NaN}}')
+
+
+def test_marker_text_inside_json_string_uses_strict_json_fallback() -> None:
+    payload = '{"tool":"WriteFile","path":"a.py","content":"[cm:action]"}'
+
+    assert parse_action_stream(payload)[0]["content"] == "[cm:action]"
