@@ -196,11 +196,11 @@ def test_import_contracts_cover_the_frozen_dependency_layers() -> None:
     assert names == {"frozen layers", "forbidden product imports", "independent domain packages"}
     layer_contract = next(contract for contract in contracts if contract["name"] == "frozen layers")
     assert layer_contract["layers"] == [
-        "codemigrator.core",
-        "codemigrator.analysis | codemigrator.planning | codemigrator.verification",
-        "codemigrator.sandbox | codemigrator.workspace",
-        "codemigrator.api",
         "codemigrator.runtime",
+        "codemigrator.api",
+        "codemigrator.sandbox | codemigrator.workspace",
+        "codemigrator.analysis | codemigrator.planning | codemigrator.verification",
+        "codemigrator.core",
     ]
 
 
