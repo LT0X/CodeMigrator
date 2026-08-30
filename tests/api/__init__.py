@@ -1,0 +1,1 @@
+"""Deterministic API contract tests."""
