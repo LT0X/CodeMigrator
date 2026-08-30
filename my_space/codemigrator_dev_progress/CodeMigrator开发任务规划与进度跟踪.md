@@ -411,7 +411,7 @@ flowchart TD
 | ----------------- | ------------------------------------------------------------------------------------------------------------------- | --- | ---- | ------ | ---------------------------- |
 | CM-CORE-001       | Python 公共契约层（M-00）：ID/四阶段状态机/枚举/错误码/phase 授权矩阵/V6 契约（Advice/RepairDecision/GlobalRepairSession/DossierInconsistent） | 已完成 | 2026-08-30    | 2026-08-30      | Wave 0；全部子包上游；已对齐：my_space/code_alignment_record/core/CM-CORE-001-对齐记录.md；迭代记录：my_space/codemigrator_dev_progress/core/CM-CORE-001-公共契约层迭代记录.md；PR #1 已完成既有审查反馈的修复与验证并合并（`683f398`）；按用户流程不再追加审查；当前验证：`PYTHONPATH=src /tmp/codemigrator-infra/.venv/bin/python -m pytest tests/core tests/contracts -q`（55 passed）、compileall、静态扫描；分支 `feature/core-contracts` |
 | CM-INFRA-001      | 工程基线（M-01）：Python 8 子包/uv/import-linter/descriptors/compose(app+PG)/migrations/tests/CI                             | 已完成 | 2026-08-30    | 2026-08-30      | Wave 0；依赖 CM-CORE（已完成）；已对齐：my_space/code_alignment_record/infra/CM-INFRA-001-对齐记录.md；迭代记录：my_space/codemigrator_dev_progress/infra/CM-INFRA-001-工程基线迭代记录.md；PR #2 已按唯一一次审查反馈修复后直接合并（`d482d88`）；70 passed、import-linter 3 contracts、Ruff/mypy/compileall/Compose config 通过；target-python 重建与 app/PG 冒烟待联网环境完成；分支 `feature/infra-python-skeleton` |
-| CM-SPEC-001       | Migration Spec 能力门（M-05）：四道门/canonical/不可变/描述符三码拒绝                                                                  | 已完成 | 2026-08-30 | 2026-08-30 | Wave 1；依赖 CM-CORE/CM-INFRA（均已完成）；已对齐：my_space/code_alignment_record/spec/CM-SPEC-001-对齐记录.md；四份收口文档、四道门、JCS/hash、端口替身、DDL 与契约测试已完成；101 passed、import-linter/Ruff/mypy/compileall/diff 通过；待唯一一次 PR 审查与合并；分支 `feature/spec-capability-gate` |
+| CM-SPEC-001       | Migration Spec 能力门（M-05）：四道门/canonical/不可变/描述符三码拒绝                                                                  | 已完成 | 2026-08-30 | 2026-08-30 | Wave 1；依赖 CM-CORE/CM-INFRA（均已完成）；已对齐：my_space/code_alignment_record/spec/CM-SPEC-001-对齐记录.md；四份收口文档、四道门、JCS/hash、端口替身、DDL 与契约测试已完成；113 passed、import-linter/Ruff/mypy/compileall/diff 通过；唯一一次审查反馈已修复，待直接合并；分支 `feature/spec-capability-gate` |
 | CM-ANALYSIS-001   | 源端分析与知识图谱（M-06）：图谱构建前移/F1-F4/PSF/图谱导航/重建投影                                                                          | 未开始 | —    | —      | Wave 1；图谱前移使 ANALYSIS 提前；已对齐：my_space/code_alignment_record/analysis/CM-ANALYSIS-001-对齐记录.md |
 | CM-DRAFT-001      | 起草期多 Agent 理解与四件工件（M-16 起草+M-04+M-14）：图谱域扇出/探索协调者/多轮 AskUser（不限次）/一次确认                                              | 未开始 | —    | —      | Wave 2；Blueprint 字段待定（本任务不臆造，CM-PLAN 对齐收口）；已对齐：my_space/code_alignment_record/draft/CM-DRAFT-001-对齐记录.md |
 | CM-PLAN-001       | LLM Planner+机器校验器（M-07）：PlanProposal/DAG 冻结/四重护栏/条件化联合域/涟漪                                                          | 未开始 | —    | —      | Wave 2；校验拒绝码已对齐定稿（八码）；已对齐：my_space/code_alignment_record/plan/CM-PLAN-001-对齐记录.md |
@@ -534,7 +534,7 @@ flowchart TD
 * 变更内容：完成四道门短路校验、有限范围匹配器、JCS canonical/hash、DescriptorRegistry/SpecRepository 端口与内存替身、`migration_specs` DDL；新增专用门测试、契约测试，并同步四份任务收口文档和主表。
 * 影响范围：CM-SPEC-001；仅触及 core Spec 契约、对应迁移、测试和 `my_space/` 任务文档，不实现 runtime I/O、SQL repository 或完整 API。
 * 验证：101 passed；import-linter 3 contracts kept、0 broken；Ruff、mypy、compileall、`git diff --check` 通过；未进行真实模型调用。
-* 后续行动：创建 PR 后只启动一次独立审查并等待其明确完成；若有反馈，仅在原分支修复一次，重新验证后直接合并，再在主工作区拉取 `develop`。
+* 后续行动：唯一一次独立审查已明确完成并返回 `REQUEST_CHANGES`，反馈已在原分支修复；重新验证后直接合并，不追加审查，再在主工作区拉取 `develop`。
 
 ### CHG-20260830-06：CM-INFRA-001 唯一审查反馈修复
 

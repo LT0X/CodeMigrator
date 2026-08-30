@@ -18,7 +18,7 @@
 
 ### 2.1 Spec v3 typed model
 
-`MigrationSpec` 使用 `CoreModel(extra="forbid")`，字段为 `schema`、`version`、`name`、可选 `description`、源/目标语言、四字段 `DescriptorLock`、`SpecScope`、`RequiredCheckSelection[]` 与可选 `Decomposition`。名称按 UTF-8 字节限制 1..128，描述按 UTF-8 字节限制不超过 1024；语言 id 为非空小写 slug 且源/目标必须不同。
+`MigrationSpec` 使用冻结的 `CoreModel(extra="forbid")`，字段为 `schema`、严格整数 `version`、`name`、可选 `description`、源/目标语言、四字段 `DescriptorLock`、`SpecScope`、`RequiredCheckSelection[]` 与可选 `Decomposition`。名称按 UTF-8 字节限制 1..128，描述按 UTF-8 字节限制不超过 1024；语言 id 为 ASCII 非空小写 slug 且源/目标必须不同。描述符锁要求合法 semver 和三份 64 位十六进制摘要；Spec 及其嵌套模型深层不可变。
 
 `SpecScope` 的 include 至少一项，exclude 可空；两者在 Schema 门校验为有限模式。`RequiredCheckSelection` 只允许 action 与模板摘要，命令正文、参数、超时和 write scope 由 extra-forbid 拒绝。分解策略只作为 Planner 提示，`max_parallelism` 只能收窄且不改变沙箱公式。
 
@@ -26,7 +26,7 @@
 
 `validate_spec_bytes` 固定执行：
 
-1. 字节/JSON 门：拒绝超过 262144 bytes、UTF-8 BOM/非法编码、重复 key、超过 32 的嵌套深度；返回首门问题后停止。
+1. 字节/JSON 门：拒绝超过 262144 bytes、UTF-8 BOM/非法编码、重复 key、孤立 Unicode surrogate、超过 32 的嵌套深度；在调用 JSON 解析器前以字符串扫描阻断病理深度，返回首门问题后停止。
 2. Schema 门：严格 JSON 顶层与嵌套模型、版本/语言/范围/模式/字段边界；问题按 JSON Pointer UTF-8 字典序、最多 100 条，超出置 `truncated`。
 3. 资源门：调用 `DescriptorRegistry` 端口核对源/目标存在、版本/双资源摘要/镜像摘要、grammar 与镜像可验证状态；只接受 registry 已冻结结果，不在 core 做 I/O。
 4. 检查集门：按 `(action, template_sha256)` 查目标端模板覆盖，Compile 与 Test 各至少一项，选择对不能重复；通过后才规范化。
@@ -35,13 +35,13 @@
 
 ### 2.3 范围模式
 
-匹配器不使用 `fnmatch`/`glob`。允许字面目录前缀（尾 `/`）、字面文件、以及前缀目录下最后一段至多一个 `*`；拒绝 `**`、`?`、字符类、大括号、正则、绝对路径、空段、`.`/`..` 和 `.git` 前缀。exclude 必须被至少一个 include 包含；`.git/` 永远不进入范围。匹配是纯函数，供 M-06 快照扫描期调用。
+匹配器不使用 `fnmatch`/`glob`。允许字面目录前缀（尾 `/`）、字面文件、以及前缀目录下最后一段至多一个匹配一个或多个字符的 `*`；拒绝 `**`、`?`、字符类、大括号、正则、绝对路径、空段、`.`/`..`、NUL 和 `.git` 前缀。exclude 必须被至少一个 include 包含；`.git/` 永远不进入范围。匹配是纯函数，供 M-06 快照扫描期调用。
 
 ### 2.4 规范化与端口
 
 Schema 门成功后复制业务字段：include/exclude 去重后按 UTF-8 字节排序，required checks 按 action 值与摘要排序，decomposition 缺省不写入业务正文。使用 `core.canonical_json_bytes`（RFC 8785 JCS）计算 `SHA-256(canonical_bytes)`；不把 SpecId/时间写入 hash。`InMemorySpecRepository` 仅是测试替身，实现 hash 相同 canonical bytes 的 insert-or-get，不伪装成 runtime SQL。
 
-`DescriptorRegistry` 暴露无副作用的 `resolve(source_language_id, target_language_id)`，返回包含语言对、描述符版本、三份摘要、检查模板覆盖及 grammar/镜像可用性事实的 `DescriptorResolution`；core 不读取文件或镜像。`SpecRepository` 暴露 insert-or-get 与引用感知 delete Protocol。runtime 后续实现文件/数据库事实时必须复用这些端口。
+`DescriptorRegistry` 暴露无副作用的 `resolve(source_language_id, target_language_id)`，返回包含语言对、描述符版本、三份摘要、检查模板覆盖及 grammar/镜像可用性事实的 `DescriptorResolution`；可用性事实默认均为不可用，必须由 runtime 显式证明，core 不读取文件或镜像。`SpecRepository` 暴露 insert-or-get 与引用感知 delete Protocol。runtime 后续实现文件/数据库事实时必须复用这些端口。
 
 ## 3. 持久化设计
 

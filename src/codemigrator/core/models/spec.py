@@ -6,7 +6,7 @@ import re
 from typing import Annotated
 
 import semver
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from .._base import CoreModel
 from ..enums import CheckAction
@@ -24,7 +24,11 @@ def _normalize_sha256(value: object) -> str:
 _Digest = Annotated[str, Field(min_length=64, max_length=64)]
 
 
-class DescriptorLock(CoreModel):
+class _FrozenSpecModel(CoreModel):
+    model_config = ConfigDict(frozen=True)
+
+
+class DescriptorLock(_FrozenSpecModel):
     """The exact resource versions a Spec is allowed to consume."""
 
     descriptor_version: str
@@ -52,7 +56,7 @@ class DescriptorLock(CoreModel):
         return _normalize_sha256(value)
 
 
-class SpecScope(CoreModel):
+class SpecScope(_FrozenSpecModel):
     """The finite repository-relative path language used by Spec v3."""
 
     include: list[str]
@@ -87,7 +91,7 @@ class SpecScope(CoreModel):
         return scope_includes_path(self, path)
 
 
-class RequiredCheckSelection(CoreModel):
+class RequiredCheckSelection(_FrozenSpecModel):
     """A reference to a target descriptor command template."""
 
     action: CheckAction
@@ -99,11 +103,11 @@ class RequiredCheckSelection(CoreModel):
         return _normalize_sha256(value)
 
 
-class Decomposition(CoreModel):
+class Decomposition(_FrozenSpecModel):
     """Planner hints; they never carry commands or write scope."""
 
     module_granularity: str | None = None
-    max_parallelism: int | None = None
+    max_parallelism: StrictInt | None = None
     test_grouping: str | None = None
 
     @field_validator("module_granularity", "test_grouping")
@@ -121,11 +125,11 @@ class Decomposition(CoreModel):
         return value
 
 
-class MigrationSpec(CoreModel):
+class MigrationSpec(_FrozenSpecModel):
     """The typed business document accepted by the four Spec gates."""
 
     schema_name: str = Field(alias="schema")
-    version: int
+    version: StrictInt
     name: str
     description: str | None = None
     source_language_id: str

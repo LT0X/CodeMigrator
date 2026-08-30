@@ -18,11 +18,13 @@
 - `tests/spec/`、`tests/contracts/` 与基线测试：覆盖四道门、短路、边界、规范化、资源锁、检查集、删除保护、DDL 和 import contract。
 - `my_space/`：同步实施计划、详细设计、迭代记录、主任务表和本 PR 说明。
 
+唯一一次审查提出的边界反馈已在原分支修订：数值字段严格类型化、JSON 深度预检、有限通配符非空段、资源能力 fail-closed、surrogate/NUL 拒绝，以及 Spec 嵌套模型深层不可变；未追加第二次审查。
+
 本 PR 不改变 M-00 公共状态机、枚举或稳定错误码，不实现 runtime repository、descriptor 文件扫描、完整 API、CreateRun 编排、M-06 快照扫描或真实模型调用。无 BREAKING 变更。
 
 ## 自测证据
 
-- [x] `uv run --frozen pytest -q`：101 passed
+- [x] `uv run --frozen pytest -q`：113 passed
 - [x] `uv run --frozen lint-imports`：3 contracts kept，0 broken
 - [x] `uv run --frozen ruff check .`：通过
 - [x] `uv run --frozen mypy src`：通过
@@ -35,4 +37,5 @@
 
 - descriptor registry 的真实资源事实和 SQL 持久化仍由后续 runtime 任务实现；本 PR 只冻结端口与 DDL 边界。
 - `max_parallelism` 仅作为 planner hint 做正值校验，沙箱最终公式由后续执行层收敛。
+- 资源 registry 的 grammar/image 可用性默认为不可用，runtime 必须显式提供已验证事实。
 - 若需回滚，在本分支对应提交上使用 `git revert`；不重置或覆盖 `develop`。

@@ -20,6 +20,8 @@ def validate_scope_pattern(pattern: object) -> str:
 
     if not isinstance(pattern, str) or not pattern:
         raise ValueError("scope pattern must be a non-empty string")
+    if "\x00" in pattern:
+        raise ValueError("scope pattern must not contain NUL")
     if pattern.startswith(("/", "~")) or "\\" in pattern:
         raise ValueError("scope pattern must be repository-relative")
     if any(character in _UNSUPPORTED_PATTERN_CHARS for character in pattern):
@@ -32,7 +34,7 @@ def validate_scope_pattern(pattern: object) -> str:
     parts = body.split("/")
     if any(part in {"", ".", "..", ".git"} for part in parts):
         raise ValueError("scope pattern contains an unsafe path segment")
-    if any(part.startswith(".git") and part == ".git" for part in parts):
+    if parts[0] == ".git":
         raise ValueError("scope pattern cannot start with .git")
 
     star_positions = [index for index, character in enumerate(body) if character == "*"]
@@ -45,7 +47,7 @@ def validate_scope_pattern(pattern: object) -> str:
 
 def _pattern_regex(pattern: str) -> re.Pattern[str]:
     body = pattern[:-1] if pattern.endswith("/") else pattern
-    escaped = re.escape(body).replace(r"\*", "[^/]*")
+    escaped = re.escape(body).replace(r"\*", "[^/]+")
     if pattern.endswith("/"):
         return re.compile(r"^" + escaped + r"/")
     return re.compile(r"^" + escaped + r"$")

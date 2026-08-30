@@ -24,8 +24,8 @@ class DescriptorResolution:
     target_descriptor_sha256: str
     toolchain_image_digest: str
     checks: tuple[RequiredCheckSelection, ...] = ()
-    grammar_available: bool = True
-    image_available: bool = True
+    grammar_available: bool = False
+    image_available: bool = False
 
     @property
     def supported_checks(self) -> frozenset[tuple[CheckAction, str]]:

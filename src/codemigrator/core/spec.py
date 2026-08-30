@@ -49,6 +49,54 @@ def _object_depth(value: object, depth: int = 1) -> int:
     return max(((_object_depth(child, depth + 1)) for child in children), default=depth)
 
 
+def _json_nesting_exceeds_limit(text: str) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_SPEC_DEPTH:
+                return True
+        elif character in "]}":
+            depth = max(depth - 1, 0)
+    return False
+
+
+def _first_invalid_unicode(
+    value: object, location: tuple[object, ...] = ()
+) -> tuple[object, ...] | None:
+    if isinstance(value, str):
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+            return location
+        return None
+    if isinstance(value, dict):
+        for key, child in value.items():
+            invalid_key = _first_invalid_unicode(key, (*location, key))
+            if invalid_key is not None:
+                return invalid_key
+            invalid_child = _first_invalid_unicode(child, (*location, key))
+            if invalid_child is not None:
+                return invalid_child
+        return None
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            invalid_child = _first_invalid_unicode(child, (*location, index))
+            if invalid_child is not None:
+                return invalid_child
+    return None
+
+
 def _json_problem(code: StableErrorCode, message: str) -> SpecProblem:
     return SpecProblem(pointer="", code=code, message=message)
 
@@ -74,6 +122,7 @@ def _json_pointer(location: tuple[object, ...]) -> str:
     segments = []
     for item in location:
         value = str(item).replace("~", "~0").replace("/", "~1")
+        value = value.encode("utf-8", "backslashreplace").decode("utf-8")
         segments.append(value)
     return "/" + "/".join(segments)
 
@@ -182,6 +231,11 @@ def _parse_json_gate(raw: bytes) -> tuple[object | None, LimitedProblems | None]
         )
     try:
         text = raw.decode("utf-8")
+        if _json_nesting_exceeds_limit(text):
+            return None, LimitedProblems(
+                (_json_problem(StableErrorCode.SPEC_DEPTH_EXCEEDED, "Spec nesting exceeds 32"),),
+                False,
+            )
         value = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
     except _DuplicateKeyError as exc:
         return None, LimitedProblems(
@@ -191,7 +245,26 @@ def _parse_json_gate(raw: bytes) -> tuple[object | None, LimitedProblems | None]
         return None, LimitedProblems(
             (_json_problem(StableErrorCode.SPEC_JSON_INVALID, str(exc)),), False
         )
-    if _object_depth(value) > MAX_SPEC_DEPTH:
+    except RecursionError:
+        return None, LimitedProblems(
+            (_json_problem(StableErrorCode.SPEC_DEPTH_EXCEEDED, "Spec nesting exceeds 32"),), False
+        )
+    invalid_unicode = _first_invalid_unicode(value)
+    if invalid_unicode is not None:
+        return None, limit_problems(
+            [
+                SpecProblem(
+                    pointer=_json_pointer(invalid_unicode),
+                    code=StableErrorCode.SPEC_JSON_INVALID,
+                    message="Spec contains an unpaired Unicode surrogate",
+                )
+            ]
+        )
+    try:
+        too_deep = _object_depth(value) > MAX_SPEC_DEPTH
+    except RecursionError:
+        too_deep = True
+    if too_deep:
         return None, LimitedProblems(
             (_json_problem(StableErrorCode.SPEC_DEPTH_EXCEEDED, "Spec nesting exceeds 32"),), False
         )
@@ -204,13 +277,24 @@ def _schema_gate(document: object) -> tuple[MigrationSpec | None, LimitedProblem
             (_json_problem(StableErrorCode.SPEC_SCHEMA_INVALID, "Spec root must be an object"),),
             False,
         )
-    if document.get("schema") != SPEC_SCHEMA or document.get("version") != SPEC_VERSION:
+    if document.get("schema") != SPEC_SCHEMA:
         return None, LimitedProblems(
             (
                 _json_problem(
                     StableErrorCode.SPEC_SCHEMA_UNSUPPORTED, "unsupported Spec schema or version"
                 ),
             ),
+            False,
+        )
+    version = document.get("version")
+    if type(version) is not int:
+        return None, LimitedProblems(
+            (_json_problem(StableErrorCode.SPEC_SCHEMA_INVALID, "version must be an integer"),),
+            False,
+        )
+    if version != SPEC_VERSION:
+        return None, LimitedProblems(
+            (_json_problem(StableErrorCode.SPEC_SCHEMA_UNSUPPORTED, "unsupported Spec version"),),
             False,
         )
     try:
@@ -368,8 +452,16 @@ def validate_spec_bytes(
         return SpecValidationResult(
             None, None, None, check_problems.problems, check_problems.truncated
         )
-    business_document = _canonical_business_document(spec)
-    canonical = canonical_json_bytes(business_document)
+    try:
+        business_document = _canonical_business_document(spec)
+        canonical = canonical_json_bytes(business_document)
+    except (TypeError, ValueError) as exc:
+        problem = SpecProblem(
+            pointer="",
+            code=StableErrorCode.SPEC_SCHEMA_INVALID,
+            message=f"Spec cannot be canonicalized: {exc}",
+        )
+        return SpecValidationResult(None, None, None, (problem,))
     return SpecValidationResult(
         MigrationSpec.model_validate(business_document),
         canonical,

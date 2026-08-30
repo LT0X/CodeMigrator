@@ -19,9 +19,13 @@ CM-CORE-001 与 CM-INFRA-001 已合并，下一 Wave 需要把迁移意图收敛
 - 已实现：`migration_specs` 版本化 SQL DDL；明确不实现 runtime repository、registry 文件 I/O 或完整 API。
 - 文档：实施计划、详细设计、主任务表、PR 说明与本迭代记录均已同步。
 
+### 2.1 唯一一次审查后的修订
+
+PR 唯一审查返回 `REQUEST_CHANGES` 后，在原分支一次性完成以下修订，未再次启动审查：严格拒绝 `version`/`max_parallelism` 的 bool、float、字符串；在 JSON 解析前预检病理嵌套深度并捕获递归异常；将单星匹配改为非空段并修正 exclude containment；将 grammar/image 能力事实改为 fail-closed；在 JSON 门拒绝孤立 surrogate 并兜底 canonical 异常；拒绝范围模式 NUL；冻结 Spec 嵌套模型，保证仓储记录不可被浅层变更污染。
+
 ## 3. 自测与验证结果
 
-- 当前阶段：CM-SPEC-001 实现完成，等待唯一一次 PR 审查后按流程合并。
+- 当前阶段：CM-SPEC-001 已完成唯一一次 PR 审查及反馈修订，等待直接合并。
 - DoD：V-M05-V4-001～012 已由专用门测试、契约测试与全量回归覆盖；全量 pytest、import-linter、Ruff、mypy、compileall 均通过。
 - 验证结果：`uv run --frozen pytest -q`（101 passed）；`lint-imports`（3 contracts kept，0 broken）；Ruff、mypy、compileall 与 `git diff --check` 通过。
 - 真实模型测试：不需要；本任务为确定性门逻辑和持久化契约。

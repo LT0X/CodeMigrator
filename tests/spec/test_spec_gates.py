@@ -116,6 +116,14 @@ def test_json_depth_gate_rejects_depth_33() -> None:
     assert codes(result) == [StableErrorCode.SPEC_DEPTH_EXCEEDED]
 
 
+def test_json_depth_gate_rejects_pathological_depth_without_recursion_error() -> None:
+    raw = b"[" * 500 + b"0" + b"]" * 500
+
+    result = validate_spec_bytes(raw, registry=registry())
+
+    assert codes(result) == [StableErrorCode.SPEC_DEPTH_EXCEEDED]
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -143,6 +151,35 @@ def test_schema_gate_rejects_invalid_typed_fields(field: str, value: object) -> 
 
     assert StableErrorCode.SPEC_SCHEMA_INVALID in codes(result)
     assert result.side_effects == 0
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("version", 3.0),
+        ("version", True),
+        ("version", "3"),
+        ("decomposition", {"max_parallelism": True}),
+        ("decomposition", {"max_parallelism": 2.0}),
+        ("decomposition", {"max_parallelism": "2"}),
+    ],
+)
+def test_schema_gate_rejects_non_strict_numeric_values(field: str, value: object) -> None:
+    payload = valid_payload()
+    payload[field] = value
+
+    result = validate_spec_bytes(json.dumps(payload).encode(), registry=registry())
+
+    assert codes(result) == [StableErrorCode.SPEC_SCHEMA_INVALID]
+
+
+def test_schema_gate_rejects_unpaired_unicode_surrogates() -> None:
+    payload = valid_payload()
+    payload["description"] = "bad\ud800"
+
+    result = validate_spec_bytes(json.dumps(payload).encode(), registry=registry())
+
+    assert codes(result) == [StableErrorCode.SPEC_JSON_INVALID]
 
 
 def test_schema_gate_rejects_unsupported_version_with_dedicated_code() -> None:
@@ -178,7 +215,17 @@ def test_scope_matcher_accepts_finite_patterns_and_permanently_excludes_git() ->
 
 @pytest.mark.parametrize(
     "pattern",
-    ["**/*.go", "src/?.go", "src/[a].go", "src/{a,b}.go", "/src/", "src//x", "../src", ".git/"],
+    [
+        "**/*.go",
+        "src/?.go",
+        "src/[a].go",
+        "src/{a,b}.go",
+        "/src/",
+        "src//x",
+        "../src",
+        ".git/",
+        "a\x00",
+    ],
 )
 def test_scope_gate_rejects_patterns_outside_the_finite_language(pattern: str) -> None:
     payload = valid_payload()
@@ -192,6 +239,15 @@ def test_scope_gate_rejects_patterns_outside_the_finite_language(pattern: str) -
 def test_exclude_must_be_contained_by_include() -> None:
     payload = valid_payload()
     payload["scope"] = {"include": ["src/"], "exclude": ["tests/"]}
+
+    result = validate_spec_bytes(json.dumps(payload).encode(), registry=registry())
+
+    assert codes(result) == [StableErrorCode.SPEC_SCHEMA_INVALID]
+
+
+def test_exclude_directory_is_not_contained_by_single_segment_file_glob() -> None:
+    payload = valid_payload()
+    payload["scope"] = {"include": ["src/*"], "exclude": ["src/"]}
 
     result = validate_spec_bytes(json.dumps(payload).encode(), registry=registry())
 
@@ -219,6 +275,28 @@ def test_resource_gate_rejects_without_creating_side_effects(
     assert codes(result) == [expected]
     assert result.side_effects == 0
     assert result.canonical_bytes is None
+
+
+def test_resource_gate_fails_closed_when_availability_is_not_proven() -> None:
+    unproven = DescriptorResolution(
+        source_language_id="go",
+        target_language_id="python",
+        descriptor_version="1.0.0",
+        source_descriptor_sha256=SOURCE_DIGEST,
+        target_descriptor_sha256=TARGET_DIGEST,
+        toolchain_image_digest=IMAGE_DIGEST,
+        checks=tuple(
+            RequiredCheckSelection(action=action, template_sha256=digest)
+            for action, digest in CHECK_DIGESTS.items()
+        ),
+    )
+
+    result = validate_spec_bytes(
+        json.dumps(valid_payload()).encode(),
+        registry=InMemoryDescriptorRegistry({("go", "python"): unproven}),
+    )
+
+    assert codes(result) == [StableErrorCode.DESCRIPTOR_NOT_FOUND]
 
 
 def test_check_gate_requires_compile_and_test_and_rejects_unsupported_or_duplicate_pairs() -> None:
@@ -265,3 +343,15 @@ def test_in_memory_insert_or_get_preserves_spec_identity_and_rejects_referenced_
     repository.mark_referenced(first.spec_id)
     with pytest.raises(ValueError, match="SPEC_IN_USE"):
         repository.delete(first.spec_id)
+
+
+def test_spec_artifact_and_stored_record_are_deeply_immutable() -> None:
+    result = validate_spec_bytes(json.dumps(valid_payload()).encode(), registry=registry())
+    artifact = SpecArtifact.from_result(result)
+    repository = InMemorySpecRepository()
+    record = repository.insert_or_get(artifact)
+
+    with pytest.raises(ValueError):
+        artifact.spec.name = "mutated"  # type: ignore[misc]
+
+    assert record.artifact.spec.name == "go-to-python"
