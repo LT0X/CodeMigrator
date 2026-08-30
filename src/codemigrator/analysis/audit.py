@@ -47,6 +47,7 @@ class CompletenessAuditor:
     def __init__(self, *, seed: int) -> None:
         self._random = random.Random(seed)
         self._rounds: list[AuditRound] = []
+        self._state: AuditState | None = None
 
     def sample(
         self,
@@ -62,12 +63,16 @@ class CompletenessAuditor:
         return AuditSample(random_files=random_files, adversarial_files=adversarial_files)
 
     def record_round(self, round_: AuditRound) -> AuditState:
+        if self._state in {AuditState.Clean, AuditState.Escalate}:
+            return self._state
         self._rounds.append(round_)
         if not round_.diff.findings:
-            return AuditState.Clean
-        if len(self._rounds) >= 3:
-            return AuditState.Escalate
-        return AuditState.ReviseRules
+            self._state = AuditState.Clean
+        elif len(self._rounds) >= 3:
+            self._state = AuditState.Escalate
+        else:
+            self._state = AuditState.ReviseRules
+        return self._state
 
     @property
     def rounds(self) -> tuple[AuditRound, ...]:

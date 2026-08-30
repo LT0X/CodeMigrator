@@ -10,13 +10,14 @@ from .audit import (
     CompletenessAuditor,
 )
 from .errors import AnalysisFailure, GrammarFailure
-from .grammar import GrammarCache, GrammarCacheKey, GrammarCircuitBreaker, GrammarHandle
+from .grammar import GrammarCache, GrammarCacheKey, GrammarCircuitBreaker, GrammarHandle, SyntaxNode
 from .models import (
     AnalysisCapability,
     AnalysisError,
     AnalysisResult,
     ArtifactFact,
     ArtifactKind,
+    CallEdge,
     CoverageDerivation,
     CoverageEntry,
     DependencyEntry,
@@ -80,6 +81,7 @@ __all__ = [
     "AnalysisFailure",
     "ArtifactRule",
     "ArtifactKind",
+    "CallEdge",
     "AuditDiff",
     "AuditFinding",
     "AuditRecord",
@@ -98,6 +100,7 @@ __all__ = [
     "GrammarCircuitBreaker",
     "GrammarFailure",
     "GrammarHandle",
+    "SyntaxNode",
     "GotoDefinition",
     "ImportRule",
     "InMemoryProjectionStore",

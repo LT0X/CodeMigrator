@@ -103,3 +103,19 @@ def test_projection_cleanup_uses_seven_day_retention() -> None:
     assert store.cleanup(now=now) == [old]
     assert store.read(old) is None
     assert store.read(fresh) is not None
+
+
+def test_projection_store_rebuilds_atomically_from_a_frozen_key() -> None:
+    store = InMemoryProjectionStore()
+    key = ProjectionKey(snapshot_oid="e" * 40, descriptor_sha256="f" * 64)
+    artifact = AnalysisArtifact(
+        key=key,
+        result=__import__("codemigrator.analysis", fromlist=["analyze_snapshot"]).analyze_snapshot(
+            snapshot(), descriptor()
+        ),
+    )
+
+    rebuilt = store.rebuild(key, lambda: artifact)
+
+    assert rebuilt == artifact
+    assert store.read(key) == artifact

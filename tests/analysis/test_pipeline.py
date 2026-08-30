@@ -10,6 +10,7 @@ from codemigrator.analysis import (
     InMemorySnapshotSource,
     ManifestRule,
     SourceAnalysisDescriptor,
+    SyntaxNode,
     TextRule,
     analyze_snapshot,
 )
@@ -196,3 +197,76 @@ def test_parser_failures_are_isolated_by_grammar_circuit_breaker() -> None:
     assert calls == 2
     assert len(result.errors) == 3
     assert result.modules
+
+
+def test_ast_nodes_are_retained_as_the_source_of_exports_and_degraded_files() -> None:
+    def parser(_: bytes) -> SyntaxNode:
+        return SyntaxNode(
+            kind="module",
+            start_byte=0,
+            end_byte=4,
+            children=(
+                SyntaxNode(kind="function_definition", name="run", start_byte=0, end_byte=4),
+                SyntaxNode(kind="ERROR", start_byte=4, end_byte=4),
+            ),
+        )
+
+    source = InMemorySnapshotSource(snapshot_oid="8" * 40, files={"src/main.py": b"????"})
+    result = analyze_snapshot(source, descriptor(), parser=parser)
+
+    assert [export.symbol for module in result.modules for export in module.exported_symbols] == [
+        "run"
+    ]
+    assert result.modules[0].degraded_files == ["src/main.py"]
+
+
+def test_reference_and_call_queries_use_actual_symbol_sites() -> None:
+    source = snapshot()
+    result = analyze_snapshot(source, descriptor())
+    service = __import__("codemigrator.analysis", fromlist=["QuerySourceAst"]).QuerySourceAst(
+        result=result, snapshot=source
+    )
+
+    references = service.query(
+        __import__("codemigrator.analysis", fromlist=["FindReferences"]).FindReferences(
+            kind="FIND_REFERENCES", symbol="helper"
+        )
+    )
+    callers = service.query(
+        __import__("codemigrator.analysis", fromlist=["FindCallers"]).FindCallers(
+            kind="FIND_CALLERS", symbol_or_range="helper"
+        )
+    )
+
+    assert references.hits
+    assert all(hit.range.start.line == 4 for hit in references.hits)
+    assert callers.hits
+    assert all(hit.range.file_path == "src/main/main.py" for hit in callers.hits)
+
+
+def test_alias_imports_bind_reference_sites_to_the_exported_symbol() -> None:
+    aliased = replace(
+        descriptor(),
+        import_rules=(
+            ImportRule(
+                pattern=(
+                    r"^\s*from\s+(?P<target>[A-Za-z_][\w./]*)\s+import\s+"
+                    r"(?P<symbol>[A-Za-z_]\w*)\s+as\s+(?P<alias>[A-Za-z_]\w*)"
+                ),
+                symbol_group="symbol",
+            ),
+        ),
+    )
+    source = InMemorySnapshotSource(
+        snapshot_oid="9" * 40,
+        files={
+            "src/main.py": b"from src.util import helper as h\n\nh()\n",
+            "src/util.py": b"def helper():\n    return 1\n",
+        },
+    )
+
+    result = analyze_snapshot(source, aliased)
+
+    assert [
+        (reference.symbol, reference.site.start.line) for reference in result.reference_sites
+    ] == [("helper", 3)]

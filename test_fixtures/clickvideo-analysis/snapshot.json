@@ -1,0 +1,9 @@
+{
+  "snapshot_oid": "c00000000000000000000000000000000000000c",
+  "files": {
+    "cmd/server/main.go": "package main\n\nimport \"internal/clickvideo\"\n\nfunc Main() { clickvideo.Handle() }\n",
+    "internal/clickvideo/service.go": "package clickvideo\n\nfunc Handle() {}\n",
+    "internal/clickvideo/service_test.go": "package clickvideo\n\nimport \"internal/clickvideo\"\n\nfunc TestHandle() { clickvideo.Handle() }\n",
+    "README.md": "click-video backend fixture\n"
+  }
+}

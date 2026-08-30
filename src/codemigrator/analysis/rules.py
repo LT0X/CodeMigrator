@@ -9,8 +9,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from codemigrator.core import ArtifactKind, ModuleBoundaryStrategy
-from codemigrator.core.paths import canonical_json_bytes
 
+from .canonical import canonical_bytes
 from .models import AnalysisCapability, EdgeConfidence, UnknownReason
 
 
@@ -30,11 +30,19 @@ class ImportRule:
     confidence: EdgeConfidence = EdgeConfidence.Static
     reason: UnknownReason | None = None
     symbol_group: str | None = None
+    local_symbol_group: str | None = None
 
     def __post_init__(self) -> None:
         compiled = re.compile(self.pattern)
         if self.symbol_group is not None and self.symbol_group not in compiled.groupindex:
             raise ValueError(f"import rule symbol group is missing: {self.symbol_group}")
+        if (
+            self.local_symbol_group is not None
+            and self.local_symbol_group not in compiled.groupindex
+        ):
+            raise ValueError(
+                f"import rule local symbol group is missing: {self.local_symbol_group}"
+            )
         confidence = getattr(self.confidence, "value", self.confidence)
         reason = getattr(self.reason, "value", self.reason)
         if confidence == EdgeConfidence.Unknown.value and reason is None:
@@ -115,6 +123,7 @@ class SourceAnalysisDescriptor:
                     "confidence": enum_value(rule.confidence),
                     "reason": enum_value(rule.reason),
                     "symbol_group": rule.symbol_group,
+                    "local_symbol_group": rule.local_symbol_group,
                 }
                 for rule in self.import_rules
             ],
@@ -147,7 +156,7 @@ class SourceAnalysisDescriptor:
             "text_fallback": self.text_fallback,
             "max_file_bytes": self.max_file_bytes,
         }
-        return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+        return hashlib.sha256(canonical_bytes(payload)).hexdigest()
 
     def is_source_file(self, path: str) -> bool:
         return any(path.endswith(extension) for extension in self.extensions)
