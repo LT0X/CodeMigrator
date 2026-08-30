@@ -72,6 +72,24 @@ from .policy import (
     load_session_templates,
     load_verification_policy,
 )
+from .ports import (
+    DescriptorRegistry,
+    DescriptorResolution,
+    InMemoryDescriptorRegistry,
+    SpecRepository,
+)
+from .spec import (
+    InMemorySpecRepository,
+    LimitedProblems,
+    SpecArtifact,
+    SpecInUseError,
+    SpecProblem,
+    SpecRecord,
+    SpecValidationResult,
+    limit_problems,
+    validate_spec,
+    validate_spec_bytes,
+)
 
 __all__ = [
     "AdviceId",
@@ -85,6 +103,8 @@ __all__ = [
     "DeliveryChannelStatus",
     "DiagnosticSeverity",
     "DossierBudgetTier",
+    "DescriptorRegistry",
+    "DescriptorResolution",
     "FailureReason",
     "InteractionStatus",
     "MigrationSessionStatus",
@@ -95,6 +115,9 @@ __all__ = [
     "ResidentRole",
     "RunStatus",
     "ResourceDocument",
+    "InMemoryDescriptorRegistry",
+    "InMemorySpecRepository",
+    "LimitedProblems",
     "SessionKind",
     "SliceAttemptStatus",
     "SliceKind",
@@ -106,6 +129,9 @@ __all__ = [
     "normalize_repo_relative_paths",
     "validate_candidate_generation",
     "validate_branch_prefix",
+    "limit_problems",
+    "validate_spec",
+    "validate_spec_bytes",
     "load_phase_tool_policy",
     "load_resource",
     "load_session_budget",
@@ -139,6 +165,12 @@ __all__ += [
     "SpecId",
     "TaskDraftRevisionId",
     "TaskId",
+    "SpecArtifact",
+    "SpecInUseError",
+    "SpecProblem",
+    "SpecRecord",
+    "SpecRepository",
+    "SpecValidationResult",
 ]
 
 __all__ += _MODEL_EXPORTS

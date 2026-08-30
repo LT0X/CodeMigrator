@@ -167,7 +167,10 @@ def test_product_entry_directories_are_not_core_subpackages() -> None:
 
 def test_migration_and_frozen_test_directories_exist() -> None:
     migration_files = sorted((ROOT / "migrations").glob("*.sql"))
-    assert [path.name for path in migration_files] == ["0001_schema_migrations.sql"]
+    assert [path.name for path in migration_files] == [
+        "0001_schema_migrations.sql",
+        "0002_migration_specs.sql",
+    ]
     assert "CREATE TABLE" in migration_files[0].read_text(encoding="utf-8")
     for directory in (
         "contracts",
