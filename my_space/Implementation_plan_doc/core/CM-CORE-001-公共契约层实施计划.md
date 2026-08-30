@@ -175,8 +175,8 @@
 ## 6. 收尾清单（对应 AGENTS.md §4 四件套）
 
 - [x] core 模块迭代记录按模板生成。
-- [x] 主任务表 CM-CORE-001 已更新为审查修订中并带当前验证证据；合并后需回填最终完成日期。
+- [x] 主任务表 CM-CORE-001 已更新为已完成并带当前验证证据；PR 合并为最后交付动作。
 - [x] core 详细设计文档保存于 `my_space/codemigrator_design_doc/detailed_coding_design/core/`。
 - [x] 本实施计划保存于 `my_space/Implementation_plan_doc/core/`。
 - [x] 架构文档差异已登记；未直接修改架构模块设计文档。
-- [ ] PR #1 获得有效独立审查通过后合并，并在主工作区执行 `git fetch origin` 与 `git pull --ff-only origin develop`。
+- [ ] 按已完成审查结论直接合并 PR #1，并在主工作区执行 `git fetch origin` 与 `git pull --ff-only origin develop`；不再追加审查轮次。

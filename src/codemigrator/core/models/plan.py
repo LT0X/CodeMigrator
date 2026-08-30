@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TypedDict, cast
+
 from pydantic import ConfigDict, Field, model_serializer
 from pydantic_core.core_schema import SerializationInfo, SerializerFunctionWrapHandler
 
@@ -9,6 +11,11 @@ from .._base import CoreModel
 from ..enums import PlanEdgeKind
 from ..ids import SliceId
 from .common import DossierEntry
+
+_PlanEdgeJson = TypedDict(
+    "_PlanEdgeJson",
+    {"from": str, "to": str, "kind": str},
+)
 
 
 class PlanProposal(CoreModel):
@@ -38,13 +45,13 @@ class PlanEdge(CoreModel):
     to: SliceId
     kind: PlanEdgeKind
 
-    @model_serializer(mode="wrap")
+    @model_serializer(mode="wrap", when_used="json")
     def serialize_with_json_alias(
         self,
         handler: SerializerFunctionWrapHandler,
         info: SerializationInfo,
-    ) -> object:
+    ) -> _PlanEdgeJson:
         data = handler(self)
         if isinstance(data, dict) and not info.by_alias and "from_" in data:
             data["from"] = data.pop("from_")
-        return data
+        return cast(_PlanEdgeJson, data)

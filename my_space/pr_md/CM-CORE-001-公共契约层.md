@@ -5,7 +5,7 @@
 - PR 标题：`feat(core): add core contracts`
 - 任务编号：`CM-CORE-001`
 - 任务分支：`feature/core-contracts`
-- 模块迭代记录：[CM-CORE-001-公共契约层迭代记录](../codemigrator_dev_progress/core/CM-CORE-001-公共契约层迭代记录.md)
+- 模块迭代记录：[CM-CORE-001-公共契约层迭代记录](my_space/codemigrator_dev_progress/core/CM-CORE-001-公共契约层迭代记录.md)
 
 ## 2. 背景
 
@@ -21,8 +21,8 @@
 
 ## 4. 自测证据
 
-- [x] `PYTHONPATH=src python -m pytest -q tests/core tests/contracts`：审查修订后 55 passed。
-- [x] `PYTHONPATH=src python -m compileall -q src tests`：通过。
+- [x] `PYTHONPATH=src /tmp/codemigrator-infra/.venv/bin/python -m pytest tests/core tests/contracts -q`：审查修订后 55 passed。
+- [x] `PYTHONPATH=src /tmp/codemigrator-infra/.venv/bin/python -m compileall -q src tests`：通过。
 - [x] `git diff --check`：通过。
 - [x] 核对 `feature/core-contracts` 相对 `develop` 的差异，仅包含 CM-CORE-001 范围及其交付文档。
 - [x] 未执行真实模型测试：本任务只包含确定性公共契约与资源校验，不需要 provider/会话行为验证。

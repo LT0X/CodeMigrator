@@ -104,6 +104,10 @@ def test_plan_edge_uses_from_alias_in_json() -> None:
     assert '"from":' in edge.model_dump_json()
     assert '"from_":' not in edge.model_dump_json()
     assert PlanEdge.model_validate_json(edge.model_dump_json()) == edge
+    assert PlanEdge.model_json_schema()["properties"]["from"]["type"] == "string"
+    serialized_schema = PlanEdge.model_json_schema(mode="serialization")
+    serialized_definition = serialized_schema["$defs"]["_PlanEdgeJson"]
+    assert serialized_definition["properties"]["from"]["type"] == "string"
 
 
 def test_create_run_source_union_is_closed() -> None:
