@@ -102,7 +102,18 @@ from .recovery import (
 from .report import build_report
 from .scheduler import FairScheduler, ReadySlice, ResourcePool
 from .store import InMemoryRuntimeStore, PostgreSQLRuntimeStore, RuntimeStore, StoreCommitError
-from .supervisor import SupervisorAdviceKind, SupervisorTrigger, supervisor_triggers
+from .supervisor import (
+    RouteSuggestion,
+    SuggestedRoute,
+    SupervisorAdviceKind,
+    SupervisorProjection,
+    SupervisorTrigger,
+    build_adopted_event,
+    build_proposed_event,
+    build_repair_decision_event,
+    supervisor_triggers,
+)
+from .supervisor_session import AdviceSink, SupervisorEventSink, SupervisorResult, SupervisorSession
 from .templates import CatalogError, StaticTemplateCatalog
 
 
@@ -201,7 +212,14 @@ __all__ = [
     "StaticTemplateCatalog",
     "StoreCommitError",
     "SupervisorAdviceKind",
+    "SupervisorEventSink",
+    "SupervisorProjection",
+    "SupervisorResult",
+    "SupervisorSession",
     "SupervisorTrigger",
+    "AdviceSink",
+    "RouteSuggestion",
+    "SuggestedRoute",
     "TokenUsage",
     "ToolGatewayPort",
     "ToolObservation",
@@ -223,5 +241,8 @@ __all__ = [
     "prompt_text",
     "retry_delay_for_attempt",
     "supervisor_triggers",
+    "build_adopted_event",
+    "build_proposed_event",
+    "build_repair_decision_event",
     "validate_session_admission",
 ]

@@ -6,7 +6,7 @@
   "TEST_TRANSLATION": "TEST_TRANSLATION",
   "TEST_GENERATION": "TEST_GENERATION",
   "EXPLORE_COORDINATOR": "EXPLORE_COORDINATOR",
-  "EXECUTE_SUPERVISOR": "EXECUTE_SUPERVISOR",
+  "EXECUTE_SUPERVISOR": "你是 EXECUTE Supervisor 判断层。只处理两类事件：归因多义或双错时形成 RepairDecision，Slice 会话失败或停止时形成 RouteSuggestion。只消费 RepairEvidence、失败测试身份与诊断摘要、相关 Slice 状态和前次修复决策引用；只输出带 proposal_hash 的 Advice。RepairDecision 供约束内校验，RouteSuggestion 仅供边界参考；不得调用工具、启动子 Agent，或直接写入 Run、Slice、Git、数据库、工作区与控制面。",
   "REPAIR_SESSION": "REPAIR_SESSION",
   "DRAFTING": "DRAFTING"
 }
