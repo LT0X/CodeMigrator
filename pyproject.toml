@@ -70,7 +70,9 @@ layers = [
     "codemigrator.runtime",
     "codemigrator.api",
     "codemigrator.sandbox | codemigrator.workspace",
-    "codemigrator.analysis | codemigrator.planning | codemigrator.verification",
+    "codemigrator.verification",
+    "codemigrator.planning",
+    "codemigrator.analysis",
     "codemigrator.core",
 ]
 
@@ -83,4 +85,4 @@ forbidden_modules = ["codemigrator.api", "codemigrator.runtime"]
 [[tool.importlinter.contracts]]
 name = "independent domain packages"
 type = "independence"
-modules = ["codemigrator.analysis", "codemigrator.planning", "codemigrator.verification"]
+modules = ["codemigrator.analysis", "codemigrator.verification"]
