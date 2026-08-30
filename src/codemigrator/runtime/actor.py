@@ -9,6 +9,7 @@ from typing import Protocol
 from codemigrator.core import (
     ActiveDispatch,
     Advice,
+    AdviceKind,
     CreateRun,
     FailureReason,
     RunId,
@@ -56,6 +57,11 @@ class ArchivePort(Protocol):
         """Archive unverified candidate material before budget failure."""
 
 
+class RepairAdvicePort(Protocol):
+    async def dispatch_adopted(self, advice: Advice) -> None:
+        """Materialize and dispatch an adopted global repair decision."""
+
+
 class _Stop:
     pass
 
@@ -77,6 +83,7 @@ class RunActor:
         continuation_port: ContinuationPort | None = None,
         archive_port: ArchivePort | None = None,
         integration_coordinator: IntegrationCoordinator | None = None,
+        repair_advice_port: RepairAdvicePort | None = None,
     ) -> None:
         self.run_id = run_id
         self.store = store
@@ -87,6 +94,7 @@ class RunActor:
         self.continuation_port = continuation_port
         self.archive_port = archive_port
         self.integration_coordinator = integration_coordinator
+        self.repair_advice_port = repair_advice_port
         self._state: RunState | None = None
         self._queue: asyncio.Queue[RuntimeMessage | _Stop] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
@@ -514,7 +522,7 @@ class RunActor:
                         pending_advice_ids=(*state.pending_advice_ids, advice_id),
                         version=state.version + 1,
                     )
-        await self._commit(
+        committed = await self._commit(
             next_state,
             (
                 EventSpec(
@@ -523,6 +531,16 @@ class RunActor:
                 ),
             ),
         )
+        if (
+            committed
+            and event_type == "advice.adopted"
+            and advice.kind is AdviceKind.RepairDecision
+            and self.repair_advice_port is not None
+        ):
+            try:
+                await self.repair_advice_port.dispatch_adopted(advice)
+            except Exception as exc:
+                self.last_error = exc
 
     async def _commit(self, state: RunState, events: tuple[EventSpec, ...]) -> bool:
         try:
@@ -587,5 +605,6 @@ __all__ = [
     "CancellationPort",
     "CheckpointWriter",
     "ContinuationPort",
+    "RepairAdvicePort",
     "RunActor",
 ]

@@ -35,6 +35,14 @@ class RecordingCancellation:
         self.run_ids.append(run_id)
 
 
+class RecordingRepairDispatch:
+    def __init__(self):
+        self.advices = []
+
+    async def dispatch_adopted(self, advice):
+        self.advices.append(advice)
+
+
 async def start_actor(run_id):
     store = InMemoryRuntimeStore()
     actor = RunActor(run_id, store)
@@ -197,6 +205,35 @@ async def test_advice_adoption_changes_projection_and_boundary_advice_waits_for_
     await actor.join()
     assert str(boundary.advice_id) not in actor.state.pending_advice_ids
     assert str(boundary.advice_id) in actor.state.adopted_advice_ids
+    await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_adopted_repair_advice_is_forwarded_after_actor_commit(run_id):
+    store = InMemoryRuntimeStore()
+    repair_dispatch = RecordingRepairDispatch()
+    slice_id = uid()
+    actor = RunActor(
+        run_id,
+        store,
+        advice_context=AdviceValidationContext(attribution_candidates=frozenset({slice_id})),
+        repair_advice_port=repair_dispatch,
+    )
+    await actor.start()
+    await actor.create(create_run())
+    advice = Advice(
+        advice_id=uid(),
+        kind=AdviceKind.RepairDecision,
+        run_id=run_id,
+        role=ResidentRole.ExecuteSupervisor,
+        payload={"repair_set": [str(slice_id)]},
+        proposal_hash=Sha256("0" * 64),
+    )
+    advice = advice.model_copy(update={"proposal_hash": Sha256(advice_proposal_hash(advice))})
+    await actor.submit(AdviceMessage(advice))
+    await actor.join()
+    assert repair_dispatch.advices == [advice]
+    assert (await store.snapshot(run_id)).events[-1].event_type == "advice.adopted"
     await actor.stop()
 
 
