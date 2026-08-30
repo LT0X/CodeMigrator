@@ -1,0 +1,22 @@
+:root {
+  --cm-background: #FAF9F7;
+  --cm-foreground: #1A1B1E;
+  --cm-card: #FFFFFF;
+  --cm-muted: #F1F0ED;
+  --cm-muted-foreground: #6B6E76;
+  --cm-border: #E4E2DD;
+  --cm-ring: #4F46E5;
+  --cm-state-verified: #0D9488;
+  --cm-state-verified-soft: #CCFBF1;
+  --cm-state-agent: #2563EB;
+  --cm-state-agent-soft: #DBEAFE;
+  --cm-state-waiting: #D97706;
+  --cm-state-waiting-soft: #FEF3C7;
+  --cm-state-failure: #E11D48;
+  --cm-state-failure-soft: #FFE4E6;
+  --cm-radius-sm: 4px;
+  --cm-radius-md: 8px;
+  --cm-radius-lg: 12px;
+  --cm-font-sans: "Inter", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+  --cm-font-mono: "JetBrains Mono", "Fira Code", Consolas, monospace;
+}

@@ -140,6 +140,104 @@ SSE 从已提交事件账本读取数据，`Last-Event-ID` 只作为严格的回
 只负责唤醒，不能作为事件正文来源。连接具有进程级上限和有界待发送队列，终态
 事件交付后自动关闭。
 
+## 产品入口
+
+CodeMigrator 提供两个互补的产品入口：命令行负责发起和控制迁移，Web 工作台负责
+观察运行事实、理解验证证据和提交受限会话输入。两者消费同一套版本化 REST/SSE
+投影，不各自维护一套运行状态。
+
+### 命令行
+
+CLI 适合自动化脚本、持续集成和需要明确退出码的终端操作。常用命令如下：
+
+```bash
+# 安装 CLI 应用
+uv pip install -e apps/codemigrator-cli
+
+# 创建迁移并进入过程观察
+codemigrator migrate start path/to/migration-spec.json --follow
+
+# 只创建并输出 Run 标识与 Web 深链接
+codemigrator migrate start path/to/migration-spec.json --no-follow --output json
+
+# 继续观察既有 Run
+codemigrator run watch <run_id> --follow --output human
+```
+
+输出格式由 `--output human|json|jsonl` 选择。`human` 面向交互式终端，展示 Header、
+关键事实过程流和活动摘要；`json` 输出一个稳定的最终对象；`jsonl` 按事件输出稳定
+摘要，适合管道和日志处理。`human`、`json` 与 `jsonl` 共享同一事件归约和安全边界，
+不输出模型推理、提示词、源码正文、完整日志、宿主路径、ArtifactRef 或凭据。Run 的
+退出码为：完成 `0`、部分完成 `2`、失败 `3`、外部取消 `4`、协议或网络结果未知 `5`；
+本地 Ctrl+C 且取消已确认时为 `130`。
+
+### Web 工作台
+
+启动前端开发服务：
+
+```bash
+cd web
+npm ci
+npm run dev
+```
+
+生产构建使用 `npm run build`。工作台以浅色暖白画布、实线边界和明确的语义状态色
+呈现迁移汇流场：
+
+访问 `/demo` 可查看不依赖服务的本地演示；正式路由只消费后端 REST/SSE 投影，服务不可用时
+显示诊断而不伪造运行、报告或健康结论。
+
+- 作业区展示真实活动中的 persona，区分 Slice、代次和当前动作。
+- 等待区展示契约阻塞、排队集成和队首集成，不把等待误报为失败。
+- 重生成位展示已有归因事实与定向重派，不自行判断失败归属。
+- 汇流口只对 `integration.completed` 与 `verified.advanced` 的配对事实播放一次
+  verified 庆祝，并将结果记录到唯一 Verified Spine。
+
+舞台变化严格按事件 `sequence` 归约。重复事件不会重复动画，序列缺口会进入补读状态，
+未知事件保留为可理解的默认时间线事实；全局修复会话和 Supervisor 决策以独立的只读
+呈现位展示，不插入 Slice 舞台分区。桌面、平板和移动端分别提供完整舞台、检查器抽屉
+和按冻结顺序排列的列表视图；键盘操作、非打断式状态播报及 reduced-motion 降级均属于
+基础交互约束。
+
+Web 不提供迁移控制、代码编辑、Git 写入、取消或交付重试入口。会话消息、问题回答、
+任务草稿确认和影响预览确认均通过后端既有受限通道提交，不能绕过 Run actor 修改领域
+事实。
+
+## 典型运行链路
+
+```text
+注册项目或准备源快照
+        │
+        ▼
+冻结规格、工具链描述符与检查集
+        │
+        ▼
+只读分析 → 计划校验 → Slice DAG 与 write scope 冻结
+        │
+        ▼
+候选生成 → 局部验证 → checkpoint → 按序集成
+        │
+        ├─ 失败：结构化诊断与归因 → 受限重生成或全局修复
+        │
+        ▼
+最终验证 → 证据与报告 → Verified 代码交付
+```
+
+每个阶段均由可审计事实推动。源项目保持只读，候选结果写入托管工作区；只有通过
+验证与集成约束的候选才能推进 Verified 主线。中断或服务重启后，系统依据数据库事件
+账本、checkpoint、执行回执和上下文身份重建运行，而不是依赖客户端内存中的过程状态。
+
+## 配置与部署边界
+
+本地开发可使用 `uv` 和 Compose；生产部署应由外部密钥管理与运行环境提供数据库、
+沙箱委派目录及 API 认证信息。凭证不得写入源代码、descriptor、事件正文、指标标签、
+README 或其他版本化文件。Compose 环境需要 `POSTGRES_PASSWORD` 与
+`CODEMIGRATOR_CGROUP_DELEGATED_DIR`，其具体值只应通过部署环境注入。
+
+部署前应确认 Linux bubblewrap、cgroup v2、PostgreSQL 连接和目标工具链镜像均符合
+版本约束。可选的 Prometheus、Grafana、Jaeger 或对象存储只接收有界、脱敏后的观测
+投影；观测系统故障不能阻塞领域事务，也不能改变迁移结论。
+
 ## 安全与数据边界
 
 - 源仓库只读，输出工作区与源项目物理隔离。
