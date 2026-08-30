@@ -13,7 +13,9 @@ from sse_starlette import ServerSentEvent
 from codemigrator.core import RunStatus
 
 from .deps import ApiBackend
-from .dto import MigrationEvent
+from .dto import MigrationEvent, SessionEvent
+
+EventEnvelope = type[MigrationEvent] | type[SessionEvent]
 
 
 class ConnectionLimitError(RuntimeError):
@@ -66,6 +68,8 @@ async def sse_events(
     after_sequence: int,
     heartbeat_seconds: float = 15.0,
     queue_size: int = 64,
+    event_name: str = "migration.event",
+    envelope_type: EventEnvelope = MigrationEvent,
 ) -> AsyncIterator[ServerSentEvent]:
     """Replay committed events through a bounded queue with heartbeat fallback."""
 
@@ -82,6 +86,8 @@ async def sse_events(
             after_sequence=after_sequence,
             heartbeat_seconds=heartbeat_seconds,
             queue=queue,
+            event_name=event_name,
+            envelope_type=envelope_type,
         )
     )
     try:
@@ -110,6 +116,8 @@ async def _produce_events(
     after_sequence: int,
     heartbeat_seconds: float,
     queue: asyncio.Queue[ServerSentEvent],
+    event_name: str,
+    envelope_type: EventEnvelope,
 ) -> None:
     cursor = after_sequence
     while True:
@@ -118,7 +126,7 @@ async def _produce_events(
         for record in sorted(records, key=lambda item: item.sequence):
             if record.sequence <= cursor:
                 continue
-            envelope = MigrationEvent.from_record(record)
+            envelope = envelope_type.from_record(record)
             _enqueue(
                 queue,
                 ServerSentEvent(
@@ -126,7 +134,7 @@ async def _produce_events(
                         envelope.model_dump(mode="json", by_alias=True),
                         separators=(",", ":"),
                     ),
-                    event="migration.event",
+                    event=event_name,
                     id=envelope.sse_id,
                 ),
             )
@@ -136,11 +144,17 @@ async def _produce_events(
                 return
         if delivered:
             continue
+        if await backend.is_stream_terminal(run_id, cursor):
+            return
         try:
             await asyncio.wait_for(
                 backend.wait_for_events(run_id, cursor), timeout=heartbeat_seconds
             )
         except TimeoutError:
+            if await backend.read_events(run_id, cursor):
+                continue
+            if await backend.is_stream_terminal(run_id, cursor):
+                return
             _enqueue(queue, ServerSentEvent(comment="heartbeat"))
 
 
@@ -151,16 +165,24 @@ def _enqueue(queue: asyncio.Queue[ServerSentEvent], event: ServerSentEvent) -> N
         raise SseQueueOverflowError("SSE pending-event queue is full") from exc
 
 
-def _is_terminal(event: MigrationEvent) -> bool:
-    if event.type != "run.status_changed":
+def _is_terminal(event: MigrationEvent | SessionEvent) -> bool:
+    expected_type = (
+        {"session.status_changed", "session.closed"}
+        if event.schema == "migration.session.event"
+        else {"run.status_changed"}
+    )
+    if event.type not in expected_type:
         return False
     status = event.data.get("run_status", event.data.get("status"))
-    return getattr(status, "value", status) in {
+    terminal_statuses = {
         RunStatus.Completed.value,
         RunStatus.PartiallyCompleted.value,
         RunStatus.Failed.value,
         RunStatus.Cancelled.value,
     }
+    if event.schema == "migration.session.event":
+        terminal_statuses.add("CLOSED")
+    return getattr(status, "value", status) in terminal_statuses
 
 
 def parse_sequence_header(value: str | None, *, name: str) -> int:

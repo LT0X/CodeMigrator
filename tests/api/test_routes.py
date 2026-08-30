@@ -65,3 +65,27 @@ async def test_cancel_forwards_if_match_as_expected_version(backend) -> None:  #
     request = backend.requests[-1]
     assert request.operation == "cancel_run"
     assert request.expected_version == 4
+
+
+@pytest.mark.asyncio
+async def test_read_projection_rejects_sensitive_backend_fields(backend) -> None:  # type: ignore[no-untyped-def]
+    async def unsafe(request):  # type: ignore[no-untyped-def]
+        del request
+        return {
+            "run_id": str(uuid4()),
+            "status": "PLANNING",
+            "version": 1,
+            "verification_outcome": {"path": "/private/source.py"},
+        }
+
+    backend.execute = unsafe
+    app = create_app(backend, config=ApiConfig(token="secret"))
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1")
+    async with client:
+        response = await client.get(
+            f"/api/v1/migrations/{uuid4()}",
+            headers={"Authorization": "Bearer secret"},
+        )
+    assert response.status_code == 500
+    assert response.json()["type"].endswith("/invalid_projection")
+    assert "/private/source.py" not in response.text

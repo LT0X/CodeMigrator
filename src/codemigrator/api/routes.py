@@ -3,26 +3,47 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
+from ipaddress import ip_address
 from secrets import compare_digest
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
-from codemigrator.core import CreateRun, MigrationSpec, canonical_json_bytes
+from codemigrator.core import (
+    CreateRun,
+    MigrationSpec,
+    RemoteRepository,
+    canonical_json_bytes,
+)
 
 from .deps import ApiBackend, ApiConfig, ApiRequest
 from .dto import (
+    ChangesView,
     CorrectionConfirmRequest,
+    DescriptorListView,
+    EvidenceView,
+    HealthView,
+    MigrationListView,
+    MigrationView,
+    OutputView,
+    ProjectListView,
+    ProjectView,
+    ReportView,
     SessionAnswerRequest,
     SessionConfirmRequest,
     SessionCreateRequest,
+    SessionEvent,
     SessionMessageRequest,
+    SessionView,
+    SkillListView,
+    SpecView,
+    WorkspaceView,
 )
-from .idempotency import IdempotencyStore
 from .problems import ApiError, problem_response
 from .sse import ConnectionLimitError, SseConnectionManager, parse_sequence_header, sse_events
 
@@ -51,6 +72,29 @@ _ROUTE_SURFACE = (
     ("GET", "/api/v1/skills"),
 )
 
+_PROJECTION_MODELS: dict[str, type[BaseModel]] = {
+    "create_spec": SpecView,
+    "create_run": MigrationView,
+    "cancel_run": MigrationView,
+    "list_migrations": MigrationListView,
+    "get_migration": MigrationView,
+    "get_workspace": WorkspaceView,
+    "get_report": ReportView,
+    "get_evidence": EvidenceView,
+    "list_descriptors": DescriptorListView,
+    "health": HealthView,
+    "register_project": ProjectView,
+    "list_projects": ProjectListView,
+    "create_session": SessionView,
+    "session_message": SessionView,
+    "session_answer": SessionView,
+    "session_confirm": SessionView,
+    "correction_confirm": SessionView,
+    "get_changes": ChangesView,
+    "get_output": OutputView,
+    "list_skills": SkillListView,
+}
+
 
 def route_surface() -> tuple[tuple[str, str], ...]:
     return _ROUTE_SURFACE
@@ -60,12 +104,10 @@ def create_app(
     backend: ApiBackend,
     *,
     config: ApiConfig,
-    idempotency: IdempotencyStore | None = None,
     connections: SseConnectionManager | None = None,
 ) -> FastAPI:
     """Build an API app from runtime-owned ports and deployment configuration."""
 
-    store = idempotency or IdempotencyStore()
     connection_manager = connections or SseConnectionManager(
         limit=config.max_sse_connections, queue_size=config.sse_queue_size
     )
@@ -86,6 +128,31 @@ def create_app(
                     ApiError(413, "request body is too large", "BODY_TOO_LARGE"),
                     _request_id(request),
                 )
+
+        receive = request._receive
+        messages = []
+        raw_size = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] != "http.request":
+                break
+            raw_size += len(message.get("body", b""))
+            if raw_size > config.max_body_bytes:
+                return problem_response(
+                    ApiError(413, "request body is too large", "BODY_TOO_LARGE"),
+                    _request_id(request),
+                )
+            if not message.get("more_body", False):
+                break
+
+        async def replay_receive():  # type: ignore[no-untyped-def]
+            if messages:
+                return messages.pop(0)
+            return {"type": "http.disconnect"}
+
+        request._receive = replay_receive
+        request.state.raw_body_size = raw_size
         return await call_next(request)
 
     @app.exception_handler(ApiError)
@@ -120,11 +187,11 @@ def create_app(
         payload: MigrationSpec, request: Request, principal_id: str = Depends(authenticate)
     ) -> object:
         body = _canonical_body(payload)
-        if len(body) > config.max_spec_bytes:
+        raw_size = getattr(request.state, "raw_body_size", len(body))
+        if raw_size > config.max_spec_bytes:
             raise ApiError(422, "spec exceeds the 256 KiB limit", "SPEC_TOO_LARGE")
         return await _write(
             backend,
-            store,
             request,
             principal_id,
             operation="create_spec",
@@ -137,9 +204,9 @@ def create_app(
     async def create_migration(
         payload: CreateRun, request: Request, principal_id: str = Depends(authenticate)
     ) -> object:
+        _validate_create_run_source(payload)
         return await _write(
             backend,
-            store,
             request,
             principal_id,
             operation="create_run",
@@ -155,7 +222,6 @@ def create_app(
         expected_version = _parse_if_match(request.headers.get("if-match"))
         return await _write(
             backend,
-            store,
             request,
             principal_id,
             operation="cancel_run",
@@ -255,7 +321,6 @@ def create_app(
     ) -> object:
         return await _write(
             backend,
-            store,
             request,
             principal_id,
             operation="register_project",
@@ -276,7 +341,6 @@ def create_app(
     ) -> object:
         return await _write(
             backend,
-            store,
             request,
             principal_id,
             operation="create_session",
@@ -294,7 +358,6 @@ def create_app(
     ) -> object:
         return await _write(
             backend,
-            store,
             request,
             principal_id,
             operation="session_message",
@@ -313,7 +376,6 @@ def create_app(
     ) -> object:
         return await _write(
             backend,
-            store,
             request,
             principal_id,
             operation="session_answer",
@@ -332,7 +394,6 @@ def create_app(
     ) -> object:
         return await _write(
             backend,
-            store,
             request,
             principal_id,
             operation="session_confirm",
@@ -352,7 +413,6 @@ def create_app(
     ) -> object:
         return await _write(
             backend,
-            store,
             request,
             principal_id,
             operation="correction_confirm",
@@ -386,6 +446,8 @@ def create_app(
                     after_sequence=after_sequence,
                     heartbeat_seconds=config.heartbeat_seconds,
                     queue_size=connection_manager.queue_size,
+                    event_name="migration.session.event",
+                    envelope_type=SessionEvent,
                 ):
                     yield item
             finally:
@@ -417,7 +479,7 @@ async def _read(
     query: Mapping[str, str] | None = None,
 ) -> object:
     try:
-        return await backend.execute(
+        result = await backend.execute(
             ApiRequest(
                 operation=operation,
                 principal_id=principal_id,
@@ -429,11 +491,11 @@ async def _read(
         raise
     except KeyError as exc:
         raise ApiError(404, "resource not found", "NOT_FOUND") from exc
+    return _project(operation, result)
 
 
 async def _write(
     backend: ApiBackend,
-    store: IdempotencyStore,
     request: Request,
     principal_id: str,
     *,
@@ -450,34 +512,30 @@ async def _write(
     key = request.headers.get("idempotency-key")
     if require_key and (key is None or not key.strip()):
         raise ApiError(422, "Idempotency-Key is required", "IDEMPOTENCY_KEY_REQUIRED")
-    if key is not None:
-        cached = store.lookup(principal_id, route, key, body)
-        if cached is not None:
-            if cached.conflict:
-                raise ApiError(
-                    409,
-                    "idempotency key was reused with a different body",
-                    "IDEMPOTENCY_CONFLICT",
-                )
-            return JSONResponse(status_code=cached.status_code, content=cached.body)
     try:
-        result = await backend.execute(
-            ApiRequest(
-                operation=operation,
-                principal_id=principal_id,
-                resource_id=resource_id,
-                payload=payload,
-                query=query or {},
-                expected_version=expected_version,
-            )
+        api_request = ApiRequest(
+            operation=operation,
+            principal_id=principal_id,
+            resource_id=resource_id,
+            payload=payload,
+            query=query or {},
+            expected_version=expected_version,
         )
+        if key is not None:
+            result = await backend.execute_idempotent(
+                api_request,
+                route=route,
+                key=key,
+                canonical_body=body,
+                status_code=status_code,
+            )
+        else:
+            result = await backend.execute(api_request)
     except ApiError:
         raise
     except KeyError as exc:
         raise ApiError(404, "resource not found", "NOT_FOUND") from exc
-    serialized = _jsonable(result)
-    if key is not None:
-        store.remember(principal_id, route, key, body, status_code, serialized)
+    serialized = _project(operation, result)
     return JSONResponse(status_code=status_code, content=serialized)
 
 
@@ -487,14 +545,55 @@ def _canonical_body(value: object) -> bytes:
     return canonical_json_bytes(value)
 
 
-def _jsonable(value: object) -> object:
-    if isinstance(value, BaseModel):
-        return value.model_dump(mode="json", by_alias=True)
+def _project(operation: str, value: object) -> object:
+    model = _PROJECTION_MODELS.get(operation)
+    if model is None:
+        raise ApiError(500, "backend returned an unsupported projection", "INVALID_PROJECTION")
+    if operation in {
+        "list_descriptors",
+        "list_migrations",
+        "list_projects",
+        "list_skills",
+    } and isinstance(value, list):
+        value = {"items": value}
+    try:
+        projection = model.model_validate(value)
+    except ValidationError as exc:
+        raise ApiError(500, "backend returned an invalid projection", "INVALID_PROJECTION") from exc
+    serialized = projection.model_dump(mode="json", by_alias=True)
+    _assert_public_projection(serialized)
+    return serialized
+
+
+def _assert_public_projection(value: object) -> None:
+    forbidden = {
+        "api_key",
+        "authorization",
+        "content",
+        "cookie",
+        "credential",
+        "database_url",
+        "new_text",
+        "old_text",
+        "password",
+        "path",
+        "private_key",
+        "prompt",
+        "secret",
+        "source",
+        "source_code",
+        "stderr",
+        "stdout",
+        "token",
+    }
     if isinstance(value, Mapping):
-        return {str(key): _jsonable(nested) for key, nested in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(nested) for nested in value]
-    return value
+        for key, nested in value.items():
+            if str(key).lower() in forbidden:
+                raise ApiError(500, "backend returned an unsafe projection", "INVALID_PROJECTION")
+            _assert_public_projection(nested)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            _assert_public_projection(nested)
 
 
 def _parse_if_match(value: str | None) -> int:
@@ -506,6 +605,39 @@ def _parse_if_match(value: str | None) -> int:
     if not raw.isascii() or not raw.isdecimal():
         raise ApiError(422, "If-Match must contain a non-negative version", "INVALID_IF_MATCH")
     return int(raw)
+
+
+def _validate_create_run_source(payload: CreateRun) -> None:
+    source = payload.source
+    if not isinstance(source, RemoteRepository):
+        return
+    try:
+        parsed = urlsplit(str(source.repository_url))
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ApiError(
+            422,
+            "repository_url is not a valid HTTPS URL",
+            "INVALID_REPOSITORY_URL",
+        ) from exc
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is None and ":" in parsed.netloc.rsplit("@", 1)[-1]
+    ):
+        raise ApiError(
+            422,
+            "repository_url must be an HTTPS URL without userinfo",
+            "INVALID_REPOSITORY_URL",
+        )
+    try:
+        ip_address(hostname)
+    except ValueError:
+        return
+    raise ApiError(422, "repository_url must not use an IP literal", "INVALID_REPOSITORY_URL")
 
 
 def _request_id(request: Request) -> str:

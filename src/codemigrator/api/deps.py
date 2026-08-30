@@ -68,11 +68,29 @@ class ApiBackend(Protocol):
     async def execute(self, request: ApiRequest) -> object:
         """Execute a command or read projection and return committed facts."""
 
+    async def execute_idempotent(
+        self,
+        request: ApiRequest,
+        *,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+    ) -> object:
+        """Atomically replay or execute a write in the durable control-plane store.
+
+        Implementations persist the idempotency record in the same transaction as
+        the command's observable projection and events.
+        """
+
     async def read_events(self, run_id: UUID, after_sequence: int) -> Sequence[EventRecord]:
         """Read committed events strictly after a sequence cursor."""
 
     async def wait_for_events(self, run_id: UUID, after_sequence: int) -> None:
         """Wait for a NOTIFY wake-up; the ledger remains the source of event data."""
+
+    async def is_stream_terminal(self, run_id: UUID, after_sequence: int) -> bool:
+        """Report whether a terminal event at or before the cursor is committed."""
 
 
 __all__ = ["ApiBackend", "ApiConfig", "ApiRequest", "EventRecord"]

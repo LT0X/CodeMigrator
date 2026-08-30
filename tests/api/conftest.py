@@ -7,20 +7,102 @@ from uuid import UUID, uuid4
 import pytest
 
 from codemigrator.api.deps import ApiRequest, EventRecord
+from codemigrator.api.idempotency import IdempotencyStore
+from codemigrator.api.problems import ApiError
 
 
 class FakeBackend:
     def __init__(self) -> None:
         self.requests: list[ApiRequest] = []
         self.events: list[EventRecord] = []
+        self.idempotency = IdempotencyStore()
+        self.idempotency_lock = asyncio.Lock()
 
     async def execute(self, request: ApiRequest) -> object:
         self.requests.append(request)
         if request.operation == "create_spec":
-            return {"spec_id": str(uuid4()), "accepted": True}
+            payload = request.payload
+            return {
+                "spec_id": str(uuid4()),
+                "canonical_sha256": "f" * 64,
+                "source_language_id": payload.source_language_id,
+                "target_language_id": payload.target_language_id,
+                "descriptor_lock": payload.descriptor_lock,
+                "required_checks": payload.required_checks,
+            }
         if request.operation in {"create_run", "cancel_run"}:
-            return {"run_id": str(request.resource_id or uuid4()), "status": "PLANNING"}
+            return {
+                "run_id": str(request.resource_id or uuid4()),
+                "status": "PLANNING",
+                "version": 1,
+            }
+        if request.operation in {
+            "list_migrations",
+            "list_descriptors",
+            "list_projects",
+            "list_skills",
+        }:
+            return {"items": []}
+        if request.operation == "get_workspace":
+            return {"run_id": str(request.resource_id), "slices": []}
+        if request.operation == "get_report":
+            return {"run_id": str(request.resource_id), "status": "READY"}
+        if request.operation == "get_evidence":
+            return {
+                "run_id": str(request.resource_id),
+                "receipt_id": request.query["receipt_id"],
+                "status": "READY",
+            }
+        if request.operation == "health":
+            return {"app": "READY", "postgres": "READY", "sandbox": "READY"}
+        if request.operation == "register_project":
+            return {"project_id": str(uuid4())}
+        if request.operation == "create_session":
+            return {"session_id": str(uuid4()), "status": "DRAFTING"}
+        if request.operation in {
+            "session_message",
+            "session_answer",
+            "session_confirm",
+            "correction_confirm",
+        }:
+            return {"session_id": str(request.resource_id), "status": "DRAFTING"}
+        if request.operation == "get_changes":
+            return {"run_id": str(request.resource_id), "changes": []}
+        if request.operation == "get_output":
+            return {"run_id": str(request.resource_id), "status": "READY", "files": []}
         return {"operation": request.operation}
+
+    async def execute_idempotent(
+        self,
+        request: ApiRequest,
+        *,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+    ) -> object:
+        async with self.idempotency_lock:
+            cached = self.idempotency.lookup(
+                request.principal_id, route, key, canonical_body
+            )
+            if cached is not None:
+                if cached.conflict:
+                    raise ApiError(
+                        409,
+                        "idempotency key was reused with a different body",
+                        "IDEMPOTENCY_CONFLICT",
+                    )
+                return cached.body
+            result = await self.execute(request)
+            self.idempotency.remember(
+                request.principal_id,
+                route,
+                key,
+                canonical_body,
+                status_code,
+                result,
+            )
+            return result
 
     async def read_events(self, run_id: UUID, after_sequence: int) -> tuple[EventRecord, ...]:
         return tuple(
@@ -32,6 +114,15 @@ class FakeBackend:
     async def wait_for_events(self, run_id: UUID, after_sequence: int) -> None:
         del run_id, after_sequence
         await asyncio.sleep(60)
+
+    async def is_stream_terminal(self, run_id: UUID, after_sequence: int) -> bool:
+        terminal = {"COMPLETED", "PARTIALLY_COMPLETED", "FAILED", "CANCELLED", "CLOSED"}
+        return any(
+            item.run_id == run_id
+            and item.sequence <= after_sequence
+            and item.data.get("run_status", item.data.get("status")) in terminal
+            for item in self.events
+        )
 
 
 @pytest.fixture

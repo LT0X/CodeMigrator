@@ -62,6 +62,11 @@ class MigrationView(ApiModel):
     code_delivery_status: DeliveryChannelStatus = DeliveryChannelStatus.Pending
 
 
+class MigrationListView(ApiModel):
+    items: list[MigrationView] = Field(default_factory=list)
+    next_cursor: str | None = None
+
+
 class WorkspaceView(ApiModel):
     run_id: UUID
     slices: list[SliceView] = Field(default_factory=list)
@@ -92,6 +97,10 @@ class DescriptorView(ApiModel):
     checks: list[RequiredCheckView] = Field(default_factory=list)
 
 
+class DescriptorListView(ApiModel):
+    items: list[DescriptorView] = Field(default_factory=list)
+
+
 class HealthView(ApiModel):
     app: str
     postgres: str
@@ -103,6 +112,10 @@ class ProjectView(ApiModel):
     project_id: UUID
     snapshot_id: UUID | None = None
     status: str = "READY"
+
+
+class ProjectListView(ApiModel):
+    items: list[ProjectView] = Field(default_factory=list)
 
 
 class SessionView(ApiModel):
@@ -126,6 +139,10 @@ class SkillView(ApiModel):
     skill_id: str
     version: str
     summary: str
+
+
+class SkillListView(ApiModel):
+    items: list[SkillView] = Field(default_factory=list)
 
 
 class SessionCreateRequest(ApiModel):
@@ -235,8 +252,91 @@ class MigrationEvent(ApiModel):
         )
 
 
+class SessionEvent(ApiModel):
+    schema_name: Literal["migration.session.event"] = Field(
+        "migration.session.event", alias="schema"
+    )
+    version: Literal[1] = 1
+    type: str
+    data: dict[str, object]
+    sequence: int
+    timestamp_utc: datetime
+
+    @field_validator("type")
+    @classmethod
+    def event_type_is_non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("event type must not be empty")
+        return value
+
+    @field_validator("sequence")
+    @classmethod
+    def sequence_is_positive(cls, value: int) -> int:
+        if type(value) is not int or value < 1:
+            raise ValueError("event sequence must be a positive integer")
+        return value
+
+    @field_validator("timestamp_utc")
+    @classmethod
+    def timestamp_is_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("event timestamp must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def event_data_is_redacted(self) -> SessionEvent:
+        _assert_redacted(self.data)
+        return self
+
+    @property
+    def sse_id(self) -> str:
+        return str(self.sequence)
+
+    @property
+    def schema(self) -> str:  # type: ignore[override]
+        return self.schema_name
+
+    @classmethod
+    def from_record(
+        cls,
+        record: object,
+        *,
+        data: dict[str, object] | None = None,
+    ) -> SessionEvent:
+        from .deps import EventRecord
+
+        if not isinstance(record, EventRecord):
+            raise TypeError("record must use EventRecord")
+        return cls(
+            schema="migration.session.event",
+            type=record.event_type,
+            data=record.data if data is None else data,
+            sequence=record.sequence,
+            timestamp_utc=record.timestamp_utc,
+        )
+
+
 _REDACTION_KEYS = frozenset(
-    {"authorization", "cookie", "password", "secret", "token", "credential", "source"}
+    {
+        "api_key",
+        "authorization",
+        "content",
+        "cookie",
+        "credential",
+        "database_url",
+        "new_text",
+        "old_text",
+        "password",
+        "path",
+        "private_key",
+        "prompt",
+        "secret",
+        "source",
+        "source_code",
+        "stderr",
+        "stdout",
+        "token",
+    }
 )
 
 
@@ -256,21 +356,26 @@ __all__ = [
     "ChangesView",
     "CorrectionConfirmRequest",
     "DescriptorLockView",
+    "DescriptorListView",
     "DescriptorView",
     "EvidenceView",
     "HealthView",
     "MigrationEvent",
+    "MigrationListView",
     "MigrationView",
     "OutputView",
     "ProjectView",
+    "ProjectListView",
     "ReportView",
     "RequiredCheckView",
     "SessionAnswerRequest",
     "SessionConfirmRequest",
     "SessionCreateRequest",
+    "SessionEvent",
     "SessionMessageRequest",
     "SessionView",
     "SkillView",
+    "SkillListView",
     "SliceView",
     "SpecView",
     "WorkspaceView",
