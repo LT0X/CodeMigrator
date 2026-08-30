@@ -35,6 +35,7 @@ from .run import (
     RemoteRepository,
 )
 from .slice import ActiveDispatch, MigrationSlice, SliceCandidate, WriteScope, WriteScopeOut
+from .spec import Decomposition, DescriptorLock, MigrationSpec, RequiredCheckSelection, SpecScope
 from .verification import (
     CheckResult,
     DerivedVerificationGuard,
@@ -81,6 +82,7 @@ __all__ = [
     "LocalCandidate",
     "ManifestParserRef",
     "MigrationRulebook",
+    "MigrationSpec",
     "MigrationSlice",
     "PlanEdge",
     "PlanProposal",
@@ -91,6 +93,7 @@ __all__ = [
     "RepairEvidence",
     "RemoteRepository",
     "RequiredCheck",
+    "RequiredCheckSelection",
     "RulebookEntry",
     "RulebookEntryKind",
     "RuleEntrySource",
@@ -98,6 +101,7 @@ __all__ = [
     "SliceCandidate",
     "SliceGenerationRef",
     "SourceToolchain",
+    "SpecScope",
     "TargetProjectBlueprint",
     "TargetToolchain",
     "TestIdentity",
@@ -109,4 +113,6 @@ __all__ = [
     "VerificationSubject",
     "WriteScope",
     "WriteScopeOut",
+    "Decomposition",
+    "DescriptorLock",
 ]
