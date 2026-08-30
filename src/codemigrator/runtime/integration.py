@@ -10,10 +10,11 @@ from dataclasses import dataclass
 class IntegrationItem:
     run_id: str
     slice_id: str
-    generation: int
+    generation: int | None
     candidate_commit_oid: str
     prospective_checks_passed: bool = False
     repair: bool = False
+    repair_decision_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,7 +44,34 @@ class IntegrationCoordinator:
         if self._active is not None and self._active.run_id == run_id:
             self._active = None
 
-    def mark_prospective_passed(self, run_id: str, slice_id: str, generation: int) -> None:
+    def revoke_slice(self, run_id: str, slice_id: str) -> bool:
+        """Revoke an unstarted failed Slice placeholder from the FIFO."""
+
+        if self._active is not None and (
+            self._active.run_id,
+            self._active.slice_id,
+        ) == (run_id, slice_id):
+            raise RuntimeError("active integration item cannot be revoked")
+        before = len(self._queue)
+        self._queue = deque(
+            item for item in self._queue if (item.run_id, item.slice_id) != (run_id, slice_id)
+        )
+        return len(self._queue) != before
+
+    revoke_placeholder = revoke_slice
+
+    def enqueue_repair(self, item: IntegrationItem) -> bool:
+        """Append a completed RepairSession result without bypassing FIFO gates."""
+
+        if not item.repair:
+            raise ValueError("repair integration item must be marked repair")
+        return self.enqueue(item)
+
+    append_repair = enqueue_repair
+
+    def mark_prospective_passed(
+        self, run_id: str, slice_id: str, generation: int | None
+    ) -> None:
         self._queue = deque(
             item
             if (item.run_id, item.slice_id, item.generation) != (run_id, slice_id, generation)
@@ -54,6 +82,7 @@ class IntegrationCoordinator:
                 candidate_commit_oid=item.candidate_commit_oid,
                 prospective_checks_passed=True,
                 repair=item.repair,
+                repair_decision_id=item.repair_decision_id,
             )
             for item in self._queue
         )
@@ -95,6 +124,9 @@ class IntegrationCoordinator:
     @property
     def active(self) -> IntegrationItem | None:
         return self._active
+
+    def latest_verified_oid(self, run_id: str) -> str | None:
+        return self._verified_oids.get(run_id)
 
 
 class RepairRetryBudget:
