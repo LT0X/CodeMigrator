@@ -3,8 +3,8 @@
 > 文档定位：CodeMigrator 代码实现的跨模块任务规划、依赖分析、并行开发路线与总体进度看板（AGENTS.md §1.1 指定的整体任务规划与进度跟踪主表）。
 > 架构基线：**V6（Python 版）**。跨语言代码迁移 Agent；三层架构（权力层 Harness / 判断层常驻主 Agent / 执行层工作会话）；四阶段 Run 状态机；app + PostgreSQL 两服务部署拓扑，8 个 Python 子包 src-layout 单包。
 > 代码范围：`src/codemigrator/`（8 子包）+ `apps/codemigrator-cli` + `web/` + `descriptors/` + `migrations/` + `deploy/` + `tests/` + `pyproject.toml` + `compose.yaml`。
-> 当前阶段：V6 Wave 1；`CM-CORE-001` 的 PR #1、`CM-INFRA-001` 的 PR #2、`CM-SPEC-001` 的 PR #3、`CM-ANALYSIS-001` 的 PR #4 已按唯一审查闭环合并，`CM-SANDBOX-001` 已完成唯一审查与反馈修复，待直接合并。
-> 总体状态：进行中（18 个任务中 5 个已完成、13 个未开始；其中 4 个已合并，Sandbox PR 待直接合并）。
+> 当前阶段：V6 Wave 2；`CM-CORE-001` 的 PR #1、`CM-INFRA-001` 的 PR #2、`CM-SPEC-001` 的 PR #3、`CM-ANALYSIS-001` 的 PR #4、`CM-SANDBOX-001` 的 PR #5 均已按“一次审查、一次修复、直接合并”闭环，当前开发 `CM-DRAFT-001`。
+> 总体状态：进行中（18 个任务中 5 个已完成、1 个进行中、12 个未开始；5 个已合并）。
 > 创建日期：2026-08-28（V5 重写版）；2026-08-29 升级为 V6 单基线。最后更新日期：2026-08-30。
 > 维护原则：总体表反映跨模块事实，模块迭代记录保存实现细节；代码、测试和进度记录必须同步更新；每次计划变更必须先与用户对齐（§8）；V6 开放实施项标注"待定"不得臆造为事实。
 
@@ -120,7 +120,7 @@
 | 项目            | 当前状态     | 事实依据                                                                                                                                |
 | ------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
 | V6 设计文档       | 已冻结      | `architecture_module_design/` M-00\~M-16 V6 收敛版 + `feedback_doc/fb10_align_records.md`、fb11\_align\_records.md + 文档迭代记录.md（V6 收敛基线） |
-| 代码实现          | 进行中      | `CM-CORE-001`、`CM-INFRA-001`、`CM-SPEC-001`、`CM-ANALYSIS-001` PR #1～#4 已合并（最新 `360a1e8`）；`CM-SANDBOX-001` PR #5 已完成唯一审查及反馈修复，待直接合并 |
+| 代码实现          | 进行中      | `CM-CORE-001`、`CM-INFRA-001`、`CM-SPEC-001`、`CM-ANALYSIS-001`、`CM-SANDBOX-001` PR #1～#5 已按唯一审查闭环合并（最新 `c540dbb`）；`CM-DRAFT-001` 已从合并后的 develop 创建 `feature/draft-orchestration` 开发 |
 | WSL2 开发环境     | 部分就绪     | Docker CE + compose；**Python 3.12+/uv 环境待建**（V6 为 Python，见其他更新记录与 .env）                                                             |
 | PostgreSQL 部署 | 未建       | 待 CM-INFRA-001 建 compose.yaml（app+PG）后部署并回填 `my_space/.env`                                                                         |
 | 模型 API key    | 已就绪      | `my_space/model_api_key.json`（LLM Planner/Supervisor/修复/多 Agent/Exec 测试用）                                                           |
@@ -374,14 +374,14 @@ flowchart TD
 | ------------ | ------------------------------------------- | ----------------------------------------- | ----------------- |
 | MS-0 V6 设计定稿 | 17 篇 V6 + fb10/fb11 aligned + 迭代记录冻结        | —                                         | 已完成（2026-08-29 前） |
 | MS-1 工程地基    | 公共契约（V6）+ Python 工程基线（import-linter、app+PG） | CM-CORE、CM-INFRA                          | 已完成（2026-08-30）               |
-| MS-2 基础能力    | 图谱前移、Spec、app 内 bwrap、控制面、Web/CLI、观测        | CM-ANALYSIS/SPEC/SANDBOX/API/WEB/OBS      | 进行中（CM-SPEC、CM-ANALYSIS 已完成，Sandbox PR #5 待直接合并）         |
-| MS-3 计划与验证   | 起草/计划/工作区/Git/统一上下文；两层修复路由准备                | CM-DRAFT/PLAN/WORKSPACE/GIT/MEMORY/VERIFY | 未开始               |
+| MS-2 基础能力    | 图谱前移、Spec、app 内 bwrap、控制面、Web/CLI、观测        | CM-ANALYSIS/SPEC/SANDBOX/API/WEB/OBS      | 进行中（CM-SPEC、CM-ANALYSIS、CM-SANDBOX 已完成；API/WEB/OBS 待开发）         |
+| MS-3 计划与验证   | 起草/计划/工作区/Git/统一上下文；两层修复路由准备                | CM-DRAFT/PLAN/WORKSPACE/GIT/MEMORY/VERIFY | 进行中（CM-DRAFT-001 开发中）               |
 | MS-4 运行与修复闭环 | Run actor、判断层 Supervisor、全局修复会话             | CM-RUNTIME/LOOP/SUPERVISOR/REPAIR         | 未开始               |
 | MS-5 交付      | Compose 两服务联调 + click-video 靶场 + V6 增量验收    | 全部任务完善 + 验收活动                             | 未开始               |
 
 ### 6.2 状态统计
 
-按主任务表 18 个任务计：已完成 5 / 未开始 13（完成度约 27.8%；CM-SANDBOX-001 已完成分支实现与唯一审查修复，PR 待直接合并）。
+按主任务表 18 个任务计：已完成 5 / 进行中 1 / 未开始 12（完成度约 27.8%；5 个 PR 已按唯一审查闭环合并）。
 
 > 完成度仅为任务数量比例，不替代各任务质量门（V6 增量/运行性质）；V6 开放实施项细化前不计为验收欠账，单独在 §9 跟踪。
 
@@ -413,10 +413,10 @@ flowchart TD
 | CM-INFRA-001      | 工程基线（M-01）：Python 8 子包/uv/import-linter/descriptors/compose(app+PG)/migrations/tests/CI                             | 已完成 | 2026-08-30    | 2026-08-30      | Wave 0；依赖 CM-CORE（已完成）；已对齐：my_space/code_alignment_record/infra/CM-INFRA-001-对齐记录.md；迭代记录：my_space/codemigrator_dev_progress/infra/CM-INFRA-001-工程基线迭代记录.md；PR #2 已按唯一一次审查反馈修复后直接合并（`d482d88`）；70 passed、import-linter 3 contracts、Ruff/mypy/compileall/Compose config 通过；target-python 重建与 app/PG 冒烟待联网环境完成；分支 `feature/infra-python-skeleton` |
 | CM-SPEC-001       | Migration Spec 能力门（M-05）：四道门/canonical/不可变/描述符三码拒绝                                                                  | 已完成 | 2026-08-30 | 2026-08-30 | Wave 1；依赖 CM-CORE/CM-INFRA（均已完成）；已对齐：my_space/code_alignment_record/spec/CM-SPEC-001-对齐记录.md；四份收口文档、四道门、JCS/hash、端口替身、DDL 与契约测试已完成；113 passed、import-linter/Ruff/mypy/compileall/diff 通过；唯一一次审查反馈已修复并直接合并 PR #3（`857590e`）；分支 `feature/spec-capability-gate` |
 | CM-ANALYSIS-001   | 源端分析与知识图谱（M-06）：图谱构建前移/F1-F4/PSF/图谱导航/重建投影                                                                          | 已完成 | 2026-08-30 | 2026-08-30 | Wave 1；依赖 CM-CORE/CM-SPEC（均已完成）；已对齐：my_space/code_alignment_record/analysis/CM-ANALYSIS-001-对齐记录.md；四份收口文档、AST/PSF-2/3、投影重建、查询边界、审计终态、click-video fixture 已完成；唯一一次审查反馈已在原分支修复；151 passed、import-linter/Ruff/mypy/compileall/diff 通过；PR #4 已直接合并（`360a1e8`）；分支 `feature/analysis-graph` |
-| CM-DRAFT-001      | 起草期多 Agent 理解与四件工件（M-16 起草+M-04+M-14）：图谱域扇出/探索协调者/多轮 AskUser（不限次）/一次确认                                              | 未开始 | —    | —      | Wave 2；Blueprint 字段待定（本任务不臆造，CM-PLAN 对齐收口）；已对齐：my_space/code_alignment_record/draft/CM-DRAFT-001-对齐记录.md |
+| CM-DRAFT-001      | 起草期多 Agent 理解与四件工件（M-16 起草+M-04+M-14）：图谱域扇出/探索协调者/多轮 AskUser（不限次）/一次确认                                              | 进行中 | 2026-08-30 | —      | Wave 2；已从合并后的 `develop` 创建 `feature/draft-orchestration`；Blueprint 字段待定（本任务不臆造，CM-PLAN 对齐收口）；已对齐：my_space/code_alignment_record/draft/CM-DRAFT-001-对齐记录.md；计划/详细设计/迭代记录：`my_space/Implementation_plan_doc/session/CM-DRAFT-001-起草期编排与四件工件实施计划.md`、`my_space/codemigrator_design_doc/detailed_coding_design/session/CM-DRAFT-001-起草期编排与四件工件详细设计.md`、`my_space/codemigrator_dev_progress/session/CM-DRAFT-001-起草期编排与四件工件迭代记录.md` |
 | CM-PLAN-001       | LLM Planner+机器校验器（M-07）：PlanProposal/DAG 冻结/四重护栏/条件化联合域/涟漪                                                          | 未开始 | —    | —      | Wave 2；校验拒绝码已对齐定稿（八码）；已对齐：my_space/code_alignment_record/plan/CM-PLAN-001-对齐记录.md |
 | CM-WORKSPACE-001  | 候选工作区与工具网关（M-08+M-12 执行面）：沙箱卷生命周期/六工具/checkpoint/审计账本                                                               | 未开始 | —    | —      | Wave 2；与 CM-GIT 共享 workspace；已对齐：my_space/code_alignment_record/workspace/CM-WORKSPACE-001-对齐记录.md |
-| CM-SANDBOX-001    | 内联 bwrap 沙箱适配（M-09）：PDEATHSIG/cgroup/命名空间/长期卷/临时物化/三池                                                               | 已完成 | 2026-08-30 | 2026-08-30 | Wave 1；已对齐：my_space/code_alignment_record/sandbox/CM-SANDBOX-001-对齐记录.md；实施计划/详细设计/迭代记录已同步；`command.py`/`preflight.py`/`lifecycle.py`/`limits.py`/`pool.py`/`termination.py`/`executor.py`/`proxy.py` 与 sandbox/security 规则测试完成，20 passed；唯一审查反馈已在原分支一次性修复；真实 bwrap/cgroup/compose/deploy 由 CM-INFRA 联动；分支 `feature/sandbox-bwrap`，PR #5 待直接合并 |
+| CM-SANDBOX-001    | 内联 bwrap 沙箱适配（M-09）：PDEATHSIG/cgroup/命名空间/长期卷/临时物化/三池                                                               | 已完成 | 2026-08-30 | 2026-08-30 | Wave 1；已对齐：my_space/code_alignment_record/sandbox/CM-SANDBOX-001-对齐记录.md；实施计划/详细设计/迭代记录已同步；`command.py`/`preflight.py`/`lifecycle.py`/`limits.py`/`pool.py`/`termination.py`/`executor.py`/`proxy.py` 与 sandbox/security 规则测试完成，20 passed；唯一审查反馈已在原分支一次性修复；真实 bwrap/cgroup/compose/deploy 由 CM-INFRA 联动；分支 `feature/sandbox-bwrap`，PR #5 已直接合并（`c540dbb`），主工作区已拉取 |
 | CM-GIT-001        | 工作空间与 Git 集成（M-11）：refs/CAS 单写者集成/修复 FIFO/non-force 交付                                                              | 未开始 | —    | —      | Wave 2；已对齐：my_space/code_alignment_record/git/CM-GIT-001-对齐记录.md |
 | CM-VERIFY-001     | 验证引擎（M-10）：三层 Oracle/两级修复路由（可靠域直通+其余统一）/fingerprint/flaky/守恒/parity                                                 | 未开始 | —    | —      | Wave 3；V6 收敛-001/002/003；已对齐（推荐方案采纳）：my_space/code_alignment_record/verify/CM-VERIFY-001-对齐记录.md |
 | CM-RUNTIME-001    | Harness Run actor（M-03）：四阶段 CreateRun/Advice 两级收养/Supervisor 触发/取消/预算/恢复                                            | 未开始 | —    | —      | Wave 3；10 条运行性质；已对齐（推荐方案采纳）：my_space/code_alignment_record/runtime/CM-RUNTIME-001-对齐记录.md |
@@ -525,6 +525,26 @@ flowchart TD
 ## 11. 更新记录
 
 > 每次完成任务或计划变更后在本标题下方置顶追加 CHG 条目（模板见 §8.4）；最新记录在最上方。
+
+### CHG-20260830-13：CM-DRAFT-001 实现与验证完成，进入唯一审查
+
+* 时间：2026-08-30
+* 变更类型：任务实现/交付准备
+* 变更原因：CM-DRAFT-001 起草期编排需要冻结确定性切域、D-01 档案核对、四件工件双轨账本、AskUser 对齐和试译校准的 runtime 契约。
+* 变更内容：新增 `runtime/draft_models.py`、`draft_validation.py`、`draft.py` 及 19 项起草契约测试；同步实施计划、详细设计、迭代记录和 PR 说明；四件工件摘要复用 JCS，确认回执生成 core `FrozenArtifactBundle`，起草与试译无外部副作用。
+* 影响范围：CM-DRAFT-001 的 runtime 起草契约、`tests/draft/` 和本任务收口文档；不修改架构模块设计、core 公共模型、数据库、API、sandbox；不进行真实模型调用。
+* 验证：起草专项 `19 passed`；全量 `190 passed`；Ruff、mypy、import-linter、compileall、`git diff --check` 通过。
+* 后续行动：提交并推送 `feature/draft-orchestration`，创建 PR；仅启动一次审查并等待终态，按该次结论一次性修复后直接合并，再在主工作区拉取 `develop`。
+
+### CHG-20260830-12：CM-SANDBOX-001 合并收口与 CM-DRAFT-001 开工
+
+* 时间：2026-08-30
+* 变更类型：任务切换/进度同步
+* 变更原因：CM-SANDBOX-001 已完成唯一审查反馈的一次性修复并直接合并 PR #5；主工作区已拉取合并后的 `develop`，按 Wave 2 依赖关系领取 CM-DRAFT-001。
+* 变更内容：主干更新至 `c540dbb`；创建 `feature/draft-orchestration`；完整阅读 M-16/M-04/M-14 当前设计及 `code_alignment_record/draft/CM-DRAFT-001-对齐记录.md`；建立本任务实施计划、详细设计和迭代记录；主任务表将 CM-DRAFT-001 标为进行中。
+* 影响范围：CM-DRAFT-001 起草期编排；本分支允许包含 Sandbox 合并事实的进度同步，不修改主工作区既有用户未提交文件，不追加 Sandbox PR 审查轮次。
+* 验证：从合并后的 `develop` 创建分支前全量规则测试 `171 passed`；本任务代码测试待执行。
+* 后续行动：按计划测试先行实现 runtime 起草契约；完成后仅启动一次 PR 审查并等待子 agent 终态，按该次结论一次性修复后直接合并，再拉取 `develop`。
 
 ### CHG-20260830-11：CM-SANDBOX-001 唯一审查反馈一次性收口
 
