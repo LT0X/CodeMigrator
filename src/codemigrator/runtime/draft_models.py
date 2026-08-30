@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from enum import Enum
 from typing import Literal
@@ -12,7 +13,7 @@ from codemigrator.analysis import SourceRange
 from codemigrator.core import (
     FrozenArtifactBundle,
     MigrationRulebook,
-    MigrationSpec,
+    ModelProfile,
     QuestionId,
     RepoRelativePath,
     TargetProjectBlueprint,
@@ -22,6 +23,7 @@ from codemigrator.core import (
 from codemigrator.core._base import CoreModel
 from codemigrator.core.ids import new_uuid7
 from codemigrator.core.paths import _validate_repo_relative_path, normalize_repo_relative_paths
+from codemigrator.core.spec import SpecArtifact
 
 
 class _FrozenDraftModel(CoreModel):
@@ -98,7 +100,9 @@ class ExplorationReport(_FrozenDraftModel):
     @field_validator("coverage", mode="before")
     @classmethod
     def coverage_is_normalized(cls, value: object) -> tuple[str, ...]:
-        return tuple(normalize_repo_relative_paths(value))
+        if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+            raise TypeError("coverage must be a sequence")
+        return tuple(_validate_repo_relative_path(path) for path in value)
 
 
 class DomainSkeleton(_FrozenDraftModel):
@@ -125,6 +129,14 @@ class CoverageResult(_FrozenDraftModel):
     unknown_files: tuple[RepoRelativePath, ...] = ()
 
 
+class ExplorationMerge(_FrozenDraftModel):
+    """Coordinator-owned merge fact consumed by the alignment stage."""
+
+    reports: tuple[ExplorationReport, ...] = Field(min_length=1)
+    coverage: CoverageResult
+    unresolved_conflict_count: StrictInt = Field(ge=0)
+
+
 class DossierConsistencyResult(_FrozenDraftModel):
     valid: bool
     reasons: tuple[str, ...] = ()
@@ -135,10 +147,29 @@ class DossierConsistencyResult(_FrozenDraftModel):
 class DraftArtifacts(_FrozenDraftModel):
     """The four core-owned artifacts carried by a draft revision."""
 
-    spec: MigrationSpec
+    spec: SpecArtifact
     understanding_dossier: UnderstandingDossier
     target_project_blueprint: TargetProjectBlueprint
     migration_rulebook: MigrationRulebook
+
+    @model_validator(mode="after")
+    def spec_hash_matches_canonical_bytes(self) -> DraftArtifacts:
+        if hashlib.sha256(self.spec.canonical_bytes).hexdigest() != self.spec.canonical_sha256:
+            raise ValueError("SpecArtifact canonical hash does not match its bytes")
+        return self
+
+    def __getattribute__(self, name: str) -> object:
+        value = super().__getattribute__(name)
+        if name in {
+            "spec",
+            "understanding_dossier",
+            "target_project_blueprint",
+            "migration_rulebook",
+        }:
+            from copy import deepcopy
+
+            return deepcopy(value)
+        return value
 
 
 DraftArtifactName = Literal[
@@ -208,6 +239,32 @@ class AskUserAnswer(_FrozenDraftModel):
         return self
 
 
+class DraftExecRequest(_FrozenDraftModel):
+    """Closed input accepted by the draft Exec orchestration boundary."""
+
+    operation: Literal["ReadFile", "QuerySourceAst", "AskUser"]
+    path: RepoRelativePath | None = None
+    query: str | None = Field(default=None, min_length=1, max_length=4096)
+    question_id: QuestionId | None = None
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def optional_path_is_safe(cls, value: object) -> str | None:
+        return None if value is None else _validate_repo_relative_path(value)
+
+    @model_validator(mode="after")
+    def operation_has_exactly_read_only_arguments(self) -> DraftExecRequest:
+        if self.operation == "ReadFile":
+            if self.path is None or self.query is not None or self.question_id is not None:
+                raise ValueError("ReadFile Exec requires only one repository path")
+        elif self.operation == "QuerySourceAst":
+            if self.path is None or self.query is None or self.question_id is not None:
+                raise ValueError("QuerySourceAst Exec requires a path and query")
+        elif self.question_id is None or self.path is not None or self.query is not None:
+            raise ValueError("AskUser Exec requires only a question id")
+        return self
+
+
 class DraftFreezeReceipt(_FrozenDraftModel):
     revision_id: TaskDraftRevisionId
     revision_number: StrictInt = Field(ge=1)
@@ -220,6 +277,7 @@ class TrialTranslation(_FrozenDraftModel):
     file_path: RepoRelativePath
     constrained_output: str = Field(min_length=1)
     freeform_output: str = Field(min_length=1)
+    profile: Literal[ModelProfile.Code] = ModelProfile.Code
     discarded: Literal[True] = True
 
     @field_validator("file_path", mode="before")
@@ -235,10 +293,12 @@ __all__ = [
     "CoverageResult",
     "DomainSkeleton",
     "DraftArtifacts",
+    "DraftExecRequest",
     "DraftFreezeReceipt",
     "DraftStage",
     "DossierConsistencyResult",
     "ExploreReassignment",
+    "ExplorationMerge",
     "ExplorationReport",
     "FocusBrief",
     "FocusHighlight",

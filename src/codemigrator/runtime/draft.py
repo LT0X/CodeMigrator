@@ -16,6 +16,7 @@ from codemigrator.core import (
     canonical_json_bytes,
     new_uuid7,
 )
+from codemigrator.core.spec import SpecArtifact
 
 from .draft_models import (
     ArtifactSnapshot,
@@ -23,15 +24,17 @@ from .draft_models import (
     AskUserQuestion,
     DraftArtifactName,
     DraftArtifacts,
+    DraftExecRequest,
     DraftFreezeReceipt,
     DraftStage,
+    ExplorationMerge,
     ExplorationReport,
     ExploreReassignment,
     ReadOnlyDraftTool,
     TaskDraftRevision,
     TrialTranslation,
 )
-from .draft_validation import validate_exact_coverage
+from .draft_validation import build_domain_skeleton, validate_exact_coverage
 
 
 class DraftConflictError(ValueError):
@@ -174,11 +177,22 @@ class DraftLedger:
 class DraftFlow:
     """Stage-gated pre-Run drafting flow with no external side-effect ports."""
 
-    def __init__(self, ledger: DraftLedger | None = None) -> None:
+    def __init__(
+        self,
+        ledger: DraftLedger | None = None,
+        *,
+        module_files: Mapping[str, Sequence[str]] | None = None,
+        max_fanout: int = 6,
+    ) -> None:
+        if type(max_fanout) is not int or max_fanout < 1:
+            raise ValueError("max_fanout must be a positive integer")
         self.ledger = ledger or DraftLedger()
         self._stage = DraftStage.Explore
+        self._module_files = module_files
+        self._max_fanout = max_fanout
         self._reports: list[ExplorationReport] = []
         self._reassignments: list[ExploreReassignment] = []
+        self._merged_exploration: ExplorationMerge | None = None
         self._trial_results: tuple[TrialTranslation, ...] = ()
 
     @property
@@ -192,6 +206,10 @@ class DraftFlow:
     @property
     def reassignments(self) -> tuple[ExploreReassignment, ...]:
         return tuple(self._reassignments)
+
+    @property
+    def merged_exploration(self) -> ExplorationMerge | None:
+        return self._merged_exploration
 
     @property
     def side_effects(self) -> tuple[str, ...]:
@@ -222,6 +240,13 @@ class DraftFlow:
     def tool_is_allowed(self, tool_name: str) -> bool:
         return tool_name in {tool.value for tool in ReadOnlyDraftTool}
 
+    def validate_exec(self, request: DraftExecRequest) -> DraftExecRequest:
+        """Validate an Exec orchestration request without executing it."""
+
+        if not self.tool_is_allowed(ReadOnlyDraftTool.Exec.value):
+            raise DraftConflictError("Exec is not allowed in draft sessions")
+        return request
+
     def submit_report(self, report: ExplorationReport) -> None:
         self._require_stage(DraftStage.Explore)
         self._reports.append(report)
@@ -229,22 +254,65 @@ class DraftFlow:
     def record_reassignment(self, advice: ExploreReassignment) -> None:
         if self.stage not in {DraftStage.Explore, DraftStage.Align}:
             raise DraftConflictError("reassignment is only available during exploration alignment")
+        if len(advice.focus_brief.domain_paths) > self._max_fanout:
+            raise DraftConflictError("reassignment exceeds the configured exploration fanout")
+        known_domains = {report.domain_path for report in self._reports}
+        if advice.op != "split" and not set(advice.domain_paths).issubset(known_domains):
+            raise DraftConflictError("reassignment references an unknown exploration domain")
+        module_files = self._module_files or {
+            str(report.domain_path): report.coverage for report in self._reports
+        }
+        if module_files:
+            build_domain_skeleton(module_files, max_fanout=self._max_fanout)
         self._reassignments.append(advice)
 
-    def finish_exploration(self, expected_files: Sequence[str]) -> None:
+    def finish_exploration(self, expected_files: Sequence[str]) -> ExplorationMerge:
         self._require_stage(DraftStage.Explore)
         if not self._reports:
             raise DraftConflictError("at least one exploration report is required")
         from .draft_models import DomainSkeleton
 
+        report_domains = {report.domain_path for report in self._reports}
+        if len(report_domains) > self._max_fanout:
+            raise DraftConflictError("exploration fanout exceeds the configured maximum")
+        if len(report_domains) != len(self._reports):
+            raise DraftConflictError("each exploration domain must have one merged report")
+        for report in self._reports:
+            domain_prefix = f"{report.domain_path}/"
+            if any(
+                file_path != report.domain_path and not file_path.startswith(domain_prefix)
+                for file_path in report.coverage
+            ):
+                raise DraftConflictError(
+                    f"report coverage is outside its domain {report.domain_path!r}"
+                )
+
         skeleton = tuple(
             DomainSkeleton(domain_path=report.domain_path, files=report.coverage)
             for report in self._reports
         )
+        module_files = self._module_files or {
+            str(report.domain_path): report.coverage for report in self._reports
+        }
+        expected_skeleton = build_domain_skeleton(
+            module_files,
+            max_fanout=self._max_fanout,
+        )
+        expected_domains = {domain.domain_path for domain in expected_skeleton}
+        if report_domains != expected_domains:
+            raise DraftConflictError("reports do not match the machine-built domain skeleton")
         coverage = validate_exact_coverage(skeleton, expected_files)
         if not coverage.valid:
             raise DraftConflictError(f"exploration coverage is not exact: {coverage.model_dump()}")
+        self._merged_exploration = ExplorationMerge(
+            reports=tuple(self._reports),
+            coverage=coverage,
+            unresolved_conflict_count=sum(
+                report.unresolved_conflict_count for report in self._reports
+            ),
+        )
         self._stage = DraftStage.Align
+        return self._merged_exploration
 
     def save_artifacts(self, artifacts: DraftArtifacts) -> TaskDraftRevision:
         if self.stage not in {DraftStage.Align, DraftStage.Draft}:
@@ -253,6 +321,18 @@ class DraftFlow:
         self._stage = DraftStage.Draft
         self._trial_results = ()
         return revision
+
+    def seed_artifacts(self, artifacts: DraftArtifacts) -> TaskDraftRevision:
+        """Store provisional artifacts while keeping the flow in AskUser alignment."""
+
+        self._require_stage(DraftStage.Align)
+        return self.ledger.create_revision(artifacts)
+
+    def finalize_alignment(self) -> None:
+        self._require_stage(DraftStage.Align)
+        if self.ledger.current_revision is None:
+            raise DraftConflictError("alignment requires provisional artifacts")
+        self._stage = DraftStage.Draft
 
     def revise_artifacts(self, artifacts: DraftArtifacts) -> TaskDraftRevision:
         """Apply an alignment or calibration conclusion as a new artifact revision."""
@@ -268,11 +348,13 @@ class DraftFlow:
         return updated
 
     def ask_user(self, question: AskUserQuestion) -> AskUserQuestion:
-        self._require_stage(DraftStage.Draft)
+        if self.stage not in {DraftStage.Align, DraftStage.Draft}:
+            raise DraftConflictError("AskUser is only available during alignment and drafting")
         return self.ledger.append_question(question)
 
     def answer_user(self, answer: AskUserAnswer) -> AskUserAnswer:
-        self._require_stage(DraftStage.Draft)
+        if self.stage not in {DraftStage.Align, DraftStage.Draft}:
+            raise DraftConflictError("AskUser is only available during alignment and drafting")
         return self.ledger.answer_question(answer)
 
     def begin_calibration(self) -> None:
@@ -349,7 +431,11 @@ def _artifact_snapshots(artifacts: DraftArtifacts, version: int) -> tuple[Artifa
 
 
 def _artifact_snapshot(artifact: object, name: DraftArtifactName, version: int) -> ArtifactSnapshot:
-    payload = canonical_json_bytes(artifact)
+    payload = (
+        artifact.canonical_bytes
+        if isinstance(artifact, SpecArtifact)
+        else canonical_json_bytes(artifact)
+    )
     return ArtifactSnapshot(
         name=name,
         version=version,

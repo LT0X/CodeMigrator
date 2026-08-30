@@ -53,6 +53,11 @@ def test_artifact_change_creates_revision_but_answer_does_not(artifacts) -> None
     assert second.revision_id != first.revision_id
     assert second.artifact_snapshots != first.artifact_snapshots
 
+    revision_copy = first.artifacts.migration_rulebook
+    revision_copy.version = 99
+    assert first.artifacts.migration_rulebook.version == 1
+    assert first.artifact_snapshots[3].sha256 != second.artifact_snapshots[3].sha256
+
 
 def test_stale_revision_and_conflicting_answer_are_rejected(artifacts) -> None:
     ledger = DraftLedger()
