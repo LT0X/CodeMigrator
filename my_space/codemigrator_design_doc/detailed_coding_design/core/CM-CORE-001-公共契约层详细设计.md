@@ -164,4 +164,3 @@ core 不新增数据库表，不定义 REST/SSE DTO，不定义 run_events 事�
 - `uuid-utils` 和 canonical JSON 适配依赖需由 CM-INFRA-001 登记到项目依赖；core 任务不创建第二套工程基线。
 - 三类静态资源随包发布，CM-VERIFY、CM-LOOP、CM-MEMORY、CM-WORKSPACE 在 Run 创建时读取并冻结摘要，运行期不热加载。
 - 资源正文和高层 payload 的未定业务字段保持最小边界，后续任务只能扩充已对齐的契约变更，并需追加记录。
-
