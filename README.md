@@ -1,13 +1,14 @@
 # CodeMigrator
 
-CodeMigrator 是一个面向跨语言源代码迁移的确定性、证据驱动型系统。它将
-源代码分析、迁移规格约束、迁移计划、候选工作区、受控工具调用、隔离执行、
-多层验证和可审计运行编排组织为一套统一的工程体系。
+CodeMigrator 是一个面向跨语言源代码迁移的确定性、证据驱动型 Agent 系统。它将
+源代码分析、迁移规格、迁移计划、候选工作区、受控工具调用、隔离执行、多层验证
+和可审计运行编排组织为一套统一的工程体系，最终生成可复核、可验证、可交付的
+目标项目。
 
-CodeMigrator 不把迁移理解为不受约束的代码生成，而是把一次迁移建模为一组
-可冻结、可验证、可回放的事实与操作：输入规格和工具链先经过契约校验，计划
-被拆分为有依赖关系且具有明确写入边界的切片，候选修改通过受控工作区产生，
-执行结果以回执和证据保存，只有满足验证条件的结果才能进入后续集成与交付。
+CodeMigrator 不把迁移理解为不受约束的代码生成，而是把一次迁移建模为一组可冻结、
+可验证、可回放的事实与操作：输入规格和工具链先经过契约校验，计划被拆分为具有
+依赖关系和明确写入边界的切片，候选修改通过受控工作区产生，执行结果以回执和
+证据保存，只有满足验证条件的结果才能进入后续集成与交付。
 
 ## 项目目标
 
@@ -17,8 +18,7 @@ CodeMigrator 不把迁移理解为不受约束的代码生成，而是把一次�
 - 以冻结的 write scope 限制所有候选工作区写入。
 - 通过 sandbox、资源池和受控工具网关隔离高风险操作。
 - 通过事件账本、执行回执和集成事实保留完整的审计链路。
-- 通过声明式 descriptor 支持不同语言与工具链，避免把语言插件逻辑散落在
-  Python 包中。
+- 通过声明式 descriptor 支持不同语言与工具链，避免把语言知识散落在代码分支中。
 
 ## 设计原则
 
@@ -35,8 +35,8 @@ CodeMigrator 不把迁移理解为不受约束的代码生成，而是把一次�
 
 ### 写入边界明确
 
-迁移计划冻结后，每个 Slice 都拥有明确的文件写入范围。工作区、工具网关和
-Git 操作必须遵循该范围；模型输出不能直接获得任意文件系统写权限。
+迁移计划冻结后，每个 Slice 都拥有明确的文件写入范围。工作区、工具网关和 Git
+操作必须遵循该范围；模型输出不能直接获得任意文件系统写权限。
 
 ### 组合根集中副作用
 
@@ -51,24 +51,29 @@ Git 操作必须遵循该范围；模型输出不能直接获得任意文件系�
 
 ## 系统架构
 
-项目采用 Python `src` 布局和八个边界清晰的子包。依赖方向以 `core` 为底层
-契约中心，`runtime` 负责组合各类端口和适配器，`api` 负责外部投影与命令入口。
+项目采用 Python `src` 布局和八个边界清晰的子包。依赖方向以 `core` 为底层契约
+中心，`runtime` 负责组合各类端口和适配器，`api` 负责外部投影与命令入口。
 
-| 子包 | 架构职责 |
+| 子包或目录 | 架构职责 |
 | --- | --- |
-| `codemigrator.core` | 稳定 ID、枚举、错误码、Pydantic 契约、canonicalization、路径与 scope 原语，以及版本化策略资源。 |
-| `codemigrator.analysis` | 基于 tree-sitter 的只读源端分析，构建模块、依赖、测试覆盖图并提供分析投影。 |
-| `codemigrator.planning` | 对迁移提案执行确定性校验，将合格提案冻结为有向无环计划、Slice 和依赖边。 |
-| `codemigrator.workspace` | 候选工作区、checkpoint、安全路径、写入范围、工具网关及受控文件/Git 操作边界。 |
-| `codemigrator.sandbox` | app 内 bubblewrap/cgroup 适配、长期卷、验证临时目录和资源限制。 |
-| `codemigrator.verification` | 检查集筛选、执行事实归一、诊断解析、归因证据、验证 fingerprint 与 guard。 |
-| `codemigrator.runtime` | Run actor、事务编排、调度、集成、恢复、生命周期和应用组合根。 |
-| `codemigrator.api` | REST/SSE 外部投影、幂等命令、`If-Match` 版本控制和 RFC 9457 错误映射。 |
+| `src/codemigrator/core/` | 公共 ID、状态、错误码、Spec、路径规范和无副作用领域契约。 |
+| `src/codemigrator/analysis/` | 基于只读源端事实构建模块、依赖、测试覆盖图并提供分析投影。 |
+| `src/codemigrator/planning/` | 校验迁移提案，生成 DAG、Slice、write scope 和集成顺序。 |
+| `src/codemigrator/workspace/` | 候选工作区、checkpoint、Git 输出历史和集成原语。 |
+| `src/codemigrator/sandbox/` | bubblewrap/cgroup 适配、长期卷、验证临时目录和资源限制。 |
+| `src/codemigrator/verification/` | 检查执行结果归一、诊断解析、指纹与失败归因。 |
+| `src/codemigrator/runtime/` | Run actor、调度、会话编排、恢复、事务适配和组合根。 |
+| `src/codemigrator/api/` | REST/SSE DTO、认证、幂等、If-Match、事件回放和 Problem Details。 |
+| `descriptors/` | 源端与目标端语言、工具链及检查能力的声明式资源。 |
+| `apps/codemigrator-cli/` | CLI 产品入口资产。 |
+| `web/` | Web 产品入口资产。 |
+| `migrations/` | PostgreSQL 版本化迁移脚本。 |
+| `deploy/` | 应用、数据库和沙箱的部署基线。 |
 
-Run 的控制面遵循单 Run 单写者原则：actor 串行接收 typed mailbox 消息并作出
-状态决定；模型、工具、Git、sandbox 和检查命令等耗时操作通过端口在 actor 外部
-执行，再以带身份信息的回执返回。API 只提交命令和读取投影，不绕过 runtime 直接
-修改领域事实。
+Run 的控制面遵循单 Run 单写者原则：actor 串行接收 typed mailbox 消息并作出状态
+决定；模型、工具、Git、sandbox 和检查命令等耗时操作通过端口在 actor 外部执行，
+再以带身份信息的回执返回。API 只提交命令和读取投影，不绕过 runtime 直接修改
+领域事实。
 
 ## 迁移生命周期
 
@@ -83,28 +88,68 @@ Run 的控制面遵循单 Run 单写者原则：actor 串行接收 typed mailbox
 7. 对失败进行诊断归因，在规则允许的边界内重生成或修复候选版本。
 8. 通过受控 Git 集成推进 verified 结果，并生成确定性报告。
 
-各阶段的状态转换、失败原因、幂等键、事件顺序和验收语义以 `core` 契约及相应
-模块设计为准。
+```text
+源项目快照
+    │
+    ├─ 项目分析与结构事实
+    ├─ Spec、理解档案、目标蓝图、迁移规则冻结
+    │
+    └─ CreateRun
+         │
+         ├─ 描述符与工件预检
+         ├─ 计划生成、机器校验与 Slice 冻结
+         ├─ 候选生成、局部验证与有序集成
+         ├─ 最终验证与证据归档
+         └─ 报告交付 / 目标代码交付
+```
+
+源快照始终只读。目标代码写入由系统托管的输出工作区完成，目标 Git 历史从空输出
+基线开始；源仓库历史、宿主路径、凭据和大对象正文不会通过公共 API 泄露。
 
 ## 目录结构
 
 ```text
 .
-├── apps/codemigrator-cli/       应用入口资产
-├── descriptors/                源端与目标端工具链声明式事实
-├── deploy/                     容器、目标工具链和 sandbox 部署资产
-├── migrations/                 PostgreSQL 版本化迁移脚本
-├── src/codemigrator/           Python 应用包
-├── test_fixtures/              确定性分析与契约测试夹具
-├── tests/                      单元测试、契约测试和边界测试
-├── compose.yaml                本地 app 与 PostgreSQL 服务
-├── pyproject.toml              构建、依赖、测试、lint 和类型检查配置
-└── uv.lock                     锁定的 Python 依赖解析结果
+├── apps/codemigrator-cli/       CLI 应用入口资产
+├── descriptors/                 源端与目标端工具链声明式事实
+├── deploy/                      容器、目标工具链和 sandbox 部署资产
+├── migrations/                  PostgreSQL 版本化迁移脚本
+├── src/codemigrator/            Python 应用包
+├── test_fixtures/               确定性分析与契约测试夹具
+├── tests/                       单元测试、契约测试和边界测试
+├── compose.yaml                 本地 app 与 PostgreSQL 服务
+├── pyproject.toml               构建、依赖、测试、lint 和类型检查配置
+└── uv.lock                      锁定的 Python 依赖解析结果
 ```
 
-设计文档、需求对齐记录、迭代记录、临时文件、凭证、agent 指令和其他内部工作
-材料属于本地工作区，不是项目源代码的一部分，不能提交或通过 `git add -f`
-强制加入版本库。
+## HTTP API
+
+API 默认以 `/api/v1` 为前缀，使用单一部署令牌和固定主体。主要资源包括：
+
+- Spec 与迁移：创建 Spec、创建或取消 Run、Run 列表与详情、Workspace、Changes、Output。
+- 验证与交付：Report、Evidence、Descriptors、Skills 和系统健康摘要。
+- 项目与会话：项目注册、会话消息、AskUser 答案、任务草稿确认和修正确认。
+- 事件流：迁移事件与会话事件均通过 SSE 提供，事件正文使用版本化事件信封。
+
+写请求要求使用 `Idempotency-Key`。幂等范围为主体、路由和键的组合，正文采用
+canonical JSON 比对；相同正文重放首次响应，不同正文返回冲突。取消请求使用
+`If-Match` 传递 Run 版本，由 Run actor 执行并发判断。错误统一返回
+`application/problem+json`。
+
+SSE 从已提交事件账本读取数据，`Last-Event-ID` 只作为严格的回放游标；通知机制
+只负责唤醒，不能作为事件正文来源。连接具有进程级上限和有界待发送队列，终态
+事件交付后自动关闭。
+
+## 安全与数据边界
+
+- 源仓库只读，输出工作区与源项目物理隔离。
+- HTTP body、Spec 正文、事件队列和检查资源均有明确容量限制。
+- 仓库地址、分支前缀、相对路径和工具命令执行面进行严格校验。
+- API、日志、事件、指标和报告引用不包含 bearer token、仓库凭据、源码正文、
+  完整提示词、宿主路径或完整工具输出。
+- 工具链事实通过锁定的声明式描述符提供，不使用可动态注入的语言插件执行任意命令。
+- PostgreSQL 保存控制面事实；大对象通过受控 ArtifactRef 引用，不能凭任意引用读取正文。
+- 内部设计资料、对齐记录、凭证、参考工程和临时资料不属于发布内容。
 
 ## 运行环境
 
@@ -114,9 +159,9 @@ Run 的控制面遵循单 Run 单写者原则：actor 串行接收 typed mailbox
 - Linux、bubblewrap 和 cgroup v2：运行 sandbox 相关工作流。
 
 项目的运行时依赖和开发依赖均在 `pyproject.toml` 中声明，推荐使用 `uv.lock`
-对应的锁定环境执行检查。
+对应的锁定环境执行检查。运行凭证由部署环境提供，不应写入源码、配置提交或项目文档。
 
-## 安装与入口
+## 安装与运行
 
 在项目根目录执行：
 
@@ -124,40 +169,21 @@ Run 的控制面遵循单 Run 单写者原则：actor 串行接收 typed mailbox
 uv sync --dev
 ```
 
-验证包可以被正确导入：
-
-```bash
-uv run python -c "import codemigrator"
-```
-
-应用控制台入口由项目脚本提供：
+启动应用入口：
 
 ```bash
 uv run codemigrator-app
 ```
 
-环境变量、数据库凭证和宿主机路径必须由本地运行环境提供，不得写入源码、
-descriptor、Compose 文件或项目文档。
-
-## 本地服务
-
-`compose.yaml` 定义两个服务：
-
-- `app`：CodeMigrator 应用容器，包含部署模型要求的 sandbox 权限和 delegated
-  cgroup 挂载。
-- `postgres`：PostgreSQL 17，用于控制面账本、事件历史和相关持久化事实。
-
-示例（敏感值只从 shell 或未纳入版本控制的本地环境文件提供）：
+启动本地基础设施时，请从 shell 或未纳入版本控制的环境文件提供凭证：
 
 ```bash
-POSTGRES_PASSWORD='change-me' \
-CODEMIGRATOR_CGROUP_DELEGATED_DIR='/path/to/delegated/cgroup' \
-docker compose up --build
+POSTGRES_PASSWORD='<由部署环境提供>' docker compose up --build
 ```
 
-`POSTGRES_PASSWORD` 是数据库服务的必填项；启用 sandbox 生命周期管理时，
-`CODEMIGRATOR_CGROUP_DELEGATED_DIR` 必须指向可委派的 cgroup v2 目录。授予额外
-宿主机能力前，应先审阅 `compose.yaml` 与 `deploy/` 中的部署配置。
+`compose.yaml` 定义应用与 PostgreSQL 服务。启用 sandbox 生命周期管理时，还需将
+`CODEMIGRATOR_CGROUP_DELEGATED_DIR` 指向可委派的 cgroup v2 目录；授予额外宿主机
+能力前，应先审阅部署配置。
 
 ## 测试与质量门
 
@@ -168,46 +194,35 @@ uv run pytest -q
 uv run ruff check src tests
 uv run mypy src
 uv run lint-imports
-uv run python -m compileall -q src
+uv run python -m compileall -q src tests
 ```
 
-按模块执行聚焦测试：
+每项代码变更都应覆盖正常路径、边界条件、失败路径、幂等性和安全不变量。涉及
+数据库事务、事件序列、恢复和交付适配器的测试，应在隔离的本地基础设施中运行。
+真实模型调用只用于验证 provider 特有行为、token 计数或必要的端到端会话，不作为
+普通回归测试的默认依赖。
 
-```bash
-uv run pytest -q tests/core
-uv run pytest -q tests/verification
-```
+## Descriptor 与扩展约束
 
-每项代码变更都应覆盖正常路径、边界条件、失败路径、幂等性和安全不变量。
-只有在规则测试和本地替身无法验证 provider 特有行为时，才使用最小范围的真实
-模型调用，例如确认 provider usage 回执或完整模型会话行为。
+`descriptors/` 是语言和工具链事实的声明式来源，可描述 grammar、镜像摘要、能力、
+检查集和相关资源引用。descriptor 不得包含凭证、可执行应用逻辑、模型 prompt、
+任意命令注入内容或工作区写入范围；这些内容分别由契约、运行时、sandbox 和
+workspace 边界负责。Python 包通过已验证的公共契约消费 descriptor 事实。
 
-## Descriptor 约束
+扩展功能应保持以下原则：
 
-`descriptors/` 是语言和工具链事实的声明式来源，可描述 grammar、镜像摘要、
-能力、检查集和相关资源引用。descriptor 不得包含凭证、可执行应用逻辑、模型
-prompt、任意命令注入内容或工作区写入范围；这些内容分别由契约、运行时、sandbox
-和 workspace 边界负责。Python 包通过已验证的公共契约消费 descriptor 事实。
-
-## 安全边界
-
-CodeMigrator 将源仓库、模型输出、生成文件、工具输出、执行回执和验证结论视为
-不同信任域：
-
-- 模型输出在进入计划或工作区动作前必须经过契约和能力校验。
-- 文件操作仅允许安全的仓库相对路径，并受冻结 write scope 约束。
-- sandbox 工作负载不应获得 PostgreSQL、宿主 Git 或控制面网络访问。
-- 大型日志和正文通过受控 artifact reference 管理，事件只保留必要摘要。
-- 凭证、内部设计材料和本地运行规则必须被版本控制与 Docker build context 排除。
-- 修改契约、写入边界、sandbox 权限、数据库 schema 或事件语义时，必须同步更新
-  测试和文档。
+1. 公共状态、错误码和 ID 只在 `core` 定义一份。
+2. 外部输入使用封闭 schema，未知字段默认拒绝。
+3. 副作用经过明确的端口和组合根，不从纯逻辑包直接访问环境或基础设施。
+4. 每项变更同时覆盖成功路径、边界条件、失败路径和安全约束。
+5. 可观察事实进入统一事件账本，展示层不自行创造领域状态。
 
 ## 贡献约定
 
 领域逻辑应尽量保持纯函数、确定性和最小副作用；环境读取与适配器装配集中在
-runtime 组合根。优先复用 `codemigrator.core` 的公共契约，禁止在其他子包中
-复制平行枚举或错误码。提交变更前应完成质量门检查，并检查差异中是否包含凭证、
-本地工作区材料、生成文件或违反依赖边界的导入。
+runtime 组合根。优先复用 `codemigrator.core` 的公共契约，禁止在其他子包中复制
+平行枚举或错误码。提交变更前应完成质量门检查，并检查差异中是否包含凭证、内部
+工作材料、生成文件或违反依赖边界的导入。
 
 ## 许可证
 
