@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from codemigrator.analysis import ModuleRole
+from codemigrator.analysis import ArtifactFact, ArtifactKind, ModuleCoverage, ModuleFact, ModuleRole
 from codemigrator.core import (
     MigrationSlice,
     PlanEdge,
     ProjectModuleId,
+    SliceKind,
     StableErrorCode,
     WriteScope,
     WriteScopeOut,
@@ -59,20 +61,13 @@ class PlanValidator:
         expected_files = _in_scope_source_files(inputs)
         actual_coverage: dict[str, list[str]] = defaultdict(list)
 
-        for slice_index, slice_proposal in enumerate(proposal.slices):
+        violations.extend(_validate_slice_modules(proposal, inputs, modules))
+        for slice_proposal in proposal.slices:
+            if slice_proposal.kind not in {SliceKind.Implementation, SliceKind.TestTranslation}:
+                continue
             for module_id in slice_proposal.source_modules:
                 module = modules.get(module_id)
                 if module is None:
-                    violations.append(
-                        _violation(
-                            StableErrorCode.PLAN_COVERAGE_INVALID,
-                            f"/slices/{slice_index}/source_modules",
-                            "source module is not present in analysis facts",
-                            module_id=str(module_id),
-                        )
-                    )
-                    continue
-                if slice_proposal.kind.value not in {"IMPLEMENTATION", "TEST_TRANSLATION"}:
                     continue
                 for path in module.file_paths:
                     path_text = str(path)
@@ -80,6 +75,7 @@ class PlanValidator:
                         actual_coverage[path_text].append(slice_proposal.local_ref)
 
         violations.extend(_validate_edges(proposal))
+        violations.extend(_validate_artifacts(proposal, inputs))
         violations.extend(_validate_artifact_scopes(proposal))
         violations.extend(_validate_test_edges(proposal, inputs))
         violations.extend(_validate_scope_conflicts(proposal))
@@ -152,6 +148,75 @@ class PlanValidator:
         )
 
 
+def _validate_slice_modules(
+    proposal: PlanProposal,
+    inputs: PlanningInputs,
+    modules: Mapping[ProjectModuleId, ModuleFact],
+) -> list[PlanViolation]:
+    expected_roles = {
+        SliceKind.Implementation: ModuleRole.Source,
+        SliceKind.TestTranslation: ModuleRole.Test,
+        SliceKind.TestGeneration: ModuleRole.Source,
+    }
+    status_by_module = {
+        status.module: status.status for status in inputs.analysis.coverage_status
+    }
+    violations: list[PlanViolation] = []
+    for slice_index, slice_proposal in enumerate(proposal.slices):
+        expected_role = expected_roles.get(slice_proposal.kind)
+        for module_index, module_id in enumerate(slice_proposal.source_modules):
+            pointer = f"/slices/{slice_index}/source_modules/{module_index}"
+            module = modules.get(module_id)
+            if module is None:
+                violations.append(
+                    _violation(
+                        StableErrorCode.PLAN_COVERAGE_INVALID,
+                        pointer,
+                        "source module is not present in analysis facts",
+                        module_id=str(module_id),
+                    )
+                )
+                continue
+            if expected_role is not None and module.role is not expected_role:
+                violations.append(
+                    _violation(
+                        StableErrorCode.PLAN_COVERAGE_INVALID,
+                        pointer,
+                        "slice source module role does not match its Slice kind",
+                        expected_role=expected_role.value,
+                        actual_role=module.role.value,
+                    )
+                )
+            out_of_scope = [
+                str(path) for path in module.file_paths if not inputs.spec.scope.includes(str(path))
+            ]
+            if out_of_scope:
+                violations.append(
+                    _violation(
+                        StableErrorCode.PLAN_COVERAGE_INVALID,
+                        pointer,
+                        "slice source module contains files outside the migration scope",
+                        paths=out_of_scope,
+                    )
+                )
+            if slice_proposal.kind is SliceKind.TestGeneration and status_by_module.get(
+                module_id
+            ) is not ModuleCoverage.EmptyTestSuite:
+                violations.append(
+                    _violation(
+                        StableErrorCode.PLAN_COVERAGE_INVALID,
+                        pointer,
+                        "TestGeneration requires an EmptyTestSuite source module",
+                        status=(
+                            status_by_module[module_id].value
+                            if module_id in status_by_module
+                            else "MISSING"
+                        ),
+                    )
+                )
+    return violations
+
+
 class PlanLedger:
     """A transaction-shaped ledger that publishes only accepted frozen plans."""
 
@@ -204,6 +269,7 @@ class PlanLedger:
             for edge in proposal.edges
         )
         edge_provenance = tuple(edge.provenance for edge in proposal.edges)
+        edge_evidence = tuple(edge.evidence for edge in proposal.edges)
         integration_order = tuple(
             local_ref_to_id[local_ref]
             for local_ref in sorted(
@@ -218,6 +284,7 @@ class PlanLedger:
             "slices": slices,
             "edges": edges,
             "edge_provenance": edge_provenance,
+            "edge_evidence": edge_evidence,
             "validation": validation,
             "integration_order": integration_order,
             "local_ref_to_id": local_ref_to_id,
@@ -237,6 +304,7 @@ class PlanLedger:
             slices=slices,
             edges=edges,
             edge_provenance=edge_provenance,
+            edge_evidence=edge_evidence,
             validation=validation,
             integration_order=integration_order,
             local_ref_to_id=local_ref_to_id,
@@ -245,7 +313,7 @@ class PlanLedger:
                 for slice_proposal in proposal.slices
                 if slice_proposal.artifact_tasks
             },
-            planner_rationale=proposal.planner_rationale,
+            planner_rationale=tuple(proposal.planner_rationale),
             frozen_artifacts=inputs.frozen_artifacts,
             proposal=proposal,
         )
@@ -264,6 +332,7 @@ def compute_plan_hash(payload: Mapping[str, Any] | FrozenPlan) -> str:
             "slices": payload.slices,
             "edges": payload.edges,
             "edge_provenance": payload.edge_provenance,
+            "edge_evidence": payload.edge_evidence,
             "validation": payload.validation,
             "integration_order": payload.integration_order,
             "local_ref_to_id": payload.local_ref_to_id,
@@ -278,6 +347,7 @@ def compute_plan_hash(payload: Mapping[str, Any] | FrozenPlan) -> str:
         "slices": _json_value(payload["slices"]),
         "edges": _json_value(payload["edges"]),
         "edge_provenance": _json_value(payload.get("edge_provenance", ())),
+        "edge_evidence": _json_value(payload.get("edge_evidence", ())),
         "validation": _json_value(payload["validation"]),
         "integration_order": [str(item) for item in payload["integration_order"]],
         "local_ref_to_id": {
@@ -393,9 +463,12 @@ def _validate_test_edges(proposal: PlanProposal, inputs: PlanningInputs) -> list
         ):
             continue
         tested_modules: set[ProjectModuleId] = set()
-        for module_id in modules_by_ref[test_ref]:
-            if modules.get(module_id) is not None:
-                tested_modules.update(tested_by_test_module.get(module_id, set()))
+        if kind_by_ref[test_ref] is SliceKind.TestGeneration:
+            tested_modules.update(modules_by_ref[test_ref])
+        else:
+            for module_id in modules_by_ref[test_ref]:
+                if modules.get(module_id) is not None:
+                    tested_modules.update(tested_by_test_module.get(module_id, set()))
         if tested_modules.intersection(modules_by_ref[implementation_ref]):
             violations.append(
                 _violation(
@@ -407,20 +480,80 @@ def _validate_test_edges(proposal: PlanProposal, inputs: PlanningInputs) -> list
     return violations
 
 
+def _validate_artifacts(
+    proposal: PlanProposal, inputs: PlanningInputs
+) -> list[PlanViolation]:
+    facts = tuple(inputs.analysis.artifacts)
+    tasks = tuple(
+        (slice_index, task_index, task)
+        for slice_index, slice_proposal in enumerate(proposal.slices)
+        for task_index, task in enumerate(slice_proposal.artifact_tasks)
+    )
+    violations: list[PlanViolation] = []
+
+    def task_matches_fact(task: Any, fact: ArtifactFact) -> bool:
+        if task.artifact_path is not None:
+            return str(task.artifact_path) == str(fact.path)
+        return str(task.source_path) == str(fact.source_path or fact.path)
+
+    for fact in facts:
+        matches = [item for item in tasks if task_matches_fact(item[2], fact)]
+        if len(matches) != 1:
+            violations.append(
+                _violation(
+                    StableErrorCode.PLAN_COVERAGE_INVALID,
+                    "/slices",
+                    "each analyzed artifact must be assigned to exactly one artifact task",
+                    artifact_path=str(fact.path),
+                    task_count=len(matches),
+                )
+            )
+            continue
+        task = matches[0][2]
+        if task.kind is not fact.artifact_kind:
+            violations.append(
+                _violation(
+                    StableErrorCode.PLAN_COVERAGE_INVALID,
+                    f"/slices/{matches[0][0]}/artifact_tasks/{matches[0][1]}",
+                    "artifact task kind does not match the analyzed artifact",
+                    artifact_path=str(fact.path),
+                )
+            )
+
+    for slice_index, task_index, task in tasks:
+        matching_facts = [fact for fact in facts if task_matches_fact(task, fact)]
+        if len(matching_facts) != 1:
+            violations.append(
+                _violation(
+                    StableErrorCode.PLAN_COVERAGE_INVALID,
+                    f"/slices/{slice_index}/artifact_tasks/{task_index}",
+                    "artifact task does not identify exactly one analyzed artifact",
+                    task_source_path=str(task.source_path),
+                )
+            )
+    return violations
+
+
 def _validate_artifact_scopes(proposal: PlanProposal) -> list[PlanViolation]:
     violations: list[PlanViolation] = []
-    translation_kinds = {"IMPLEMENTATION", "TEST_TRANSLATION", "TEST_GENERATION"}
+    translation_slices = tuple(
+        (index, slice_proposal)
+        for index, slice_proposal in enumerate(proposal.slices)
+        if slice_proposal.kind
+        in {SliceKind.Implementation, SliceKind.TestTranslation, SliceKind.TestGeneration}
+    )
     for index, slice_proposal in enumerate(proposal.slices):
-        if slice_proposal.kind.value not in translation_kinds:
-            continue
         for task_index, task in enumerate(slice_proposal.artifact_tasks):
-            if task.kind.value != "RESOURCE_FILE":
+            if task.kind is not ArtifactKind.ResourceFile:
                 continue
-            if _scopes_overlap(
-                (task.target_path,),
-                (),
-                slice_proposal.write_paths,
-                slice_proposal.create_roots,
+            if any(
+                _scopes_overlap(
+                    (task.target_path,),
+                    (),
+                    target_slice.write_paths,
+                    target_slice.create_roots,
+                )
+                for _target_index, target_slice in translation_slices
             ):
                 violations.append(
                     _violation(
@@ -486,6 +619,8 @@ def _validate_blueprint(proposal: PlanProposal, inputs: PlanningInputs) -> list[
             value = boundary.get(key)
             if isinstance(value, str) and value:
                 prefixes.add(value.rstrip("/"))
+    for principle in inputs.target_project_blueprint.target_layout_principles:
+        prefixes.update(_layout_principle_prefixes(principle))
     if not prefixes:
         return []
     violations: list[PlanViolation] = []
@@ -502,6 +637,20 @@ def _validate_blueprint(proposal: PlanProposal, inputs: PlanningInputs) -> list[
                     )
                 )
     return violations
+
+
+def _layout_principle_prefixes(principle: str) -> set[str]:
+    """Extract only explicit path constraints from opaque layout guidance."""
+
+    patterns = (
+        r"\b(?:target\s+)?layout\s+(?:prefix|root)\s*[:=]\s*[`\"']?([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)",
+        r"\b(?:target\s+)?(?:paths?|files?)\s+under\s+[`\"']?([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)",
+    )
+    return {
+        match.group(1).rstrip("/")
+        for pattern in patterns
+        if (match := re.search(pattern, principle, flags=re.IGNORECASE)) is not None
+    }
 
 
 def _has_cycle(proposal: PlanProposal) -> bool:

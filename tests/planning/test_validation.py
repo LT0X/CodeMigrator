@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from codemigrator.analysis import (
+    ArtifactFact,
     CoverageDerivation,
     CoverageEntry,
     ModuleRole,
@@ -18,6 +19,7 @@ from codemigrator.planning import (
     ArtifactAction,
     ArtifactTask,
     EdgeProvenance,
+    PlanEdgeEvidence,
     PlanEdgeProposal,
     PlanLedger,
     PlanningLimits,
@@ -62,8 +64,17 @@ def edge(
     *,
     kind: PlanEdgeKind = PlanEdgeKind.Requires,
     provenance: EdgeProvenance = EdgeProvenance.Structural,
+    evidence: PlanEdgeEvidence | None = None,
 ) -> PlanEdgeProposal:
-    return PlanEdgeProposal(from_=from_, to=to, kind=kind, provenance=provenance)
+    values: dict[str, object] = {
+        "from_": from_,
+        "to": to,
+        "kind": kind,
+        "provenance": provenance,
+    }
+    if evidence is not None:
+        values["evidence"] = evidence
+    return PlanEdgeProposal(**values)
 
 
 def codes(report: object) -> set[StableErrorCode]:
@@ -215,6 +226,10 @@ def test_unknown_import_cannot_be_submitted_as_requires(planning_inputs: object)
                 "A",
                 "B",
                 provenance=EdgeProvenance.ImportUnknown,
+                evidence=PlanEdgeEvidence(
+                    unknown_reason="DYNAMIC_IMPORT",
+                    evidence_location="analysis.imports[0].evidence",
+                ),
             ),
         ),
     )
@@ -223,6 +238,176 @@ def test_unknown_import_cannot_be_submitted_as_requires(planning_inputs: object)
 
     assert report.accepted is False
     assert StableErrorCode.PLAN_EDGE_INVALID in codes(report)
+
+
+def test_known_artifacts_must_be_assigned_exactly_once(planning_inputs: object) -> None:
+    analysis = planning_inputs.analysis.model_copy(
+        update={
+            "artifacts": [
+                ArtifactFact(
+                    path="schema.pb.go",
+                    artifact_kind=ArtifactKind.GeneratedCode,
+                    source_path="schema.proto",
+                )
+            ]
+        }
+    )
+    inputs = planning_inputs.model_copy(update={"analysis": analysis})
+    plan = proposal(
+        slice_("A", 1, "target/a.py", root="target/a"),
+        slice_("B", 2, "target/b.py", root="target/b"),
+    )
+
+    report = PlanValidator().validate(plan, inputs)
+
+    assert report.accepted is False
+    assert StableErrorCode.PLAN_COVERAGE_INVALID in codes(report)
+
+
+def test_resource_artifact_cannot_target_any_translation_slice_scope(
+    planning_inputs: object,
+) -> None:
+    analysis = planning_inputs.analysis.model_copy(
+        update={
+            "artifacts": [
+                ArtifactFact(path="schema.sql", artifact_kind=ArtifactKind.ResourceFile)
+            ]
+        }
+    )
+    inputs = planning_inputs.model_copy(update={"analysis": analysis})
+    plan = PlanProposal(
+        slices=(
+            PlanSliceProposal(
+                local_ref="CT",
+                kind=SliceKind.Contract,
+                artifact_tasks=(
+                    ArtifactTask(
+                        kind=ArtifactKind.ResourceFile,
+                        action=ArtifactAction.Copy,
+                        source_path="schema.sql",
+                        target_path="target/a.py",
+                    ),
+                ),
+                write_paths=["target/resources/schema.sql"],
+            ),
+            slice_("A", 1, "target/a.py", root="target/a"),
+            slice_("B", 2, "target/b.py", root="target/b"),
+        ),
+        edges=(),
+        integration_ranks={"CT": 0, "A": 1, "B": 2},
+        planner_rationale=(),
+    )
+
+    report = PlanValidator().validate(plan, inputs)
+
+    assert report.accepted is False
+    assert StableErrorCode.PLAN_SCOPE_CONFLICT in codes(report)
+
+
+def test_slice_module_role_and_test_generation_status_are_guarded(
+    planning_inputs: object,
+) -> None:
+    from codemigrator.analysis import ModuleCoverageStatus
+
+    test_module = planning_inputs.analysis.modules[0].model_copy(
+        update={
+            "module_id": module_id(3),
+            "file_paths": ["tests/a.test.ts"],
+            "role": ModuleRole.Test,
+        }
+    )
+    analysis = planning_inputs.analysis.model_copy(
+        update={
+            "modules": [*planning_inputs.analysis.modules, test_module],
+            "coverage_status": [
+                ModuleCoverageStatus(
+                    module=ProjectModuleId(module_id(1)), status="COVERED"
+                )
+            ],
+        }
+    )
+    inputs = planning_inputs.model_copy(update={"analysis": analysis})
+    plan = proposal(
+        slice_("A", 3, "target/a.py", root="target/a"),
+        slice_("B", 2, "target/b.py", root="target/b"),
+        PlanSliceProposal(
+            local_ref="TG-A",
+            kind=SliceKind.TestGeneration,
+            source_modules=[ProjectModuleId(module_id(1))],
+            write_paths=["target/tests/generated/a.py"],
+            create_roots=["target/tests/generated/a"],
+        ),
+    )
+
+    report = PlanValidator().validate(plan, inputs)
+
+    assert report.accepted is False
+    assert StableErrorCode.PLAN_COVERAGE_INVALID in codes(report)
+
+
+def test_test_generation_cannot_edge_to_its_source_implementation(
+    planning_inputs: object,
+) -> None:
+    from codemigrator.analysis import ModuleCoverageStatus
+
+    inputs = planning_inputs.model_copy(
+        update={
+            "analysis": planning_inputs.analysis.model_copy(
+                update={
+                    "coverage_status": [
+                        ModuleCoverageStatus(
+                            module=ProjectModuleId(module_id(1)),
+                            status="EMPTY_TEST_SUITE",
+                        )
+                    ]
+                }
+            )
+        }
+    )
+    slices = (
+        slice_("I", 1, "target/a.py", root="target/a"),
+        slice_("B", 2, "target/b.py", root="target/b"),
+        PlanSliceProposal(
+            local_ref="TG-A",
+            kind=SliceKind.TestGeneration,
+            source_modules=[ProjectModuleId(module_id(1))],
+            write_paths=["target/tests/generated/a.py"],
+            create_roots=["target/tests/generated/a"],
+        ),
+    )
+    plan = PlanProposal(
+        slices=slices,
+        edges=(edge("TG-A", "I", kind=PlanEdgeKind.OrderedBefore),),
+        integration_ranks={"I": 0, "B": 1, "TG-A": 2},
+        planner_rationale=(),
+    )
+
+    report = PlanValidator().validate(plan, inputs)
+
+    assert report.accepted is False
+    assert StableErrorCode.PLAN_EDGE_INVALID in codes(report)
+
+
+def test_layout_only_blueprint_principle_is_checked(planning_inputs: object) -> None:
+    inputs = planning_inputs.model_copy(
+        update={
+            "target_project_blueprint": planning_inputs.target_project_blueprint.model_copy(
+                update={
+                    "module_boundaries": [],
+                    "target_layout_principles": ["target layout prefix: pkg"],
+                }
+            )
+        }
+    )
+    plan = proposal(
+        slice_("A", 1, "target/a.py", root="target/a"),
+        slice_("B", 2, "target/b.py", root="target/b"),
+    )
+
+    report = PlanValidator().validate(plan, inputs)
+
+    assert report.accepted is False
+    assert StableErrorCode.PLAN_BLUEPRINT_VIOLATION in codes(report)
 
 
 def test_resource_artifact_cannot_use_a_translation_slice_write_scope(

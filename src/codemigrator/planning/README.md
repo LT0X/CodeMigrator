@@ -1,9 +1,11 @@
 # Planning
 
-`planning` is the deterministic, side-effect-free owner of migration-plan
-proposals. It validates closed local-reference proposals against the frozen
-Spec, Blueprint, analysis facts, DAG/rank and scale limits; only the accepted
-proposal is converted to UUIDv7-backed core slices and edges in `FrozenPlan`.
+`codemigrator.core` owns the canonical closed migration-plan proposal,
+validation, edge-evidence, and core graph contracts. `planning` is their
+deterministic, side-effect-free execution boundary: it validates proposals
+against the frozen Spec, Blueprint, analysis facts, DAG/rank and scale limits;
+only an accepted proposal is converted to UUIDv7-backed core slices and edges
+in `FrozenPlan`.
 
 The package deliberately does not call a model, schedule work, write a
 repository, or intercept tools. Runtime owns the planner conversation and
@@ -13,7 +15,7 @@ for the runtime correction protocol.
 
 ## 负责
 
-- 提案 schema、机器护栏、冻结、plan hash、派生和只读涟漪预览。
+- core 提案契约的 planning re-export、机器护栏、冻结、plan hash、派生和只读涟漪预览。
 
 ## 不负责
 

@@ -79,6 +79,8 @@ def derive_artifact_tasks(
         ArtifactKind.ResourceFile: ArtifactAction.Copy,
     }
     for fact in sorted(facts, key=lambda item: str(item.path).encode("utf-8")):
+        if fact.artifact_kind is ArtifactKind.GeneratedCode and fact.source_path is None:
+            raise ValueError("GeneratedCode artifacts require source_path")
         source_path = str(fact.source_path or fact.path)
         target_path = paths.get(str(fact.path), f"target/{fact.path}")
         tasks.append(
@@ -87,6 +89,7 @@ def derive_artifact_tasks(
                 action=actions[fact.artifact_kind],
                 source_path=RepoRelativePath(source_path),
                 target_path=RepoRelativePath(target_path),
+                artifact_path=fact.path,
             )
         )
     return tuple(tasks)
@@ -101,8 +104,16 @@ def derive_plan_proposal(inputs: PlanningInputs) -> PlanProposal:
     """
 
     modules = sorted(inputs.analysis.modules, key=lambda item: item.module_id.bytes)
-    source_modules = [module for module in modules if module.role is ModuleRole.Source]
-    test_modules = [module for module in modules if module.role is ModuleRole.Test]
+    source_modules = [
+        module
+        for module in modules
+        if module.role is ModuleRole.Source and _module_is_in_scope(module, inputs)
+    ]
+    test_modules = [
+        module
+        for module in modules
+        if module.role is ModuleRole.Test and _module_is_in_scope(module, inputs)
+    ]
     names = normalize_group_names([str(module.module_id) for module in source_modules])
     slices: list[PlanSliceProposal] = []
 
@@ -169,10 +180,10 @@ def derive_plan_proposal(inputs: PlanningInputs) -> PlanProposal:
         )
 
     return PlanProposal(
-        slices=tuple(slices),
-        edges=(),
+        slices=slices,
+        edges=[],
         integration_ranks={slice_.local_ref: index for index, slice_ in enumerate(slices)},
-        planner_rationale=(_rationale("derived from frozen analysis facts"),),
+        planner_rationale=[_rationale("derived from frozen analysis facts")],
     )
 
 
@@ -233,6 +244,10 @@ def _covered_test_modules(
         for module_id, paths in paths_by_module.items()
         if entry.test_file in paths
     }
+
+
+def _module_is_in_scope(module: ModuleFact, inputs: PlanningInputs) -> bool:
+    return all(inputs.spec.scope.includes(str(path)) for path in module.file_paths)
 
 
 def _target_paths(paths: Sequence[str], *, prefix: str) -> tuple[RepoRelativePath, ...]:
