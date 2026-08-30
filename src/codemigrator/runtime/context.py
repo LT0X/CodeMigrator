@@ -9,12 +9,26 @@ from dataclasses import dataclass
 class ContextSegment:
     kind: str
     content: str
+    required: bool = False
+    evictable: bool = True
+    source_body: bool = False
+    source_ref: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"stable", "evolving", "targeted"}:
             raise ValueError("context segment kind is not supported")
         if not isinstance(self.content, str):
             raise TypeError("context segment content must be text")
+        if type(self.required) is not bool or type(self.evictable) is not bool:
+            raise TypeError("context segment flags must be booleans")
+        if type(self.source_body) is not bool:
+            raise TypeError("source_body must be a boolean")
+        if self.source_ref is not None and (
+            not isinstance(self.source_ref, str) or not self.source_ref.strip()
+        ):
+            raise ValueError("source_ref must be non-empty text")
+        if self.kind in {"stable", "evolving"} and self.evictable:
+            object.__setattr__(self, "evictable", False)
 
 
 @dataclass(frozen=True, slots=True)

@@ -20,6 +20,7 @@ from codemigrator.core import (
 
 from .budget import BudgetUsage
 from .contracts import EventSpec, RunState, RuntimeEvent, RuntimeSnapshot
+from .memory import EvolutionSegment
 from .schema import RUNTIME_SCHEMA_SQL
 
 
@@ -194,6 +195,74 @@ class PostgreSQLRuntimeStore:
         if snapshot is None:
             raise StoreCommitError("committed runtime run disappeared")
         return snapshot
+
+    async def append_evolution_segment(
+        self,
+        *,
+        run_id: object,
+        slice_id: object,
+        summary_text: str,
+        template_sha256: str,
+    ) -> EvolutionSegment:
+        """Append one immutable evolution entry in the runtime transaction boundary."""
+
+        if not summary_text.strip():
+            raise ValueError("evolution summary must be non-empty")
+        if len(template_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in template_sha256
+        ):
+            raise ValueError("template digest must be SHA-256")
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT COALESCE(MAX(entry_index) + 1, 0) AS next_index
+                    FROM context_evolution_segments
+                    WHERE run_id = $1
+                    """,
+                    run_id,
+                )
+                entry_index = int(_row_value(row, "next_index"))
+                try:
+                    await connection.execute(
+                        """
+                        INSERT INTO context_evolution_segments(
+                            run_id, entry_index, slice_id, summary_text, template_sha256
+                        ) VALUES ($1, $2, $3, $4, $5)
+                        """,
+                        run_id,
+                        entry_index,
+                        slice_id,
+                        summary_text,
+                        template_sha256,
+                    )
+                except Exception as exc:
+                    raise StoreCommitError("unable to append context evolution") from exc
+        return EvolutionSegment(run_id, entry_index, slice_id, summary_text, template_sha256)
+
+    async def evolution_segments(self, *, run_id: object) -> tuple[EvolutionSegment, ...]:
+        """Read an ordered immutable evolution projection for one Run."""
+
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT entry_index, slice_id, summary_text, template_sha256
+                FROM context_evolution_segments
+                WHERE run_id = $1
+                ORDER BY entry_index
+                """,
+                run_id,
+            )
+        return tuple(
+            EvolutionSegment(
+                run_id,
+                int(_row_value(row, "entry_index")),
+                _row_value(row, "slice_id"),
+                str(_row_value(row, "summary_text")),
+                str(_row_value(row, "template_sha256")),
+            )
+            for row in rows
+        )
 
 
 async def _insert_events(
