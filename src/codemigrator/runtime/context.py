@@ -13,6 +13,7 @@ class ContextSegment:
     evictable: bool = True
     source_body: bool = False
     source_ref: str | None = None
+    turn_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"stable", "evolving", "targeted"}:
@@ -23,6 +24,10 @@ class ContextSegment:
             raise TypeError("context segment flags must be booleans")
         if type(self.source_body) is not bool:
             raise TypeError("source_body must be a boolean")
+        if self.turn_index is not None and (
+            type(self.turn_index) is not int or self.turn_index < 0
+        ):
+            raise ValueError("turn_index must be a non-negative integer")
         if self.source_ref is not None and (
             not isinstance(self.source_ref, str) or not self.source_ref.strip()
         ):

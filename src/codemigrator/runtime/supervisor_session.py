@@ -25,7 +25,7 @@ from codemigrator.core import (
 
 from .advice import advice_proposal_hash
 from .binding import ContextOverflowError, ensure_context_fits, validate_session_admission
-from .context import prompt_text, render_prompt
+from .context import PromptMessage, prompt_text, render_prompt
 from .contracts import EventSpec
 from .loop import (
     BudgetGate,
@@ -36,6 +36,7 @@ from .loop import (
     UsageSink,
 )
 from .loop_contracts import SessionSpec
+from .memory import ContextBudgetError, ContextManager
 from .provider import (
     AsyncProvider,
     ProviderCallIdentity,
@@ -227,6 +228,9 @@ class SupervisorSession:
         cancellation: CancellationGate | None = None,
         budget: BudgetGate | None = None,
         usage_sink: UsageSink | None = None,
+        context_manager: ContextManager | None = None,
+        context_tool_schema_tokens: int = 0,
+        context_envelope_margin: int = 0,
     ) -> None:
         self.provider = provider
         self.advice_sink = advice_sink
@@ -234,6 +238,11 @@ class SupervisorSession:
         self.cancellation = cancellation
         self.budget = budget
         self.usage_sink = usage_sink
+        if context_tool_schema_tokens < 0 or context_envelope_margin < 0:
+            raise ValueError("context measurement margins must not be negative")
+        self.context_manager = context_manager
+        self.context_tool_schema_tokens = context_tool_schema_tokens
+        self.context_envelope_margin = context_envelope_margin
 
     async def run(
         self,
@@ -249,8 +258,8 @@ class SupervisorSession:
             if self.budget is not None and not await self.budget.admit(spec.identity):
                 return self._fallback("budget_closed")
             messages = render_prompt(spec.template, projection.to_context())
-            ensure_context_fits(prompt_text(messages), spec.binding)
-        except ContextOverflowError:
+            self._ensure_context_fits(messages, spec)
+        except (ContextOverflowError, ContextBudgetError):
             return self._fallback("context_rejected")
         except Exception as exc:
             return self._fallback("invalid_identity", failure=self._failure(exc))
@@ -335,6 +344,24 @@ class SupervisorSession:
                 failure=f"delivery_error: {self._failure(exc)}",
             )
         return SupervisorResult(advice=advice, events=tuple(events))
+
+    def _ensure_context_fits(
+        self, messages: tuple[PromptMessage, ...], spec: SessionSpec
+    ) -> int:
+        if self.context_manager is not None:
+            return self.context_manager.fit_messages(
+                messages,
+                context_window=spec.binding.context_window,
+                reserved_output=spec.binding.output_cap,
+                tool_schema_tokens=self.context_tool_schema_tokens,
+                envelope_margin=self.context_envelope_margin,
+            )
+        if spec.context_pack.identity.template_sha256 != "0" * 64:
+            raise ContextBudgetError(
+                "a frozen M-14 context pack requires the unified ContextManager",
+                code="CONTEXT_CAPABILITY_INVALID",
+            )
+        return ensure_context_fits(prompt_text(messages), spec.binding)
 
     async def _provider_call(
         self,

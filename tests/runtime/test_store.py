@@ -4,6 +4,7 @@ import pytest
 
 from codemigrator.core import SecretRegistry
 from codemigrator.runtime.contracts import EventSpec, RunState
+from codemigrator.runtime.memory import EvolutionSegmentDraft
 from codemigrator.runtime.schema import RUNTIME_SCHEMA_SQL
 from codemigrator.runtime.store import (
     InMemoryRuntimeStore,
@@ -24,6 +25,32 @@ def test_runtime_schema_contains_separate_run_and_append_only_event_tables():
     assert "CREATE TABLE IF NOT EXISTS runtime_runs" in RUNTIME_SCHEMA_SQL
     assert "CREATE TABLE IF NOT EXISTS runtime_events" in RUNTIME_SCHEMA_SQL
     assert "PRIMARY KEY (run_id, sequence)" in RUNTIME_SCHEMA_SQL
+    assert "UNIQUE (run_id, slice_id)" in RUNTIME_SCHEMA_SQL
+    assert "context evolution template is frozen per Run" in RUNTIME_SCHEMA_SQL
+
+
+@pytest.mark.asyncio
+async def test_in_memory_commit_can_atomically_append_evolution_with_events():
+    from .conftest import uid
+
+    store = InMemoryRuntimeStore()
+    run_id = uid()
+    slice_id = uid()
+    await store.create(RunState(run_id=run_id), ())
+    await store.commit(
+        RunState(run_id=run_id, version=1),
+        (EventSpec("slice.integrated", {"slice_id": str(slice_id)}),),
+        evolution=EvolutionSegmentDraft(run_id, slice_id, "verified slice", "a" * 64),
+    )
+    assert len((await store.load(run_id)).events) == 1
+    entries = await store.evolution_segments(run_id=run_id)
+    assert entries[0].slice_id == slice_id
+    with pytest.raises(StoreCommitError, match="already been appended"):
+        await store.commit(
+            RunState(run_id=run_id, version=2),
+            (),
+            evolution=EvolutionSegmentDraft(run_id, slice_id, "duplicate", "a" * 64),
+        )
 
 
 @pytest.mark.asyncio

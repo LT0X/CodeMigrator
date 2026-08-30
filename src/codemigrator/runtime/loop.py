@@ -13,6 +13,7 @@ from codemigrator.core import SessionKind
 from .binding import ContextOverflowError, ensure_context_fits, validate_session_admission
 from .context import PromptMessage, prompt_text, render_prompt
 from .loop_contracts import SessionExit, SessionIdentity, SessionSpec, SessionState
+from .memory import ContextBudgetError, ContextManager
 from .normalizer import NormalizationError, normalize_response
 from .provider import (
     AsyncProvider,
@@ -140,6 +141,9 @@ class AgentLoop:
         budget: BudgetGate | None = None,
         usage_sink: UsageSink | None = None,
         max_self_corrections: int = 3,
+        context_manager: ContextManager | None = None,
+        context_tool_schema_tokens: int = 0,
+        context_envelope_margin: int = 0,
     ) -> None:
         if max_self_corrections < 0:
             raise ValueError("max self corrections must not be negative")
@@ -150,6 +154,11 @@ class AgentLoop:
         self.budget = budget
         self.usage_sink = usage_sink
         self.max_self_corrections = max_self_corrections
+        if context_tool_schema_tokens < 0 or context_envelope_margin < 0:
+            raise ValueError("context measurement margins must not be negative")
+        self.context_manager = context_manager
+        self.context_tool_schema_tokens = context_tool_schema_tokens
+        self.context_envelope_margin = context_envelope_margin
 
     async def run(self, spec: SessionSpec) -> SessionResult:
         """Execute the session in its own task, separate from the caller/actor."""
@@ -163,7 +172,7 @@ class AgentLoop:
         validate_session_admission(spec)
         provenance = SessionProvenance(spec.identity)
         messages = list(render_prompt(spec.template, spec.context))
-        ensure_context_fits(prompt_text(messages), spec.binding)
+        self._ensure_context_fits(messages, spec)
         observations: list[ToolObservation] = []
         assistant_texts: list[str] = []
         usages: list[TokenUsage] = []
@@ -178,8 +187,8 @@ class AgentLoop:
                     observations, assistant_texts, usages, round_index - 1, provenance
                 )
             try:
-                ensure_context_fits(prompt_text(messages), spec.binding)
-            except ContextOverflowError:
+                self._ensure_context_fits(messages, spec)
+            except (ContextOverflowError, ContextBudgetError):
                 return self._failed(
                     observations,
                     assistant_texts,
@@ -389,6 +398,24 @@ class AgentLoop:
             spec.context_pack.budget.max_rounds,
             provenance,
         )
+
+    def _ensure_context_fits(
+        self, messages: list[PromptMessage], spec: SessionSpec
+    ) -> int:
+        if self.context_manager is not None:
+            return self.context_manager.fit_messages(
+                messages,
+                context_window=spec.binding.context_window,
+                reserved_output=spec.binding.output_cap,
+                tool_schema_tokens=self.context_tool_schema_tokens,
+                envelope_margin=self.context_envelope_margin,
+            )
+        if spec.context_pack.identity.template_sha256 != "0" * 64:
+            raise ContextBudgetError(
+                "a frozen M-14 context pack requires the unified ContextManager",
+                code="CONTEXT_CAPABILITY_INVALID",
+            )
+        return ensure_context_fits(prompt_text(messages), spec.binding)
 
     async def _provider_call(
         self,

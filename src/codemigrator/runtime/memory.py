@@ -10,11 +10,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Protocol
+from typing import Any, Protocol, cast
+
+from pydantic import BaseModel
 
 from codemigrator.core import (
     ArtifactRef,
@@ -100,6 +102,8 @@ class DraftingBudgetProfile:
 
 
 BudgetProfile = SessionBudgetProfile | DraftingBudgetProfile
+CasRefValidator = Callable[[str, object], bool]
+EvictionAuditSink = Callable[[tuple["EvictionAudit", ...]], None]
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -170,6 +174,7 @@ class ContextPackCache:
 
     def __init__(self) -> None:
         self._packs: dict[str, ContextPack] = {}
+        self._run_keys: dict[object, set[str]] = {}
 
     @staticmethod
     def key(identity: ContextPackIdentity, *, contract_refs_sha256: str | None = None) -> str:
@@ -180,7 +185,8 @@ class ContextPackCache:
     def get(
         self, identity: ContextPackIdentity, *, contract_refs_sha256: str | None = None
     ) -> ContextPack | None:
-        return self._packs.get(self.key(identity, contract_refs_sha256=contract_refs_sha256))
+        pack = self._packs.get(self.key(identity, contract_refs_sha256=contract_refs_sha256))
+        return pack if pack is not None and pack.identity == identity else None
 
     def put(
         self,
@@ -189,9 +195,17 @@ class ContextPackCache:
         *,
         contract_refs_sha256: str | None = None,
     ) -> None:
+        if pack.identity != identity:
+            raise ValueError("context pack cache identity does not match pack")
         if pack.identity.run_id != identity.run_id:
             raise ValueError("context pack cache cannot cross Run boundaries")
-        self._packs[self.key(identity, contract_refs_sha256=contract_refs_sha256)] = pack
+        cache_key = self.key(identity, contract_refs_sha256=contract_refs_sha256)
+        for old_key in self._run_keys.get(identity.run_id, set()):
+            if old_key != cache_key:
+                self._packs.pop(old_key, None)
+        self._packs[cache_key] = pack
+        self._run_keys.setdefault(identity.run_id, set()).clear()
+        self._run_keys[identity.run_id].add(cache_key)
 
     def __len__(self) -> int:
         return len(self._packs)
@@ -335,7 +349,7 @@ class ContextManager:
 
     @staticmethod
     def segment_from_block(
-        block: ContextDataBlock, *, required: bool = False
+        block: ContextDataBlock, *, required: bool = False, turn_index: int | None = None
     ) -> ContextSegment:
         """Convert one governed tool block into a runtime-targeted segment."""
 
@@ -350,6 +364,7 @@ class ContextManager:
             evictable=not required,
             source_body=source_body,
             source_ref=source_ref,
+            turn_index=turn_index,
         )
 
     def fit_messages(
@@ -436,6 +451,16 @@ class EvolutionSegment:
     template_sha256: str
 
 
+@dataclass(frozen=True, slots=True)
+class EvolutionSegmentDraft:
+    """An evolution entry staged with the state/events transaction."""
+
+    run_id: object
+    slice_id: object
+    summary_text: str
+    template_sha256: str
+
+
 class InMemoryEvolutionSegmentStore:
     """Append-only test adapter mirroring the runtime SQL contract."""
 
@@ -456,6 +481,10 @@ class InMemoryEvolutionSegmentStore:
         if not re.fullmatch(r"[0-9a-f]{64}", template_sha256):
             raise ValueError("template digest must be SHA-256")
         entries = self._entries.setdefault(run_id, [])
+        if entries and entries[0].template_sha256 != template_sha256:
+            raise ValueError("evolution template is frozen per Run")
+        if any(entry.slice_id == slice_id for entry in entries):
+            raise ValueError("evolution append-only slice has already been appended")
         expected = len(entries) if entry_index is None else entry_index
         if type(expected) is not int or expected != len(entries):
             raise ValueError("evolution entries are append-only")
@@ -518,6 +547,26 @@ def _cas_ref(value: str | ArtifactRef | None) -> str | None:
     return result.lower()
 
 
+def _owned_cas_ref(
+    value: str | ArtifactRef | None,
+    *,
+    run_id: object | None,
+    cas_ref_validator: CasRefValidator | None,
+) -> str | None:
+    reference = _cas_ref(value)
+    if reference is None:
+        return None
+    if run_id is None or cas_ref_validator is None:
+        raise ValueError("CAS ownership validation requires the current run identity")
+    try:
+        owned = cas_ref_validator(reference, run_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("CAS ownership validation failed") from exc
+    if owned is not True:
+        raise ValueError("CAS reference is not owned by the current run")
+    return reference
+
+
 def govern_read_file(
     body: str,
     *,
@@ -563,26 +612,33 @@ def govern_shell_output(
     stderr: str,
     exit_code: int,
     artifact_ref: str | ArtifactRef | None = None,
+    run_id: object | None = None,
+    cas_ref_validator: CasRefValidator | None = None,
 ) -> ContextDataBlock:
     if not isinstance(stdout, str) or not isinstance(stderr, str) or type(exit_code) is not int:
         raise ValueError("Shell context facts are invalid")
-    combined = f"[stdout]\n{stdout}\n[stderr]\n{stderr}".strip()
+    combined = f"[exit_code={exit_code}]\n[stdout]\n{stdout}\n[stderr]\n{stderr}".strip()
     total_bytes = len(combined.encode("utf-8"))
     truncated = total_bytes > MAX_CONTEXT_BLOCK_BYTES
-    reference = _cas_ref(artifact_ref)
+    reference = _owned_cas_ref(
+        artifact_ref, run_id=run_id, cas_ref_validator=cas_ref_validator
+    )
     if truncated and reference is None:
         raise ValueError("oversized Shell output requires a CAS artifact reference")
     if truncated:
-        half = MAX_CONTEXT_BLOCK_BYTES // 2
-        text = (
-            "[truncated=true]\n[head]\n"
-            + _byte_prefix(combined, half)
-            + "\n[tail]\n"
-            + combined.encode("utf-8")[-(MAX_CONTEXT_BLOCK_BYTES - half) :].decode(
-                "utf-8", errors="ignore"
-            )
+        prefix = "[truncated=true]\n[head]\n"
+        separator = "\n[tail]\n"
+        payload_limit = MAX_CONTEXT_BLOCK_BYTES - len(
+            (prefix + separator).encode("utf-8")
         )
-        text = _byte_prefix(text, MAX_CONTEXT_BLOCK_BYTES)
+        head_limit = payload_limit // 2
+        tail_limit = payload_limit - head_limit
+        text = (
+            prefix
+            + _byte_prefix(combined, head_limit)
+            + separator
+            + combined.encode("utf-8")[-tail_limit:].decode("utf-8", errors="ignore")
+        )
     else:
         text = combined
     return ContextDataBlock(
@@ -601,16 +657,46 @@ def govern_exec_result(
     step_count: int,
     error_message: str | None = None,
     artifact_ref: str | ArtifactRef | None = None,
+    run_id: object | None = None,
+    cas_ref_validator: CasRefValidator | None = None,
 ) -> ContextDataBlock:
     if not isinstance(summary, str):
         raise ValueError("Exec summary must be text")
+    if error_message is not None and not isinstance(error_message, str):
+        raise ValueError("Exec error message must be text")
     if type(step_count) is not int or step_count < 0:
         raise ValueError("Exec step count is invalid")
+    total_bytes = len(summary.encode("utf-8")) + (
+        len(error_message.encode("utf-8")) if error_message is not None else 0
+    )
+    truncated = total_bytes > MAX_CONTEXT_BLOCK_BYTES
+    reference = _owned_cas_ref(
+        artifact_ref, run_id=run_id, cas_ref_validator=cas_ref_validator
+    )
+    if truncated and reference is None:
+        raise ValueError("oversized Exec summary requires a CAS artifact reference")
     # The full per-receipt result is audit-only. Only this bounded structural
     # receipt summary is allowed into the provider context.
+    summary_limit = MAX_CONTEXT_BLOCK_BYTES - 8192
+    summary_text = summary
+    if len(summary.encode("utf-8")) > summary_limit:
+        truncated = True
+        if reference is None:
+            raise ValueError("oversized Exec summary requires a CAS artifact reference")
+        half = summary_limit // 2
+        summary_text = (
+            "[head]\n"
+            + _byte_prefix(summary, half)
+            + "\n[tail]\n"
+            + summary.encode("utf-8")[-(summary_limit - half) :].decode(
+                "utf-8", errors="ignore"
+            )
+        )
     payload: dict[str, object] = {
         "step_count": step_count,
         "outcome": "FAILED" if error_message else "OK",
+        "summary": summary_text,
+        "truncated": truncated,
     }
     if error_message:
         payload["error"] = _byte_prefix(error_message, 4096)
@@ -618,9 +704,9 @@ def govern_exec_result(
     return ContextDataBlock(
         DataBlockKind.Exec,
         text,
-        len(summary.encode("utf-8")),
-        truncated=False,
-        artifact_ref=_cas_ref(artifact_ref),
+        total_bytes,
+        truncated=truncated,
+        artifact_ref=reference,
     )
 
 
@@ -628,12 +714,16 @@ def govern_complete_log(
     *,
     total_bytes: int,
     artifact_ref: str | ArtifactRef,
+    run_id: object | None = None,
+    cas_ref_validator: CasRefValidator | None = None,
 ) -> ContextDataBlock:
     """Represent a complete log only by its CAS identity and size."""
 
     if type(total_bytes) is not int or total_bytes < 0:
         raise ValueError("complete log byte count is invalid")
-    reference = _cas_ref(artifact_ref)
+    reference = _owned_cas_ref(
+        artifact_ref, run_id=run_id, cas_ref_validator=cas_ref_validator
+    )
     assert reference is not None
     text = json.dumps(
         {"artifact_ref": reference, "bytes": total_bytes},
@@ -700,6 +790,10 @@ def govern_contract_reference(refs: Sequence[str]) -> ContextDataBlock:
 
 
 def _jsonable(value: object) -> object:
+    if isinstance(value, BaseModel):
+        return _jsonable(value.model_dump(mode="json"))
+    if is_dataclass(value):
+        return _jsonable(asdict(cast(Any, value)))
     if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -714,6 +808,7 @@ class EvictionAudit:
     segment_kind: str
     source_ref: str | None
     replacement: str
+    turn_index: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -729,20 +824,33 @@ class EvictionEngine:
         self,
         envelope: ContextEnvelope,
         *,
+        current_turn: int,
         current_tokens: int,
         net_input_cap: int,
         watermark_pct: int,
+        measure: Callable[[ContextEnvelope], int] | None = None,
+        audit_sink: EvictionAuditSink | None = None,
     ) -> EvictionResult:
-        if type(current_tokens) is not int or type(net_input_cap) is not int:
+        if (
+            type(current_turn) is not int
+            or current_turn < 0
+            or type(current_tokens) is not int
+            or type(net_input_cap) is not int
+        ):
             raise TypeError("eviction measurements must be integers")
         if net_input_cap <= 0 or not 1 <= watermark_pct <= 100:
             raise ValueError("eviction measurements are invalid")
-        if current_tokens < net_input_cap * watermark_pct / 100:
+        if current_tokens * 100 < net_input_cap * watermark_pct:
             return EvictionResult(envelope, ())
         targeted: list[ContextSegment] = []
         audit: list[EvictionAudit] = []
         for segment in envelope.targeted:
-            if not segment.evictable or segment.required:
+            if (
+                not segment.evictable
+                or segment.required
+                or segment.turn_index is None
+                or segment.turn_index >= current_turn
+            ):
                 targeted.append(segment)
                 continue
             replacement = json.dumps(
@@ -762,10 +870,20 @@ class EvictionEngine:
                     required=False,
                     evictable=False,
                     source_ref=segment.source_ref,
+                    turn_index=segment.turn_index,
                 )
             )
-            audit.append(EvictionAudit("targeted", segment.source_ref, replacement))
-        return EvictionResult(
+            audit.append(
+                EvictionAudit("targeted", segment.source_ref, replacement, segment.turn_index)
+            )
+        if not audit:
+            return EvictionResult(envelope, ())
+        if measure is None or audit_sink is None:
+            raise ContextBudgetError(
+                "eviction requires exact remeasurement and durable audit",
+                code="CONTEXT_CAPABILITY_INVALID",
+            )
+        result = EvictionResult(
             ContextEnvelope(
                 stable=envelope.stable,
                 evolving=envelope.evolving,
@@ -773,6 +891,15 @@ class EvictionEngine:
             ),
             tuple(audit),
         )
+        measured = measure(result.envelope)
+        if type(measured) is not int or measured < 0:
+            raise ContextBudgetError(
+                "eviction remeasurement is invalid", code="CONTEXT_CAPABILITY_INVALID"
+            )
+        if measured > net_input_cap:
+            raise ContextBudgetError("context remains above the locked net-input cap")
+        audit_sink(result.audit)
+        return result
 
 
 class RecoveryBriefBuilder:
@@ -828,6 +955,7 @@ class RecoveryBriefBuilder:
         cls,
         *,
         slice_ref: SliceGenerationRef,
+        run_id: object,
         events: Sequence[Mapping[str, object]],
         discarded_turns: int,
         completed_items: Sequence[str] = (),
@@ -835,12 +963,22 @@ class RecoveryBriefBuilder:
     ) -> RecoveryBrief:
         """Derive a brief from typed audit facts without replaying dialogue."""
 
+        if run_id is None:
+            raise ValueError("recovery event projection requires a Run identity")
         checkpoint: tuple[str, int, int] | None = None
         feedback: list[tuple[CheckAction, int, str]] = []
         for event in events:
             event_type = event.get("event_type", event.get("type"))
             raw_data = event.get("data", event)
             if not isinstance(event_type, str) or not isinstance(raw_data, Mapping):
+                continue
+            scope = {**event, **raw_data}
+            generation = scope.get("generation")
+            if (
+                str(scope.get("run_id")) != str(run_id)
+                or str(scope.get("slice_id")) != str(slice_ref.slice_id)
+                or (generation is not None and generation != slice_ref.generation)
+            ):
                 continue
             if event_type in {"checkpoint.committed", "checkpoint.completed"}:
                 candidate = raw_data.get("candidate_commit_oid")
@@ -890,13 +1028,19 @@ class RegenerationHistory:
         *,
         max_inline_bytes: int | None = None,
         checkpoint_diff_artifact_ref: str | ArtifactRef | None = None,
+        run_id: object | None = None,
+        cas_ref_validator: CasRefValidator | None = None,
     ) -> tuple[ContextSegment, ContextSegment]:
         diagnostic = self.diagnostic_summary
         diff = self.checkpoint_diff_summary
         if max_inline_bytes is not None and max_inline_bytes < 1:
             raise ValueError("max_inline_bytes must be positive")
         if max_inline_bytes is not None and len(diff.encode("utf-8")) > max_inline_bytes:
-            reference = _cas_ref(checkpoint_diff_artifact_ref)
+            reference = _owned_cas_ref(
+                checkpoint_diff_artifact_ref,
+                run_id=run_id,
+                cas_ref_validator=cas_ref_validator,
+            )
             if reference is None:
                 raise ValueError("oversized checkpoint diff requires a CAS artifact")
             diff = json.dumps({"artifact_ref": reference}, sort_keys=True, separators=(",", ":"))
@@ -927,6 +1071,8 @@ def repair_navigation_segments(
     brief: object,
     max_index_bytes: int = MAX_CONTEXT_BLOCK_BYTES,
     index_artifact_ref: str | ArtifactRef | None = None,
+    run_id: object | None = None,
+    cas_ref_validator: CasRefValidator | None = None,
 ) -> tuple[ContextSegment, ContextSegment]:
     """Render required repair facts plus an on-demand navigation index."""
 
@@ -934,8 +1080,8 @@ def repair_navigation_segments(
     scope_index = getattr(brief, "scope_index", None)
     if failure_facts is None or scope_index is None:
         raise TypeError("repair brief must expose failure_facts and scope_index")
-    if type(max_index_bytes) is not int or max_index_bytes < 1:
-        raise ValueError("max_index_bytes must be positive")
+    if type(max_index_bytes) is not int or not 1 <= max_index_bytes <= MAX_CONTEXT_BLOCK_BYTES:
+        raise ValueError("max_index_bytes must be within the context block limit")
     required = json.dumps(
         {
             "failure_facts": {
@@ -944,7 +1090,10 @@ def repair_navigation_segments(
                     getattr(failure_facts, "diagnostic_summary")
                 ),
                 "cas_refs": list(getattr(failure_facts, "cas_refs")),
-            }
+            },
+            "attribution": _jsonable(getattr(brief, "attribution")),
+            "repair_history": _jsonable(getattr(brief, "repair_history")),
+            "constraints": _jsonable(getattr(brief, "constraints")),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -962,7 +1111,9 @@ def repair_navigation_segments(
         separators=(",", ":"),
     )
     if len(index.encode("utf-8")) > max_index_bytes:
-        reference = _cas_ref(index_artifact_ref)
+        reference = _owned_cas_ref(
+            index_artifact_ref, run_id=run_id, cas_ref_validator=cas_ref_validator
+        )
         if reference is None:
             raise ValueError("oversized repair navigation index requires a CAS artifact")
         index = json.dumps({"artifact_ref": reference}, sort_keys=True, separators=(",", ":"))
@@ -996,6 +1147,7 @@ __all__ = [
     "EvictionEngine",
     "EvictionResult",
     "EvolutionSegment",
+    "EvolutionSegmentDraft",
     "FormulaNetInputCap",
     "InMemoryEvolutionSegmentStore",
     "NetInputCap",

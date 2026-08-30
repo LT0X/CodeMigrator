@@ -227,20 +227,28 @@ def test_data_block_governors_keep_boundaries_and_externalize_full_logs() -> Non
         stderr="",
         exit_code=1,
         artifact_ref="cas://" + "a" * 64,
+        run_id=RUN_ID,
+        cas_ref_validator=lambda reference, run_id: run_id == RUN_ID,
     )
     assert shell.truncated is True
     assert "head" in shell.text and "tail" in shell.text
+    assert "exit_code=1" in shell.text
+    assert "\ntail\n[stderr]" in shell.text
     assert shell.artifact_ref == "cas://" + "a" * 64
-    exec_block = govern_exec_result("full receipts must stay in audit", step_count=2)
+    exec_block = govern_exec_result("aggregate summary", step_count=2)
     assert exec_block.kind is DataBlockKind.Exec
-    assert "full receipts" not in exec_block.text
+    assert "aggregate summary" in exec_block.text
     assert json.loads(exec_block.text)["step_count"] == 2
     with pytest.raises(ValueError, match="artifact"):
         govern_shell_output(stdout="x" * (300 * 1024), stderr="", exit_code=1)
+    with pytest.raises(ValueError, match="artifact"):
+        govern_exec_result("x" * (300 * 1024), step_count=2)
     assert len(govern_ast_matches(range(250)).facts) == 200
     complete = govern_complete_log(
         total_bytes=1024,
         artifact_ref=ArtifactRef(sha256=Sha256("b" * 64), size=1024, media_type="text/plain"),
+        run_id=RUN_ID,
+        cas_ref_validator=lambda reference, run_id: run_id == RUN_ID,
     )
     assert complete.text == '{"artifact_ref":"cas://' + "b" * 64 + '","bytes":1024}'
 
@@ -250,22 +258,31 @@ def test_eviction_only_replaces_old_targeted_results() -> None:
         stable=(ContextSegment("stable", "system", required=True),),
         evolving=(ContextSegment("evolving", "verified", required=True),),
         targeted=(
-            ContextSegment("targeted", "old tool output", source_ref="src/a.py:1"),
+            ContextSegment("targeted", "old tool output", source_ref="src/a.py:1", turn_index=1),
             ContextSegment("targeted", "keep me", required=True),
+            ContextSegment("targeted", "current output", source_ref="src/b.py:2", turn_index=2),
         ),
     )
+    audit_records = []
     result = EvictionEngine().evict(
         envelope,
-        current_tokens=90,
-        net_input_cap=100,
+        current_turn=2,
+        current_tokens=180,
+        net_input_cap=200,
         watermark_pct=80,
+        measure=lambda candidate: sum(
+            len(segment.content) for segment in candidate.targeted
+        ),
+        audit_sink=audit_records.append,
     )
     assert result.envelope.stable == envelope.stable
     assert result.envelope.evolving == envelope.evolving
     assert "old tool output" not in result.envelope.targeted[0].content
     assert "src/a.py:1" in result.envelope.targeted[0].content
     assert result.envelope.targeted[1] == envelope.targeted[1]
+    assert result.envelope.targeted[2] == envelope.targeted[2]
     assert result.audit[0].segment_kind == "targeted"
+    assert audit_records == [result.audit]
 
 
 def test_recovery_brief_is_structured_and_distinguishes_continuation() -> None:
@@ -289,10 +306,23 @@ def test_recovery_brief_is_structured_and_distinguishes_continuation() -> None:
         events=(
             {
                 "event_type": "checkpoint.completed",
+                "run_id": RUN_ID,
+                "slice_id": uuid4(),
+                "generation": 0,
+                "data": {"candidate_commit_oid": "z" * 40, "file_count": 99, "total_bytes": 99},
+            },
+            {
+                "event_type": "checkpoint.completed",
+                "run_id": RUN_ID,
+                "slice_id": SLICE_ID,
+                "generation": 0,
                 "data": {"candidate_commit_oid": "c" * 40, "file_count": 3, "total_bytes": 20},
             },
             {
                 "event_type": "check.feedback",
+                "run_id": RUN_ID,
+                "slice_id": SLICE_ID,
+                "generation": 0,
                 "data": {
                     "action": "TEST",
                     "exit_code": 1,
@@ -300,11 +330,24 @@ def test_recovery_brief_is_structured_and_distinguishes_continuation() -> None:
                 },
             },
         ),
+        run_id=RUN_ID,
         discarded_turns=4,
     )
     assert rebuilt.latest_checkpoint is not None
     assert rebuilt.latest_checkpoint.candidate_commit_oid == "c" * 40
     assert rebuilt.discarded_turns == 4
+
+
+def test_cas_references_require_current_run_ownership() -> None:
+    with pytest.raises(ValueError, match="ownership"):
+        govern_complete_log(total_bytes=1, artifact_ref="cas://" + "a" * 64)
+    with pytest.raises(ValueError, match="owned"):
+        govern_complete_log(
+            total_bytes=1,
+            artifact_ref="cas://" + "a" * 64,
+            run_id=RUN_ID,
+            cas_ref_validator=lambda reference, run_id: False,
+        )
 
 
 def test_regeneration_history_has_exactly_two_fact_segments() -> None:
@@ -349,10 +392,14 @@ def test_repair_navigation_keeps_required_facts_and_externalizes_only_index() ->
         brief=brief,
         max_index_bytes=1,
         index_artifact_ref="cas://" + "c" * 64,
+        run_id=RUN_ID,
+        cas_ref_validator=lambda reference, run_id: run_id == RUN_ID,
     )
     assert required.required is True
     assert "test://suite/case" in required.content
     assert "cas://" + "a" * 64 in required.content
+    assert "decision-1" in required.content
+    assert "src/a.py" in required.content
     assert index.content == '{"artifact_ref":"cas://' + "c" * 64 + '"}'
     assert index.evictable is True
     with pytest.raises(ValueError, match="max_index_bytes"):
