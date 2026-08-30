@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 from codemigrator.analysis import SourcePosition, SourceRange
 from codemigrator.core import MigrationSpec, RepoRelativePath, SpecScope, UnderstandingDossier
 from codemigrator.core.paths import _validate_repo_relative_path, normalize_repo_relative_paths
+from codemigrator.core.spec import SpecArtifact
 
 from .draft_models import (
     CoverageResult,
@@ -133,7 +134,7 @@ def validate_exact_coverage(
 
 def check_dossier_consistency(
     dossier: UnderstandingDossier,
-    spec_or_scope: MigrationSpec | SpecScope,
+    spec_or_scope: MigrationSpec | SpecArtifact | SpecScope,
     f1_files: Sequence[str],
     unresolved_conflict_count: int,
 ) -> DossierConsistencyResult:
@@ -141,7 +142,12 @@ def check_dossier_consistency(
 
     if type(unresolved_conflict_count) is not int or unresolved_conflict_count < 0:
         raise ValueError("unresolved_conflict_count must be a non-negative integer")
-    scope = spec_or_scope.scope if isinstance(spec_or_scope, MigrationSpec) else spec_or_scope
+    if isinstance(spec_or_scope, SpecArtifact):
+        scope = spec_or_scope.spec.scope
+    elif isinstance(spec_or_scope, MigrationSpec):
+        scope = spec_or_scope.scope
+    else:
+        scope = spec_or_scope
     f1 = set(normalize_repo_relative_paths(f1_files))
     reasons: list[str] = []
     sections = (

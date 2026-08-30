@@ -526,6 +526,16 @@ flowchart TD
 
 > 每次完成任务或计划变更后在本标题下方置顶追加 CHG 条目（模板见 §8.4）；最新记录在最上方。
 
+### CHG-20260830-14：CM-DRAFT-001 唯一审查反馈一次性修复
+
+* 时间：2026-08-30
+* 变更类型：审查反馈修复/交付收口
+* 变更原因：PR #6 的唯一审查在完整等待后返回 `REQUEST_CHANGES`；反馈指出起草阶段门控、Harness 骨架复核、M-05 canonical Spec 边界、工件不可变性、Exec 只读请求、Code profile、重复覆盖和 PR 说明约束缺口。
+* 变更内容：在原 `feature/draft-orchestration` 分支一次性补齐报告归并模型与阶段门、`build_domain_skeleton` 复核、M-05 `SpecArtifact` 输入和 canonical hash 校验、深拷贝隔离、封闭 `DraftExecRequest`/校验入口、core Code profile、覆盖重复保留和 PR 说明清理；同步详细设计、迭代记录和 PR 说明；未启动第二次审查。
+* 影响范围：CM-DRAFT-001 runtime 起草契约和确定性测试；不改变架构模块设计、core 公共模型、数据库、API 或 sandbox。
+* 验证：起草专项 `25 passed`；全量 `196 passed`；Ruff、mypy、import-linter（3 kept/0 broken）、compileall、`git diff --check` 通过；未进行真实模型调用。
+* 后续行动：提交并推送本次修复，直接合并 PR #6；合并后在主工作区拉取 `develop`，不追加本 PR 审查轮次。
+
 ### CHG-20260830-13：CM-DRAFT-001 实现与验证完成，进入唯一审查
 
 * 时间：2026-08-30

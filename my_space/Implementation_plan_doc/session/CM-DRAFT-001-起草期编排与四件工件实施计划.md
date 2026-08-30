@@ -25,8 +25,8 @@
 1. - [x] 建立 runtime 起草契约模型：FocusBrief、ExploreReassignment、探索锚点/报告、域骨架与阶段状态（`src/codemigrator/runtime/draft_models.py` → D-02/D-03）。
 2. - [x] 编写确定性域骨架和恰好一次覆盖校验（`src/codemigrator/runtime/draft_validation.py`、`tests/draft/test_validation.py` → D-02）。
 3. - [x] 编写档案锚点/语义模块/冲突的最小机械一致性核对纯函数（`src/codemigrator/runtime/draft_validation.py`、`tests/draft/test_dossier_consistency.py` → D-01）。
-4. - [x] 建立四件工件摘要与 TaskDraftRevision 双轨账本；让工件变更发新 revision，问答仅追加 ledger，确认冻结当前 revision 与问答指针（`src/codemigrator/runtime/draft.py`、`tests/draft/test_ledger.py` → D-06/V-M16-V4-014）。
-5. - [x] 实现起草阶段顺序和只读工具授权断言，接入探索报告归并/切域建议记录及试译校准（`src/codemigrator/runtime/draft.py`、`tests/draft/test_flow.py` → V-M16-V4-012/D-03/D-04）。
+4. - [x] 建立已通过 M-05 的 `SpecArtifact`、四件工件摘要与 TaskDraftRevision 双轨账本；让工件变更发新 revision，问答仅追加 ledger，确认冻结当前 revision、FrozenArtifactBundle 与问答指针（`src/codemigrator/runtime/draft.py`、`tests/draft/test_ledger.py` → D-06/V-M16-V4-014）。
+5. - [x] 实现 Harness 域骨架复核、归并/AskUser 阶段顺序和只读 Exec 请求授权，接入探索报告归并/切域建议记录及 Code profile 试译校准（`src/codemigrator/runtime/draft.py`、`tests/draft/test_flow.py` → V-M16-V4-012/D-03/D-04）。
 6. - [x] 用零副作用计数替身验证未确认草稿不创建 Run、事件、Slice、candidate 或托管输出，并验证确认只返回冻结事实（`tests/draft/test_side_effects.py` → V-M16-V4-013/V-M16-V4-014）。
 7. - [x] 同步迭代记录、主任务表和任务设计文档，执行 runtime/draft 专项、全量 pytest、Ruff、mypy、import-linter、compileall、diff check（`my_space/`、`tests/` → §4）。
 8. - [ ] 从当前分支提交并推送，创建 PR；仅启动一次审查并等待子 agent 终态，按该次结论一次性修复后直接合并，不对同一 PR 发起第二次审查。

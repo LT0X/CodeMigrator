@@ -29,19 +29,19 @@
 
 ### 3.1 结构与职责
 
-- `runtime/draft_models.py`：封闭的 FocusBrief、ExploreReassignment、探索锚点/报告、域骨架、阶段和试译结果模型；路径字段统一复用 core 的安全路径规则。
+- `runtime/draft_models.py`：封闭的 FocusBrief、ExploreReassignment、探索锚点/报告/归并结果、域骨架、TaskDraftRevision、AskUser、只读 Exec 请求和试译结果模型；路径字段统一复用 core 的安全路径规则。
 - `runtime/draft_validation.py`：纯函数 `build_domain_skeleton`、`validate_exact_coverage`、`check_dossier_consistency`。输入是有限路径/报告/现有 core 工件，输出只有校验事实，不创建 Run 或写外部存储。
-- `runtime/draft.py`：`DraftLedger` 负责 TaskDraftRevision 与 Question/Answer append-only 账本；`DraftFlow` 负责阶段顺序、只读工具授权、报告/Advice 记录、试译和确认门。
-- TaskDraftRevision 的工件字段直接引用 core 四件模型；runtime 仅计算 JCS SHA-256 摘要、revision id 和问答指针，不建立第二套公共工件类型。
+- `runtime/draft.py`：`DraftLedger` 负责 TaskDraftRevision 与 Question/Answer append-only 账本；`DraftFlow` 负责机器域骨架校验、阶段顺序、只读工具请求校验、报告归并/Advice 记录、试译和确认门。
+- TaskDraftRevision 的工件字段直接引用 core 的 `SpecArtifact` 与三件工件模型；runtime 仅复用已通过 M-05 的 canonical bytes 计算 SHA-256、revision id 和问答指针，不建立第二套公共工件类型。
 
 ### 3.2 关键机制
 
-1. **确定性切域**：按 UTF-8 字节序处理 module boundary 和文件；单域不超过 20 个文件保持一个域，超过 20 个文件按第二级目录分组；生成域总数超过配置扇出上限（默认 6）则拒绝派发；骨架扁平文件集合与输入集合必须恰好一致。
+1. **确定性切域**：按 UTF-8 字节序处理 module boundary 和文件；单域不超过 20 个文件保持一个域，超过 20 个文件按第二级目录分组；生成域总数超过配置扇出上限（默认 6）则拒绝派发；Flow 完成探索时再次通过 `build_domain_skeleton` 验证报告域归属、扇出和骨架，扁平文件集合与输入集合必须恰好一致。
 2. **探索与切域 Advice**：FocusBrief 只含域路径、风险热点/大文件/import 重量标注和正整数预算提示；ExploreReassignment 只含 `merge|split|refocus`、涉及域、理由和更新后的 brief。协调者记录 Advice，零直接写入权。
 3. **档案一致性**：纯函数逐条解析 `file + start_line + end_line` 锚点；非 advisory 条目不得空锚点；语义模块锚点文件必须同时属于 Spec scope 与 F1 文件集合；未解决冲突数必须为零。失败结果携带 `DOSSIER_INCONSISTENT` 语义，CreateRun 的拒绝与副作用边界留给 CM-RUNTIME。
-4. **双轨账本**：四件工件内容的摘要 tuple 改变才创建新的 revision；问答以 Question/Answer 追加记录，不改变 revision。回答必须绑定当前 revision；相同 question/revision 的相同回答幂等，冲突回答和过期 revision 拒绝。
+4. **双轨账本**：输入必须是 M-05 已接受的 `SpecArtifact`，并核验其 canonical bytes/hash 一致；四件工件内容的摘要 tuple 改变才创建新的 revision；问答以 Question/Answer 追加记录，不改变 revision。回答必须绑定当前 revision；相同 question/revision 的相同回答幂等，冲突回答和过期 revision 拒绝。revision 对外返回工件深拷贝，防止调用方修改已摘要内容。
 5. **确认冻结**：确认门只接受当前 revision，且所有绑定问题均有回答；冻结回执保存 revision、四件工件摘要、`FrozenArtifactBundle` 引用和问答 ID。引用的摘要来自现有 JCS canonical JSON，媒体类型保持为 JSON；工件持久化由后续存储层负责。未确认阶段没有 Run、run event、Slice、candidate 或托管输出写入端口。
-6. **试译校准**：从风险热点中确定性选择 2–3 个代表文件，接收约束版与自由版 Code profile 字符串并排返回；结果不含路径写入能力，不落盘、不建 candidate、不触碰 Run，校准结论由上层转化为下一次工件 revision。
+6. **试译校准**：从风险热点中确定性选择 2–3 个代表文件，接收约束版与自由版并标记 core `ModelProfile.Code`，会话内并排返回；结果不含路径写入能力，不落盘、不建 candidate、不触碰 Run，校准结论由上层转化为下一次工件 revision。
 
 ### 3.3 数据与接口
 
@@ -49,10 +49,12 @@
 - `validate_exact_coverage(skeleton, expected_files) -> CoverageResult`
 - `check_dossier_consistency(dossier, spec_scope, f1_files, unresolved_conflict_count) -> DossierConsistencyResult`
 - `DraftLedger.create_revision(artifacts) -> TaskDraftRevision`
+- `DraftFlow.seed_artifacts(artifacts) -> TaskDraftRevision`、`finalize_alignment() -> None`
 - `DraftLedger.revise(revision_id, artifacts) -> TaskDraftRevision`；内容摘要不变时返回原 revision
 - `DraftLedger.append_question(question) -> AskUserQuestion`
 - `DraftLedger.answer_question(answer) -> AskUserAnswer`；同答案幂等，过期/冲突拒绝
 - `DraftLedger.freeze(revision_id) -> DraftFreezeReceipt`（含 core `FrozenArtifactBundle` 引用）
+- `DraftFlow.validate_exec(request: DraftExecRequest) -> DraftExecRequest`（仅 ReadFile/QuerySourceAst/AskUser 的闭合参数）
 - `DraftFlow.trial_translate(paths, constrained, freeform) -> tuple[TrialTranslation, ...]`
 
 本任务不增加 PostgreSQL 表、REST/SSE DTO 或外部端口；后续 CM-API、CM-RUNTIME 使用这些内存契约接入各自存储/副作用边界。
