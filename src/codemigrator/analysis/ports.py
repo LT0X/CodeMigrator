@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -69,6 +69,12 @@ class ProjectionStore(Protocol):
 
     def read(self, key: ProjectionKey) -> AnalysisArtifact | None: ...
 
+    def rebuild(
+        self,
+        key: ProjectionKey,
+        builder: Callable[[], AnalysisArtifact],
+    ) -> AnalysisArtifact: ...
+
     def cleanup(self, *, now: datetime | None = None) -> list[ProjectionKey]: ...
 
 
@@ -96,6 +102,22 @@ class InMemoryProjectionStore:
     def read(self, key: ProjectionKey) -> AnalysisArtifact | None:
         record = self._records.get(key)
         return None if record is None else record[0]
+
+    def rebuild(
+        self,
+        key: ProjectionKey,
+        builder: Callable[[], AnalysisArtifact],
+    ) -> AnalysisArtifact:
+        """Build off to the side, then publish with the existing atomic write path."""
+
+        artifact = builder()
+        if artifact.key != key:
+            raise AnalysisFailure(
+                StableErrorCode.ANALYSIS_INFRA_ERROR,
+                "projection rebuild key does not match the requested frozen key",
+            )
+        self.write(artifact)
+        return artifact
 
     def seed(self, key: ProjectionKey, created_at: datetime) -> None:
         result = AnalysisResult(

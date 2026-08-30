@@ -30,15 +30,16 @@
 4. - [x] 实现 F2 import 四分派与 Static/Unknown 证据、F3 测试识别/覆盖/守恒基线、F4 manifest 摘要/描述符 artifact_rules 分类。
 5. - [x] 实现 PSF-1 grammar parser/cache 熔断、PSF-2 符号索引/引用归属、PSF-3 复合图与 text-fallback 降级。
 6. - [x] 实现 QuerySourceAst 八操作 closed-schema、上限/超时/路径安全/索引查询与 ProjectionStore/grammar 端口；不实现 runtime 物理 I/O。
-7. - [x] 实现双怀疑派审计记录结构与三轮规则状态机，补齐重建/留存/零写入契约测试及 click-video fixture 适配接口。
-8. - [x] 更新详细设计、迭代记录、主任务表、PR 说明，完成全量质量门并复核分支只含本任务及必要进度同步。
+7. - [x] 实现双怀疑派审计记录结构与终态三轮规则状态机，补齐重建/留存/零写入契约测试及 click-video fixture 金标准回归。
+8. - [x] 根据唯一一次审查反馈在原分支完成一次性修复：AST 节点提取、实际引用/调用边、查询契约边界、投影重建端口、analysis canonical 与审计终态。
+9. - [x] 更新详细设计、迭代记录、主任务表、PR 说明，完成全量质量门并复核分支只含本任务及必要进度同步。
 
 ## 4. 验证计划
 
 | 验证项 | 命令 | 通过标准 | 关联条款 |
 | --- | --- | --- | --- |
-| 分析契约测试 | `uv run --frozen pytest tests/analysis tests/contracts -q` | 25 passed（含路径、熔断、PSF-3、降级和端口回归） | V-M06-V4-001～019 |
-| 全量规则测试 | `uv run --frozen pytest -q` | 待最终门禁后回填 | M-00/M-06 |
+| 分析契约测试 | `uv run --frozen pytest tests/analysis tests/contracts -q` | 44 passed（含 AST、实际引用/调用边、路径、熔断、PSF-3、降级、重建和 fixture 回归） | V-M06-V4-001～019 |
+| 全量规则测试 | `uv run --frozen pytest -q` | 151 passed | M-00/M-06 |
 | import-linter | `uv run --frozen lint-imports` | 3 contracts kept，0 broken；层级顺序为 runtime→…→core | M-01 |
 | 静态质量 | `uv run --frozen ruff check .`、`uv run --frozen mypy src` | 零错误 | 工程质量门 |
 | 编译与差异 | `uv run --frozen python -m compileall -q src tests`、`git diff --check` | 零错误、无空白问题 | AGENTS.md §4 |
@@ -56,4 +57,4 @@
 - [x] 主任务表已同步开工与上游合并事实
 - [x] 详细设计文档已保存于 `my_space/codemigrator_design_doc/detailed_coding_design/analysis/`
 - [x] 本实施计划已保存于 `my_space/Implementation_plan_doc/analysis/`
-- [x] 若设计与对齐结果有差异：当前不新增架构模块设计偏差
+- [x] 若设计与对齐结果有差异：以对齐记录为准，analysis canonical 明确独立于 Spec JCS；架构模块设计无新增偏差

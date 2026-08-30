@@ -14,38 +14,39 @@
 
 - `SourceRange`：文件路径、起止行列；所有导航命中必须有 file:range。
 - F1：`ModuleFact`、`ExportSummary`，记录模块 id、文件路径、Source/Test 角色、Manifest/Directory/File 边界、导出摘要、Full/TextFallback 能力与 degraded 文件。
-- F2：`ImportEdge`，记录 from 模块、Module/External 目标、Static/Unknown 可信度、Unknown 原因和证据范围；动态/反射/无法解析不猜目标。
+- F2：`ImportEdge`，记录 from 模块、Module/External 目标、Static/Unknown 可信度、Unknown 原因、证据范围和（目标符号、本地别名）绑定；动态/反射/无法解析不猜目标。
 - F3：`CoverageEntry`、`ModuleCoverageStatus`、`TestConservationBaseline`，测试识别遵循描述符声明；ImportGraph 优先、DirectoryConvention 降级、Uncovered 保留；Covered/EmptyTestSuite/Undetermined 三态不混淆。
 - F4：`ManifestSummary`、`ArtifactFact`，manifest 依赖/脚本/入口为摘要；工件分类完全由描述符 `artifact_rules` 模式驱动，不写语言分支。
+- PSF-2 调用索引：`CallEdge` 保存调用点与被调用定义点的符号级范围，caller/callee 查询不得退化为模块级 import 命中。
 
 ## 2. 分析管线与确定性
 
 1. 输入只读 `SnapshotSource`，枚举路径并拒绝候选/verified；单文件超过 64 MiB 标记跳过并记录 `SOURCE_FILE_TOO_LARGE`，不阻断全仓。
-2. `GrammarRegistry` 按 snapshot OID、文件路径和 grammar SHA 使用有界 LRU 缓存解析器；`ParserCircuitBreaker` 对每 grammar 连续两次崩溃熔断并返回 `ANALYSIS_INFRA_ERROR`，其他 grammar 不受影响。含 ERROR/MISSING 的树仍尽力提取并记入 degraded_files。
+2. grammar 适配器按 snapshot OID、文件路径和 grammar SHA 使用有界 LRU 缓存不可变语法树；`ParserCircuitBreaker` 对每 grammar 连续两次崩溃熔断并返回 `ANALYSIS_INFRA_ERROR`，其他 grammar 不受影响。F1 导出摘要与降级标记从保留的语法节点派生；含 ERROR/MISSING 的树仍尽力提取并记入 degraded_files。无 runtime grammar 注入时仅使用 descriptor-backed 测试/fixture 适配树，生产组合根仍应注入 tree-sitter 树。
 3. F1/F2/F4 确定性提取后派生 F3、PSF-2、PSF-3；不使用模型，不做 AST 改写、pretty-printer 或 AST 落盘序列化。
 4. text-fallback 只按描述符提供的正则/目录模板产出路径级 F1/F2/F3/F4，能力显式为 TextFallback，不生成 PSF-2，符号查询返回 `TEXT_FALLBACK_UNSUPPORTED`。
-5. `AnalysisResult` 包含 snapshot OID、descriptor/grammar 摘要、事实和 canonical bytes；所有集合按稳定键排序，重建同键逐字节相等。ID、路径、工件类型和稳定错误码均引用 `codemigrator.core` 的唯一公共契约，不在 analysis 复制定义。
+5. `AnalysisResult` 包含 snapshot OID、descriptor/grammar 摘要、事实和 canonical bytes；analysis 自有 canonical 函数固定键序、数值格式和数组序，不复用 Spec 的 RFC 8785 JCS。重建同键逐字节相等。ID、路径、工件类型和稳定错误码均引用 `codemigrator.core` 的唯一公共契约，不在 analysis 复制定义。
 
 ## 3. PSF 三层
 
 - PSF-1 是进程内不可变解析树缓存，键为 snapshot OID + 文件路径 + grammar 摘要，采用有界 LRU，不写入投影。
-- PSF-2 是 F1+F2 派生的 SymbolBinding/ReferenceSite 双向索引。唯一绑定归属；同名多绑定标记 ambiguous；别名按 import 目标归属；通配导入和成员表达式不产出符号级条目，宁缺勿误；import 规则显式携带导入符号以避免整模块误挂。
+- PSF-2 是 F1+F2 派生的 SymbolBinding/ReferenceSite 双向索引，并保留 `CallEdge` 调用点索引。唯一绑定归属；同名多绑定标记 ambiguous；别名按 import 目标归属；通配导入和成员表达式不产出符号级条目，宁缺勿误；import 规则显式携带导入符号以避免整模块误挂。ReferenceSite 的范围是实际标识符使用点，排除 import 语句证据范围。
 - PSF-3 是 import/coverage/containment 三类模块级复合图；包含边以 `file_path → to_module` 表达，覆盖边方向为测试模块到被测源模块；Unknown 边保留证据，不自动成为 Requires。
 
 ## 4. QuerySourceAst
 
-采用 discriminator=`kind` 的八变体 closed-schema：FindSymbol、GotoDefinition、FindReferences、FindCallers、FindCallees、FindImpact、SearchContext、ExtractSubtree。请求 extra-forbid，拒绝自由 query/写字段；仅查源快照与 PSF 端口。路径越界抛出带 `PATH_OUTSIDE_SNAPSHOT` 的边界错误，单次 60 秒超时抛出 `QUERY_TIMEOUT`，命中超过 200 或文本超过 256 KiB 返回截断标记；text-fallback 的符号级操作返回 `TEXT_FALLBACK_UNSUPPORTED`。
+采用 discriminator=`kind` 的八变体 closed-schema：FindSymbol、GotoDefinition、FindReferences、FindCallers、FindCallees、FindImpact、SearchContext、ExtractSubtree。请求 extra-forbid，拒绝自由 query/写字段；仅查源快照与 PSF 端口。模块过滤使用 `ProjectModuleId` 精确匹配，caller/callee 只查 `CallEdge`。路径越界抛出带 `PATH_OUTSIDE_SNAPSHOT` 的边界错误，单次 60 秒超时抛出 `QUERY_TIMEOUT`，构造服务时拒绝超过 200/256 KiB/60 秒的上限；命中超过 200 或文本超过 256 KiB 返回 `truncated=true` 与 `TRUNCATED`，text-fallback 的符号级操作返回 `TEXT_FALLBACK_UNSUPPORTED`。
 
 ## 5. 端口与物理边界
 
-- `ProjectionStore`：write/read/rebuild/cleanup 端口；runtime 实现 SQLite+FTS5，每投影独立文件，写失败重试一次且整体原子，不读半成品，7 天后清理。
+- `ProjectionStore`：write/read/rebuild/cleanup 端口；runtime 实现 SQLite+FTS5，每投影独立文件，写失败重试一次且整体原子，不读半成品，7 天后清理。`QuerySourceAst` 通过 read 端口装载键为 snapshot OID+descriptor 摘要的 PSF 投影。
 - `SnapshotSource`：只读路径/字节端口；分析层不取得写句柄。
 - `GrammarProvider`：按 grammar id/SHA 获取解析器或 text-fallback 能力；analysis 不扫描宿主资源。
 - 端口只描述事实和生命周期，不在本任务实现 SQLite、PG、文件扫描 registry 或工具注册。
 
 ## 6. 对抗审计框架
 
-只交付确定性的 `AuditSample`、`AuditDiff`、`AuditRound`、`AuditRecord` 结构和最多三轮状态机：随机样本与对抗样本不相交；双向 diff；规则修订而非修样本；三轮失败/同类复发升级用户。评审会话及上下文隔离归 CM-DRAFT。
+只交付确定性的 `AuditSample`、`AuditDiff`、`AuditRound`、`AuditRecord` 结构和最多三轮状态机：随机样本与对抗样本不相交；双向 diff；规则修订而非修样本；一轮干净后进入 `CLEAN` 终态，三轮失败进入 `ESCALATE` 终态，终态不再接受后续轮次。评审会话及上下文隔离归 CM-DRAFT。
 
 ## 7. 验收映射
 
@@ -55,8 +56,8 @@
 | V-M06-V4-003/004/009/015/016/018 | F2/F3/PSF-2 确定性提取、Unknown/ambiguous、降级和守恒模型 |
 | V-M06-V4-005/006/007/008/014 | QuerySourceAst closed-schema、路径/超时/上限/text-fallback 服务 |
 | V-M06-V4-011/017 | 静态边界扫描、artifact_rules 驱动且无语言分支 |
-| V-M06-V4-019 | click-video fixture 接口与机械候选集/锚点审计结构；具体 fixture 随资源落盘 |
+| V-M06-V4-019 | `test_fixtures/clickvideo-analysis/` 的 snapshot/golden 回归：候选模块与 Static import 边逐项核对，Static 误报集为空 |
 
 ## 8. 偏差与交接
 
-本任务不修改 M-06 架构模块设计。物理 SQLite/FTS5 由对齐 D-01 锁定但实现归 runtime；analysis 只提供端口。M-07/M-10 消费 Unknown/ambiguous/EmptyTestSuite 时必须保留降级事实。
+本任务不修改 M-06 架构模块设计。物理 SQLite/FTS5 由对齐 D-01 锁定但实现归 runtime；analysis 只提供端口。审查反馈已在本分支一次性收口：解析结果实际进入 AST 驱动提取，PSF-2 使用实际引用/调用范围，查询上限和 `TRUNCATED`、投影重建、canonical 分离、审计终态与 click-video fixture 均已补齐。M-07/M-10 消费 Unknown/ambiguous/EmptyTestSuite 时必须保留降级事实。

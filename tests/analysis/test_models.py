@@ -7,6 +7,7 @@ from codemigrator.analysis import (
     AnalysisCapability,
     AnalysisResult,
     ArtifactFact,
+    CallEdge,
     EdgeConfidence,
     ExportSummary,
     ImportEdge,
@@ -20,6 +21,7 @@ from codemigrator.analysis import (
     SymbolKind,
     UnknownReason,
 )
+from codemigrator.analysis.canonical import canonical_bytes as analysis_canonical_bytes
 from codemigrator.core import ArtifactKind, ProjectModuleId, RepoRelativePath
 
 
@@ -103,3 +105,18 @@ def test_empty_analysis_result_has_stable_canonical_bytes() -> None:
 
     assert result.canonical_bytes == result.canonical_bytes
     assert len(result.canonical_sha256) == 64
+
+
+def test_call_edge_keeps_symbol_level_caller_and_callee_ranges() -> None:
+    caller = source_range("src/main.py")
+    callee = source_range("src/util.py")
+
+    edge = CallEdge(symbol="helper", caller=caller, callee=callee)
+
+    assert edge.symbol == "helper"
+    assert edge.caller.file_path == "src/main.py"
+    assert edge.callee.file_path == "src/util.py"
+
+
+def test_analysis_canonicalization_owns_projection_array_order() -> None:
+    assert analysis_canonical_bytes({"items": [2, 1]}) == b'{"items":[1,2]}'

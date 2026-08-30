@@ -1,0 +1,16 @@
+{
+  "fixture": "click-video",
+  "candidate_modules": [
+    "cmd/server",
+    "internal/clickvideo"
+  ],
+  "static_import_edges": [
+    ["cmd/server", "internal/clickvideo"],
+    ["internal/clickvideo#test", "internal/clickvideo"]
+  ],
+  "expected_source_files": [
+    "cmd/server/main.go",
+    "internal/clickvideo/service.go"
+  ],
+  "static_false_positive_edges": []
+}

@@ -19,7 +19,7 @@ from .models import (
     SourcePosition,
     SourceRange,
 )
-from .ports import SnapshotSource
+from .ports import ProjectionKey, ProjectionStore, SnapshotSource
 
 
 class _QueryModel(CoreModel):
@@ -29,7 +29,7 @@ class _QueryModel(CoreModel):
 class FindSymbol(_QueryModel):
     kind: Literal["FIND_SYMBOL"]
     symbol: str = Field(min_length=1)
-    module: str | None = None
+    module: ProjectModuleId | None = None
 
 
 class GotoDefinition(_QueryModel):
@@ -61,7 +61,7 @@ class FindImpact(_QueryModel):
 class SearchContext(_QueryModel):
     kind: Literal["SEARCH_CONTEXT"]
     query: str = Field(min_length=1)
-    module: str | None = None
+    module: ProjectModuleId | None = None
 
 
 class ExtractSubtree(_QueryModel):
@@ -97,6 +97,10 @@ class QueryResult(_QueryModel):
 class QuerySourceAst:
     """Pure read service; all durable facts come from the supplied projection."""
 
+    MAX_HITS = 200
+    MAX_TEXT_BYTES = 256 * 1024
+    MAX_TIMEOUT_SECONDS = 60.0
+
     def __init__(
         self,
         *,
@@ -105,15 +109,31 @@ class QuerySourceAst:
         max_hits: int = 200,
         max_text_bytes: int = 256 * 1024,
         timeout_seconds: float = 60.0,
+        projection_store: ProjectionStore | None = None,
+        projection_key: ProjectionKey | None = None,
     ) -> None:
         if max_hits < 1 or max_text_bytes < 1 or timeout_seconds <= 0:
             raise ValueError("query limits and timeout must be positive")
+        if max_hits > self.MAX_HITS:
+            raise ValueError(f"max_hits cannot exceed {self.MAX_HITS}")
+        if max_text_bytes > self.MAX_TEXT_BYTES:
+            raise ValueError(f"max_text_bytes cannot exceed {self.MAX_TEXT_BYTES}")
+        if timeout_seconds > self.MAX_TIMEOUT_SECONDS:
+            raise ValueError(f"timeout_seconds cannot exceed {self.MAX_TIMEOUT_SECONDS}")
         self.result = result
         self.snapshot = snapshot
         self.max_hits = max_hits
         self.max_text_bytes = max_text_bytes
         self.timeout_seconds = timeout_seconds
         self._deadline = 0.0
+        if projection_store is not None:
+            key = projection_key or ProjectionKey(
+                snapshot_oid=result.snapshot_oid,
+                descriptor_sha256=result.descriptor_sha256,
+            )
+            artifact = projection_store.read(key)
+            if artifact is not None:
+                self.result = artifact.result
 
     def query(self, request: SourceAstQuery) -> QueryResult:
         self._deadline = time.monotonic() + self.timeout_seconds
@@ -134,6 +154,7 @@ class QuerySourceAst:
                 self._hit(binding.definition, binding.kind.value, binding.signature_text)
                 for binding in self.result.symbol_bindings
                 if binding.symbol == request.symbol
+                and (request.module is None or binding.module == request.module)
             ]
             return self._limit(hits)
         if isinstance(request, FindReferences):
@@ -211,7 +232,11 @@ class QuerySourceAst:
                 break
             bounded.append(hit)
             text_bytes += len(encoded)
-        return QueryResult(hits=bounded, truncated=truncated)
+        return QueryResult(
+            hits=bounded,
+            truncated=truncated,
+            error=StableErrorCode.TRUNCATED if truncated else None,
+        )
 
     def _search(self, request: SearchContext) -> QueryResult:
         hits: list[QueryHit] = []
@@ -219,7 +244,7 @@ class QuerySourceAst:
             self._check_timeout()
             if path == ".git" or path.startswith(".git/"):
                 continue
-            if request.module is not None and request.module not in path:
+            if request.module is not None and self._module_for_path(path) != request.module:
                 continue
             try:
                 text = self.snapshot.read(path).decode("utf-8")
@@ -264,26 +289,58 @@ class QuerySourceAst:
                 )
         return None
 
-    def _call_graph_hits(self, symbol: str, request: FindCallers | FindCallees) -> list[QueryHit]:
-        modules: dict[str, ProjectModuleId] = {
-            binding.symbol: module.module_id
-            for module in self.result.modules
-            for binding in module.exported_symbols
-        }
-        target = modules.get(symbol)
-        if target is None:
-            return []
+    def _module_for_path(self, path: str) -> ProjectModuleId | None:
+        return next(
+            (
+                module.module_id
+                for module in self.result.modules
+                if path in {str(item) for item in module.file_paths}
+            ),
+            None,
+        )
+
+    def _range_selector(self, value: str) -> SourceRange | None:
+        path, separator, column_text = value.rpartition(":")
+        if not separator:
+            return None
+        path, separator, line_text = path.rpartition(":")
+        if not separator or not line_text.isdigit() or not column_text.isdigit():
+            return None
+        self._ensure_snapshot_path(path)
+        line = int(line_text)
+        column = int(column_text)
+        return SourceRange(
+            file_path=RepoRelativePath(path),
+            start=SourcePosition(line=line, column=column),
+            end=SourcePosition(line=line, column=column),
+        )
+
+    @staticmethod
+    def _same_position(left: SourceRange, right: SourceRange) -> bool:
+        return (
+            left.file_path == right.file_path
+            and left.start.line == right.start.line
+            and left.start.column == right.start.column
+        )
+
+    def _call_graph_hits(
+        self,
+        selector: str,
+        request: FindCallers | FindCallees,
+    ) -> list[QueryHit]:
+        selected_range = self._range_selector(selector)
         hits: list[QueryHit] = []
-        for edge in self.result.imports:
-            if not isinstance(edge.to, ModuleTarget):
+        for edge in self.result.call_edges:
+            if selected_range is None:
+                matches = edge.symbol == selector
+            elif isinstance(request, FindCallers):
+                matches = self._same_position(edge.callee, selected_range)
+            else:
+                matches = self._same_position(edge.caller, selected_range)
+            if not matches:
                 continue
-            selected = edge.from_module if isinstance(request, FindCallers) else edge.to.module_id
-            if (isinstance(request, FindCallers) and edge.to.module_id == target) or (
-                isinstance(request, FindCallees) and edge.from_module == target
-            ):
-                location = self._module_range(selected)
-                if location is not None:
-                    hits.append(self._hit(location, None, None))
+            location = edge.caller if isinstance(request, FindCallers) else edge.callee
+            hits.append(self._hit(location, None, None))
         return hits
 
     def _impact_hits(self, value: str, direction: str) -> list[QueryHit]:

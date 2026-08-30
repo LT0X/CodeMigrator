@@ -17,11 +17,12 @@ from codemigrator.core import (
     StableErrorCode,
 )
 
-from .grammar import GrammarCircuitBreaker, GrammarFailure
+from .grammar import GrammarCache, GrammarCircuitBreaker, GrammarFailure, SyntaxNode
 from .models import (
     AnalysisError,
     AnalysisResult,
     ArtifactFact,
+    CallEdge,
     CoverageDerivation,
     CoverageEntry,
     DependencyEntry,
@@ -107,6 +108,211 @@ def _source_range(path: str, text: str, start: int, end: int) -> SourceRange:
 
 def _rule_matches(text: str, rule: TextRule | ImportRule) -> list[re.Match[str]]:
     return list(re.finditer(rule.pattern, text, re.MULTILINE))
+
+
+def _byte_offset(text: str, character_offset: int) -> int:
+    return len(text[:character_offset].encode("utf-8"))
+
+
+def _character_offset(text: str, byte_offset: int) -> int:
+    return len(text.encode("utf-8")[:byte_offset].decode("utf-8", errors="ignore"))
+
+
+def _range_from_bytes(path: str, text: str, start_byte: int, end_byte: int) -> SourceRange:
+    return _source_range(
+        path,
+        text,
+        _character_offset(text, start_byte),
+        _character_offset(text, end_byte),
+    )
+
+
+def _tree_sitter_name(node: object, content: bytes) -> str | None:
+    child_by_field_name = getattr(node, "child_by_field_name", None)
+    if not callable(child_by_field_name):
+        return None
+    name_node = child_by_field_name("name")
+    if name_node is None:
+        return None
+    start = getattr(name_node, "start_byte", None)
+    end = getattr(name_node, "end_byte", None)
+    if not isinstance(start, int) or not isinstance(end, int):
+        return None
+    return content[start:end].decode("utf-8", errors="ignore") or None
+
+
+def _syntax_nodes(tree: object, content: bytes) -> tuple[SyntaxNode, ...]:
+    """Adapt the local immutable node shape or a tree-sitter tree to one view."""
+
+    root = getattr(tree, "root_node", tree)
+    if isinstance(root, SyntaxNode):
+        nodes: list[SyntaxNode] = []
+
+        def visit(local: SyntaxNode) -> None:
+            nodes.append(local)
+            for child in local.children:
+                visit(child)
+
+        visit(root)
+        return tuple(nodes)
+
+    nodes = []
+
+    def visit_external(node: object) -> None:
+        kind = getattr(node, "type", None)
+        start = getattr(node, "start_byte", None)
+        end = getattr(node, "end_byte", None)
+        if not isinstance(kind, str) or not isinstance(start, int) or not isinstance(end, int):
+            return
+        nodes.append(
+            SyntaxNode(
+                kind=kind,
+                start_byte=start,
+                end_byte=end,
+                name=_tree_sitter_name(node, content),
+            )
+        )
+        children = getattr(node, "children", ())
+        for child in children:
+            visit_external(child)
+
+    visit_external(root)
+    return tuple(nodes)
+
+
+def _default_syntax_tree(content: bytes, descriptor: SourceAnalysisDescriptor) -> SyntaxNode:
+    """Provide a deterministic descriptor-backed tree when no runtime grammar is injected.
+
+    Runtime integrations pass a tree-sitter tree.  This small adapter keeps the
+    pure analysis API useful for descriptors and fixtures that do not ship a
+    grammar binary; facts still flow through syntax nodes rather than discarding
+    a parser result.
+    """
+
+    text = content.decode("utf-8", errors="replace")
+    children: list[SyntaxNode] = []
+    for rule in descriptor.export_rules:
+        for match in _rule_matches(text, rule):
+            try:
+                name = match.group("symbol")
+            except IndexError:
+                continue
+            children.append(
+                SyntaxNode(
+                    kind=rule.kind.lower(),
+                    name=name,
+                    start_byte=_byte_offset(text, match.start()),
+                    end_byte=_byte_offset(text, match.end()),
+                )
+            )
+    for marker in re.finditer(r"\b(?:ERROR|MISSING)\b", text):
+        children.append(
+            SyntaxNode(
+                kind=marker.group(0),
+                start_byte=_byte_offset(text, marker.start()),
+                end_byte=_byte_offset(text, marker.end()),
+            )
+        )
+    return SyntaxNode(
+        kind="module",
+        start_byte=0,
+        end_byte=len(content),
+        children=tuple(children),
+    )
+
+
+def _node_kind_matches(node_kind: str, rule_kind: str) -> bool:
+    node_kind = node_kind.lower()
+    rule_kind = rule_kind.lower()
+    aliases = {
+        "function": {
+            "function",
+            "function_definition",
+            "function_declaration",
+            "method_definition",
+        },
+        "class": {"class", "class_definition", "class_declaration"},
+        "type": {"type", "type_alias", "type_definition"},
+        "interface": {"interface", "interface_declaration"},
+        "constant": {"constant", "const_declaration", "variable_declaration"},
+    }
+    return node_kind in aliases.get(rule_kind, {rule_kind})
+
+
+def _ast_export_matches(
+    path: str,
+    text: str,
+    tree: object | None,
+    descriptor: SourceAnalysisDescriptor,
+) -> list[tuple[str, TextRule, SourceRange]]:
+    if tree is None:
+        return []
+    content = text.encode("utf-8")
+    nodes = sorted(
+        _syntax_nodes(tree, content),
+        key=lambda node: (node.start_byte, node.end_byte, node.kind),
+    )
+    matches: list[tuple[str, TextRule, SourceRange]] = []
+    for rule in descriptor.export_rules:
+        for node in nodes:
+            if node.name is None or not _node_kind_matches(node.kind, rule.kind):
+                continue
+            matches.append(
+                (node.name, rule, _range_from_bytes(path, text, node.start_byte, node.end_byte))
+            )
+    return matches
+
+
+def _tree_is_degraded(tree: object | None, content: bytes) -> bool:
+    if tree is None:
+        return False
+    return any(
+        node.kind.upper() == "ERROR" or node.kind.upper().startswith("MISSING")
+        for node in _syntax_nodes(tree, content)
+    )
+
+
+def _range_offsets(text: str, source_range: SourceRange) -> tuple[int, int]:
+    lines = text.splitlines(keepends=True)
+
+    def offset(position: SourcePosition) -> int:
+        prefix = "".join(lines[: position.line - 1])
+        return len(prefix) + position.column
+
+    return offset(source_range.start), offset(source_range.end)
+
+
+def _identifier_ranges(
+    path: str,
+    text: str,
+    tree: object | None,
+    symbol: str,
+) -> list[tuple[int, SourceRange]]:
+    if tree is not None:
+        identifier_nodes = [
+            node
+            for node in _syntax_nodes(tree, text.encode("utf-8"))
+            if node.name == symbol
+            and node.kind.lower()
+            in {"identifier", "field_identifier", "property_identifier", "type_identifier"}
+        ]
+        if identifier_nodes:
+            return [
+                (
+                    _character_offset(text, node.start_byte),
+                    _range_from_bytes(path, text, node.start_byte, node.end_byte),
+                )
+                for node in identifier_nodes
+            ]
+    return [
+        (match.start(), _source_range(path, text, match.start(), match.end()))
+        for match in re.finditer(rf"(?<!\w){re.escape(symbol)}(?!\w)", text)
+    ]
+
+
+def _is_call_site(text: str, source_range: SourceRange) -> bool:
+    _, end = _range_offsets(text, source_range)
+    return text[end:].lstrip().startswith("(")
 
 
 def _symbol_kind(value: str) -> SymbolKind:
@@ -234,6 +440,8 @@ def analyze_snapshot(
     skipped_files: list[str] = []
     errors: list[AnalysisError] = []
     grammar_breaker = GrammarCircuitBreaker()
+    grammar_cache = GrammarCache[object](max_entries=256)
+    syntax_trees: dict[str, object] = {}
     for path in snapshot.paths:
         try:
             content = snapshot.read(path)
@@ -258,12 +466,19 @@ def analyze_snapshot(
         except UnicodeDecodeError:
             texts[path] = content.decode("utf-8", errors="replace")
             errors.append(_error(StableErrorCode.ANALYSIS_INFRA_ERROR, "source is not UTF-8", path))
-        if parser is not None and descriptor.is_source_file(path):
+        if not descriptor.text_fallback and descriptor.is_source_file(path):
             try:
-                parser_fn: Callable[[bytes], object] = parser
-                grammar_breaker.run(
-                    descriptor.grammar_id or "generic",
-                    lambda: parser_fn(content),
+                parser_fn: Callable[[bytes], object] = parser or (
+                    lambda payload: _default_syntax_tree(payload, descriptor)
+                )
+                syntax_trees[path] = grammar_cache.get_or_load(
+                    snapshot.snapshot_oid,
+                    path,
+                    descriptor.grammar_sha256 or "",
+                    lambda: grammar_breaker.run(
+                        descriptor.grammar_id or "generic",
+                        lambda: parser_fn(content),
+                    ),
                 )
             except GrammarFailure as exc:
                 errors.append(_error(exc.code, str(exc), path))
@@ -316,22 +531,17 @@ def analyze_snapshot(
     if not descriptor.text_fallback:
         for path in sorted(source_paths):
             module_id = path_to_module[path]
-            for export_rule in descriptor.export_rules:
-                for match in _rule_matches(texts[path], export_rule):
-                    try:
-                        symbol = match.group("symbol")
-                    except IndexError as exc:
-                        errors.append(_error(StableErrorCode.ANALYSIS_INFRA_ERROR, str(exc), path))
-                        continue
-                    export = ExportSummary(
-                        symbol=symbol,
-                        kind=_symbol_kind(export_rule.kind),
-                        signature_text=texts[path][match.start() : match.end()][:4096],
-                    )
-                    exports_by_module[module_id].append(export)
-                    export_ranges[(module_id, symbol)].append(
-                        _source_range(path, texts[path], match.start(), match.end())
-                    )
+            for symbol, export_rule, definition in _ast_export_matches(
+                path, texts[path], syntax_trees.get(path), descriptor
+            ):
+                definition_start, definition_end = _range_offsets(texts[path], definition)
+                export = ExportSummary(
+                    symbol=symbol,
+                    kind=_symbol_kind(export_rule.kind),
+                    signature_text=texts[path][definition_start:definition_end][:4096],
+                )
+                exports_by_module[module_id].append(export)
+                export_ranges[(module_id, symbol)].append(definition)
 
     imports: list[ImportEdge] = []
     for path in sorted(source_paths | test_paths):
@@ -366,13 +576,31 @@ def analyze_snapshot(
                     reason = UnknownReason.UnresolvedPath
                 confidence = import_rule.confidence
                 imported_symbols: tuple[str, ...] = ()
+                local_symbols: tuple[tuple[str, str], ...] = ()
                 if import_rule.symbol_group is not None:
                     try:
                         imported_symbol = match.group(import_rule.symbol_group)
                     except IndexError as exc:
                         errors.append(_error(StableErrorCode.ANALYSIS_INFRA_ERROR, str(exc), path))
                         continue
-                    imported_symbols = () if imported_symbol in {None, "*"} else (imported_symbol,)
+                    if imported_symbol not in {None, "*"}:
+                        local_symbol = imported_symbol
+                        local_group = import_rule.local_symbol_group
+                        if local_group is None:
+                            groups = match.groupdict()
+                            local_symbol = (
+                                groups.get("alias") or groups.get("local") or local_symbol
+                            )
+                        else:
+                            try:
+                                local_symbol = match.group(local_group)
+                            except IndexError as exc:
+                                errors.append(
+                                    _error(StableErrorCode.ANALYSIS_INFRA_ERROR, str(exc), path)
+                                )
+                                continue
+                        imported_symbols = (imported_symbol,)
+                        local_symbols = ((imported_symbol, local_symbol),)
                 if _enum_value(confidence) == EdgeConfidence.Static.value and target is None:
                     confidence = EdgeConfidence.Unknown
                     reason = reason or UnknownReason.UnresolvedPath
@@ -384,6 +612,7 @@ def analyze_snapshot(
                         reason=reason,
                         evidence=evidence,
                         imported_symbols=imported_symbols,
+                        local_symbols=local_symbols,
                     )
                 )
 
@@ -391,7 +620,11 @@ def analyze_snapshot(
     boundary = _module_boundary(descriptor.module_boundary_strategy)
     for module_id in sorted(module_files, key=str):
         paths = sorted(module_files[module_id])
-        degraded = [path for path in paths if "ERROR" in texts[path] or "MISSING" in texts[path]]
+        degraded = [
+            path
+            for path in paths
+            if _tree_is_degraded(syntax_trees.get(path), files[path])
+        ]
         modules.append(
             ModuleFact(
                 module_id=module_id,
@@ -534,6 +767,7 @@ def analyze_snapshot(
                 definition=definition,
                 signature_text=export.signature_text,
                 ambiguous=ambiguous,
+                module=module_id,
             )
             for definition in ranges
         )
@@ -547,18 +781,40 @@ def analyze_snapshot(
         if not isinstance(edge.to, ModuleTarget):
             continue
         target_exports = {export.symbol for export in exports_by_module[edge.to.module_id]}
-        for symbol in edge.imported_symbols:
+        symbols = edge.local_symbols or tuple((symbol, symbol) for symbol in edge.imported_symbols)
+        source_path = str(edge.evidence.file_path)
+        source_text = texts.get(source_path)
+        if source_text is None:
+            continue
+        for symbol, local_symbol in symbols:
             if symbol not in target_exports:
                 continue
             definitions = definitions_by_symbol[symbol]
-            reference_sites.append(
-                ReferenceSite(
-                    symbol=symbol,
-                    site=edge.evidence,
-                    binding=definitions[0] if len(definitions) == 1 else None,
-                    ambiguous=len(definitions) != 1,
+            for start, site in _identifier_ranges(
+                source_path, source_text, syntax_trees.get(source_path), local_symbol
+            ):
+                evidence_start, evidence_end = _range_offsets(source_text, edge.evidence)
+                if evidence_start <= start < evidence_end:
+                    continue
+                reference_sites.append(
+                    ReferenceSite(
+                        symbol=symbol,
+                        site=site,
+                        binding=definitions[0] if len(definitions) == 1 else None,
+                        ambiguous=len(definitions) != 1,
+                    )
                 )
-            )
+
+    call_edges = [
+        CallEdge(symbol=reference.symbol, caller=reference.site, callee=reference.binding)
+        for reference in reference_sites
+        if reference.binding is not None
+        and not reference.ambiguous
+        and _is_call_site(
+            texts[str(reference.site.file_path)],
+            reference.site,
+        )
+    ]
 
     symbol_coverage = [
         SymbolCoverageEdge(
@@ -634,6 +890,15 @@ def analyze_snapshot(
             ),
         ),
         symbol_coverage=symbol_coverage,
+        call_edges=sorted(
+            call_edges,
+            key=lambda edge: (
+                edge.symbol,
+                str(edge.caller.file_path),
+                edge.caller.start.line,
+                edge.caller.start.column,
+            ),
+        ),
         relation_edges=sorted(
             relation_edges, key=lambda edge: (edge.kind, str(edge.from_module), str(edge.to_module))
         ),

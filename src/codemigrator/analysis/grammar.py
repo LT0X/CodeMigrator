@@ -14,6 +14,23 @@ from .errors import GrammarFailure
 T = TypeVar("T")
 
 
+@dataclass(frozen=True, slots=True)
+class SyntaxNode:
+    """Small immutable adapter shape shared by grammar implementations and tests."""
+
+    kind: str
+    start_byte: int
+    end_byte: int
+    name: str | None = None
+    children: tuple[SyntaxNode, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.kind:
+            raise ValueError("syntax node kind must be non-empty")
+        if self.start_byte < 0 or self.end_byte < self.start_byte:
+            raise ValueError("syntax node byte range is invalid")
+
+
 @dataclass(frozen=True)
 class GrammarHandle:
     grammar_id: str
@@ -93,4 +110,5 @@ __all__ = [
     "GrammarCircuitBreaker",
     "GrammarFailure",
     "GrammarHandle",
+    "SyntaxNode",
 ]

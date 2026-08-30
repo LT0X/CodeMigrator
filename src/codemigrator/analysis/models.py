@@ -10,7 +10,9 @@ from pydantic import ConfigDict, Field, StrictInt, field_validator, model_valida
 
 from codemigrator.core import ArtifactKind, ProjectModuleId, RepoRelativePath, StableErrorCode
 from codemigrator.core._base import CoreModel
-from codemigrator.core.paths import _validate_repo_relative_path, canonical_json_bytes
+from codemigrator.core.paths import _validate_repo_relative_path
+
+from .canonical import canonical_bytes
 
 
 class _FrozenModel(CoreModel):
@@ -122,6 +124,7 @@ class ImportEdge(_FrozenModel):
     reason: UnknownReason | None = None
     evidence: SourceRange
     imported_symbols: tuple[str, ...] = ()
+    local_symbols: tuple[tuple[str, str], ...] = ()
 
     @model_validator(mode="after")
     def confidence_matches_resolution(self) -> ImportEdge:
@@ -190,12 +193,20 @@ class SymbolBinding(_FrozenModel):
     definition: SourceRange
     signature_text: str = Field(max_length=4096)
     ambiguous: bool = False
+    module: ProjectModuleId | None = None
 
 
 class ReferenceSite(_FrozenModel):
     symbol: str = Field(min_length=1)
     site: SourceRange
     binding: SourceRange | None = None
+    ambiguous: bool = False
+
+
+class CallEdge(_FrozenModel):
+    symbol: str = Field(min_length=1)
+    caller: SourceRange
+    callee: SourceRange
     ambiguous: bool = False
 
 
@@ -252,13 +263,14 @@ class AnalysisResult(_FrozenModel):
     symbol_bindings: list[SymbolBinding]
     reference_sites: list[ReferenceSite]
     symbol_coverage: list[SymbolCoverageEdge]
+    call_edges: list[CallEdge] = Field(default_factory=list)
     relation_edges: list[RelationEdge] = Field(default_factory=list)
     skipped_files: list[RepoRelativePath] = Field(default_factory=list)
     errors: list[AnalysisError] = Field(default_factory=list)
 
     @property
     def canonical_bytes(self) -> bytes:
-        return canonical_json_bytes(self.model_dump(mode="json"))
+        return canonical_bytes(self.model_dump(mode="json"))
 
     @property
     def canonical_sha256(self) -> str:
@@ -270,6 +282,7 @@ __all__ = [
     "AnalysisError",
     "AnalysisResult",
     "ArtifactFact",
+    "CallEdge",
     "ArtifactKind",
     "CoverageDerivation",
     "CoverageEntry",
