@@ -14,4 +14,4 @@
 
 ## 公共入口
 
-由后续 CM-WORKSPACE-001 定义工作区与六工具端口。
+CM-WORKSPACE-001 提供 `WorkspaceManager`、`ToolGateway`、`CheckpointService`、安全根路径原语、六工具端口、动作协议和 GeneratedCode scaffold 端口；真实 bwrap、Git、PSF、QuickJS 与数据库适配由对应 owner 注入。
