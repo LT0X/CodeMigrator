@@ -38,6 +38,13 @@ def test_repair_retry_budget_is_independent_and_capped_at_three():
         budget.record("repair-a")
 
 
+def test_cancelled_run_cannot_enqueue_or_start_integration():
+    coordinator = IntegrationCoordinator()
+    coordinator.cancel_run("run-1")
+    assert coordinator.enqueue(item("slice-a")) is False
+    assert coordinator.start_next("run-1", "verified-0") is None
+
+
 def test_supervisor_has_exactly_two_event_conditions():
     from codemigrator.runtime.supervisor import SupervisorAdviceKind, supervisor_triggers
 

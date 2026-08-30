@@ -5,9 +5,23 @@ import pytest
 from codemigrator.runtime.app import (
     AppLifecycle,
     AppState,
+    AsyncAppLifecycle,
     InMemoryAdvisoryLock,
     PostgreSQLUnavailable,
+    run_from_environment,
 )
+
+
+class AsyncLock:
+    def __init__(self):
+        self.acquired = False
+
+    async def try_acquire(self):
+        self.acquired = True
+        return True
+
+    async def release(self):
+        self.acquired = False
 
 
 @pytest.mark.asyncio
@@ -42,3 +56,23 @@ async def test_postgres_unavailable_is_not_ready():
     assert app.state is AppState.Exited
     assert app.ready is False
     assert app.last_error == PostgreSQLUnavailable.__name__
+
+
+@pytest.mark.asyncio
+async def test_async_composition_root_recovers_before_readiness():
+    order: list[str] = []
+
+    async def recover():
+        order.append("recovery")
+
+    lock = AsyncLock()
+    app = AsyncAppLifecycle(lock, recovery=recover)
+    await app.start()
+    assert app.ready is True
+    assert order == ["recovery"]
+    await app.stop()
+
+
+def test_entrypoint_requires_environment_dsn(monkeypatch):
+    monkeypatch.delenv("CODEMIGRATOR_DATABASE_URL", raising=False)
+    assert run_from_environment() == 1

@@ -45,7 +45,8 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_json_safe(item) for item in value]
+        items = [_json_safe(item) for item in value]
+        return sorted(items, key=lambda item: canonical_json_bytes(item))
     return value
 
 

@@ -1,18 +1,38 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from codemigrator.core import FailureReason, RunStatus
-from codemigrator.runtime.actor import RunActor
+from codemigrator.core import (
+    Advice,
+    AdviceKind,
+    FailureReason,
+    ResidentRole,
+    RunStatus,
+    Sha256,
+)
+from codemigrator.runtime.actor import ActorRegistry, RunActor
+from codemigrator.runtime.advice import AdviceValidationContext, advice_proposal_hash
 from codemigrator.runtime.contracts import (
+    AdviceMessage,
     ApiCommand,
     CancelCommand,
     CreateRunCommand,
     SessionInputCommand,
 )
+from codemigrator.runtime.integration import IntegrationCoordinator, IntegrationItem
 from codemigrator.runtime.store import InMemoryRuntimeStore
 
-from .conftest import create_run
+from .conftest import create_run, uid
+
+
+class RecordingCancellation:
+    def __init__(self):
+        self.run_ids = []
+
+    async def cancel(self, run_id):
+        self.run_ids.append(run_id)
 
 
 async def start_actor(run_id):
@@ -116,3 +136,87 @@ async def test_segment_continuation_requires_progress_and_has_independent_cap(ru
 
 def test_failure_reason_contract_is_used_without_runtime_duplication():
     assert FailureReason.BudgetExhausted.value == "BUDGET_EXHAUSTED"
+
+
+@pytest.mark.asyncio
+async def test_actor_registry_race_returns_one_actor(run_id):
+    registry = ActorRegistry(InMemoryRuntimeStore())
+    actors = await asyncio.gather(
+        registry.get_or_create(run_id),
+        registry.get_or_create(run_id),
+    )
+    assert actors[0] is actors[1]
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_advice_adoption_changes_projection_and_boundary_advice_waits_for_confirmation(
+    run_id,
+):
+    store = InMemoryRuntimeStore()
+    actor = RunActor(
+        run_id,
+        store,
+        advice_context=AdviceValidationContext(expected_subjects=frozenset({"module-a"})),
+    )
+    await actor.start()
+    await actor.create(create_run())
+    auto = Advice(
+        advice_id=uid(),
+        kind=AdviceKind.ExploreReassignment,
+        run_id=run_id,
+        role=ResidentRole.ExecuteSupervisor,
+        payload={"assignments": {"module-a": "slice-a"}},
+        proposal_hash=Sha256("0" * 64),
+    )
+    auto = auto.model_copy(update={"proposal_hash": Sha256(advice_proposal_hash(auto))})
+    await actor.submit(AdviceMessage(auto))
+    await actor.join()
+    assert str(auto.advice_id) in actor.state.adopted_advice_ids
+
+    boundary = Advice(
+        advice_id=uid(),
+        kind=AdviceKind.AskUser,
+        run_id=run_id,
+        role=ResidentRole.ExecuteSupervisor,
+        payload={"question": "confirm"},
+        proposal_hash=Sha256("0" * 64),
+    )
+    boundary = boundary.model_copy(update={"proposal_hash": Sha256(advice_proposal_hash(boundary))})
+    await actor.submit(AdviceMessage(boundary))
+    await actor.join()
+    assert str(boundary.advice_id) in actor.state.pending_advice_ids
+    await actor.submit(
+        ApiCommand(
+            SessionInputCommand(
+                kind="confirm_advice",
+                payload={"advice_id": str(boundary.advice_id)},
+            )
+        )
+    )
+    await actor.join()
+    assert str(boundary.advice_id) not in actor.state.pending_advice_ids
+    assert str(boundary.advice_id) in actor.state.adopted_advice_ids
+    await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancel_propagates_and_closes_integration_admission(run_id):
+    cancellation = RecordingCancellation()
+    integrations = IntegrationCoordinator()
+    integrations.enqueue(IntegrationItem(str(run_id), "slice-a", 0, "oid"))
+    store = InMemoryRuntimeStore()
+    actor = RunActor(
+        run_id,
+        store,
+        cancellation_port=cancellation,
+        integration_coordinator=integrations,
+    )
+    await actor.start()
+    await actor.create(create_run())
+    version = (await store.snapshot(run_id)).state.version
+    await actor.submit(ApiCommand(CancelCommand(expected_version=version)))
+    await actor.join()
+    assert cancellation.run_ids == [run_id]
+    assert integrations.start_next(str(run_id), "verified-0") is None
+    await actor.stop()

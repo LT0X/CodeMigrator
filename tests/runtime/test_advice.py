@@ -30,6 +30,20 @@ def test_proposal_hash_is_canonical_and_covers_identity_and_payload(run_id):
     assert len(advice_proposal_hash(first)) == 64
 
 
+def test_proposal_hash_sorts_unordered_payload_sets(run_id):
+    advice_id = uid()
+    first = Advice(
+        advice_id=advice_id,
+        kind=AdviceKind.RouteSuggestion,
+        run_id=run_id,
+        role=ResidentRole.ExecuteSupervisor,
+        payload={"items": {"b", "a"}},
+        proposal_hash=Sha256("0" * 64),
+    )
+    second = first.model_copy(update={"payload": {"items": set(("a", "b"))}})
+    assert advice_proposal_hash(first) == advice_proposal_hash(second)
+
+
 def test_boundary_advice_is_confirmation_only(run_id):
     value = advice(run_id, AdviceKind.RouteSuggestion, {"route": "supervisor"})
     result = evaluate_advice(value, AdviceValidationContext())

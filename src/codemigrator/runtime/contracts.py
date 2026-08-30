@@ -44,6 +44,7 @@ class ApiCommand:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionReceiptMessage:
+    run_id: RunId
     dispatch: ActiveDispatch
     result_status: str | None = None
     started: bool = False
@@ -60,6 +61,9 @@ class BudgetEventMessage:
 class RecoveryCommandMessage:
     trigger: str
     active_dispatch_ids: tuple[str, ...] = ()
+    missing_intent_ids: tuple[str, ...] = ()
+    checkpoint_corrupt: bool = False
+    ref_drift: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +99,9 @@ class RunState:
     active_dispatches: tuple[ActiveDispatch, ...] = ()
     continuation_counts: tuple[tuple[int, int], ...] = ()
     terminal_slice_failures: tuple[str, ...] = ()
+    adopted_advice_ids: tuple[str, ...] = ()
+    pending_advice_ids: tuple[str, ...] = ()
+    reporting_halted: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -29,9 +29,19 @@ class IntegrationCoordinator:
         self._queue: deque[IntegrationItem] = deque()
         self._active: IntegrationItem | None = None
         self._verified_oids: dict[str, str] = {}
+        self._cancelled_runs: set[str] = set()
 
-    def enqueue(self, item: IntegrationItem) -> None:
+    def enqueue(self, item: IntegrationItem) -> bool:
+        if item.run_id in self._cancelled_runs:
+            return False
         self._queue.append(item)
+        return True
+
+    def cancel_run(self, run_id: str) -> None:
+        self._cancelled_runs.add(run_id)
+        self._queue = deque(item for item in self._queue if item.run_id != run_id)
+        if self._active is not None and self._active.run_id == run_id:
+            self._active = None
 
     def mark_prospective_passed(self, run_id: str, slice_id: str, generation: int) -> None:
         self._queue = deque(
@@ -52,6 +62,8 @@ class IntegrationCoordinator:
         """Start only the queue head after prospective checks have passed."""
 
         if self._active is not None:
+            return None
+        if run_id in self._cancelled_runs:
             return None
         if not self._queue or self._queue[0].run_id != run_id:
             return None

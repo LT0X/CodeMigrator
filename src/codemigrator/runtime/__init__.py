@@ -1,8 +1,13 @@
 """Runtime composition root and deterministic Run orchestration primitives."""
 
-import signal
-
-from .actor import ActorRegistry, CheckpointWriter, RunActor
+from .actor import (
+    ActorRegistry,
+    ArchivePort,
+    CancellationPort,
+    CheckpointWriter,
+    ContinuationPort,
+    RunActor,
+)
 from .advice import (
     AdviceDisposition,
     AdviceValidationContext,
@@ -10,7 +15,17 @@ from .advice import (
     advice_proposal_hash,
     evaluate_advice,
 )
-from .app import AdvisoryLockPort, AppLifecycle, AppState, InMemoryAdvisoryLock
+from .app import (
+    AdvisoryLockPort,
+    AppLifecycle,
+    AppState,
+    AsyncAdvisoryLockPort,
+    AsyncAppLifecycle,
+    InMemoryAdvisoryLock,
+    PostgreSQLAdvisoryLock,
+    RuntimeApplication,
+    run_from_environment,
+)
 from .budget import BudgetEvaluation, BudgetLimits, BudgetUsage, evaluate_budget
 from .contracts import (
     AdviceMessage,
@@ -36,6 +51,7 @@ from .integration import (
 )
 from .recovery import (
     ActorCheckpoint,
+    CheckpointPolicy,
     CheckpointRestore,
     RecoveryCoordinator,
     RecoveryPlan,
@@ -44,23 +60,28 @@ from .recovery import (
 )
 from .report import build_report
 from .scheduler import FairScheduler, ReadySlice, ResourcePool
-from .store import InMemoryRuntimeStore, RuntimeStore, StoreCommitError
+from .store import InMemoryRuntimeStore, PostgreSQLRuntimeStore, RuntimeStore, StoreCommitError
 from .supervisor import SupervisorAdviceKind, SupervisorTrigger, supervisor_triggers
 
 
 def main() -> None:
-    """Keep the process alive for the deployment-provided composition root."""
+    """Start the application using deployment-provided configuration."""
 
-    signal.pause()
+    exit_code = run_from_environment()
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 __all__ = [
     "ActorRegistry",
     "ActorCheckpoint",
+    "ArchivePort",
     "AdviceMessage",
     "AdviceDisposition",
     "AdviceValidationContext",
     "AdviceValidationResult",
+    "AsyncAdvisoryLockPort",
+    "AsyncAppLifecycle",
     "ApiCommand",
     "ApiCommandPayload",
     "AdvisoryLockPort",
@@ -72,8 +93,11 @@ __all__ = [
     "BudgetUsage",
     "CancelCommand",
     "CheckpointRestore",
+    "CheckpointPolicy",
     "CheckpointWriter",
+    "CancellationPort",
     "CreateRunCommand",
+    "ContinuationPort",
     "EventSpec",
     "ExecutionReceiptMessage",
     "FairScheduler",
@@ -94,7 +118,9 @@ __all__ = [
     "RuntimeEvent",
     "RuntimeMessage",
     "RuntimeSnapshot",
+    "RuntimeApplication",
     "RuntimeStore",
+    "PostgreSQLRuntimeStore",
     "SessionInputCommand",
     "StoreCommitError",
     "SupervisorAdviceKind",
@@ -105,5 +131,7 @@ __all__ = [
     "evaluate_budget",
     "main",
     "restore_checkpoint",
+    "PostgreSQLAdvisoryLock",
+    "run_from_environment",
     "supervisor_triggers",
 ]

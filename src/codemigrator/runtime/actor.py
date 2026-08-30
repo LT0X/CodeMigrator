@@ -31,6 +31,7 @@ from .contracts import (
     RuntimeMessage,
     SessionInputCommand,
 )
+from .integration import IntegrationCoordinator
 from .recovery import RecoveryCoordinator, RecoveryTrigger
 from .store import RuntimeStore, StoreCommitError
 
@@ -38,6 +39,21 @@ from .store import RuntimeStore, StoreCommitError
 class CheckpointWriter(Protocol):
     async def write(self, state: RunState) -> None:
         """Persist a cursor checkpoint before budget termination."""
+
+
+class CancellationPort(Protocol):
+    async def cancel(self, run_id: RunId) -> None:
+        """Stop provider and sandbox work associated with a Run."""
+
+
+class ContinuationPort(Protocol):
+    async def schedule(self, run_id: RunId, generation: int) -> None:
+        """Dispatch a same-generation continuation from the latest checkpoint."""
+
+
+class ArchivePort(Protocol):
+    async def archive(self, run_id: RunId) -> None:
+        """Archive unverified candidate material before budget failure."""
 
 
 class _Stop:
@@ -57,12 +73,20 @@ class RunActor:
         budget_limits: BudgetLimits | None = None,
         advice_context: AdviceValidationContext | None = None,
         checkpoint_writer: CheckpointWriter | None = None,
+        cancellation_port: CancellationPort | None = None,
+        continuation_port: ContinuationPort | None = None,
+        archive_port: ArchivePort | None = None,
+        integration_coordinator: IntegrationCoordinator | None = None,
     ) -> None:
         self.run_id = run_id
         self.store = store
         self.budget_limits = budget_limits or BudgetLimits(100_000, 100_000, 1_000_000)
         self.advice_context = advice_context or AdviceValidationContext()
         self.checkpoint_writer = checkpoint_writer
+        self.cancellation_port = cancellation_port
+        self.continuation_port = continuation_port
+        self.archive_port = archive_port
+        self.integration_coordinator = integration_coordinator
         self._state: RunState | None = None
         self._queue: asyncio.Queue[RuntimeMessage | _Stop] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
@@ -106,7 +130,9 @@ class RunActor:
         if dispatch is None:
             return False
         self._last_dispatch_acceptance = None
-        await self.submit(ExecutionReceiptMessage(dispatch=dispatch, started=True))
+        await self.submit(
+            ExecutionReceiptMessage(run_id=self.run_id, dispatch=dispatch, started=True)
+        )
         await self.join()
         return self._last_dispatch_acceptance is True
 
@@ -114,7 +140,9 @@ class RunActor:
         """Submit a receipt and report whether it matched the active dispatch."""
 
         self._last_dispatch_acceptance = None
-        await self.submit(ExecutionReceiptMessage(dispatch=dispatch, result_status=status))
+        await self.submit(
+            ExecutionReceiptMessage(run_id=self.run_id, dispatch=dispatch, result_status=status)
+        )
         await self.join()
         return self._last_dispatch_acceptance is True
 
@@ -174,11 +202,21 @@ class RunActor:
             active_dispatches=(),
             version=state.version + 1,
         )
-        await self._commit(next_state, (EventSpec("run.cancelled"),))
+        if await self._commit(next_state, (EventSpec("run.cancelled"),)):
+            if self.integration_coordinator is not None:
+                self.integration_coordinator.cancel_run(str(self.run_id))
+            if self.cancellation_port is not None:
+                try:
+                    await self.cancellation_port.cancel(self.run_id)
+                except Exception as exc:
+                    self.last_error = exc
 
     async def _handle_session_input(self, command: SessionInputCommand) -> None:
         state = self._state
         if state is None or state.status in _TERMINAL_STATUSES:
+            return
+        if command.kind == "confirm_advice":
+            await self._handle_advice_confirmation(command.payload)
             return
         if command.kind == "segment_stopped":
             await self._handle_segment_stopped(command.payload)
@@ -189,11 +227,34 @@ class RunActor:
             (EventSpec("session.input.accepted", {"kind": command.kind}),),
         )
 
+    async def _handle_advice_confirmation(self, payload: dict[str, object]) -> None:
+        state = self._state
+        assert state is not None
+        advice_id = str(payload.get("advice_id", ""))
+        if advice_id not in state.pending_advice_ids:
+            await self._commit(
+                state,
+                (EventSpec("advice.confirmation_rejected", {"advice_id": advice_id}),),
+            )
+            return
+        next_state = replace(
+            state,
+            pending_advice_ids=tuple(
+                item for item in state.pending_advice_ids if item != advice_id
+            ),
+            adopted_advice_ids=(*state.adopted_advice_ids, advice_id),
+            version=state.version + 1,
+        )
+        await self._commit(
+            next_state,
+            (EventSpec("advice.confirmed", {"advice_id": advice_id}),),
+        )
+
     async def _handle_segment_stopped(self, payload: dict[str, object]) -> None:
         state = self._state
         assert state is not None
         generation = payload.get("generation", 0)
-        if type(generation) is not int or generation < 0:
+        if type(generation) is not int or generation not in (0, 1, 2):
             await self._commit(
                 replace(state, version=state.version + 1),
                 (EventSpec("slice.terminal_failed", {"reason": "INVALID_GENERATION"}),),
@@ -208,9 +269,15 @@ class RunActor:
             and current < self.max_continuations_per_generation
         )
         current_counts[generation] = current + 1 if eligible else current
+        slice_id = str(payload.get("slice_id", "unknown"))
         next_state = replace(
             state,
             continuation_counts=tuple(sorted(current_counts.items())),
+            terminal_slice_failures=(
+                (*state.terminal_slice_failures, slice_id)
+                if not eligible and slice_id not in state.terminal_slice_failures
+                else state.terminal_slice_failures
+            ),
             version=state.version + 1,
         )
         event = (
@@ -224,11 +291,29 @@ class RunActor:
                 {"generation": generation, "reason": "INDEPENDENT_SLICE_TERMINAL_FAILURE"},
             )
         )
-        await self._commit(next_state, (event,))
+        committed = await self._commit(next_state, (event,))
+        if committed and eligible and self.continuation_port is not None:
+            try:
+                await self.continuation_port.schedule(self.run_id, generation)
+            except Exception as exc:
+                self.last_error = exc
 
     async def _handle_execution(self, message: ExecutionReceiptMessage) -> None:
         state = self._state
         if state is None:
+            self._last_dispatch_acceptance = False
+            return
+        if message.run_id != self.run_id:
+            if not message.started:
+                await self._commit(
+                    state,
+                    (
+                        EventSpec(
+                            "LATE_DISPATCH_RESULT",
+                            {"reason": "RUN_ID_MISMATCH"},
+                        ),
+                    ),
+                )
             self._last_dispatch_acceptance = False
             return
         if message.started:
@@ -328,26 +413,36 @@ class RunActor:
             version=state.version + 1,
         )
         if evaluation.exhausted:
+            pre_checkpoint_state = replace(
+                next_state,
+                new_calls_enabled=False,
+            )
+            events.append(EventSpec("checkpoint.pre"))
+            if self.checkpoint_writer is not None:
+                try:
+                    await self.checkpoint_writer.write(pre_checkpoint_state)
+                except Exception as exc:
+                    self.last_error = exc
+                    events.append(EventSpec("checkpoint.write_failed"))
+            if self.archive_port is not None:
+                try:
+                    await self.archive_port.archive(self.run_id)
+                except Exception as exc:
+                    self.last_error = exc
+                    events.append(EventSpec("archive.failed"))
+            events.extend(
+                (
+                    EventSpec("run.archived"),
+                    EventSpec("run.failed", {"reason": "BUDGET_EXHAUSTED"}),
+                    EventSpec("budget.exhausted"),
+                )
+            )
             next_state = replace(
                 next_state,
                 status=RunStatus.Failed,
                 failure_reason=FailureReason.BudgetExhausted,
                 new_calls_enabled=False,
                 active_dispatches=(),
-            )
-            if self.checkpoint_writer is not None:
-                try:
-                    await self.checkpoint_writer.write(next_state)
-                except Exception as exc:
-                    self.last_error = exc
-                    events.append(EventSpec("checkpoint.write_failed"))
-            events.extend(
-                (
-                    EventSpec("checkpoint.pre"),
-                    EventSpec("run.archived"),
-                    EventSpec("run.failed", {"reason": "BUDGET_EXHAUSTED"}),
-                    EventSpec("budget.exhausted"),
-                )
             )
         await self._commit(next_state, tuple(events))
 
@@ -357,7 +452,11 @@ class RunActor:
             return
         trigger = RecoveryTrigger(message.trigger)
         plan = RecoveryCoordinator().trigger(
-            trigger, active_dispatch_ids=message.active_dispatch_ids
+            trigger,
+            active_dispatch_ids=message.active_dispatch_ids,
+            missing_intent_ids=message.missing_intent_ids,
+            checkpoint_corrupt=message.checkpoint_corrupt,
+            ref_drift=message.ref_drift,
         )
         events: list[EventSpec] = []
         for item in plan.events:
@@ -370,13 +469,19 @@ class RunActor:
                 )
             else:
                 events.append(EventSpec(item))
-        next_state = replace(state, active_dispatches=(), version=state.version + 1)
+        next_state = replace(
+            state,
+            active_dispatches=(),
+            reporting_halted=plan.report_halted,
+            version=state.version + 1,
+        )
         await self._commit(next_state, tuple(events))
 
     async def _handle_advice(self, advice: Advice) -> None:
         state = self._state
         if state is None:
             return
+        next_state = state
         if advice.run_id != self.run_id:
             result_reason = "RUN_ID_MISMATCH"
             event_type = "advice.discarded"
@@ -390,8 +495,27 @@ class RunActor:
                 "DISCARDED": "advice.discarded",
             }[result.disposition.value]
             result_hash = result.proposal_hash
+            advice_id = str(advice.advice_id)
+            if result.disposition.value == "AUTO_ADOPTED":
+                if advice_id in state.adopted_advice_ids:
+                    event_type = "advice.duplicate"
+                else:
+                    next_state = replace(
+                        state,
+                        adopted_advice_ids=(*state.adopted_advice_ids, advice_id),
+                        version=state.version + 1,
+                    )
+            elif result.disposition.value == "CONFIRMATION_REQUIRED":
+                if advice_id in state.pending_advice_ids:
+                    event_type = "advice.duplicate"
+                else:
+                    next_state = replace(
+                        state,
+                        pending_advice_ids=(*state.pending_advice_ids, advice_id),
+                        version=state.version + 1,
+                    )
         await self._commit(
-            state,
+            next_state,
             (
                 EventSpec(
                     event_type,
@@ -426,18 +550,20 @@ class ActorRegistry:
     def __init__(self, store: RuntimeStore) -> None:
         self.store = store
         self._actors: dict[RunId, RunActor] = {}
+        self._lock = asyncio.Lock()
 
     async def get_or_create(self, run_id: RunId) -> RunActor | None:
-        actor = self._actors.get(run_id)
-        if actor is not None:
+        async with self._lock:
+            actor = self._actors.get(run_id)
+            if actor is not None:
+                return actor
+            snapshot = await self.store.load(run_id)
+            if snapshot is not None and snapshot.state.status in _TERMINAL_STATUSES:
+                return None
+            actor = RunActor(run_id, self.store)
+            await actor.start()
+            self._actors[run_id] = actor
             return actor
-        snapshot = await self.store.load(run_id)
-        if snapshot is not None and snapshot.state.status in _TERMINAL_STATUSES:
-            return None
-        actor = RunActor(run_id, self.store)
-        await actor.start()
-        self._actors[run_id] = actor
-        return actor
 
     async def close(self) -> None:
         actors = tuple(self._actors.values())
@@ -445,5 +571,21 @@ class ActorRegistry:
         for actor in actors:
             await actor.stop()
 
+    async def rebuild(self, run_id: RunId) -> RunActor | None:
+        """Replace one actor from durable facts after an explicit recovery trigger."""
 
-__all__ = ["ActorRegistry", "CheckpointWriter", "RunActor"]
+        async with self._lock:
+            actor = self._actors.pop(run_id, None)
+            if actor is not None:
+                await actor.stop()
+        return await self.get_or_create(run_id)
+
+
+__all__ = [
+    "ActorRegistry",
+    "ArchivePort",
+    "CancellationPort",
+    "CheckpointWriter",
+    "ContinuationPort",
+    "RunActor",
+]
