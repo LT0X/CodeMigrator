@@ -13,14 +13,14 @@
 - `src/codemigrator/planning/derivation.py`：实现四类 Slice 双轨派生、三类 artifact action、GENERATED/信息防火墙元数据、唯一组名和符号锚点降级。
 - `src/codemigrator/planning/ripple.py`：实现 PSF-2 符号引用闭包、PSF-3 反向依赖闭包、Slice 映射和只读 ImpactPreview。
 - `src/codemigrator/planning/retry.py`：实现最多 3 次反馈重试、PlanFailed 零持久化和物理故障透传。
-- `tests/planning/`：32 项模型、护栏、冻结、派生、涟漪、规模和重试契约测试。
+- `tests/planning/`：41 项模型、护栏、冻结、派生、涟漪、规模和重试契约测试。
 - `my_space/`：同步实施计划、详细设计、迭代记录和主任务表。
-- **公共契约影响**：不新增 core 公共枚举/字段，不改变既有 core `PlanEdge`；planning 只引用 core/analysis。
+- **公共契约影响**：将完整 PlanProposal/PlanValidation、边 provenance/evidence 与 ArtifactTask 契约统一归入 core；planning 通过正门 re-export 并实现校验/冻结，不改变既有 core `PlanEdge` 的字段形状。
 
 ## 自测证据
 
-- `/home/xtc/env/codemigrator-plan/bin/pytest -q tests/planning` → 32 passed。
-- `/home/xtc/env/codemigrator-plan/bin/pytest -q` → 228 passed。
+- `/home/xtc/env/codemigrator-plan/bin/pytest -q tests/planning` → 41 passed。
+- `/home/xtc/env/codemigrator-plan/bin/pytest -q` → 237 passed。
 - `/home/xtc/env/codemigrator-plan/bin/ruff check src tests` → 通过。
 - `/home/xtc/env/codemigrator-plan/bin/mypy src` → 通过。
 - `/home/xtc/env/codemigrator-plan/bin/lint-imports --config pyproject.toml` → 0 broken contracts。

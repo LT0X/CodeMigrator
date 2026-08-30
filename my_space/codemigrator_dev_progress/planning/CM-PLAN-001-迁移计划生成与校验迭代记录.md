@@ -19,11 +19,12 @@ CM-PLAN-001 是 Wave 2 的迁移计划生成器任务。需要将已对齐的 D-
 - **重试**：新增 `retry.py`；schema/校验反馈初次尝试外最多重试 3 次，耗尽抛出 `PlanFailed` 且不持久化；`ProviderPhysicalFailure` 原样交回 runtime，不计反馈次数。
 - **测试/入口**：新增 `tests/planning/` 32 项确定性契约测试与 planning README；planning 仅依赖 core/analysis，不接模型、runtime、API、文件系统或数据库。
 - **关键实现决策**：严格沿用对齐记录 D-01～D-06；校验先于 ID 分配和 ledger 写入；相交 scope 即使存在 `OrderedBefore` 也拒绝；TestGeneration 的源模块不占翻译覆盖声明；ResourceFile 不得进入翻译 Slice scope；DAG 采用迭代式拓扑检测避免大提案递归深度风险。
+- **审查修复**：将计划公共模型统一收归 `core/models/plan.py` 并由 planning re-export；补充 F4 工件一对一承载、源模块角色/范围/测试状态、TestGeneration 边禁用、跨 Slice ResourceFile 防护、布局前缀解析、PSF-3 COVERAGE 闭包、多重绑定收集和结构化边证据。
 
 ## 3. 自测与验证结果
 
-- planning 专项：`/home/xtc/env/codemigrator-plan/bin/pytest -q tests/planning` → `32 passed`。
-- 全量规则：`/home/xtc/env/codemigrator-plan/bin/pytest -q` → `227 passed`。
+- planning 专项：`/home/xtc/env/codemigrator-plan/bin/pytest -q tests/planning` → `41 passed`。
+- 全量规则：`/home/xtc/env/codemigrator-plan/bin/pytest -q` → `237 passed`。
 - `/home/xtc/env/codemigrator-plan/bin/ruff check src tests` → 通过。
 - `/home/xtc/env/codemigrator-plan/bin/mypy src` → 通过。
 - `/home/xtc/env/codemigrator-plan/bin/lint-imports --config pyproject.toml` → 3 contracts kept, 0 broken contracts。
@@ -34,7 +35,7 @@ CM-PLAN-001 是 Wave 2 的迁移计划生成器任务。需要将已对齐的 D-
 ## 4. 影响面与风险
 
 - 影响 `src/codemigrator/planning/`、`tests/planning/`、planning README 及本任务三份收口文档；主任务表已标记进行中，收尾时更新为已完成。
-- 不修改 M-07 架构文档、core 字段、数据库、API、runtime 或目标仓库；边 provenance 作为 planning 冻结输出的并行审计事实保留，兼容现有 core `PlanEdge`。
+- 不修改 M-07 架构文档、数据库、API、runtime 或目标仓库；core 计划契约统一承载完整提案/校验/边证据模型，planning 仅提供校验、冻结和投影逻辑并保留兼容的 core `PlanEdge` 输出。
 - Blueprint 仍按 M-00 占位字段解释目标路径前缀，不臆造字段；联合域安全算法和验证归因 schema 继续由对齐记录指定的后续任务负责。
 
 ## 5. 后续行动

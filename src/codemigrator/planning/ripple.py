@@ -51,16 +51,14 @@ def calculate_ripple(
     relevant_bindings = [
         binding for binding in analysis.symbol_bindings if binding.symbol in symbols
     ]
-    bindings = {
-        binding.symbol: binding.module
-        for binding in relevant_bindings
-        if binding.module is not None
-    }
+    bindings: dict[str, set[ProjectModuleId]] = defaultdict(set)
+    for binding in relevant_bindings:
+        if binding.module is not None:
+            bindings[binding.symbol].add(binding.module)
     if any(binding.ambiguous for binding in relevant_bindings):
         reasons.append("ambiguous SymbolBinding degraded to module closure")
     for symbol in symbols:
-        if symbol in bindings:
-            affected.add(bindings[symbol])
+        affected.update(bindings.get(symbol, set()))
     for binding in analysis.symbol_bindings:
         if binding.symbol in symbols and binding.module is None:
             module_id = module_for_path.get(str(binding.definition.file_path))
@@ -141,7 +139,7 @@ def _reverse_import_closure(
         if target is not None:
             reverse[target].add(edge.from_module)
     for relation in analysis.relation_edges:
-        if relation.kind == "IMPORT" and relation.from_module is not None:
+        if relation.kind in {"IMPORT", "COVERAGE"} and relation.from_module is not None:
             reverse[relation.to_module].add(relation.from_module)
     seen = set(seeds)
     queue = deque(seeds)

@@ -3,7 +3,19 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from codemigrator.core import ArtifactKind, DossierEntry, ProjectModuleId, SliceKind
+from codemigrator.core import (
+    ArtifactKind,
+    DossierEntry,
+    PlanEdgeEvidence,
+    ProjectModuleId,
+    SliceKind,
+)
+from codemigrator.core import (
+    PlanProposal as CorePlanProposal,
+)
+from codemigrator.core import (
+    PlanValidation as CorePlanValidation,
+)
 from codemigrator.planning import (
     ArtifactAction,
     ArtifactTask,
@@ -41,6 +53,31 @@ def test_plan_proposal_is_closed_and_normalizes_scope() -> None:
     assert proposal.slices[0].create_roots == ("src",)
     with pytest.raises(ValidationError):
         PlanProposal.model_validate({**proposal.model_dump(), "unexpected": True})
+
+
+def test_planning_reexports_the_single_core_plan_contract() -> None:
+    from codemigrator.planning import PlanValidation
+
+    assert PlanProposal is CorePlanProposal
+    assert PlanValidation is CorePlanValidation
+
+
+def test_unknown_edge_keeps_structured_reason_and_evidence_location() -> None:
+    evidence = PlanEdgeEvidence(
+        unknown_reason="DYNAMIC_IMPORT",
+        evidence_location="analysis.imports[0].evidence",
+    )
+
+    edge = PlanEdgeProposal(
+        from_="A",
+        to="B",
+        kind="ORDERED_BEFORE",
+        provenance=EdgeProvenance.ImportUnknown,
+        evidence=evidence,
+    )
+
+    assert edge.evidence == evidence
+    assert edge.model_dump(mode="json")["evidence"]["unknown_reason"] == "DYNAMIC_IMPORT"
 
 
 def test_plan_slice_rejects_duplicate_local_modules_and_invalid_ref() -> None:

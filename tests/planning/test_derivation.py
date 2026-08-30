@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from codemigrator.analysis import (
     AnalysisCapability,
     ArtifactFact,
@@ -94,6 +96,14 @@ def test_artifact_derivation_is_data_driven_and_keeps_resource_out_of_translatio
     assert (
         next(task for task in tasks if task.kind is ArtifactKind.ResourceFile).translation is False
     )
+
+
+def test_generated_artifact_without_a_generation_source_is_rejected() -> None:
+    with pytest.raises(ValueError, match="source_path"):
+        derive_artifact_tasks(
+            [ArtifactFact(path="schema.pb.go", artifact_kind=ArtifactKind.GeneratedCode)],
+            owner_local_ref="CT",
+        )
 
 
 def test_ambiguous_or_text_fallback_anchor_degrades_to_module_summary(

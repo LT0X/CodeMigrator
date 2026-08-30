@@ -50,8 +50,8 @@
 
 ## 5. 风险与回滚
 
-- **Blueprint 占位字段语义模糊**：只读取现有 `module_boundaries` 的目标路径前缀和布局原则可解释摘要；无可解释前缀的占位条目不臆造新字段，不改变 core shape。
-- **公共契约漂移**：planning 只引用 core/analysis 类型；若发现现有模型与对齐记录冲突，先停止实现并追加对齐记录，不私自复制定义。
+- **Blueprint 占位字段语义模糊**：只读取现有 `module_boundaries` 的目标路径前缀和布局原则可解释摘要；无可解释前缀的占位条目不臆造新字段，具体契约仍由 core 占位模型持有。
+- **公共契约漂移**：完整计划 proposal/validation/edge/artifact 模型统一由 core 持有，planning 只引用并 re-export；若发现现有模型与对齐记录冲突，先停止实现并追加对齐记录，不私自复制定义。
 - **UUIDv7 与 hash**：验证失败时不分配 SliceId、不调用账本写入；哈希只使用 core `canonical_json_bytes`，冻结对象通过深拷贝/只读访问防止漂移。
 - **回滚方式**：保留任务分支提交历史；必要时使用 `git revert <commit>` 回退，不改写远程历史。
 
