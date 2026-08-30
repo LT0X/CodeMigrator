@@ -24,6 +24,12 @@ TestResults.xml
 
 my_space/temp/
 my_space/model_api_key.json
+
+# Local-only project design, progress, reference, and staging material.
+# Keep these directories on disk; never re-add them with git add -f.
+my_space/
+ref/
+temp_doc/
 .dsh/
 .trae/
 ref/test_project/
