@@ -178,12 +178,14 @@ uv run codemigrator-app
 启动本地基础设施时，请从 shell 或未纳入版本控制的环境文件提供凭证：
 
 ```bash
-POSTGRES_PASSWORD='<由部署环境提供>' docker compose up --build
+POSTGRES_PASSWORD='<由部署环境提供>' \
+CODEMIGRATOR_CGROUP_DELEGATED_DIR='/path/to/delegated/cgroup' \
+docker compose up --build
 ```
 
-`compose.yaml` 定义应用与 PostgreSQL 服务。启用 sandbox 生命周期管理时，还需将
-`CODEMIGRATOR_CGROUP_DELEGATED_DIR` 指向可委派的 cgroup v2 目录；授予额外宿主机
-能力前，应先审阅部署配置。
+`compose.yaml` 定义应用与 PostgreSQL 服务；启动 Compose 时必须提供
+`POSTGRES_PASSWORD` 和 `CODEMIGRATOR_CGROUP_DELEGATED_DIR`。后者应指向可委派的
+cgroup v2 目录。授予额外宿主机能力前，应先审阅部署配置。
 
 ## 测试与质量门
 
