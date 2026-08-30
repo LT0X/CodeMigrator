@@ -15,6 +15,32 @@ V3 处置对照：插件进程沙箱、能力协商、插件 wire 协议与规�
 
 app 直接创建和回收 bwrap，并为每个执行设置 PDEATHSIG、cgroup、命名空间和差异化网络策略；不可信进程不再通过独立服务或 UDS 转发。Shell 在 Slice 长期卷内运行，并可通过受控出口代理联网；验证使用默认拒绝网络的临时目录，该目录由被测 commit 物化而来，替代一次性 overlay grant。裁决层仍只接受冻结的 CheckCommandTemplate，Oracle 语义和 fingerprint 输入不变。
 
+### CM-SANDBOX-001 V5 验收矩阵同步
+
+以下矩阵依据 `my_space/code_alignment_record/sandbox/CM-SANDBOX-001-对齐记录.md` D-01 回填，作为 V5 当前实现与后续模块联调的边界；V4 的 UDS/worker/overlay 条款仅保留在下文历史追溯段，不再作为当前执行协议。
+
+| V5 条款 | 当前适配层口径 | 责任边界/证据 |
+|---|---|---|
+| V-M09-V5-001 | bwrap namespace 不挂载 PG、Git 控制面或宿主 socket | `command.py` 挂载/路径安全门；Runtime/部署联调验证 |
+| V-M09-V5-002 | 只接受描述符冻结的 program、argv、timeout 与 canonical template digest | `FrozenCommand` canonical hash；Runtime 提供冻结输入 |
+| V-M09-V5-003 | 镜像 digest、seccomp digest 与 preflight 不匹配时零启动 | `BwrapPolicy` + `PreflightResult` fail-closed |
+| V-M09-V5-004 | 迟到/跨 subject/错 check/旧 OID 的接纳拒绝不在本层完成 | Runtime active-attempt gate；本层只返回执行事实 |
+| V-M09-V5-005 | PDEATHSIG、cgroup 与进程组清理窗口为 5 秒 | `lifecycle.py`、必需的委派 cgroup；Runtime 负责 Run 终态 |
+| V-M09-V5-006 | 物理重派仅由上层生成新 attempt；Shell 在途故障不写验证账本 | Runtime/Workspace 组合；本层提供清理回执 |
+| V-M09-V5-007 | 每次验证使用受管临时目录并在调用方生命周期结束时销毁 | `TemporaryValidationDirectory`；物化来源由 Workspace/Git 提供 |
+| V-M09-V5-008 | 验证 argv 不挂载候选、scratch 或 verified 工作树 | 固定 validation bind；Workspace checkpoint 兜底 |
+| V-M09-V5-009 | Scaffold 仅由 Harness 触发并由上层受信提取 | `CheckAction.Scaffold` 复用冻结命令；Harness/Workspace 接入 |
+| V-M09-V5-010 | 固定 bwrap 参数、只读 rootfs/cache、最小 dev/proc、seccomp 与 allowlist 环境 | `command.py` argv 快照与路径/环境安全测试 |
+| V-M09-V5-011 | 4 GiB/2 CPU/10 GiB 与三池活跃位公式 | `ResourceLimits`、`calculate_pool_capacity`、`SandboxExecutionPool` |
+| V-M09-V5-012 | stdout/stderr 各 256 MiB、单文件 64 MiB、模板 deadline 超限即不 Passed | `executor.py` 流/目录 quota；部署 quota receipt 联动 |
+| V-M09-V5-013 | output limit → timeout → infrastructure → seccomp → exit 的唯一归约 | `reduce_termination`；seccomp+exit 0 为 Failed |
+| V-M09-V5-014 | 仅内部验证与 Scaffold 使用裁决执行面，模型工具不得触发 | Runtime/Workspace 路由；`FrozenCommand` 与 `ShellCommand` 分离 |
+| V-M09-V5-015 | Slice 长驻卷与会话对齐，缓存驻留不进入验证输入 | Workspace 管卷生命周期；本层提供 Shell bwrap 绑定策略 |
+| V-M09-V5-016 | Shell 自检只反馈、不产 CheckResult；checkpoint 后独立冻结验证 | Shell/Oracle 上层语义；本层不接纳账本结果 |
+| V-M09-V5-017 | 裁决/Scaffold default-deny；Shell 需 veth attachment + 白名单代理 | `AsyncForwardProxy`、`NetworkAttachment` fail-closed；CM-INFRA 落地 veth/firewall |
+
+本任务实现 `codemigrator.sandbox` 的可复用执行底座与确定性规则测试；active-attempt、tested-commit 物化、Slice 卷、Scaffold 提取、cgroup 委派、seccomp policy 文件、veth/firewall 与 Compose 物理配置仍由其拥有模块完成，不能由本层测试结果替代。
+
 ### V5 执行面不变量
 
 | 执行面 | 物理目录 | 网络 | 资源与生命周期 |
