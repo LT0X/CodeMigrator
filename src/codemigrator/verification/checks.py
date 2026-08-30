@@ -43,6 +43,7 @@ class CheckSpec:
     required_check: RequiredCheck
     template: CheckCommandTemplate
     invocation_hash: Sha256
+    layer: VerificationLayer
     test_files: tuple[str, ...] = ()
 
     @property
@@ -65,6 +66,33 @@ class SkippedEmptyResult:
     def status(self) -> CheckStatus:
         return self.result.status
 
+    def as_evidence(
+        self, *, generated: bool = False, low_quality: bool = False
+    ) -> CheckResultEvidence:
+        return CheckResultEvidence(
+            result=self.result,
+            disposition=self.disposition,
+            generated=generated,
+            low_quality=low_quality,
+        )
+
+
+@dataclass(frozen=True)
+class CheckResultEvidence:
+    """Typed evidence metadata kept beside the closed core CheckResult contract."""
+
+    result: CheckResult
+    disposition: str | None = None
+    generated: bool = False
+    low_quality: bool = False
+
+    @property
+    def status(self) -> CheckStatus:
+        return self.result.status
+
+
+ResultEvidence = CheckResult | SkippedEmptyResult | CheckResultEvidence
+
 
 @dataclass(frozen=True)
 class CheckSetValidation:
@@ -72,6 +100,7 @@ class CheckSetValidation:
 
     errors: tuple[StableErrorCode, ...]
     guard: DerivedVerificationGuard
+    invalid_typed_result_count: int = 0
 
 
 def _id_key(value: object) -> bytes:
@@ -143,14 +172,39 @@ def instantiate_checks(
         },
         VerificationLayer.FINAL: {CheckAction.Test},
     }[layer]
-    coverage = test_coverage or {}
+    normalized_test_files = tuple(normalize_repo_relative_paths(list(test_files)))
+    needs_test_coverage = any(item.action is CheckAction.Test for item in required_checks)
+    if (
+        layer is VerificationLayer.INTEGRATION
+        and needs_test_coverage
+        and normalized_test_files
+        and test_coverage is None
+    ):
+        raise ValueError("integration test coverage mapping is required for non-empty test files")
+    coverage = {
+        normalize_repo_relative_paths([path])[0]: set(slices)
+        for path, slices in (test_coverage or {}).items()
+    }
     integrated = set(integrated_slices)
     eligible = _eligible_test_files(
-        test_files,
+        normalized_test_files,
         coverage,
         integrated,
         require_coverage=layer is VerificationLayer.INTEGRATION,
     )
+    if layer is VerificationLayer.INTEGRATION and needs_test_coverage:
+        missing_coverage = set(normalized_test_files) - set(coverage)
+        if missing_coverage:
+            raise ValueError(
+                "integration test coverage mapping is missing: "
+                + ", ".join(sorted(missing_coverage))
+            )
+        empty_coverage = [path for path in normalized_test_files if not coverage[path]]
+        if empty_coverage:
+            raise ValueError(
+                "integration test coverage mapping is empty: "
+                + ", ".join(sorted(empty_coverage))
+            )
     specs: list[CheckSpec] = []
     for required in required_checks:
         if required.action not in allowed:
@@ -166,6 +220,7 @@ def instantiate_checks(
                 required_check=required,
                 template=template,
                 invocation_hash=_invocation_hash(required, template),
+                layer=layer,
                 test_files=eligible if required.action is CheckAction.Test else (),
             )
         )
@@ -183,6 +238,13 @@ def _empty_artifact() -> ArtifactRef:
 def make_skipped_empty_result(spec: CheckSpec, receipt_id: ReceiptId | None) -> SkippedEmptyResult:
     """Create the typed Passed/SkippedEmpty result for an empty Test set."""
 
+    if spec.required_check.action is not CheckAction.Test:
+        raise ValueError("SkippedEmpty is only valid for a Test check")
+    if spec.layer not in {VerificationLayer.INTEGRATION, VerificationLayer.FINAL}:
+        raise ValueError("SkippedEmpty is only valid for Integration or Final Test checks")
+    if spec.test_files:
+        raise ValueError("SkippedEmpty requires an empty test set")
+
     result = CheckResult(
         check_id=spec.check_id,
         invocation_hash=spec.invocation_hash,
@@ -196,12 +258,13 @@ def make_skipped_empty_result(spec: CheckSpec, receipt_id: ReceiptId | None) -> 
 
 
 def validate_check_results(
-    specs: Sequence[CheckSpec], results: Sequence[CheckResult]
+    specs: Sequence[CheckSpec], results: Sequence[ResultEvidence]
 ) -> CheckSetValidation:
     """Validate exact CheckId coverage and invocation identities."""
 
     expected = {spec.check_id: spec for spec in specs}
-    result_counts = Counter(result.check_id for result in results)
+    unwrapped = [_unwrap_result(result) for result in results]
+    result_counts = Counter(result.check_id for result in unwrapped)
     expected_counts = Counter(spec.check_id for spec in specs)
     errors: list[StableErrorCode] = []
     if any(count > 1 for count in result_counts.values()) or any(
@@ -215,21 +278,46 @@ def validate_check_results(
     if any(
         result.check_id in expected
         and result.invocation_hash != expected[result.check_id].invocation_hash
-        for result in results
+        for result in unwrapped
     ):
         errors.append(StableErrorCode.INVOCATION_HASH_MISMATCH)
 
+    invalid_typed_result_count = 0
+    for original, result in zip(results, unwrapped):
+        spec = expected.get(result.check_id)
+        disposition = _result_disposition(original)
+        if spec is None:
+            continue
+        if isinstance(original, (SkippedEmptyResult, CheckResultEvidence)) and disposition not in {
+            None,
+            "SkippedEmpty",
+        }:
+            invalid_typed_result_count += 1
+            continue
+        if disposition == "SkippedEmpty":
+            if (
+                spec.required_check.action is not CheckAction.Test
+                or spec.test_files
+                or result.status is not CheckStatus.Passed
+                or result.diagnostics
+            ):
+                invalid_typed_result_count += 1
+        elif spec.should_skip_empty_test:
+            invalid_typed_result_count += 1
+
     unknown_count = sum(
         1
-        for result in results
+        for result in unwrapped
         for diagnostic in result.diagnostics
         if diagnostic.severity is DiagnosticSeverity.Error
         and isinstance(diagnostic.target, Unknown)
     )
     all_passed = (
         not errors
+        and invalid_typed_result_count == 0
         and len(results) == len(specs)
-        and all(result.status is CheckStatus.Passed for result in results)
+        and unknown_count == 0
+        and all(result.status is CheckStatus.Passed for result in unwrapped)
     )
     return CheckSetValidation(
         errors=tuple(dict.fromkeys(errors)),
@@ -237,4 +325,19 @@ def validate_check_results(
             all_required_checks_passed=all_passed,
             error_unknown_count=unknown_count,
         ),
+        invalid_typed_result_count=invalid_typed_result_count,
     )
+
+
+def _unwrap_result(result: ResultEvidence) -> CheckResult:
+    if isinstance(result, (SkippedEmptyResult, CheckResultEvidence)):
+        return result.result
+    return result
+
+
+def _result_disposition(result: ResultEvidence) -> str | None:
+    if isinstance(result, SkippedEmptyResult):
+        return result.disposition
+    if isinstance(result, CheckResultEvidence):
+        return result.disposition
+    return None

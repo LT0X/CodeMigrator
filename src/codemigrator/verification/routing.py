@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
+from types import MappingProxyType
 from typing import Literal, cast
 from uuid import UUID
 
 from codemigrator.core import (
     AttributionReliability,
+    CheckAction,
+    CheckStatus,
     RepairEvidence,
     SliceId,
     load_resource,
-    load_verification_policy,
 )
+
+from .checks import VerificationLayer
 
 
 def _as_slice_id(value: object) -> SliceId:
@@ -29,11 +34,30 @@ class VerificationPolicySnapshot:
     conservation_bandwidth: tuple[float, float]
     global_repair_attempts: int
     sha256: str
+    default_timeout_secs: Mapping[str, int]
 
 
+VERIFICATION_POLICY_URI = "core://verification-policy/v1"
+EXPECTED_VERIFICATION_POLICY_SHA256 = (
+    "fd4d792a8ae408828d8e70930f203b7ada19b7333a12a9299eb56e962081c54f"
+)
+DEFAULT_TIMEOUT_SECS = MappingProxyType(
+    {
+        CheckAction.Scaffold.value: 300,
+        CheckAction.Compile.value: 300,
+        CheckAction.Lint.value: 300,
+        CheckAction.TypeCheck.value: 300,
+        CheckAction.Test.value: 120,
+    }
+)
+
+
+@lru_cache(maxsize=1)
 def load_policy_snapshot() -> VerificationPolicySnapshot:
-    document = load_resource("core://verification-policy/v1")
-    payload = load_verification_policy()
+    document = load_resource(VERIFICATION_POLICY_URI)
+    if document.sha256 != EXPECTED_VERIFICATION_POLICY_SHA256:
+        raise ValueError("verification policy resource digest does not match the frozen digest")
+    payload = document.payload
     majority = payload["majority"]
     if not isinstance(majority, dict):
         raise ValueError("verification policy majority must be an object")
@@ -48,6 +72,7 @@ def load_policy_snapshot() -> VerificationPolicySnapshot:
         conservation_bandwidth=(float(bandwidth[0]), float(bandwidth[1])),
         global_repair_attempts=int(payload["global_repair_attempts"]),
         sha256=document.sha256,
+        default_timeout_secs=DEFAULT_TIMEOUT_SECS,
     )
     if snapshot.flaky_reruns + 1 != snapshot.majority_total:
         raise ValueError("flaky policy total must equal initial execution plus reruns")
@@ -69,6 +94,46 @@ class RouteDecision:
     generation: int | None = None
 
 
+@dataclass(frozen=True)
+class FailureReduction:
+    """Status-priority and layer reduction applied before attribution routing."""
+
+    status: CheckStatus
+    action: CheckAction
+    layer: str
+    route: Literal["DIRECT_ELIGIBLE", "SUPERVISOR", "NO_FAILURE"]
+    reason: str
+
+
+def reduce_failure(
+    *,
+    status: CheckStatus,
+    action: CheckAction,
+    layer: VerificationLayer | str,
+    error_unknown_count: int = 0,
+) -> FailureReduction:
+    """Reduce a check failure before any evidence can select a repair route."""
+
+    layer_name = layer.value if isinstance(layer, VerificationLayer) else str(layer)
+    if error_unknown_count < 0:
+        raise ValueError("error_unknown_count cannot be negative")
+    if error_unknown_count:
+        return FailureReduction(status, action, layer_name, "SUPERVISOR", "error_unknown")
+    if status is CheckStatus.Passed:
+        return FailureReduction(status, action, layer_name, "NO_FAILURE", "passed")
+    if status in {
+        CheckStatus.TimedOut,
+        CheckStatus.OutputLimitExceeded,
+        CheckStatus.InfrastructureError,
+    }:
+        return FailureReduction(status, action, layer_name, "SUPERVISOR", "resource_failure")
+    if action is CheckAction.Test:
+        return FailureReduction(status, action, layer_name, "SUPERVISOR", "dynamic_test_failure")
+    if layer_name not in {item.value for item in VerificationLayer}:
+        return FailureReduction(status, action, layer_name, "SUPERVISOR", "unknown_layer")
+    return FailureReduction(status, action, layer_name, "DIRECT_ELIGIBLE", "static_failure")
+
+
 def build_repair_evidence(
     candidate_slice_set: Iterable[object],
     reliability: AttributionReliability,
@@ -76,22 +141,39 @@ def build_repair_evidence(
     strong_coupling: bool = False,
     cross_generation_recurrence: bool = False,
     conservation_signal_summary: Mapping[str, object] | None = None,
+    error_unknown_count: int = 0,
+    coupling_evidence_complete: bool = False,
 ) -> RepairEvidence:
     candidates = sorted(set(candidate_slice_set), key=lambda value: str(value))
+    summary = dict(conservation_signal_summary or {})
+    summary["error_unknown_count"] = error_unknown_count
+    summary["coupling_evidence_complete"] = coupling_evidence_complete
     return RepairEvidence(
         candidate_slice_set=[_as_slice_id(item) for item in candidates],
         reliability=reliability,
         strong_coupling=strong_coupling,
         cross_generation_recurrence=cross_generation_recurrence,
-        conservation_signal_summary=dict(conservation_signal_summary or {}),
+        conservation_signal_summary=summary,
     )
 
 
-def choose_failure_route(evidence: RepairEvidence, *, generation: int = 0) -> RouteDecision:
+def choose_failure_route(
+    evidence: RepairEvidence,
+    *,
+    generation: int = 0,
+    failure: FailureReduction | None = None,
+) -> RouteDecision:
     """Apply only the reliable-domain direct-route boundary."""
 
     if type(generation) is not int or not 0 <= generation <= 2:
         raise ValueError("candidate generation must be between 0 and 2")
+    if failure is None or failure.route != "DIRECT_ELIGIBLE":
+        return RouteDecision("SUPERVISOR")
+    unknown_count = evidence.conservation_signal_summary.get("error_unknown_count", 0)
+    if type(unknown_count) is not int or unknown_count != 0:
+        return RouteDecision("SUPERVISOR")
+    if evidence.conservation_signal_summary.get("coupling_evidence_complete") is not True:
+        return RouteDecision("SUPERVISOR")
     if (
         evidence.reliability is AttributionReliability.Reliable
         and len(evidence.candidate_slice_set) == 1
@@ -182,29 +264,59 @@ class ConfidenceAssessment:
     primary_evidence: Literal["TRANSLATED_TESTS", "GENERATED_TESTS"]
     downgraded: bool
     disclosure: str | None = None
+    usable_as_primary: bool = True
+    source_smoke_passed: bool | None = None
 
 
-def assess_confidence(*, source_has_tests: bool) -> ConfidenceAssessment:
+def assess_confidence(
+    *,
+    source_has_tests: bool,
+    source_smoke_passed: bool | None = None,
+    generated: bool = False,
+    low_quality: bool = False,
+    generated_assessment: object | None = None,
+) -> ConfidenceAssessment:
     """Select the two evidence tiers without changing execution strictness."""
 
+    if generated_assessment is not None:
+        generated = bool(getattr(generated_assessment, "generated", generated))
+        low_quality = bool(getattr(generated_assessment, "low_quality", low_quality))
+
     if source_has_tests:
-        return ConfidenceAssessment("TRANSLATED_TESTS", False)
+        downgraded = source_smoke_passed is False
+        return ConfidenceAssessment(
+            "TRANSLATED_TESTS",
+            downgraded,
+            disclosure=("source baseline smoke verification failed" if downgraded else None),
+            usable_as_primary=True,
+            source_smoke_passed=source_smoke_passed,
+        )
     return ConfidenceAssessment(
         "GENERATED_TESTS",
         True,
-        "generated tests establish self-consistency with the Agent's source understanding",
+        disclosure=(
+            "generated tests are below the LOW_QUALITY gate and cannot be primary evidence"
+            if low_quality
+            else "generated tests establish self-consistency with the Agent's source understanding"
+        ),
+        usable_as_primary=generated and not low_quality if generated else not low_quality,
+        source_smoke_passed=source_smoke_passed,
     )
 
 
 @dataclass(frozen=True)
 class TerminalClassification:
-    status: Literal["PARTIALLY_COMPLETED", "FAILED"]
-    reason: Literal["INDEPENDENT_SLICE", "VERIFICATION_TERMINAL"]
+    status: Literal["PARTIALLY_COMPLETED", "FAILED", "NON_TERMINAL"]
+    reason: Literal["INDEPENDENT_SLICE", "VERIFICATION_TERMINAL", "REPAIR_IN_PROGRESS"]
 
 
-def classify_terminal_failure(*, independent_slice: bool) -> TerminalClassification:
-    """Apply the M-10 partial-completion boundary after repair exhaustion."""
+def classify_terminal_failure(
+    *, independent_slice: bool, budget: GlobalRepairBudget | None = None
+) -> TerminalClassification:
+    """Apply the terminal boundary only after the global repair budget is exhausted."""
 
+    if budget is None or not budget.exhausted:
+        return TerminalClassification("NON_TERMINAL", "REPAIR_IN_PROGRESS")
     if independent_slice:
         return TerminalClassification("PARTIALLY_COMPLETED", "INDEPENDENT_SLICE")
     return TerminalClassification("FAILED", "VERIFICATION_TERMINAL")
@@ -217,6 +329,15 @@ class ModuleConservation:
     assertion_ratio: float | None
     loc_ratio: float | None
     outlier: bool
+    source_test_count: int | None = None
+    source_assertion_count: int | None = None
+    source_loc_count: int | None = None
+    target_test_count: int = 0
+    target_assertion_count: int = 0
+    target_loc_count: int = 0
+    test_outlier: bool | None = None
+    assertion_outlier: bool | None = None
+    loc_outlier: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +354,25 @@ class StructuralConservationFacts:
             ratio is not None
             for item in self.per_module
             for ratio in (item.test_ratio, item.assertion_ratio, item.loc_ratio)
+        )
+
+    @property
+    def has_test_or_assertion_outlier(self) -> bool:
+        return any(
+            item.test_outlier or item.assertion_outlier
+            if item.test_outlier is not None or item.assertion_outlier is not None
+            else item.outlier and (item.test_ratio is not None or item.assertion_ratio is not None)
+            for item in self.per_module
+        )
+
+    @property
+    def zero_baseline_modules(self) -> tuple[object, ...]:
+        return tuple(
+            item.module
+            for item in self.per_module
+            if item.source_test_count in (None, 0)
+            or item.source_assertion_count in (None, 0)
+            or item.source_loc_count in (None, 0)
         )
 
 
@@ -258,7 +398,27 @@ def structural_conservation(
             _ratio(destination, baseline) for destination, baseline in zip(target, source)
         )
         outlier = any(ratio is not None and not low <= ratio <= high for ratio in ratios)
-        facts.append(ModuleConservation(module, ratios[0], ratios[1], ratios[2], outlier))
+        outliers = tuple(
+            ratio is not None and not low <= ratio <= high for ratio in ratios
+        )
+        facts.append(
+            ModuleConservation(
+                module,
+                ratios[0],
+                ratios[1],
+                ratios[2],
+                outlier,
+                source[0],
+                source[1],
+                source[2],
+                target[0],
+                target[1],
+                target[2],
+                outliers[0],
+                outliers[1],
+                outliers[2],
+            )
+        )
     return StructuralConservationFacts(tuple(facts))
 
 
@@ -277,7 +437,7 @@ def assist_ambiguous_failure(
 
     if facts is None or not facts.per_module or not facts.has_comparable_baseline:
         return ConservationDecision("SUPERVISOR")
-    if facts.has_outlier:
+    if facts.has_test_or_assertion_outlier:
         return ConservationDecision("TEST_TRANSLATION", test_slice)
     return ConservationDecision("IMPLEMENTATION", implementation_slice)
 
@@ -339,4 +499,5 @@ BOUNDARY_DECLARATIONS = (
     "performance equivalence is outside the primary proof scope",
     "security equivalence is outside the primary proof scope",
     "ecosystem convention equivalence is outside the primary proof scope",
+    "same-source implementation and test misunderstandings can form a collusion blind spot",
 )

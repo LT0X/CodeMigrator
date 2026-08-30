@@ -1,6 +1,7 @@
 from codemigrator.core import CheckAction, CheckStatus
 from codemigrator.verification.execution import (
     ExecutionFacts,
+    annotate_generated_result,
     assess_generated_test,
     flaky_reduce,
     normalize_execution,
@@ -67,6 +68,28 @@ def test_flaky_is_only_test_integration_or_final_and_timeout_is_not_flaky() -> N
     )
 
 
+def test_flaky_reduction_is_per_test_and_preserves_failure_lists() -> None:
+    reduction = flaky_reduce(
+        CheckAction.Test,
+        "FINAL",
+        {
+            "tests/test_app.py::test_flaky": [
+                CheckStatus.Failed,
+                CheckStatus.Passed,
+                CheckStatus.Passed,
+            ],
+            "tests/test_app.py::test_broken": [
+                CheckStatus.Failed,
+                CheckStatus.Failed,
+                CheckStatus.Passed,
+            ],
+        },
+    )
+    assert reduction.status is CheckStatus.Failed
+    assert reduction.flaky_tests == ("tests/test_app.py::test_flaky",)
+    assert reduction.failed_tests == ("tests/test_app.py::test_broken",)
+
+
 def test_generated_test_quality_is_deterministic_and_separate_from_execution() -> None:
     low = assess_generated_test("def test_empty():\n    assert True\n")
     good = assess_generated_test("def test_value(value):\n    assert value == 'expected'\n")
@@ -91,3 +114,13 @@ def test_generated_test_quality_is_deterministic_and_separate_from_execution() -
         ).status
         is CheckStatus.Failed
     )
+
+
+def test_generated_annotation_is_evidence_and_not_fingerprint_semantics() -> None:
+    from .conftest import check, result
+
+    required = check(CheckAction.Test, "1" * 64)
+    assessment = assess_generated_test("def test_value(value):\n    assert value == 'expected'\n")
+    evidence = annotate_generated_result(result(required), assessment)
+    assert evidence.generated is True
+    assert evidence.low_quality is False

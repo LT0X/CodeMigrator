@@ -19,6 +19,8 @@ from codemigrator.core import (
 )
 from codemigrator.core.models.verification import VerificationOutcome, VerificationSubject
 
+from .checks import CheckResultEvidence, ResultEvidence, SkippedEmptyResult
+
 
 @dataclass(frozen=True)
 class StabilityComparison:
@@ -37,9 +39,24 @@ def _target_semantics(target: object) -> dict[str, object]:
     return {"kind": "UNKNOWN"}
 
 
-def semantic_check_result(result: CheckResult) -> dict[str, object]:
+def _unwrap_result(result: ResultEvidence) -> CheckResult:
+    if isinstance(result, (SkippedEmptyResult, CheckResultEvidence)):
+        return result.result
+    return result
+
+
+def _result_disposition(result: ResultEvidence) -> str | None:
+    if isinstance(result, SkippedEmptyResult):
+        return result.disposition
+    if isinstance(result, CheckResultEvidence):
+        return result.disposition
+    return None
+
+
+def semantic_check_result(result: ResultEvidence) -> dict[str, object]:
     """Return the fingerprint payload for one result, excluding carriers."""
 
+    unwrapped = _unwrap_result(result)
     diagnostics = [
         {
             "severity": diagnostic.severity.value,
@@ -47,26 +64,34 @@ def semantic_check_result(result: CheckResult) -> dict[str, object]:
             "code": diagnostic.code,
             "message_hash": str(diagnostic.message_hash),
         }
-        for diagnostic in result.diagnostics
+        for diagnostic in unwrapped.diagnostics
     ]
     diagnostics.sort(key=lambda item: canonical_json_bytes(item))
-    return {
-        "check_id": str(result.check_id),
-        "invocation_hash": str(result.invocation_hash),
-        "status": result.status.value,
+    semantic: dict[str, object] = {
+        "check_id": str(unwrapped.check_id),
+        "invocation_hash": str(unwrapped.invocation_hash),
+        "status": unwrapped.status.value,
         "diagnostics": diagnostics,
     }
+    disposition = _result_disposition(result)
+    if disposition is not None:
+        semantic["disposition"] = disposition
+    return semantic
 
 
 def verification_fingerprint(
     tested_commit_oid: str,
     frozen_required_checks_sha256: str,
-    results: Iterable[CheckResult],
+    results: Iterable[ResultEvidence],
 ) -> Sha256:
     """Hash only the tested commit, frozen check set and semantic results."""
 
+    materialized = list(results)
+    check_ids = [str(_unwrap_result(result).check_id) for result in materialized]
+    if len(check_ids) != len(set(check_ids)):
+        raise ValueError("duplicate CheckId blocks verification fingerprinting")
     semantic_results = sorted(
-        (semantic_check_result(result) for result in results),
+        (semantic_check_result(result) for result in materialized),
         key=lambda item: str(item["check_id"]).encode("utf-8"),
     )
     payload = {
@@ -83,37 +108,88 @@ def build_verification_outcome(
     subject: VerificationSubject,
     tested_commit_oid: GitOid,
     frozen_required_checks_sha256: Sha256,
-    results: Sequence[CheckResult],
+    results: Sequence[ResultEvidence],
 ) -> VerificationOutcome:
     """Assemble the core outcome without adding a second public contract."""
 
+    unwrapped = [_unwrap_result(result) for result in results]
     return VerificationOutcome(
         run_id=run_id,
         subject=subject,
         tested_commit_oid=tested_commit_oid,
         frozen_required_checks_sha256=frozen_required_checks_sha256,
-        check_results=list(results),
+        check_results=unwrapped,
         verification_fingerprint=verification_fingerprint(
             str(tested_commit_oid), str(frozen_required_checks_sha256), results
         ),
     )
 
 
+@dataclass(frozen=True)
+class VerificationOutcomeEvidence:
+    """Core outcome plus non-fingerprint provenance annotations."""
+
+    outcome: VerificationOutcome
+    result_evidence: tuple[CheckResultEvidence, ...]
+
+
+def build_verification_evidence(
+    *,
+    run_id: RunId,
+    subject: VerificationSubject,
+    tested_commit_oid: GitOid,
+    frozen_required_checks_sha256: Sha256,
+    results: Sequence[ResultEvidence],
+) -> VerificationOutcomeEvidence:
+    """Assemble generated/skipped evidence beside the closed core outcome."""
+
+    evidence = tuple(
+        result
+        if isinstance(result, CheckResultEvidence)
+        else result.as_evidence()
+        if isinstance(result, SkippedEmptyResult)
+        else CheckResultEvidence(result=result)
+        for result in results
+    )
+    return VerificationOutcomeEvidence(
+        outcome=build_verification_outcome(
+            run_id=run_id,
+            subject=subject,
+            tested_commit_oid=tested_commit_oid,
+            frozen_required_checks_sha256=frozen_required_checks_sha256,
+            results=evidence,
+        ),
+        result_evidence=evidence,
+    )
+
+
+def _validate_unique_check_ids(results: Sequence[ResultEvidence], label: str) -> None:
+    check_ids = [str(_unwrap_result(result).check_id) for result in results]
+    if len(check_ids) != len(set(check_ids)):
+        raise ValueError(f"duplicate CheckId blocks {label} stability comparison")
+
+
 def compare_stability(
     *,
     tested_commit_oid: str,
-    final_checks: Sequence[CheckResult],
+    final_checks: Sequence[ResultEvidence],
     final_frozen_hash: str,
-    prospective_checks: Sequence[CheckResult],
+    prospective_checks: Sequence[ResultEvidence],
     prospective_frozen_hash: str,
     prospective_tested_commit_oid: str,
 ) -> StabilityComparison:
     """Compare Final and Prospective semantics only when the commit is shared."""
 
+    _validate_unique_check_ids(final_checks, "Final")
+    _validate_unique_check_ids(prospective_checks, "Prospective")
     if tested_commit_oid != prospective_tested_commit_oid:
         return StabilityComparison(False, None)
-    final_by_id = {str(result.check_id): result for result in final_checks}
-    prospective_by_id = {str(result.check_id): result for result in prospective_checks}
+    final_by_id = {
+        str(_unwrap_result(result).check_id): result for result in final_checks
+    }
+    prospective_by_id = {
+        str(_unwrap_result(result).check_id): result for result in prospective_checks
+    }
     shared = tuple(
         sorted(final_by_id.keys() & prospective_by_id.keys(), key=lambda value: value.encode())
     )

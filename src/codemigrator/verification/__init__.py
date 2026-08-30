@@ -1,6 +1,7 @@
 """Side-effect-free verification facts and deterministic reductions."""
 
 from .checks import (
+    CheckResultEvidence,
     CheckSetValidation,
     CheckSpec,
     SkippedEmptyResult,
@@ -14,6 +15,7 @@ from .diagnostics import (
     AttributionContext,
     AttributionResult,
     DiagnosticParserRegistry,
+    ParsedDiagnostics,
     attribute_diagnostics,
     normalize_diagnostic_message,
 )
@@ -23,6 +25,7 @@ from .execution import (
     GeneratedTestAssessment,
     LaunchReceipt,
     NormalizedExecution,
+    annotate_generated_result,
     assess_generated_test,
     flaky_reduce,
     normalize_execution,
@@ -30,6 +33,8 @@ from .execution import (
 )
 from .fingerprint import (
     StabilityComparison,
+    VerificationOutcomeEvidence,
+    build_verification_evidence,
     build_verification_outcome,
     compare_stability,
     semantic_check_result,
@@ -40,6 +45,7 @@ from .routing import (
     CollectionCompleteness,
     ConfidenceAssessment,
     ConservationDecision,
+    FailureReduction,
     FeedbackRepairBudget,
     GlobalRepairBudget,
     ModuleConservation,
@@ -57,6 +63,7 @@ from .routing import (
     classify_terminal_failure,
     load_policy_snapshot,
     parity_compare,
+    reduce_failure,
     structural_conservation,
 )
 
@@ -64,6 +71,11 @@ __all__ = [
     "AttributionContext",
     "AttributionResult",
     "BOUNDARY_DECLARATIONS",
+    "CheckResultEvidence",
+    "FailureReduction",
+    "VerificationOutcomeEvidence",
+    "annotate_generated_result",
+    "build_verification_evidence",
     "build_verification_outcome",
     "CheckSetValidation",
     "CheckSpec",
@@ -81,6 +93,7 @@ __all__ = [
     "NormalizedExecution",
     "ParityEvidence",
     "ParityResult",
+    "ParsedDiagnostics",
     "RouteDecision",
     "SkippedEmptyResult",
     "StabilityComparison",
@@ -104,6 +117,7 @@ __all__ = [
     "normalize_diagnostic_message",
     "normalize_execution",
     "parity_compare",
+    "reduce_failure",
     "register_launch",
     "assess_generated_test",
     "semantic_check_result",

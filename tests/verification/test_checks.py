@@ -121,14 +121,81 @@ def test_empty_test_is_a_passed_typed_receipt_without_execution() -> None:
     assert receipt.result.status is CheckStatus.Passed
 
 
-def test_integration_test_without_coverage_mapping_is_not_in_field() -> None:
+def test_skipped_empty_is_only_valid_for_a_known_empty_test_spec() -> None:
+    compile_required = check(CheckAction.Compile, "1" * 64)
+    compile_spec = instantiate_checks(
+        VerificationLayer.LOCAL,
+        [compile_required],
+        {compile_required.template_sha256: template(CheckAction.Compile, "go")},
+    )[0]
+    with pytest.raises(ValueError, match="Test"):
+        make_skipped_empty_result(compile_spec, receipt_id=None)
+
+    test_required = check(CheckAction.Test, "2" * 64)
+    test_spec = instantiate_checks(
+        VerificationLayer.FINAL,
+        [test_required],
+        {test_required.template_sha256: template(CheckAction.Test, "pytest")},
+        test_files=["tests/test_app.py"],
+    )[0]
+    with pytest.raises(ValueError, match="empty"):
+        make_skipped_empty_result(test_spec, receipt_id=None)
+
+
+def test_exact_set_requires_typed_skip_for_a_known_empty_test_spec() -> None:
+    required = check(CheckAction.Test, "1" * 64)
+    spec = instantiate_checks(
+        VerificationLayer.FINAL,
+        [required],
+        {required.template_sha256: template(CheckAction.Test, "pytest")},
+        test_files=[],
+    )[0]
+    skipped = make_skipped_empty_result(spec, receipt_id=None)
+    assert validate_check_results([spec], [skipped]).guard.all_required_checks_passed is True
+    assert (
+        validate_check_results([spec], [skipped.result]).guard.all_required_checks_passed is False
+    )
+
+
+def test_error_unknown_blocks_the_derived_guard_even_when_checks_pass() -> None:
+    required = check(CheckAction.Compile, "1" * 64)
+    spec = instantiate_checks(
+        VerificationLayer.LOCAL,
+        [required],
+        {required.template_sha256: template(CheckAction.Compile, "go")},
+    )[0]
+    diagnostic = {
+        "severity": "Error",
+        "target": {"kind": "UNKNOWN"},
+        "code": "UNKNOWN_DIAGNOSTIC",
+        "message_hash": "a" * 64,
+    }
+    passed = result(required, invocation_hash=str(spec.invocation_hash), diagnostics=[diagnostic])
+    report = validate_check_results([spec], [passed])
+    assert report.guard.error_unknown_count == 1
+    assert report.guard.all_required_checks_passed is False
+
+
+def test_integration_test_without_coverage_mapping_is_blocked() -> None:
+    required = check(CheckAction.Test, "1" * 64)
+    with pytest.raises(ValueError, match="coverage"):
+        instantiate_checks(
+            VerificationLayer.INTEGRATION,
+            [required],
+            {required.template_sha256: template(CheckAction.Test, "pytest")},
+            test_files=["tests/test_app.py"],
+            test_coverage={},
+            integrated_slices={"slice-a"},
+        )
+
+
+def test_integration_empty_test_set_does_not_require_coverage_data() -> None:
     required = check(CheckAction.Test, "1" * 64)
     spec = instantiate_checks(
         VerificationLayer.INTEGRATION,
         [required],
         {required.template_sha256: template(CheckAction.Test, "pytest")},
-        test_files=["tests/test_app.py"],
-        test_coverage={},
+        test_files=[],
         integrated_slices={"slice-a"},
     )[0]
     assert spec.test_files == ()

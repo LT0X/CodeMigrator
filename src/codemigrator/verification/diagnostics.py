@@ -33,7 +33,16 @@ _TIMESTAMP = re.compile(
 )
 _ABSOLUTE_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|/)[^\s:]+")
 
-Parser = Callable[[str, str], list[DiagnosticMapping]]
+@dataclass(frozen=True)
+class ParsedDiagnostics:
+    """Parser output including whether every meaningful line was understood."""
+
+    mappings: tuple[DiagnosticMapping, ...]
+    complete: bool
+    unparsed_lines: tuple[str, ...] = ()
+
+
+Parser = Callable[[str, str], ParsedDiagnostics | list[DiagnosticMapping]]
 
 
 def _as_slice_id(value: object) -> SliceId:
@@ -82,11 +91,16 @@ def _safe_file(path: str) -> RepoRelativePath | None:
         return None
 
 
-def _parse_file_lines(text: str, program: str) -> list[DiagnosticMapping]:
+def _parse_file_lines(text: str, program: str) -> ParsedDiagnostics:
     mappings: list[DiagnosticMapping] = []
+    unparsed: list[str] = []
     for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
         match = _FILE_LINE.match(line.strip())
         if match is None:
+            unparsed.append(stripped)
             continue
         path = _safe_file(match.group("path"))
         if path is None:
@@ -106,15 +120,20 @@ def _parse_file_lines(text: str, program: str) -> list[DiagnosticMapping]:
                 message,
             )
         )
-    return mappings
+    return ParsedDiagnostics(tuple(mappings), not unparsed, tuple(unparsed))
 
 
-def _parse_pytest(text: str, program: str) -> list[DiagnosticMapping]:
+def _parse_pytest(text: str, program: str) -> ParsedDiagnostics:
     del program
     mappings: list[DiagnosticMapping] = []
+    unparsed: list[str] = []
     for line in text.splitlines():
-        match = _PYTEST_FAILURE.match(line.strip())
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = _PYTEST_FAILURE.match(stripped)
         if match is None:
+            unparsed.append(stripped)
             continue
         message = match.group("message") or "pytest test failed"
         mappings.append(
@@ -125,7 +144,7 @@ def _parse_pytest(text: str, program: str) -> list[DiagnosticMapping]:
                 message,
             )
         )
-    return mappings
+    return ParsedDiagnostics(tuple(mappings), not unparsed, tuple(unparsed))
 
 
 def _unknown(text: str) -> list[DiagnosticMapping]:
@@ -173,6 +192,18 @@ class DiagnosticParserRegistry:
         if parser is None:
             return _unknown(text)
         parsed = parser(text, program)
+        if isinstance(parsed, ParsedDiagnostics):
+            mappings = list(parsed.mappings)
+            if parsed.unparsed_lines or not parsed.complete:
+                mappings.append(
+                    _mapping(
+                        DiagnosticSeverity.Error,
+                        Unknown(kind="UNKNOWN"),
+                        "UNKNOWN_DIAGNOSTIC",
+                        "\n".join(parsed.unparsed_lines) or text,
+                    )
+                )
+            return mappings or _unknown(text)
         return parsed or _unknown(text)
 
 
@@ -189,6 +220,9 @@ class AttributionContext:
     dependency_file_to_slices: Mapping[str, Iterable[object]] | None = None
     interface_definition_slices: tuple[object, ...] = ()
     call_site_slices: tuple[object, ...] = ()
+    interface_definition_files: Mapping[str, Iterable[object]] | None = None
+    call_site_files: Mapping[str, Iterable[object]] | None = None
+    coupling_evidence_complete: bool = False
     cross_generation_recurrence: bool = False
 
 
@@ -200,6 +234,8 @@ class AttributionResult:
     reliability: AttributionReliability
     strong_coupling: bool = False
     cross_generation_recurrence: bool = False
+    unknown_error_count: int = 0
+    coupling_evidence_complete: bool = False
     reason: str = ""
 
     def to_repair_evidence(self) -> RepairEvidence:
@@ -208,7 +244,10 @@ class AttributionResult:
             reliability=self.reliability,
             strong_coupling=self.strong_coupling,
             cross_generation_recurrence=self.cross_generation_recurrence,
-            conservation_signal_summary={},
+            conservation_signal_summary={
+                "error_unknown_count": self.unknown_error_count,
+                "coupling_evidence_complete": self.coupling_evidence_complete,
+            },
         )
 
 
@@ -231,6 +270,19 @@ def _test_file(test_name: str) -> str:
     return test_name.split("::", 1)[0]
 
 
+def _mapped_slices(
+    diagnostics: Iterable[DiagnosticMapping], mapping: Mapping[str, Iterable[object]] | None
+) -> set[object]:
+    if not mapping:
+        return set()
+    return {
+        slice_id
+        for diagnostic in diagnostics
+        if isinstance(diagnostic.target, FileLine)
+        for slice_id in mapping.get(diagnostic.target.file_path, ())
+    }
+
+
 def attribute_diagnostics(
     diagnostics: Iterable[DiagnosticMapping],
     context: AttributionContext,
@@ -245,9 +297,8 @@ def attribute_diagnostics(
     if not errors:
         return AttributionResult((), AttributionReliability.Uncertain, reason="no_error_diagnostic")
 
-    strong_coupling = (
-        bool(context.interface_definition_slices and context.call_site_slices)
-        and len(set(context.interface_definition_slices) | set(context.call_site_slices)) >= 2
+    unknown_error_count = sum(
+        isinstance(diagnostic.target, Unknown) for diagnostic in errors
     )
     dynamic = action is CheckAction.Test or any(
         isinstance(diagnostic.target, TestIdentity) for diagnostic in errors
@@ -289,19 +340,39 @@ def attribute_diagnostics(
                         context.dependency_file_to_slices.get(diagnostic.target.file_path, ())
                     )
 
+    interface_hits = set(context.interface_definition_slices) & candidates
+    interface_hits.update(_mapped_slices(errors, context.interface_definition_files))
+    call_hits = set(context.call_site_slices) & candidates
+    call_hits.update(_mapped_slices(errors, context.call_site_files))
+    strong_coupling = (
+        bool(interface_hits and call_hits)
+        and len(interface_hits | call_hits) >= 2
+    )
+
     if dynamic:
         reliability = AttributionReliability.Dynamic
         reason = "symbol_evidence" if symbol_candidates else "file_fallback"
-    elif len(candidates) == 1 and not strong_coupling:
+    elif unknown_error_count:
+        reliability = AttributionReliability.Uncertain
+        reason = "unknown_diagnostic"
+    elif len(candidates) == 1 and context.coupling_evidence_complete and not strong_coupling:
         reliability = AttributionReliability.Reliable
         reason = "static_unique_scope"
     else:
         reliability = AttributionReliability.Uncertain
-        reason = "static_ambiguous_scope" if candidates else "static_no_scope"
+        reason = (
+            "coupling_evidence_incomplete"
+            if not context.coupling_evidence_complete
+            else "static_ambiguous_scope"
+            if candidates
+            else "static_no_scope"
+        )
     return AttributionResult(
         candidate_slice_set=_ordered(candidates),
         reliability=reliability,
         strong_coupling=strong_coupling,
         cross_generation_recurrence=context.cross_generation_recurrence,
+        unknown_error_count=unknown_error_count,
+        coupling_evidence_complete=context.coupling_evidence_complete,
         reason=reason,
     )
