@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codemigrator-cli"
+version = "0.1.0"
+description = "CodeMigrator command-line observation client"
+requires-python = ">=3.12"
+dependencies = ["rich>=13.9,<15"]
+
+[project.scripts]
+codemigrator = "codemigrator_cli.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codemigrator_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

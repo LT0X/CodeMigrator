@@ -44,3 +44,7 @@ __pycache__/
 .import_linter_cache/
 .venv/
 *.egg-info/
+
+# Web build and dependency artifacts
+web/node_modules/
+web/dist/
