@@ -1,10 +1,15 @@
+/* @vitest-environment jsdom */
+import { act } from "react";
+import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { createInitialStageState, reduceStage } from "../../shared/stage/stageReducer";
 import type { RunEvent } from "../../shared/stage/types";
 import { mascotIdentity, mascotVisualState, WorkspaceShell } from "./WorkspaceShell";
 
-const event = (sequence: number, type: string, data: Record<string, unknown>): RunEvent => ({
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+  const event = (sequence: number, type: string, data: Record<string, unknown>): RunEvent => ({
   schema: "migration.event",
   version: 1,
   sequence,
@@ -20,6 +25,7 @@ const workspaceState = () => [
   event(4, "dispatch.started", { slice_id: "slice-verified", kind: "IMPLEMENTATION", generation: 0 }),
   event(5, "integration.completed", { slice_id: "slice-verified", generation: 0 }),
   event(6, "verified.advanced", { slice_id: "slice-verified", generation: 0, commit_oid: "7f2a91c" }),
+  event(7, "slice.status_changed", { slice_id: "slice-waiting", kind: "IMPLEMENTATION", status: "INTEGRATION_QUEUED", generation: 0, integration_rank: 1 }),
 ].reduce(reduceStage, createInitialStageState());
 
 describe("WorkspaceShell", () => {
@@ -35,6 +41,8 @@ describe("WorkspaceShell", () => {
     expect(html).toContain('data-persona-key="slice-regenerating:1"');
     expect(html).toContain("等待契约集成");
     expect(html).toContain("未提供");
+    expect(html).toContain('data-visual-state="waiting"');
+    expect((html.match(/class="folder-stream"/g) ?? []).length).toBe(1);
     expect(html).not.toContain("coder-v2");
   });
 
@@ -72,5 +80,28 @@ describe("WorkspaceShell", () => {
 
     expect(html).toContain('data-celebration="slice-verified:0"');
     expect(html).toContain('data-celebration-particle="true"');
+  });
+
+  it("exposes every slice in stable integration order for the mobile list", () => {
+    const html = renderToStaticMarkup(<WorkspaceShell state={workspaceState()} onToggle={() => undefined} />);
+
+    expect(html).toContain('aria-label="移动端 Slice 列表"');
+    expect(html.indexOf('data-mobile-slice-id="slice-waiting"')).toBeLessThan(html.indexOf('data-mobile-slice-id="slice-running"'));
+    expect(html).toContain('data-mobile-slice-id="slice-blocked"');
+    expect(html).toContain('data-mobile-slice-id="slice-regenerating"');
+    expect(html).toContain('data-mobile-slice-id="slice-verified"');
+  });
+
+  it("clears a live focus lock when Escape is pressed", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    let clears = 0;
+    await act(async () => root.render(<WorkspaceShell state={workspaceState()} onToggle={() => undefined} onClearFocus={() => { clears += 1; }} />));
+    await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
+
+    expect(clears).toBe(1);
+    await act(async () => root.unmount());
+    host.remove();
   });
 });

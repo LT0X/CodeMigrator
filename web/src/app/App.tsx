@@ -16,11 +16,6 @@ function DemoWorkspace() {
   const events = useMemo(() => mockRunEvents, []);
   const [playback, setPlayback] = useState(() => createDemoPlayback(events));
   useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") setPlayback((current) => ({ ...current, state: clearFocusLock(current.state) })); };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
-  useEffect(() => {
     if (!playback.isPlaying) return;
     const timer = window.setInterval(() => setPlayback(advanceDemoPlayback), 750);
     return () => window.clearInterval(timer);
@@ -35,7 +30,7 @@ function RouteNotFound() {
 export function App() {
   const path = window.location.pathname;
   const client = useMemo(() => createApiClient(), []);
-  const isDemo = path === "/demo" || new URLSearchParams(window.location.search).get("demo") === "1";
+  const isDemo = path === "/demo";
   if (isDemo) {
     const reportMatch = path.match(/^\/runs\/([^/]+)\/report$/);
     return reportMatch ? <ReportView report={{ run_id: reportMatch[1], status: "COMPLETED" }} /> : <DemoWorkspace />;

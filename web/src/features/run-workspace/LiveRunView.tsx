@@ -11,6 +11,7 @@ export function LiveRunView({ client, runId }: { client: ApiClient; runId: strin
   const [diagnostic, setDiagnostic] = useState<string | null>(null);
   const [presentationCelebrationKey, setPresentationCelebrationKey] = useState<string | null>(null);
   const stageRef = useRef<StageState | null>(null);
+  const catchingUpRef = useRef(false);
   useEffect(() => {
     const controller = new AbortController();
     void (async () => {
@@ -19,13 +20,15 @@ export function LiveRunView({ client, runId }: { client: ApiClient; runId: strin
         const hydrated = hydrateStage(snapshot);
         stageRef.current = hydrated;
         setState(hydrated);
-        for await (const event of observeRun(client, runId, controller.signal, snapshot.latest_sequence)) {
+        for await (const event of observeRun(client, runId, controller.signal, snapshot.latest_sequence, (phase) => {
+          catchingUpRef.current = phase === "start";
+        })) {
           const current = stageRef.current;
           if (!current) continue;
           const next = reduceStage(current, event);
           stageRef.current = next;
           setState(next);
-          const celebration = presentationCelebration(current, next);
+          const celebration = catchingUpRef.current ? null : presentationCelebration(current, next);
           if (celebration) setPresentationCelebrationKey(celebration);
         }
       } catch {

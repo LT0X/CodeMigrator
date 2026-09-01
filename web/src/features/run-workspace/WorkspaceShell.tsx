@@ -121,12 +121,12 @@ function FolderStream() {
   );
 }
 
-function Mascot({ slice, action = slice.action, celebration = false }: { slice: SliceProjection; action?: StageAction; celebration?: boolean }) {
+function Mascot({ slice, action = slice.action, celebration = false, compact = false }: { slice: SliceProjection; action?: StageAction; celebration?: boolean; compact?: boolean }) {
   const identity = mascotIdentity(slice.id, slice.generation);
   const visualState = mascotVisualState(action);
   return (
     <article
-      className={`mascot mascot-${visualState}${celebration ? " mascot-celebration" : ""}`}
+      className={`mascot mascot-${visualState}${celebration ? " mascot-celebration" : ""}${compact ? " mascot-compact" : ""}`}
       data-persona-key={identity}
       data-state={visualState}
       data-visual-state={visualState}
@@ -137,7 +137,7 @@ function Mascot({ slice, action = slice.action, celebration = false }: { slice: 
         <code>{slice.id}</code>
         <span>g{slice.generation} · {actionLabel[action]}</span>
       </div>
-      {!celebration && <FolderStream />}
+      {!celebration && action === "run" && <FolderStream />}
     </article>
   );
 }
@@ -147,10 +147,11 @@ interface SliceCapsuleProps {
   readonly focused: boolean;
   readonly locked: boolean;
   readonly pulse: boolean;
+  readonly pulseVersion: number;
   readonly onToggle: () => void;
 }
 
-function SliceCapsule({ slice, focused, locked, pulse, onToggle }: SliceCapsuleProps) {
+function SliceCapsule({ slice, focused, locked, pulse, pulseVersion, onToggle }: SliceCapsuleProps) {
   const placeholder = !slice.persona && (slice.status === "CONTRACT_BLOCKED" || slice.status === "READY");
   if (placeholder) {
     return (
@@ -169,6 +170,7 @@ function SliceCapsule({ slice, focused, locked, pulse, onToggle }: SliceCapsuleP
       onClick={onToggle}
       className={`slice-capsule state-${mascotVisualState(slice.action)}${focused ? " is-focused" : ""}${locked ? " is-locked" : ""}${pulse ? " is-pulsed" : ""}`}
       data-slice-id={slice.id}
+      data-pulse-version={pulseVersion}
     >
       <span className="capsule-status">{actionLabel[slice.action]}</span>
       <code>{slice.id}</code>
@@ -207,11 +209,37 @@ function StageObject({ zone, slice }: { zone: "waiting" | "regeneration"; slice?
       aria-label={isWaiting ? "等待对象" : "重生成对象"}
     >
       <span className="stage-object-icon" aria-hidden="true">{isWaiting ? "◌" : "!"}</span>
+      {isWaiting && slice && <Mascot slice={slice} action="wait" compact />}
       <span>
         <strong>{isWaiting ? "等待对象" : "重生成对象"}</strong>
         <small>{slice ? `${slice.id} · g${slice.generation}` : isWaiting ? "等待后端事实" : "等待失败归因"}</small>
       </span>
     </div>
+  );
+}
+
+function MobileSliceList({ slices, state, onToggle }: { slices: readonly SliceProjection[]; state: StageState; onToggle: (id: string) => void }) {
+  const ordered = [...slices].sort(
+    (left, right) => (left.integrationRank ?? Number.MAX_SAFE_INTEGER) - (right.integrationRank ?? Number.MAX_SAFE_INTEGER) || left.id.localeCompare(right.id),
+  );
+  return (
+    <section className="mobile-slice-list" aria-label="移动端 Slice 列表">
+      <div className="panel-kicker">Mobile Slice List <span>{ordered.length} 个对象</span></div>
+      <ol>
+        {ordered.map((slice) => (
+          <li key={mascotIdentity(slice.id, slice.generation)} data-mobile-slice-id={slice.id}>
+            <SliceCapsule
+              slice={slice}
+              focused={state.focusedId === slice.id}
+              locked={state.lockedId === slice.id}
+              pulse={state.pulseIds.includes(slice.id)}
+              pulseVersion={state.pulseVersion[slice.id] ?? 0}
+              onToggle={() => onToggle(slice.id)}
+            />
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }
 
@@ -252,6 +280,15 @@ export function WorkspaceShell({
   demoControls,
   presentationCelebrationKey,
 }: WorkspaceShellProps) {
+  useEffect(() => {
+    if (!onClearFocus) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClearFocus();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClearFocus]);
+
   const slices = Object.values(state.slices).sort(
     (left, right) => right.lastSequence - left.lastSequence || left.id.localeCompare(right.id),
   );
@@ -296,6 +333,7 @@ export function WorkspaceShell({
                 focused={state.focusedId === slice.id}
                 locked={state.lockedId === slice.id}
                 pulse={state.pulseIds.includes(slice.id)}
+                pulseVersion={state.pulseVersion[slice.id] ?? 0}
                 onToggle={() => onToggle(slice.id)}
               />
             ))}
@@ -314,6 +352,7 @@ export function WorkspaceShell({
                 focused={state.focusedId === slice.id}
                 locked={state.lockedId === slice.id}
                 pulse={state.pulseIds.includes(slice.id)}
+                pulseVersion={state.pulseVersion[slice.id] ?? 0}
                 onToggle={() => onToggle(slice.id)}
               />
             ))}
@@ -325,6 +364,8 @@ export function WorkspaceShell({
           <div className="token-bridge" aria-hidden="true"><span>·</span><span>→</span><span>·</span></div>
           <StageObject zone="regeneration" slice={regenerationSlice} />
         </div>
+
+        <MobileSliceList slices={slices} state={state} onToggle={onToggle} />
 
         <section className="workspace-details">
           <section className="verified-spine">
