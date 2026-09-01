@@ -51,4 +51,26 @@ describe("WorkspaceShell", () => {
 
     expect(html).toContain("无已提供的冻结集成序");
   });
+
+  it("keeps waiting and regeneration object slots visible below the central surround", () => {
+    const html = renderToStaticMarkup(<WorkspaceShell state={workspaceState()} onToggle={() => undefined} />);
+
+    expect(html).toContain('data-stage-object="waiting"');
+    expect(html).toContain('data-stage-object="regeneration"');
+    expect(html).toContain("等待对象");
+    expect(html).toContain("重生成对象");
+  });
+
+  it("renders the verified flyover with transient celebration particles", () => {
+    const html = renderToStaticMarkup(
+      <WorkspaceShell
+        state={workspaceState()}
+        onToggle={() => undefined}
+        presentationCelebrationKey="slice-verified:0"
+      />,
+    );
+
+    expect(html).toContain('data-celebration="slice-verified:0"');
+    expect(html).toContain('data-celebration-particle="true"');
+  });
 });

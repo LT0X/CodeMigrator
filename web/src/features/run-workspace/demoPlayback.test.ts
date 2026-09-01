@@ -3,6 +3,7 @@ import { mockRunEvents } from "../../shared/stage/mockEvents";
 import {
   advanceDemoPlayback,
   createDemoPlayback,
+  presentationCelebration,
   replayDemoPlayback,
   toggleDemoPlayback,
 } from "./demoPlayback";
@@ -35,5 +36,15 @@ describe("deterministic demo playback", () => {
 
     expect(playback.state.celebrations.map((item) => item.key)).toEqual(["slice-a:0"]);
     expect(playback.state.slices["slice-b"].generation).toBe(1);
+  });
+
+  it("emits a presentation key only for a newly accepted celebration", () => {
+    let playback = createDemoPlayback(mockRunEvents);
+    const before = playback.state;
+    while (playback.nextIndex < 9) playback = advanceDemoPlayback(playback);
+    const after = playback.state;
+
+    expect(presentationCelebration(before, after)).toBe("slice-a:0");
+    expect(presentationCelebration(after, after)).toBeNull();
   });
 });
