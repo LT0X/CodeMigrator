@@ -132,6 +132,14 @@ from .observability import (
     SentinelSuite,
     serialize_observation,
 )
+from .project_migration import (
+    OpenAIProjectTranslator,
+    ProjectMigrationPhase,
+    ProjectMigrationReport,
+    ProjectMigrationRequest,
+    ProjectMigrationRunner,
+    TranslationResult,
+)
 from .provider import (
     DEFAULT_TOOL_DEFINITIONS,
     AnthropicProvider,
@@ -267,7 +275,12 @@ __all__ = [
     "NormalizationError",
     "NormalizedTurn",
     "OpenAICompatibleProvider",
+    "OpenAIProjectTranslator",
     "PromptMessage",
+    "ProjectMigrationPhase",
+    "ProjectMigrationReport",
+    "ProjectMigrationRequest",
+    "ProjectMigrationRunner",
     "ProviderError",
     "ProviderCallIdentity",
     "ProviderRegistry",
@@ -340,6 +353,7 @@ __all__ = [
     "RouteSuggestion",
     "SuggestedRoute",
     "TokenUsage",
+    "TranslationResult",
     "ToolGatewayPort",
     "ToolObservation",
     "UsageSink",

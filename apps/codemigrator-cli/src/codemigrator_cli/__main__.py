@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 from collections.abc import Callable, Iterable, Sequence
+from pathlib import Path
 
 from .cancel import CancelAction, CancelController
 from .client import (
@@ -31,6 +32,18 @@ def _parser() -> argparse.ArgumentParser:
     start = migrate_sub.add_parser("start", help="运行本地确定性迁移演示")
     start.add_argument("spec")
     _add_output_flags(start)
+    project = migrate_sub.add_parser("project", help="迁移本地项目并按阶段验证")
+    project.add_argument("source", type=Path)
+    project.add_argument("--target", type=Path, required=True)
+    project.add_argument("--api-key-file", type=Path, required=True)
+    project.add_argument("--state-dir", type=Path)
+    project.add_argument("--resume", action="store_true")
+    project.add_argument(
+        "--from-phase",
+        choices=("PREFLIGHT", "ANALYSIS", "PLAN", "EXECUTE", "VERIFY", "REPORT"),
+    )
+    project.add_argument("--parallelism", type=_positive_int, default=4)
+    project.add_argument("--output", choices=("human", "json"), default="human")
     run = subparsers.add_parser("run", help="Run 操作")
     run_sub = run.add_subparsers(dest="run_command", required=True)
     watch = run_sub.add_parser("watch", help="观察 Run")
@@ -60,6 +73,13 @@ def _non_negative_int(value: str) -> int:
     return parsed
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
 def _render_start(output: str) -> str:
     if output == "json":
         return json.dumps(
@@ -75,6 +95,56 @@ def _render_start(output: str) -> str:
     if output == "jsonl":
         return '{"run_id":"mock-run-001","status":"CREATED"}\n'
     return "已创建 Run mock-run-001\nWeb: /runs/mock-run-001\n"
+
+
+def _render_project(report: dict[str, object], output: str) -> str:
+    if output == "json":
+        return json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    status = report.get("status", "UNKNOWN")
+    phase = report.get("phase", "UNKNOWN")
+    failed = report.get("failed_files", [])
+    failed_count = len(failed) if isinstance(failed, list) else 0
+    return (
+        f"项目迁移 {status} · phase={phase} · "
+        f"translated={report.get('translated_files', 0)} · "
+        f"copied={report.get('copied_files', 0)} · failed={failed_count}\n"
+    )
+
+
+def _run_project_command(args: argparse.Namespace) -> tuple[int, str]:
+    from codemigrator.runtime import (
+        OpenAIProjectTranslator,
+        ProjectMigrationPhase,
+        ProjectMigrationRequest,
+        ProjectMigrationRunner,
+    )
+
+    translator = None
+    try:
+        translator = OpenAIProjectTranslator.from_key_file(args.api_key_file)
+        from_phase = (
+            None if args.from_phase is None else ProjectMigrationPhase(args.from_phase)
+        )
+        report = ProjectMigrationRunner().run(
+            ProjectMigrationRequest(
+                source=args.source,
+                target=args.target,
+                state_dir=args.state_dir,
+                resume=args.resume,
+                from_phase=from_phase,
+                translator=translator,
+                max_parallelism=args.parallelism,
+            )
+        )
+    except (OSError, ValueError, RuntimeError):
+        return int(ExitCode.UNKNOWN), _render_project({"status": "UNKNOWN"}, args.output)
+    finally:
+        if translator is not None:
+            translator.close()
+    return (
+        int(ExitCode.COMPLETED if report.status == "COMPLETED" else ExitCode.FAILED),
+        _render_project(report.as_dict(), args.output),
+    )
 
 
 def _render_payload(payload: dict[str, object], output: str) -> str:
@@ -122,6 +192,8 @@ def run_command(
     on_event: Callable[[RunEvent], None] | None = None,
 ) -> tuple[int, str]:
     args = _parser().parse_args(list(argv))
+    if args.command == "migrate" and args.migrate_command == "project":
+        return _run_project_command(args)
     run_control = control or _configured_run_control()
     if args.command == "run" and args.run_command == "show":
         try:
