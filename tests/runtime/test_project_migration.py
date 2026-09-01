@@ -4,13 +4,18 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from codemigrator.runtime.project_migration import (
     OpenAIProjectTranslator,
     ProjectMigrationRequest,
     ProjectMigrationRunner,
     TranslationResult,
+    _VerificationResult,
+    _write_json,
 )
 from codemigrator.runtime.provider import ProviderResponse, TokenUsage
+from codemigrator.workspace import PathSecurityError
 
 
 class RecordingTranslator:
@@ -188,6 +193,196 @@ def test_verify_refreshes_checkpoint_hashes_for_repaired_target_files(
     checkpoint = json.loads((state / "state.json").read_text(encoding="utf-8"))
     item = next(item for item in checkpoint["files"] if item["source_path"] == "internal.go")
     assert item["target_sha256"] == hashlib.sha256(repaired.read_bytes()).hexdigest()
+
+
+def test_resume_retranslates_only_changed_or_missing_target_files(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    state = tmp_path / "state"
+    source.mkdir()
+    make_source(source)
+
+    initial = ProjectMigrationRunner().run(
+        ProjectMigrationRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            translator=RecordingTranslator(),
+        )
+    )
+    assert initial.status == "COMPLETED"
+
+    (target / "internal.py").write_text("# changed\n", encoding="utf-8")
+    (target / "cmd" / "main.py").unlink()
+    resumed_translator = RecordingTranslator()
+    resumed = ProjectMigrationRunner().run(
+        ProjectMigrationRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            resume=True,
+            translator=resumed_translator,
+        )
+    )
+
+    assert resumed.status == "COMPLETED"
+    assert resumed_translator.calls == ["cmd/main.go", "internal.go"]
+
+
+def test_resume_rejects_checkpoint_target_path_traversal(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    state = tmp_path / "state"
+    source.mkdir()
+    make_source(source)
+    initial = ProjectMigrationRunner().run(
+        ProjectMigrationRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            translator=RecordingTranslator(),
+        )
+    )
+    assert initial.status == "COMPLETED"
+
+    checkpoint = json.loads((state / "state.json").read_text(encoding="utf-8"))
+    next(item for item in checkpoint["files"] if item["source_path"] == "internal.go")[
+        "target_path"
+    ] = "../../outside.py"
+    (state / "state.json").write_text(
+        json.dumps(checkpoint), encoding="utf-8"
+    )
+
+    resumed = ProjectMigrationRunner().run(
+        ProjectMigrationRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            resume=True,
+            translator=RecordingTranslator(),
+        )
+    )
+
+    assert resumed.status == "FAILED"
+    assert not (tmp_path / "outside.py").exists()
+
+
+def test_test_verification_is_fail_closed_without_a_sandbox_runner(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    state = tmp_path / "state"
+    source.mkdir()
+    make_source(source)
+    (source / "internal_test.go").write_text(
+        "package main\nfunc TestHelper() {}\n", encoding="utf-8"
+    )
+
+    report = ProjectMigrationRunner().run(
+        ProjectMigrationRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            translator=RecordingTranslator(),
+        )
+    )
+
+    assert report.status == "FAILED"
+    assert report.errors == ("TEST verification unavailable",)
+    target_report = json.loads(
+        (target / "codemigrator-report.json").read_text(encoding="utf-8")
+    )
+    assert target_report["status"] == "FAILED"
+    assert target_report["checks"][-1]["status"] == "INFRASTRUCTURE_ERROR"
+
+
+def test_test_verification_uses_bounded_runner_and_records_timeout(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    state = tmp_path / "state"
+    source.mkdir()
+    make_source(source)
+    (source / "internal_test.go").write_text(
+        "package main\nfunc TestHelper() {}\n", encoding="utf-8"
+    )
+
+    class FakeVerificationRunner:
+        def __init__(self, result: _VerificationResult) -> None:
+            self.result = result
+            self.calls: list[tuple[str, Path, int]] = []
+
+        def run(self, action: str, target: Path, *, timeout_secs: int) -> _VerificationResult:
+            self.calls.append((action, target, timeout_secs))
+            return self.result
+
+    passed_runner = FakeVerificationRunner(
+        _VerificationResult("PASSED", exit_code=0, output_sha256="a" * 64)
+    )
+    initial = ProjectMigrationRunner().run(
+        ProjectMigrationRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            translator=RecordingTranslator(),
+            verification_runner=passed_runner,
+        )
+    )
+    assert initial.status == "COMPLETED"
+    assert passed_runner.calls == [("TEST", target, 300)]
+
+    timeout_runner = FakeVerificationRunner(
+        _VerificationResult("TIMED_OUT", output_sha256="b" * 64)
+    )
+    resumed = ProjectMigrationRunner().run(
+        ProjectMigrationRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            resume=True,
+            from_phase="VERIFY",
+            verification_runner=timeout_runner,
+        )
+    )
+    assert resumed.status == "FAILED"
+    assert resumed.errors == ("TEST check timed out",)
+
+
+def test_safe_errors_do_not_include_provider_exception_text(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    state = tmp_path / "state"
+    source.mkdir()
+    make_source(source)
+
+    class LeakingTranslator(RecordingTranslator):
+        def translate(self, source_path: str, source_text: str) -> TranslationResult:
+            del source_path, source_text
+            raise RuntimeError("api_key=do-not-persist")
+
+    report = ProjectMigrationRunner().run(
+        ProjectMigrationRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            translator=LeakingTranslator(),
+        )
+    )
+
+    assert report.status == "FAILED"
+    assert "do-not-persist" not in " ".join(report.errors)
+    checkpoint = (state / "state.json").read_text(encoding="utf-8")
+    assert "do-not-persist" not in checkpoint
+
+
+def test_json_writer_rejects_symlink_destination(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.json"
+    outside.write_text("original", encoding="utf-8")
+    link = tmp_path / "state.json"
+    link.symlink_to(outside)
+
+    with pytest.raises(PathSecurityError):
+        _write_json(link, {"status": "FAILED"})
+
+    assert outside.read_text(encoding="utf-8") == "original"
 
 
 def test_openai_project_translator_retries_empty_and_invalid_content(monkeypatch) -> None:

@@ -114,7 +114,6 @@ def _render_project(report: dict[str, object], output: str) -> str:
 def _run_project_command(args: argparse.Namespace) -> tuple[int, str]:
     from codemigrator.runtime import (
         OpenAIProjectTranslator,
-        ProjectMigrationPhase,
         ProjectMigrationRequest,
         ProjectMigrationRunner,
     )
@@ -122,16 +121,13 @@ def _run_project_command(args: argparse.Namespace) -> tuple[int, str]:
     translator = None
     try:
         translator = OpenAIProjectTranslator.from_key_file(args.api_key_file)
-        from_phase = (
-            None if args.from_phase is None else ProjectMigrationPhase(args.from_phase)
-        )
         report = ProjectMigrationRunner().run(
             ProjectMigrationRequest(
                 source=args.source,
                 target=args.target,
                 state_dir=args.state_dir,
                 resume=args.resume,
-                from_phase=from_phase,
+                from_phase=args.from_phase,
                 translator=translator,
                 max_parallelism=args.parallelism,
             )

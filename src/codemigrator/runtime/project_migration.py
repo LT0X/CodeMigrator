@@ -14,8 +14,6 @@ import ctypes
 import hashlib
 import json
 import re
-import subprocess
-import sys
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,14 +33,20 @@ from codemigrator.analysis import (
     analyze_snapshot,
 )
 from codemigrator.core import ModelProfile, ModuleBoundaryStrategy
-from codemigrator.workspace import PathSecurityError, SecureRoot, sha256_bytes
+from codemigrator.workspace import (
+    PathNotFound,
+    PathSecurityError,
+    SecureRoot,
+    sha256_bytes,
+    validate_relative_path,
+)
 
 from .binding import LockedModelBinding
 from .context import PromptMessage
 from .provider import OpenAICompatibleProvider, ProviderRequest
 
 
-class ProjectMigrationPhase(StrEnum):
+class _ProjectMigrationPhase(StrEnum):
     PREFLIGHT = "PREFLIGHT"
     ANALYSIS = "ANALYSIS"
     PLAN = "PLAN"
@@ -53,6 +57,19 @@ class ProjectMigrationPhase(StrEnum):
 
 class ProjectTranslator(Protocol):
     def translate(self, source_path: str, source_text: str) -> TranslationResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _VerificationResult:
+    status: str
+    exit_code: int | None = None
+    output_sha256: str = ""
+
+
+class _VerificationRunner(Protocol):
+    def run(
+        self, action: str, target: Path, *, timeout_secs: int
+    ) -> _VerificationResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,9 +84,17 @@ class ProjectMigrationRequest:
     target: Path
     state_dir: Path | None = None
     resume: bool = False
-    from_phase: ProjectMigrationPhase | None = None
+    from_phase: str | None = None
     translator: ProjectTranslator | None = None
+    verification_runner: _VerificationRunner | None = None
     max_parallelism: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceSnapshot:
+    contents: dict[str, bytes]
+    skipped_paths: tuple[str, ...]
+    digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +159,12 @@ class _FileState:
             raise ValueError("file checkpoint identity is invalid")
         if not isinstance(values["status"], str) or type(values["attempts"]) is not int:
             raise ValueError("file checkpoint status is invalid")
+        if values["target_sha256"] is not None and not isinstance(
+            values["target_sha256"], str
+        ):
+            raise ValueError("file checkpoint target hash is invalid")
+        if values["error"] is not None and not isinstance(values["error"], str):
+            raise ValueError("file checkpoint error is invalid")
         return cls(**values)  # type: ignore[arg-type]
 
     def as_dict(self) -> dict[str, object]:
@@ -154,7 +185,7 @@ class _MigrationState:
     source_digest: str
     descriptor_digest: str
     files: list[_FileState]
-    phase: str = ProjectMigrationPhase.PREFLIGHT.value
+    phase: str = _ProjectMigrationPhase.PREFLIGHT.value
     skipped_paths: list[str] = field(default_factory=list)
     checks: list[dict[str, object]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -180,7 +211,7 @@ class _MigrationState:
         ]
         if len(files) != len(raw_files):
             raise ValueError("migration checkpoint contains an invalid file")
-        phase = payload.get("phase", ProjectMigrationPhase.PREFLIGHT.value)
+        phase = payload.get("phase", _ProjectMigrationPhase.PREFLIGHT.value)
         if not isinstance(phase, str):
             raise ValueError("migration checkpoint phase is invalid")
         skipped = payload.get("skipped_paths", [])
@@ -227,7 +258,16 @@ class ProjectMigrationRunner:
     """Run a local project migration while preserving completed work."""
 
     _EXCLUDED_PARTS = frozenset({".git", ".venv", "__pycache__", ".pytest_cache"})
-    _PHASE_ORDER = tuple(ProjectMigrationPhase)
+    _PHASE_ORDER = tuple(_ProjectMigrationPhase)
+    _FILE_FAILURE_ERROR = "one or more file translations failed"
+    _CHECK_FAILURES = frozenset(
+        {
+            "COMPILE check failed",
+            "TEST check failed",
+            "TEST check timed out",
+            "TEST verification unavailable",
+        }
+    )
 
     def run(self, request: ProjectMigrationRequest) -> ProjectMigrationReport:
         source = request.source.expanduser().resolve()
@@ -238,17 +278,17 @@ class ProjectMigrationRunner:
         try:
             if _is_relative_to(state_dir, source):
                 raise ValueError("state directory must not be inside source")
-            files, skipped = self._preflight(source, target)
+            snapshot = self._preflight(source, target)
         except (OSError, PathSecurityError, ValueError) as exc:
             return self._failed_report(
-                phase=ProjectMigrationPhase.PREFLIGHT,
+                phase=_ProjectMigrationPhase.PREFLIGHT,
                 source_digest="",
                 target=target,
                 state_dir=state_dir,
                 errors=(self._safe_error(exc),),
             )
 
-        source_digest = _digest_files(source, files)
+        source_digest = snapshot.digest
         descriptor = _go_analysis_descriptor()
         descriptor_digest = descriptor.descriptor_sha256
         try:
@@ -257,14 +297,13 @@ class ProjectMigrationRunner:
                 state_dir,
                 source_digest,
                 descriptor_digest,
-                files,
-                skipped,
+                snapshot,
                 target,
             )
             state.state_dir = state_dir
         except (OSError, ValueError) as exc:
             return self._failed_report(
-                phase=ProjectMigrationPhase.PREFLIGHT,
+                phase=_ProjectMigrationPhase.PREFLIGHT,
                 source_digest=source_digest,
                 target=target,
                 state_dir=state_dir,
@@ -273,43 +312,47 @@ class ProjectMigrationRunner:
 
         try:
             if not request.resume:
-                state.phase = ProjectMigrationPhase.PREFLIGHT.value
+                state.phase = _ProjectMigrationPhase.PREFLIGHT.value
                 self._write_state(state_dir, state)
-            source_snapshot = _read_snapshot(source, state.files)
+            source_snapshot = _analysis_snapshot(snapshot, state.files)
             start_phase = self._start_phase(request, state)
-            if _phase_index(start_phase) <= _phase_index(ProjectMigrationPhase.ANALYSIS):
+            if _phase_index(start_phase) <= _phase_index(_ProjectMigrationPhase.ANALYSIS):
                 self._run_analysis(state, source_snapshot, descriptor)
-            if _phase_index(start_phase) <= _phase_index(ProjectMigrationPhase.PLAN):
+            if _phase_index(start_phase) <= _phase_index(_ProjectMigrationPhase.PLAN):
                 self._run_plan(state, source_snapshot)
-            if _phase_index(start_phase) <= _phase_index(ProjectMigrationPhase.EXECUTE):
+            if _phase_index(start_phase) <= _phase_index(_ProjectMigrationPhase.EXECUTE):
                 self._run_execute(
                     state,
-                    source,
+                    snapshot.contents,
                     target,
                     request.translator,
                     request.max_parallelism,
                 )
             if self._failed_files(state):
+                if self._FILE_FAILURE_ERROR not in state.errors:
+                    state.errors.append(self._FILE_FAILURE_ERROR)
+                self._run_report(state, target)
                 return self._publish_report(state, target, state_dir)
-            if _phase_index(start_phase) <= _phase_index(ProjectMigrationPhase.VERIFY):
-                self._run_verify(state, target)
-            if _phase_index(start_phase) <= _phase_index(ProjectMigrationPhase.REPORT):
+            if _phase_index(start_phase) <= _phase_index(_ProjectMigrationPhase.VERIFY):
+                self._run_verify(state, target, request.verification_runner)
+            if _phase_index(start_phase) <= _phase_index(_ProjectMigrationPhase.REPORT):
                 self._run_report(state, target)
             return self._publish_report(state, target, state_dir)
         except (OSError, ValueError, RuntimeError) as exc:
             state.errors.append(self._safe_error(exc))
             state.phase = self._current_failure_phase(state)
             self._write_state(state_dir, state)
+            self._run_report(state, target)
             return self._publish_report(state, target, state_dir)
 
-    def _preflight(self, source: Path, target: Path) -> tuple[list[str], list[str]]:
+    def _preflight(self, source: Path, target: Path) -> _SourceSnapshot:
         if not source.is_dir() or source.is_symlink():
             raise ValueError("source must be a real directory")
         if target == source or _is_relative_to(target, source):
             raise ValueError("target must not be inside source")
         if _is_relative_to(target, source.parent) and target == source:
             raise ValueError("target path is invalid")
-        files: list[str] = []
+        contents: dict[str, bytes] = {}
         skipped: list[str] = []
         for path in sorted(
             source.rglob("*"),
@@ -324,10 +367,14 @@ class ProjectMigrationRunner:
             if path.is_symlink():
                 raise ValueError(f"source contains a symbolic link: {relative}")
             if path.is_file():
-                files.append(relative)
-        if not files:
+                contents[relative] = path.read_bytes()
+        if not contents:
             raise ValueError("source does not contain migratable files")
-        return files, skipped
+        return _SourceSnapshot(
+            contents=contents,
+            skipped_paths=tuple(skipped),
+            digest=_digest_contents(contents),
+        )
 
     def _load_or_initialize(
         self,
@@ -335,19 +382,24 @@ class ProjectMigrationRunner:
         state_dir: Path,
         source_digest: str,
         descriptor_digest: str,
-        files: list[str],
-        skipped: list[str],
+        snapshot: _SourceSnapshot,
         target: Path,
     ) -> _MigrationState:
         state_path = state_dir / "state.json"
         if request.resume:
             state = _load_state(state_path)
+            self._validate_checkpoint_files(state)
             if state.source_digest != source_digest or state.descriptor_digest != descriptor_digest:
                 raise ValueError("resume identity does not match current source or descriptor")
-            current_paths = {item.source_path for item in state.files}
-            if current_paths != set(files):
+            current_paths = tuple(snapshot.contents)
+            checkpoint_paths = tuple(item.source_path for item in state.files)
+            if set(checkpoint_paths) != set(current_paths) or len(checkpoint_paths) != len(
+                current_paths
+            ):
                 raise ValueError("resume source file set does not match checkpoint")
             self._adopt_valid_target_files(state, target)
+            if request.from_phase is None:
+                self._reconcile_target_files(state, target)
             return state
         if state_path.exists():
             raise ValueError("checkpoint already exists; use --resume or choose a new target")
@@ -357,34 +409,38 @@ class ProjectMigrationRunner:
             _FileState(
                 source_path=path,
                 target_path=_target_path(path),
-                source_sha256=sha256_bytes((request.source / path).read_bytes()),
+                source_sha256=sha256_bytes(snapshot.contents[path]),
                 kind="translate" if path.endswith(".go") else "copy",
             )
-            for path in files
+            for path in snapshot.contents
         ]
         return _MigrationState(
             source_digest=source_digest,
             descriptor_digest=descriptor_digest,
             files=file_states,
-            skipped_paths=list(skipped),
+            skipped_paths=list(snapshot.skipped_paths),
         )
 
     @staticmethod
     def _start_phase(
         request: ProjectMigrationRequest, state: _MigrationState
-    ) -> ProjectMigrationPhase:
+    ) -> _ProjectMigrationPhase:
         if request.from_phase is not None:
             if not request.resume:
                 raise ValueError("--from-phase requires --resume")
-            return request.from_phase
+            return _ProjectMigrationPhase(request.from_phase)
         if not request.resume:
-            return ProjectMigrationPhase.PREFLIGHT
+            return _ProjectMigrationPhase.PREFLIGHT
         try:
-            current = ProjectMigrationPhase(state.phase)
+            current = _ProjectMigrationPhase(state.phase)
         except ValueError:
-            return ProjectMigrationPhase.PREFLIGHT
-        if current is ProjectMigrationPhase.REPORT and state.errors:
-            return ProjectMigrationPhase.VERIFY
+            return _ProjectMigrationPhase.PREFLIGHT
+        if current is _ProjectMigrationPhase.REPORT and state.errors:
+            return (
+                _ProjectMigrationPhase.EXECUTE
+                if ProjectMigrationRunner._failed_files(state)
+                else _ProjectMigrationPhase.VERIFY
+            )
         return current
 
     def _run_analysis(
@@ -406,7 +462,7 @@ class ProjectMigrationRunner:
             "manifest_paths": [str(item.manifest_path) for item in result.manifests],
             "result": result.model_dump(mode="json"),
         }
-        state.phase = ProjectMigrationPhase.ANALYSIS.value
+        state.phase = _ProjectMigrationPhase.ANALYSIS.value
         self._write_state_from_phase(state)
 
     def _run_plan(self, state: _MigrationState, snapshot: InMemorySnapshotSource) -> None:
@@ -424,13 +480,13 @@ class ProjectMigrationRunner:
             "coverage": "EXACTLY_ONCE",
             "scope": "TARGET_ROOT_ONLY",
         }
-        state.phase = ProjectMigrationPhase.PLAN.value
+        state.phase = _ProjectMigrationPhase.PLAN.value
         self._write_state_from_phase(state)
 
     def _run_execute(
         self,
         state: _MigrationState,
-        source: Path,
+        source_contents: Mapping[str, bytes],
         target: Path,
         translator: ProjectTranslator | None,
         max_parallelism: int,
@@ -441,7 +497,10 @@ class ProjectMigrationRunner:
         root = SecureRoot("target", target)
         state_lock = threading.Lock()
         try:
-            state.phase = ProjectMigrationPhase.EXECUTE.value
+            state.errors = [
+                error for error in state.errors if error != self._FILE_FAILURE_ERROR
+            ]
+            state.phase = _ProjectMigrationPhase.EXECUTE.value
             self._write_state_from_phase(state)
             pending = [
                 item
@@ -457,7 +516,7 @@ class ProjectMigrationRunner:
                     item.attempts += 1
                     item.error = None
                 try:
-                    source_bytes = (source / item.source_path).read_bytes()
+                    source_bytes = source_contents[item.source_path]
                     current_sha = sha256_bytes(source_bytes)
                     if current_sha != item.source_sha256:
                         raise ValueError(
@@ -500,61 +559,145 @@ class ProjectMigrationRunner:
         finally:
             root.close()
 
-    def _run_verify(self, state: _MigrationState, target: Path) -> None:
+    def _run_verify(
+        self,
+        state: _MigrationState,
+        target: Path,
+        verification_runner: _VerificationRunner | None,
+    ) -> None:
         state.checks.clear()
         state.errors = [
             error
             for error in state.errors
-            if error not in {"COMPILE check failed", "TEST check failed"}
+            if error not in self._CHECK_FAILURES
+            and not error.startswith("target file missing:")
         ]
-        for item in state.files:
-            if item.status != "SUCCEEDED":
-                continue
-            output_path = target / item.target_path
-            if not output_path.is_file():
-                state.errors.append(f"target file missing: {item.target_path}")
-                state.phase = ProjectMigrationPhase.VERIFY.value
-                self._write_state_from_phase(state)
-                return
-            item.target_sha256 = sha256_bytes(output_path.read_bytes())
-        self._write_state_from_phase(state)
-        commands: list[tuple[str, list[str]]] = [
-            ("COMPILE", [sys.executable, "-m", "compileall", "-q", "."]),
-        ]
-        if any(path.endswith("_test.go") for path in (item.source_path for item in state.files)):
-            commands.append(("TEST", [sys.executable, "-m", "pytest", "-q"]))
-        for action, command in commands:
-            result = subprocess.run(
-                command,
-                cwd=target,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=300,
+        try:
+            root = SecureRoot("verification", target)
+        except OSError as exc:
+            state.errors.append(self._safe_error(exc))
+            state.phase = _ProjectMigrationPhase.VERIFY.value
+            self._write_state_from_phase(state)
+            return
+        compile_failed = False
+        try:
+            for item in state.files:
+                if item.status != "SUCCEEDED":
+                    continue
+                try:
+                    content = root.read_bytes(item.target_path)
+                    item.target_sha256 = sha256_bytes(content)
+                    if item.kind == "translate":
+                        ast.parse(content.decode("utf-8"), filename=item.target_path)
+                except (OSError, PathSecurityError):
+                    state.errors.append(f"target file missing: {item.target_path}")
+                    compile_failed = True
+                    break
+                except (UnicodeError, SyntaxError):
+                    compile_failed = True
+                    break
+        finally:
+            root.close()
+        if compile_failed:
+            state.checks.append(
+                {
+                    "action": "COMPILE",
+                    "status": "FAILED",
+                    "exit_code": 1,
+                    "output_sha256": sha256_bytes(b""),
+                }
             )
-            command_output = (result.stdout + "\n" + result.stderr).strip()
-            check: dict[str, object] = {
-                "action": action,
-                "status": "PASSED" if result.returncode == 0 else "FAILED",
-                "exit_code": result.returncode,
-                "output_sha256": sha256_bytes(command_output.encode("utf-8")),
+            state.errors.append("COMPILE check failed")
+            state.phase = _ProjectMigrationPhase.VERIFY.value
+            self._write_state_from_phase(state)
+            return
+
+        state.checks.append(
+            {
+                "action": "COMPILE",
+                "status": "PASSED",
+                "exit_code": 0,
+                "output_sha256": sha256_bytes(b""),
             }
-            state.checks.append(check)
-            if result.returncode != 0:
-                state.errors.append(f"{action} check failed")
-                state.phase = ProjectMigrationPhase.VERIFY.value
-                self._write_state_from_phase(state)
-                return
-        state.phase = ProjectMigrationPhase.VERIFY.value
+        )
+        if any(item.source_path.endswith("_test.go") for item in state.files):
+            if verification_runner is None:
+                state.checks.append(
+                    {
+                        "action": "TEST",
+                        "status": "INFRASTRUCTURE_ERROR",
+                        "exit_code": None,
+                        "output_sha256": sha256_bytes(b""),
+                    }
+                )
+                state.errors.append("TEST verification unavailable")
+            else:
+                try:
+                    result = verification_runner.run("TEST", target, timeout_secs=300)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    state.checks.append(
+                        {
+                            "action": "TEST",
+                            "status": "INFRASTRUCTURE_ERROR",
+                            "exit_code": None,
+                            "output_sha256": sha256_bytes(b""),
+                        }
+                    )
+                    state.errors.append(self._safe_error(exc))
+                else:
+                    status = (
+                        result.status
+                        if isinstance(result.status, str)
+                        else "INFRASTRUCTURE_ERROR"
+                    )
+                    if status not in {
+                        "PASSED",
+                        "FAILED",
+                        "TIMED_OUT",
+                        "INFRASTRUCTURE_ERROR",
+                    }:
+                        status = "INFRASTRUCTURE_ERROR"
+                    output_sha256 = (
+                        result.output_sha256
+                        if isinstance(result.output_sha256, str)
+                        and re.fullmatch(r"[0-9a-fA-F]{64}", result.output_sha256)
+                        else sha256_bytes(b"")
+                    )
+                    exit_code = (
+                        result.exit_code
+                        if result.exit_code is None or type(result.exit_code) is int
+                        else None
+                    )
+                    state.checks.append(
+                        {
+                            "action": "TEST",
+                            "status": status,
+                            "exit_code": exit_code,
+                            "output_sha256": output_sha256,
+                        }
+                    )
+                    if status != "PASSED":
+                        state.errors.append(
+                            "TEST check timed out"
+                            if status == "TIMED_OUT"
+                            else "TEST check failed"
+                            if status == "FAILED"
+                            else "TEST verification unavailable"
+                        )
+        state.phase = _ProjectMigrationPhase.VERIFY.value
         self._write_state_from_phase(state)
 
     def _run_report(self, state: _MigrationState, target: Path) -> None:
-        state.phase = ProjectMigrationPhase.REPORT.value
+        state.phase = _ProjectMigrationPhase.REPORT.value
         self._write_state_from_phase(state)
         report = {
             "schema": "codemigrator.project-migration-report",
             "version": 1,
-            "status": "COMPLETED" if not state.errors else "FAILED",
+            "status": (
+                "COMPLETED"
+                if not state.errors and not self._failed_files(state)
+                else "FAILED"
+            ),
             "phase": state.phase,
             "source_digest": state.source_digest,
             "included_files": len(state.files),
@@ -576,7 +719,7 @@ class ProjectMigrationRunner:
         failed = tuple(item.source_path for item in state.files if item.status == "FAILED")
         status = (
             "COMPLETED"
-            if state.phase == ProjectMigrationPhase.REPORT.value and not state.errors
+            if state.phase == _ProjectMigrationPhase.REPORT.value and not state.errors
             else "FAILED"
         )
         if status == "FAILED" and not state.errors and failed:
@@ -599,7 +742,7 @@ class ProjectMigrationRunner:
     def _failed_report(
         self,
         *,
-        phase: ProjectMigrationPhase,
+        phase: _ProjectMigrationPhase,
         source_digest: str,
         target: Path,
         state_dir: Path,
@@ -621,19 +764,93 @@ class ProjectMigrationRunner:
     def _adopt_valid_target_files(state: _MigrationState, target: Path) -> None:
         """Recover files atomically written before a process interruption."""
 
-        for item in state.files:
-            if item.status == "SUCCEEDED":
-                continue
-            path = target / item.target_path
-            try:
-                content = path.read_bytes()
-                if item.kind == "translate":
-                    ast.parse(content.decode("utf-8"), filename=item.target_path)
+        try:
+            root = SecureRoot("recovery", target)
+        except OSError:
+            return
+        try:
+            for item in state.files:
+                if item.status == "SUCCEEDED" or not root.exists(item.target_path):
+                    continue
+                try:
+                    content = root.read_bytes(item.target_path)
+                    if item.kind == "translate":
+                        ast.parse(content.decode("utf-8"), filename=item.target_path)
+                except (OSError, UnicodeError, SyntaxError, PathSecurityError):
+                    continue
                 item.target_sha256 = sha256_bytes(content)
                 item.status = "SUCCEEDED"
                 item.error = None
-            except (OSError, UnicodeError, SyntaxError):
-                continue
+        finally:
+            root.close()
+
+    @classmethod
+    def _reconcile_target_files(cls, state: _MigrationState, target: Path) -> None:
+        """Invalidate completed files whose durable target no longer matches."""
+
+        try:
+            root = SecureRoot("reconcile", target)
+        except OSError:
+            for item in state.files:
+                if item.status == "SUCCEEDED":
+                    cls._reset_file(item)
+            if any(item.status == "PENDING" for item in state.files):
+                state.phase = _ProjectMigrationPhase.EXECUTE.value
+            return
+        changed = False
+        try:
+            for item in state.files:
+                if item.status != "SUCCEEDED":
+                    continue
+                try:
+                    content = root.read_bytes(item.target_path)
+                except (OSError, PathNotFound, PathSecurityError):
+                    cls._reset_file(item)
+                    changed = True
+                    continue
+                if item.target_sha256 != sha256_bytes(content):
+                    cls._reset_file(item)
+                    changed = True
+        finally:
+            root.close()
+        if changed:
+            state.phase = _ProjectMigrationPhase.EXECUTE.value
+            state.checks.clear()
+            state.errors = [error for error in state.errors if error not in cls._CHECK_FAILURES]
+
+    @staticmethod
+    def _reset_file(item: _FileState) -> None:
+        item.status = "PENDING"
+        item.target_sha256 = None
+        item.error = None
+
+    @staticmethod
+    def _validate_checkpoint_files(state: _MigrationState) -> None:
+        if state.phase not in {phase.value for phase in _ProjectMigrationPhase}:
+            raise ValueError("migration checkpoint phase is invalid")
+        seen: set[str] = set()
+        for item in state.files:
+            validate_relative_path(item.source_path)
+            validate_relative_path(item.target_path)
+            if item.source_path in seen:
+                raise ValueError("migration checkpoint contains duplicate source paths")
+            seen.add(item.source_path)
+            if item.target_path != _target_path(item.source_path):
+                raise ValueError("migration checkpoint target path is not derived from source")
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", item.source_sha256):
+                raise ValueError("migration checkpoint source hash is invalid")
+            if item.target_sha256 is not None and not re.fullmatch(
+                r"[0-9a-fA-F]{64}", item.target_sha256
+            ):
+                raise ValueError("migration checkpoint target hash is invalid")
+            if item.kind not in {"translate", "copy"}:
+                raise ValueError("migration checkpoint file kind is invalid")
+            if item.status not in {"PENDING", "SUCCEEDED", "FAILED"}:
+                raise ValueError("migration checkpoint file status is invalid")
+            if item.attempts < 0:
+                raise ValueError("migration checkpoint attempts are invalid")
+            if item.error is not None and not isinstance(item.error, str):
+                raise ValueError("migration checkpoint file error is invalid")
 
     @staticmethod
     def _failed_files(state: _MigrationState) -> tuple[str, ...]:
@@ -641,14 +858,27 @@ class ProjectMigrationRunner:
 
     @staticmethod
     def _safe_error(error: BaseException) -> str:
-        message = str(error).replace("\n", " ").strip()
-        return f"{type(error).__name__}: {message[:240]}" if message else type(error).__name__
+        if isinstance(error, PathSecurityError):
+            return "path security boundary violation"
+        if isinstance(error, SyntaxError):
+            return "generated source syntax error"
+        if isinstance(error, UnicodeError):
+            return "source text encoding error"
+        if isinstance(error, FileNotFoundError):
+            return "required file not found"
+        if isinstance(error, OSError):
+            return "filesystem operation failed"
+        if isinstance(error, RuntimeError):
+            return "migration provider operation failed"
+        if isinstance(error, ValueError):
+            return "invalid migration data"
+        return "migration operation failed"
 
     @staticmethod
     def _current_failure_phase(state: _MigrationState) -> str:
-        if state.phase in {phase.value for phase in ProjectMigrationPhase}:
+        if state.phase in {phase.value for phase in _ProjectMigrationPhase}:
             return state.phase
-        return ProjectMigrationPhase.REPORT.value
+        return _ProjectMigrationPhase.REPORT.value
 
     def _write_state_from_phase(self, state: _MigrationState) -> None:
         # The concrete state directory is attached for phase helpers only through this
@@ -663,7 +893,8 @@ class ProjectMigrationRunner:
 
 
 def _load_state(path: Path) -> _MigrationState:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    with SecureRoot("state", path.parent) as root:
+        payload = json.loads(root.read_bytes(path.name).decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("migration checkpoint root must be an object")
     return _MigrationState.from_dict(payload)
@@ -671,12 +902,11 @@ def _load_state(path: Path) -> _MigrationState:
 
 def _write_json(path: Path, payload: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    with SecureRoot("json", path.parent) as root:
+        root.write_atomic(path.name, encoded)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -687,10 +917,10 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     return True
 
 
-def _digest_files(root: Path, files: Iterable[str]) -> str:
+def _digest_contents(contents: Mapping[str, bytes]) -> str:
     digest = hashlib.sha256()
-    for relative in files:
-        content = (root / relative).read_bytes()
+    for relative in sorted(contents, key=lambda item: item.encode("utf-8")):
+        content = contents[relative]
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(hashlib.sha256(content).digest())
@@ -698,10 +928,12 @@ def _digest_files(root: Path, files: Iterable[str]) -> str:
     return digest.hexdigest()
 
 
-def _read_snapshot(root: Path, files: Iterable[_FileState]) -> InMemorySnapshotSource:
+def _analysis_snapshot(
+    snapshot: _SourceSnapshot, files: Iterable[_FileState]
+) -> InMemorySnapshotSource:
     return InMemorySnapshotSource(
-        snapshot_oid=_digest_files(root, (item.source_path for item in files)),
-        files={item.source_path: (root / item.source_path).read_bytes() for item in files},
+        snapshot_oid=snapshot.digest,
+        files={item.source_path: snapshot.contents[item.source_path] for item in files},
     )
 
 
@@ -735,8 +967,8 @@ def _validated_translation(result: TranslationResult, expected_target: str) -> s
     return content + "\n"
 
 
-def _phase_index(phase: ProjectMigrationPhase) -> int:
-    return tuple(ProjectMigrationPhase).index(phase)
+def _phase_index(phase: _ProjectMigrationPhase) -> int:
+    return tuple(_ProjectMigrationPhase).index(phase)
 
 
 def _target_project_metadata() -> bytes:
@@ -791,7 +1023,11 @@ def _go_parser() -> Callable[[bytes], object] | None:
         library = ctypes.CDLL(str(grammar))
         language_fn = library.tree_sitter_go
         language_fn.restype = ctypes.c_void_p
-        language = Language(language_fn())
+        capsule_new = ctypes.pythonapi.PyCapsule_New
+        capsule_new.restype = ctypes.py_object
+        capsule_new.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+        capsule = capsule_new(language_fn(), b"tree_sitter.Language", None)
+        language = Language(capsule)
     except (AttributeError, OSError, TypeError, ValueError):
         return None
 
@@ -910,7 +1146,6 @@ class OpenAIProjectTranslator:
 
 __all__ = [
     "OpenAIProjectTranslator",
-    "ProjectMigrationPhase",
     "ProjectMigrationReport",
     "ProjectMigrationRequest",
     "ProjectMigrationRunner",

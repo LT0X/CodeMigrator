@@ -134,7 +134,6 @@ from .observability import (
 )
 from .project_migration import (
     OpenAIProjectTranslator,
-    ProjectMigrationPhase,
     ProjectMigrationReport,
     ProjectMigrationRequest,
     ProjectMigrationRunner,
@@ -277,7 +276,6 @@ __all__ = [
     "OpenAICompatibleProvider",
     "OpenAIProjectTranslator",
     "PromptMessage",
-    "ProjectMigrationPhase",
     "ProjectMigrationReport",
     "ProjectMigrationRequest",
     "ProjectMigrationRunner",
