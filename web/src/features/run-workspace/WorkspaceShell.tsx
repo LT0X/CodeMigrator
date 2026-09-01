@@ -227,7 +227,7 @@ function MobileSliceList({ slices, state, onToggle }: { slices: readonly SlicePr
       <div className="panel-kicker">Mobile Slice List <span>{ordered.length} 个对象</span></div>
       <ol>
         {ordered.map((slice) => (
-          <li key={mascotIdentity(slice.id, slice.generation)} data-mobile-slice-id={slice.id}>
+            <li key={`${mascotIdentity(slice.id, slice.generation)}:pulse-${state.pulseVersion[slice.id] ?? 0}`} data-mobile-slice-id={slice.id}>
             <SliceCapsule
               slice={slice}
               focused={state.focusedId === slice.id}
@@ -328,7 +328,7 @@ export function WorkspaceShell({
           <div className="capsule-flank">
             {capsules.filter((_, index) => index % 2 === 0).map((slice) => (
               <SliceCapsule
-                key={mascotIdentity(slice.id, slice.generation)}
+                key={`${mascotIdentity(slice.id, slice.generation)}:pulse-${state.pulseVersion[slice.id] ?? 0}`}
                 slice={slice}
                 focused={state.focusedId === slice.id}
                 locked={state.lockedId === slice.id}
@@ -347,7 +347,7 @@ export function WorkspaceShell({
           <div className="capsule-flank">
             {capsules.filter((_, index) => index % 2 === 1).map((slice) => (
               <SliceCapsule
-                key={mascotIdentity(slice.id, slice.generation)}
+                key={`${mascotIdentity(slice.id, slice.generation)}:pulse-${state.pulseVersion[slice.id] ?? 0}`}
                 slice={slice}
                 focused={state.focusedId === slice.id}
                 locked={state.lockedId === slice.id}
