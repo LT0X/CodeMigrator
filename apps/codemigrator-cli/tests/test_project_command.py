@@ -1,0 +1,56 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from codemigrator_cli.__main__ import run_command
+
+import codemigrator.runtime as runtime
+from codemigrator.runtime import ProjectMigrationReport
+
+
+def test_project_command_delegates_to_local_runner(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class FakeTranslator:
+        @classmethod
+        def from_key_file(cls, path: Path) -> FakeTranslator:
+            assert path.name == "model.json"
+            return cls()
+
+        def close(self) -> None:
+            return None
+
+    class FakeRunner:
+        def run(self, request: object) -> ProjectMigrationReport:
+            del request
+            return ProjectMigrationReport(
+                status="COMPLETED",
+                phase="REPORT",
+                source_digest="a" * 64,
+                target="target",
+                state_dir="state",
+                included_files=2,
+                translated_files=1,
+                copied_files=1,
+            )
+
+    monkeypatch.setattr(runtime, "OpenAIProjectTranslator", FakeTranslator)
+    monkeypatch.setattr(runtime, "ProjectMigrationRunner", FakeRunner)
+
+    code, output = run_command(
+        [
+            "migrate",
+            "project",
+            str(tmp_path / "source"),
+            "--target",
+            str(tmp_path / "target"),
+            "--api-key-file",
+            str(tmp_path / "model.json"),
+            "--output",
+            "json",
+        ]
+    )
+
+    assert code == 0
+    assert json.loads(output)["status"] == "COMPLETED"
