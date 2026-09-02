@@ -46,4 +46,23 @@ describe("live observation", () => {
     expect(seen).toEqual([4, 4]);
     expect(received).toEqual([5]);
   });
+
+  it("marks reconnect history so presentation layers can suppress replay effects", async () => {
+    const phases: string[] = [];
+    let attempts = 0;
+    const source = client(async function* (_runId, after) {
+      attempts += 1;
+      if (attempts === 1) {
+        yield { schema: "migration.event" as const, version: 1 as const, type: "dispatch.started", sequence: 6, data: { slice_id: "a" }, timestamp_utc: "" };
+        return;
+      }
+      expect(after).toBe(4);
+      yield { schema: "migration.event" as const, version: 1 as const, type: "dispatch.started", sequence: 5, data: { slice_id: "a" }, timestamp_utc: "" };
+    });
+    const received: number[] = [];
+    for await (const event of observeRun(source, "run", undefined, undefined, (phase) => phases.push(phase))) received.push(event.sequence);
+
+    expect(received).toEqual([5]);
+    expect(phases).toEqual(["start", "end"]);
+  });
 });
