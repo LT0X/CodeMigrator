@@ -22,10 +22,7 @@ def test_domain_skeleton_is_deterministic_and_splits_large_domains_by_child_dire
 
 
 def test_domain_skeleton_rejects_more_than_the_configured_exploration_fanout() -> None:
-    modules = {
-        f"src/module_{index}": [f"src/module_{index}/main.py"]
-        for index in range(7)
-    }
+    modules = {f"src/module_{index}": [f"src/module_{index}/main.py"] for index in range(7)}
 
     try:
         build_domain_skeleton(modules)
@@ -33,6 +30,14 @@ def test_domain_skeleton_rejects_more_than_the_configured_exploration_fanout() -
         assert "fanout" in str(exc)
     else:
         raise AssertionError("fanout overflow must be rejected")
+
+
+def test_domain_skeleton_can_represent_repository_root_files() -> None:
+    skeleton = build_domain_skeleton({".": ["go.mod", "README.md"]})
+
+    assert len(skeleton) == 1
+    assert skeleton[0].domain_path == "."
+    assert skeleton[0].files == ("README.md", "go.mod")
 
 
 def test_exact_coverage_reports_missing_duplicate_and_unknown_files() -> None:
