@@ -231,6 +231,35 @@ def test_repair_generated_file_is_scoped_and_validated(tmp_path: Path) -> None:
     assert (target / "pkg" / "value.py").read_text(encoding="utf-8") == result.content
 
 
+def test_generated_repairs_append_to_existing_provenance_ledger(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    first = {
+        "source_path": "pkg/first.go",
+        "target_path": "pkg/first.py",
+        "status": "APPLIED",
+        "method": "CodeMigrator.repair_generated_file",
+        "source_sha256": "1" * 64,
+        "target_sha256": "2" * 64,
+    }
+    second = {
+        "source_path": "pkg/second.go",
+        "target_path": "pkg/second.py",
+        "status": "APPLIED",
+        "method": "CodeMigrator.repair_generated_file",
+        "source_sha256": "3" * 64,
+        "target_sha256": "4" * 64,
+    }
+
+    record_generated_repairs(state, [first])
+    record_generated_repairs(state, [second])
+
+    payload = json.loads(
+        (state / "stages/05-verify-integrate/repairs.json").read_text(encoding="utf-8")
+    )
+    assert payload["repairs"] == [first, second]
+
+
 def test_repair_rejects_source_changed_after_frozen_snapshot(tmp_path: Path) -> None:
     source = make_source(tmp_path / "source")
     target = tmp_path / "target"
