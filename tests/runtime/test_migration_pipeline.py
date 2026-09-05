@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
+from codemigrator.planning import FrozenPlan, compute_plan_hash
 from codemigrator.runtime import (
     ProjectMigrationPipeline,
     ProjectMigrationPipelineRequest,
     TranslationResult,
     adopt_repaired_file,
+    record_generated_repairs,
     repair_generated_file,
 )
+from codemigrator.runtime.migration_pipeline import _PipelineCheckpoint
 
 
 class FakeTranslator:
@@ -107,6 +113,10 @@ def test_pipeline_materializes_full_v6_stage_evidence(tmp_path: Path) -> None:
     )
     assert frozen_plan["validation"]["accepted"] is True
     assert len(frozen_plan["frozen_artifacts"]) == 4
+    assert any(
+        "pkg/__init__.py" in slice_["write_scope"]["out"]["write_paths"]
+        for slice_ in frozen_plan["slices"]
+    )
     assert (
         json.loads(
             (state / "stages/02-draft-alignment/alignment.json").read_text(encoding="utf-8")
@@ -130,7 +140,44 @@ def test_pipeline_materializes_full_v6_stage_evidence(tmp_path: Path) -> None:
         (state / "stages/04-execution/execution-summary.json").read_text(encoding="utf-8")
     )
     assert execution_summary["generated_package_scaffolds"] == ["pkg/__init__.py"]
+    slice_results = json.loads(
+        (state / "stages/04-execution/slice-results.json").read_text(encoding="utf-8")
+    )
+    assert all(
+        item["status"] == "PLANNED"
+        for item in slice_results["slices"]
+        if item["kind"] == "TEST_GENERATION"
+    )
+    integration_manifest = json.loads(
+        (state / "stages/05-verify-integrate/integration-manifest.json").read_text(encoding="utf-8")
+    )
+    assert integration_manifest["generated_package_scaffolds"] == [
+        {
+            "path": "pkg/__init__.py",
+            "sha256": hashlib.sha256((target / "pkg" / "__init__.py").read_bytes()).hexdigest(),
+        }
+    ]
+    assert report.stage_dir == "stages"
 
+    state_payload = json.loads((state / "state.json").read_text(encoding="utf-8"))
+    value_item = next(
+        item for item in state_payload["files"] if item["target_path"] == "pkg/value.py"
+    )
+    record_generated_repairs(
+        state,
+        [
+            {
+                "source_path": value_item["source_path"],
+                "target_path": value_item["target_path"],
+                "status": "APPLIED",
+                "method": "CodeMigrator.repair_generated_file",
+                "source_sha256": value_item["source_sha256"],
+                "target_sha256": hashlib.sha256(
+                    (target / "pkg" / "value.py").read_bytes()
+                ).hexdigest(),
+            }
+        ],
+    )
     adopt_repaired_file(state, target, "pkg/value.py")
     state_payload = json.loads((state / "state.json").read_text(encoding="utf-8"))
     adopted = next(item for item in state_payload["files"] if item["target_path"] == "pkg/value.py")
@@ -141,14 +188,20 @@ def test_pipeline_materializes_full_v6_stage_evidence(tmp_path: Path) -> None:
 
 
 def test_repair_generated_file_is_scoped_and_validated(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "pkg").mkdir()
-    (source / "pkg" / "value.go").write_text(
-        "package pkg\n\nfunc Value() int { return 1 }\n", encoding="utf-8"
-    )
+    source = make_source(tmp_path / "source")
     target = tmp_path / "target"
-    (target / "pkg").mkdir(parents=True)
+    state = tmp_path / "state"
+    bootstrap = ProjectMigrationPipeline().run(
+        ProjectMigrationPipelineRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            translator=FakeTranslator(),
+            verification_runner=FakeVerification(),
+            max_parallelism=1,
+        )
+    )
+    assert bootstrap.status == "COMPLETED"
     (target / "pkg" / "value.py").write_text("def Value():\n    return None\n", encoding="utf-8")
 
     class RepairTranslator:
@@ -160,7 +213,7 @@ def test_repair_generated_file_is_scoped_and_validated(tmp_path: Path) -> None:
             verification_feedback: str,
         ) -> TranslationResult:
             assert source_path == "pkg/value.go"
-            assert "func Value" in source_text
+            assert "type Value" in source_text
             assert "return None" in target_text
             assert "verification failed" in verification_feedback
             return TranslationResult("def Value():\n    return 1\n")
@@ -171,10 +224,39 @@ def test_repair_generated_file_is_scoped_and_validated(tmp_path: Path) -> None:
         "pkg/value.go",
         RepairTranslator(),  # type: ignore[arg-type]
         "verification failed",
+        state_dir=state,
     )
 
     assert result.content == "def Value():\n    return 1\n"
     assert (target / "pkg" / "value.py").read_text(encoding="utf-8") == result.content
+
+
+def test_repair_rejects_source_changed_after_frozen_snapshot(tmp_path: Path) -> None:
+    source = make_source(tmp_path / "source")
+    target = tmp_path / "target"
+    state = tmp_path / "state"
+    ProjectMigrationPipeline().run(
+        ProjectMigrationPipelineRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            translator=FakeTranslator(),
+            verification_runner=FakeVerification(),
+            max_parallelism=1,
+        )
+    )
+    (source / "pkg" / "value.go").write_text(
+        "package pkg\n\nfunc Value() int { return 99 }\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="source snapshot"):
+        repair_generated_file(
+            source,
+            target,
+            "pkg/value.go",
+            FakeTranslator(),  # type: ignore[arg-type]
+            "verification failed",
+            state_dir=state,
+        )
 
 
 def test_pipeline_resume_skips_completed_model_work(tmp_path: Path) -> None:
@@ -253,6 +335,54 @@ def test_pipeline_resume_reexecutes_only_missing_file_after_execute_complete(
     assert (target / "pkg" / "value.py").exists()
 
 
+def test_resume_rejects_execution_write_outside_frozen_plan(tmp_path: Path) -> None:
+    source = make_source(tmp_path / "source")
+    target = tmp_path / "target"
+    state = tmp_path / "state"
+    first = ProjectMigrationPipeline().run(
+        ProjectMigrationPipelineRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            translator=FakeTranslator(),
+            verification_runner=FakeVerification(),
+            max_parallelism=1,
+        )
+    )
+    assert first.status == "COMPLETED"
+
+    plan_path = state / "stages/03-planning/frozen-plan.json"
+    plan_payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    implementation = next(
+        slice_ for slice_ in plan_payload["slices"] if slice_["kind"] == "IMPLEMENTATION"
+    )
+    implementation["write_scope"]["out"]["write_paths"].remove("pkg/value.py")
+    frozen = FrozenPlan.model_validate(plan_payload)
+    plan_payload["plan_hash"] = compute_plan_hash(frozen)
+    plan_path.write_text(json.dumps(plan_payload), encoding="utf-8")
+
+    state_payload = json.loads((state / "state.json").read_text(encoding="utf-8"))
+    state_payload["plan"]["plan_hash"] = plan_payload["plan_hash"]
+    (state / "state.json").write_text(json.dumps(state_payload), encoding="utf-8")
+    checkpoint_payload = json.loads((state / "pipeline.json").read_text(encoding="utf-8"))
+    checkpoint_payload["plan_hash"] = plan_payload["plan_hash"]
+    (state / "pipeline.json").write_text(json.dumps(checkpoint_payload), encoding="utf-8")
+
+    resumed = ProjectMigrationPipeline().run(
+        ProjectMigrationPipelineRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            resume=True,
+            translator=FakeTranslator(),
+            verification_runner=FakeVerification(),
+            max_parallelism=1,
+        )
+    )
+    assert resumed.status == "FAILED"
+    assert resumed.stage == "EXECUTE"
+
+
 def test_pipeline_resumes_only_the_failed_execution_file(tmp_path: Path) -> None:
     source = make_source(tmp_path / "source")
     (source / "other.go").write_text(
@@ -284,6 +414,9 @@ def test_pipeline_resumes_only_the_failed_execution_file(tmp_path: Path) -> None
         )
     )
     assert first.status == "FAILED"
+    failure_report = state / "stages/06-report/report.json"
+    assert failure_report.exists()
+    assert json.loads(failure_report.read_text(encoding="utf-8"))["status"] == "FAILED"
     checkpoint = json.loads((state / "pipeline.json").read_text(encoding="utf-8"))
     assert checkpoint["stages"]["NAVIGATION"] == "COMPLETE"
     assert checkpoint["stages"]["DRAFT_ALIGNMENT"] == "COMPLETE"
@@ -304,3 +437,38 @@ def test_pipeline_resumes_only_the_failed_execution_file(tmp_path: Path) -> None
     )
     assert second.status == "COMPLETED"
     assert recovered.calls == ["other.go"]
+
+
+def test_pipeline_rejects_state_directory_inside_source_without_writing_checkpoint(
+    tmp_path: Path,
+) -> None:
+    source = make_source(tmp_path / "source")
+    state = source / ".codemigrator-state"
+    report = ProjectMigrationPipeline().run(
+        ProjectMigrationPipelineRequest(
+            source=source,
+            target=tmp_path / "target",
+            state_dir=state,
+            translator=FakeTranslator(),
+            verification_runner=FakeVerification(),
+        )
+    )
+    assert report.status == "FAILED"
+    assert not (state / "pipeline.json").exists()
+
+
+def test_pipeline_checkpoint_rejects_invalid_output_shape_and_stage_order() -> None:
+    checkpoint = _PipelineCheckpoint.fresh("a" * 64, "b" * 64)
+    invalid_outputs = checkpoint.as_dict()
+    invalid_outputs["outputs"] = {"PREFLIGHT": "not-a-list"}
+    with pytest.raises(ValueError, match="outputs"):
+        _PipelineCheckpoint.from_payload(invalid_outputs)
+
+    invalid_order = checkpoint.as_dict()
+    invalid_order["stages"] = {
+        **checkpoint.stages,
+        "PREFLIGHT": "PENDING",
+        "NAVIGATION": "COMPLETE",
+    }
+    with pytest.raises(ValueError, match="stage order"):
+        _PipelineCheckpoint.from_payload(invalid_order)

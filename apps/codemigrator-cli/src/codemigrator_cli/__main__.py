@@ -88,16 +88,19 @@ def _positive_int(value: str) -> int:
 
 def _render_start(output: str) -> str:
     if output == "json":
-        return json.dumps(
-            {
-                "run_id": "mock-run-001",
-                "status": "CREATED",
-                "web_url": "/runs/mock-run-001",
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ) + "\n"
+        return (
+            json.dumps(
+                {
+                    "run_id": "mock-run-001",
+                    "status": "CREATED",
+                    "web_url": "/runs/mock-run-001",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
     if output == "jsonl":
         return '{"run_id":"mock-run-001","status":"CREATED"}\n'
     return "已创建 Run mock-run-001\nWeb: /runs/mock-run-001\n"
@@ -126,11 +129,27 @@ def _run_project_command(args: argparse.Namespace) -> tuple[int, str]:
         ProjectMigrationRunner,
     )
 
+    if args.workflow == "full" and args.from_phase is not None:
+        return (
+            int(ExitCode.UNKNOWN),
+            _render_project(
+                {
+                    "status": "UNKNOWN",
+                    "stage": "PREFLIGHT",
+                    "errors": [
+                        "--from-phase is only supported with --workflow legacy; "
+                        "full workflow resumes from its checkpoint"
+                    ],
+                },
+                args.output,
+            ),
+        )
+
     translator = None
     try:
         translator = OpenAIProjectTranslator.from_key_file(args.api_key_file)
         if args.workflow == "legacy":
-            report = ProjectMigrationRunner().run(
+            legacy_report = ProjectMigrationRunner().run(
                 ProjectMigrationRequest(
                     source=args.source,
                     target=args.target,
@@ -141,8 +160,9 @@ def _run_project_command(args: argparse.Namespace) -> tuple[int, str]:
                     max_parallelism=args.parallelism,
                 )
             )
+            payload = legacy_report.as_dict()
         else:
-            report = ProjectMigrationPipeline().run(
+            full_report = ProjectMigrationPipeline().run(
                 ProjectMigrationPipelineRequest(
                     source=args.source,
                     target=args.target,
@@ -152,14 +172,15 @@ def _run_project_command(args: argparse.Namespace) -> tuple[int, str]:
                     max_parallelism=args.parallelism,
                 )
             )
+            payload = full_report.as_dict()
     except (OSError, ValueError, RuntimeError):
         return int(ExitCode.UNKNOWN), _render_project({"status": "UNKNOWN"}, args.output)
     finally:
         if translator is not None:
             translator.close()
     return (
-        int(ExitCode.COMPLETED if report.status == "COMPLETED" else ExitCode.FAILED),
-        _render_project(report.as_dict(), args.output),
+        int(ExitCode.COMPLETED if payload.get("status") == "COMPLETED" else ExitCode.FAILED),
+        _render_project(payload, args.output),
     )
 
 
@@ -179,10 +200,7 @@ def _render_payload(payload: dict[str, object], output: str) -> str:
         safe_payload["web_url"] = web_url
     payload = safe_payload
     if output == "json":
-        return (
-            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            + "\n"
-        )
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
     if output == "jsonl":
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
     return (

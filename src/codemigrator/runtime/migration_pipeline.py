@@ -15,7 +15,7 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -38,6 +38,7 @@ from codemigrator.core import (
     RulebookEntry,
     RulebookEntryKind,
     RuleEntrySource,
+    SliceKind,
     TargetProjectBlueprint,
     UnderstandingDossier,
     canonical_json_bytes,
@@ -51,6 +52,7 @@ from codemigrator.planning import (
     PlanningLimits,
     PlanProposal,
     PlanSliceProposal,
+    compute_plan_hash,
     derive_plan_proposal,
 )
 from codemigrator.workspace import SecureRoot
@@ -74,6 +76,7 @@ from .project_migration import (
     TranslationResult,
     _analysis_snapshot,
     _go_analysis_descriptor,
+    _is_relative_to,
     _MigrationState,
     _ProjectMigrationPhase,
     _SourceSnapshot,
@@ -152,7 +155,9 @@ class ProjectMigrationPipelineReport:
             "source_digest": self.source_digest,
             "target": self.target,
             "state_dir": self.state_dir,
-            "stage_dir": self.stage_dir,
+            # A report is portable evidence.  The host state path is a local
+            # implementation detail and must never be serialized into it.
+            "stage_dir": "stages",
             "plan_hash": self.plan_hash,
             "included_files": self.included_files,
             "translated_files": self.translated_files,
@@ -201,31 +206,42 @@ class _PipelineCheckpoint:
         if not isinstance(stages, dict) or not isinstance(outputs, dict):
             raise ValueError("pipeline checkpoint stages are invalid")
         if any(
-            stage not in _STAGES or status not in {"PENDING", "RUNNING", "FAILED", "COMPLETE"}
+            not isinstance(stage, str)
+            or stage not in _STAGES
+            or not isinstance(status, str)
+            or status not in {"PENDING", "RUNNING", "FAILED", "COMPLETE"}
             for stage, status in stages.items()
         ):
             raise ValueError("pipeline checkpoint contains an invalid stage")
         if set(stages) != set(_STAGES):
             raise ValueError("pipeline checkpoint must contain every stage")
+        if any(
+            not isinstance(stage, str)
+            or stage not in _STAGES
+            or not isinstance(value, list)
+            or not all(isinstance(item, str) for item in value)
+            for stage, value in outputs.items()
+        ):
+            raise ValueError("pipeline checkpoint outputs are invalid")
         if not isinstance(current_stage, str) or current_stage not in _STAGES:
             raise ValueError("pipeline checkpoint current stage is invalid")
-        if plan_hash is not None and not isinstance(plan_hash, str):
+        if plan_hash is not None and (
+            not isinstance(plan_hash, str) or re.fullmatch(r"[0-9a-f]{64}", plan_hash) is None
+        ):
             raise ValueError("pipeline checkpoint plan hash is invalid")
         if not isinstance(errors, list) or not all(isinstance(item, str) for item in errors):
             raise ValueError("pipeline checkpoint errors are invalid")
-        return cls(
+        checkpoint = cls(
             source_digest=source_digest,
             descriptor_digest=descriptor_digest,
             stages={str(key): str(value) for key, value in stages.items()},
-            outputs={
-                str(key): [str(item) for item in value]
-                for key, value in outputs.items()
-                if isinstance(value, list)
-            },
+            outputs={str(key): list(value) for key, value in outputs.items()},
             current_stage=current_stage,
             plan_hash=plan_hash,
             errors=list(errors),
         )
+        _validate_stage_progression(checkpoint.stages)
+        return checkpoint
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -238,6 +254,24 @@ class _PipelineCheckpoint:
             "plan_hash": self.plan_hash,
             "errors": list(self.errors or []),
         }
+
+
+def _validate_stage_progression(stages: Mapping[str, str]) -> None:
+    """Require a prefix of completed stages plus at most one active stage."""
+
+    first_pending = next(
+        (index for index, stage in enumerate(_STAGES) if stages[stage] != "COMPLETE"),
+        len(_STAGES),
+    )
+    if first_pending == len(_STAGES):
+        return
+    active = stages[_STAGES[first_pending]]
+    if active not in {"PENDING", "RUNNING", "FAILED"}:
+        raise ValueError("pipeline checkpoint stage order is invalid")
+    if any(stages[stage] == "COMPLETE" for stage in _STAGES[first_pending + 1 :]):
+        raise ValueError("pipeline checkpoint stage order is invalid")
+    if any(stages[stage] in {"RUNNING", "FAILED"} for stage in _STAGES[first_pending + 1 :]):
+        raise ValueError("pipeline checkpoint stage order is invalid")
 
 
 class ProjectMigrationPipeline:
@@ -254,6 +288,8 @@ class ProjectMigrationPipeline:
         runner = ProjectMigrationRunner()
 
         try:
+            if _is_relative_to(state_dir, source):
+                raise ValueError("state directory must not be inside source")
             snapshot = runner._preflight(source, target)
             descriptor = _go_analysis_descriptor()
             low_request = ProjectMigrationRequest(
@@ -277,6 +313,9 @@ class ProjectMigrationPipeline:
             checkpoint = self._load_or_initialize_checkpoint(
                 state_dir, request.resume, snapshot.digest, descriptor.descriptor_sha256
             )
+            if request.resume and "stage failed" in low_state.errors:
+                low_state.errors = [error for error in low_state.errors if error != "stage failed"]
+                runner._write_state_from_phase(low_state)
         except (OSError, ValueError, RuntimeError):
             return self._failed(
                 source_digest="",
@@ -285,11 +324,6 @@ class ProjectMigrationPipeline:
                 stage="PREFLIGHT",
                 errors=("preflight failed",),
             )
-
-        if request.resume and checkpoint.stages["REPORT"] == "COMPLETE" and all(
-            item.status == "SUCCEEDED" for item in low_state.files
-        ):
-            return self._load_report_or_failed(checkpoint, state_dir, target, low_state)
 
         try:
             self._begin_stage(checkpoint, state_dir, "PREFLIGHT")
@@ -306,7 +340,7 @@ class ProjectMigrationPipeline:
                 checkpoint, state_dir, analysis, snapshot, request.translator
             )
             frozen_plan = self._planning(
-                checkpoint, state_dir, analysis, artifacts, frozen_bundle, request
+                checkpoint, state_dir, analysis, artifacts, frozen_bundle, snapshot, request
             )
             self._execute(
                 checkpoint, state_dir, runner, low_state, snapshot, target, request, frozen_plan
@@ -319,8 +353,14 @@ class ProjectMigrationPipeline:
         except (OSError, ValueError, RuntimeError):
             failed_stage = checkpoint.current_stage
             self._fail_stage(checkpoint, state_dir, failed_stage, "stage failed")
-            return self._report_from_low(
-                checkpoint, state_dir, target, low_state, failed_stage, ("stage failed",)
+            return self._persist_failure_report(
+                checkpoint,
+                state_dir,
+                runner,
+                low_state,
+                target,
+                failed_stage,
+                ("stage failed",),
             )
 
     def _navigation(
@@ -337,8 +377,35 @@ class ProjectMigrationPipeline:
             payload = _read_json(
                 state_dir / "stages" / _STAGE_DIRS["NAVIGATION"] / "navigation-map.json"
             )
+            if payload.get("snapshot_oid") != snapshot.digest:
+                raise ValueError("navigation snapshot does not match the frozen source")
+            analysis_sha256 = payload.get("analysis_sha256")
+            if (
+                not isinstance(analysis_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", analysis_sha256) is None
+            ):
+                raise ValueError("navigation analysis hash is invalid")
             analysis = AnalysisResult.model_validate(payload["analysis"])
+            redacted_analysis = _redacted_analysis_payload(analysis)
+            persisted_hash = payload.get("persisted_analysis_sha256")
+            if persisted_hash is not None and (
+                not isinstance(persisted_hash, str)
+                or persisted_hash != _canonical_sha256(redacted_analysis)
+            ):
+                raise ValueError("navigation analysis artifact hash does not match its payload")
+            state_analysis_hash = low_state.analysis.get("canonical_sha256")
+            redacted_hash = _canonical_sha256(redacted_analysis)
+            if isinstance(state_analysis_hash, str) and state_analysis_hash not in {
+                analysis_sha256,
+                redacted_hash,
+                analysis.canonical_sha256,
+            }:
+                raise ValueError("navigation analysis hash does not match the checkpoint")
+            low_state.analysis["canonical_sha256"] = analysis_sha256
             _persist_redacted_analysis(runner, low_state, analysis)
+            payload["analysis"] = redacted_analysis
+            payload["persisted_analysis_sha256"] = _canonical_sha256(redacted_analysis)
+            _write_stage_json(state_dir, "NAVIGATION", "navigation-map.json", payload)
             return analysis
         source_snapshot = _analysis_snapshot(snapshot, low_state.files)
         runner._run_analysis(low_state, source_snapshot, descriptor)  # type: ignore[arg-type]
@@ -351,6 +418,7 @@ class ProjectMigrationPipeline:
             "schema_version": 1,
             "snapshot_oid": analysis.snapshot_oid,
             "analysis_sha256": analysis.canonical_sha256,
+            "persisted_analysis_sha256": _canonical_sha256(redacted_analysis),
             "counts": _analysis_counts(analysis),
             "skipped_paths": list(snapshot.skipped_paths),
             "analysis": redacted_analysis,
@@ -494,6 +562,7 @@ class ProjectMigrationPipeline:
         analysis: AnalysisResult,
         artifacts: DraftArtifacts,
         frozen_bundle: FrozenArtifactBundle,
+        snapshot: _SourceSnapshot,
         request: ProjectMigrationPipelineRequest,
     ) -> FrozenPlan:
         self._begin_stage(checkpoint, state_dir, "PLANNING")
@@ -501,7 +570,16 @@ class ProjectMigrationPipeline:
             payload = _read_json(
                 state_dir / "stages" / _STAGE_DIRS["PLANNING"] / "frozen-plan.json"
             )
-            return FrozenPlan.model_validate(payload)
+            frozen = FrozenPlan.model_validate(payload)
+            if checkpoint.plan_hash != frozen.plan_hash:
+                raise ValueError("frozen plan hash does not match the pipeline checkpoint")
+            if compute_plan_hash(frozen) != frozen.plan_hash:
+                raise ValueError("frozen plan payload hash does not match its contents")
+            if frozen.snapshot_oid != analysis.snapshot_oid:
+                raise ValueError("frozen plan snapshot does not match navigation")
+            if not frozen.validation.accepted:
+                raise ValueError("frozen plan is not accepted")
+            return frozen
 
         planner_payload = _planner_advice(request.planner, request.translator, analysis, artifacts)
         _write_stage_json(
@@ -556,7 +634,7 @@ class ProjectMigrationPipeline:
             snapshot_oid=analysis.snapshot_oid,
             limits=limits,
         )
-        proposal = _align_proposal_to_executor(derive_plan_proposal(inputs), analysis)
+        proposal = _align_proposal_to_executor(derive_plan_proposal(inputs), analysis, snapshot)
         rationale = list(proposal.planner_rationale)
         advice = planner_payload.get("advice")
         if isinstance(advice, dict):
@@ -611,14 +689,29 @@ class ProjectMigrationPipeline:
         stage_was_complete = checkpoint.stages["EXECUTE"] == "COMPLETE"
         if stage_was_complete and all(item.status == "SUCCEEDED" for item in low_state.files):
             generated_package_scaffolds = _materialize_python_package_scaffolding(target, low_state)
-            if generated_package_scaffolds:
-                summary_path = (
-                    state_dir / "stages" / _STAGE_DIRS["EXECUTE"] / "execution-summary.json"
-                )
-                if summary_path.exists():
-                    summary = _read_json(summary_path)
-                    summary["generated_package_scaffolds"] = list(generated_package_scaffolds)
-                    _write_json(summary_path, summary)
+            summary_path = state_dir / "stages" / _STAGE_DIRS["EXECUTE"] / "execution-summary.json"
+            summary = _read_json(summary_path)
+            if not generated_package_scaffolds:
+                generated_package_scaffolds = _scaffolds_from_summary(summary)
+            _validate_frozen_plan_execution(frozen_plan, low_state)
+            scaffold_records = _package_scaffold_records(target, generated_package_scaffolds)
+            low_state.plan["generated_package_scaffolds"] = list(generated_package_scaffolds)
+            runner._write_state_from_phase(low_state)
+            _write_stage_json(
+                state_dir,
+                "EXECUTE",
+                "file-results.json",
+                {"schema_version": 1, "files": [item.as_dict() for item in low_state.files]},
+            )
+            _write_stage_json(
+                state_dir,
+                "EXECUTE",
+                "slice-results.json",
+                _slice_results(frozen_plan, low_state, snapshot),
+            )
+            summary["generated_package_scaffolds"] = list(generated_package_scaffolds)
+            summary["generated_package_scaffold_hashes"] = scaffold_records
+            _write_json(summary_path, summary)
             return
         low_state.plan = {
             "plan_hash": frozen_plan.plan_hash,
@@ -627,6 +720,7 @@ class ProjectMigrationPipeline:
             "scope": "TARGET_ROOT_ONLY",
             "integration_order": [str(item) for item in frozen_plan.integration_order],
         }
+        _validate_frozen_plan_execution(frozen_plan, low_state)
         low_state.phase = _ProjectMigrationPhase.PLAN.value
         runner._write_state_from_phase(low_state)
         runner._run_execute(
@@ -637,6 +731,13 @@ class ProjectMigrationPipeline:
             request.max_parallelism,
         )
         generated_package_scaffolds = _materialize_python_package_scaffolding(target, low_state)
+        summary_path = state_dir / "stages" / _STAGE_DIRS["EXECUTE"] / "execution-summary.json"
+        if not generated_package_scaffolds and summary_path.exists():
+            generated_package_scaffolds = _scaffolds_from_summary(_read_json(summary_path))
+        scaffold_records = _package_scaffold_records(target, generated_package_scaffolds)
+        low_state.plan["generated_package_scaffolds"] = list(generated_package_scaffolds)
+        low_state.plan["generated_package_scaffold_hashes"] = scaffold_records
+        runner._write_state_from_phase(low_state)
         _write_stage_json(
             state_dir,
             "EXECUTE",
@@ -664,6 +765,7 @@ class ProjectMigrationPipeline:
                 ),
                 "failed": [item.source_path for item in low_state.files if item.status == "FAILED"],
                 "generated_package_scaffolds": list(generated_package_scaffolds),
+                "generated_package_scaffold_hashes": scaffold_records,
             },
         )
         if runner._failed_files(low_state):
@@ -682,6 +784,18 @@ class ProjectMigrationPipeline:
     ) -> None:
         self._begin_stage(checkpoint, state_dir, "VERIFY_INTEGRATE")
         if checkpoint.stages["VERIFY_INTEGRATE"] == "COMPLETE":
+            _write_stage_json(
+                state_dir,
+                "VERIFY_INTEGRATE",
+                "integration-manifest.json",
+                _integration_manifest(frozen_plan, low_state, target),
+            )
+            _validate_integration_manifest(
+                state_dir,
+                frozen_plan,
+                low_state,
+                target,
+            )
             return
         runner._run_verify(low_state, target, request.verification_runner)
         _write_stage_json(
@@ -709,7 +823,11 @@ class ProjectMigrationPipeline:
     ) -> ProjectMigrationPipelineReport:
         self._begin_stage(checkpoint, state_dir, "REPORT")
         if checkpoint.stages["REPORT"] == "COMPLETE":
-            return self._load_report_or_failed(checkpoint, state_dir, target, low_state)
+            report = self._load_report_or_failed(checkpoint, state_dir, target, low_state)
+            report = replace(report, plan_hash=frozen_plan.plan_hash)
+            _write_stage_json(state_dir, "REPORT", "report.json", report.as_dict())
+            _write_report_markdown(state_dir, report.as_dict())
+            return report
         runner._run_report(low_state, target)
         report = self._report_from_low(
             checkpoint, state_dir, target, low_state, "REPORT", tuple(low_state.errors)
@@ -738,7 +856,7 @@ class ProjectMigrationPipeline:
             source_digest=report.source_digest,
             target=report.target,
             state_dir=report.state_dir,
-            stage_dir=str(state_dir / "stages"),
+            stage_dir="stages",
             plan_hash=frozen_plan.plan_hash,
             included_files=report.included_files,
             translated_files=report.translated_files,
@@ -763,6 +881,7 @@ class ProjectMigrationPipeline:
                 or checkpoint.descriptor_digest != descriptor_digest
             ):
                 raise ValueError("resume identity does not match pipeline checkpoint")
+            self._validate_checkpoint_outputs(state_dir, checkpoint)
             return checkpoint
         if path.exists():
             raise ValueError(
@@ -794,12 +913,29 @@ class ProjectMigrationPipeline:
     def _fail_stage(
         self, checkpoint: _PipelineCheckpoint, state_dir: Path, stage: str, error: str
     ) -> None:
+        stage_index = _STAGES.index(stage)
         checkpoint.stages[stage] = "FAILED"
+        for downstream in _STAGES[stage_index + 1 :]:
+            checkpoint.stages[downstream] = "PENDING"
         checkpoint.errors = [*(checkpoint.errors or []), error]
         self._write_checkpoint(state_dir, checkpoint)
 
     def _write_checkpoint(self, state_dir: Path, checkpoint: _PipelineCheckpoint) -> None:
         _write_json(state_dir / "pipeline.json", checkpoint.as_dict())
+
+    def _validate_checkpoint_outputs(
+        self, state_dir: Path, checkpoint: _PipelineCheckpoint
+    ) -> None:
+        for stage in _STAGES:
+            outputs = checkpoint.outputs.get(stage, [])
+            if checkpoint.stages[stage] == "COMPLETE":
+                expected = set(self._relative_outputs(stage))
+                if not expected.issubset(outputs):
+                    raise ValueError(f"checkpoint outputs are incomplete for {stage}")
+            for output in outputs:
+                candidate = (state_dir / "stages" / output).resolve()
+                if not _is_relative_to(candidate, state_dir) or not candidate.is_file():
+                    raise ValueError(f"checkpoint output is missing or unsafe: {output}")
 
     @staticmethod
     def _relative_outputs(stage: str) -> tuple[str, ...]:
@@ -879,7 +1015,7 @@ class ProjectMigrationPipeline:
             source_digest=low_state.source_digest,
             target=target.name,
             state_dir=state_dir.name,
-            stage_dir=str(state_dir / "stages"),
+            stage_dir="stages",
             plan_hash=checkpoint.plan_hash,
             included_files=len(low_state.files),
             translated_files=sum(item.kind == "translate" for item in low_state.files),
@@ -894,6 +1030,38 @@ class ProjectMigrationPipeline:
             checks=tuple(dict(item) for item in low_state.checks),
             errors=safe_errors,
         )
+
+    def _persist_failure_report(
+        self,
+        checkpoint: _PipelineCheckpoint,
+        state_dir: Path,
+        runner: ProjectMigrationRunner,
+        low_state: _MigrationState,
+        target: Path,
+        failed_stage: str,
+        errors: Sequence[str],
+    ) -> ProjectMigrationPipelineReport:
+        for error in errors:
+            if error not in low_state.errors:
+                low_state.errors.append(error)
+        try:
+            runner._run_report(low_state, target)
+        except (OSError, RuntimeError, ValueError):
+            # The stage ledger is the durable failure report when the target
+            # itself is unavailable for the low-level report writer.
+            pass
+        report = self._report_from_low(
+            checkpoint, state_dir, target, low_state, failed_stage, errors
+        )
+        payload = report.as_dict()
+        payload["stage"] = failed_stage
+        payload["plan_hash"] = checkpoint.plan_hash
+        payload["stages"] = dict(checkpoint.stages)
+        _write_stage_json(state_dir, "REPORT", "report.json", payload)
+        _write_report_markdown(state_dir, payload)
+        checkpoint.current_stage = failed_stage
+        self._write_checkpoint(state_dir, checkpoint)
+        return report
 
     def _load_report_or_failed(
         self,
@@ -910,8 +1078,8 @@ class ProjectMigrationPipeline:
                 stage=str(payload.get("stage", "REPORT")),
                 source_digest=str(payload.get("source_digest", low_state.source_digest)),
                 target=str(payload.get("target", target.name)),
-                state_dir=str(payload.get("state_dir", state_dir.name)),
-                stage_dir=str(payload.get("stage_dir", state_dir / "stages")),
+                state_dir=state_dir.name,
+                stage_dir="stages",
                 plan_hash=_optional_string(payload.get("plan_hash")) or checkpoint.plan_hash,
                 included_files=_int_value(payload.get("included_files"), len(low_state.files)),
                 translated_files=_int_value(payload.get("translated_files"), 0),
@@ -940,7 +1108,7 @@ class ProjectMigrationPipeline:
             source_digest=source_digest,
             target=target.name,
             state_dir=state_dir.name,
-            stage_dir=str(state_dir / "stages"),
+            stage_dir="stages",
             plan_hash=None,
             included_files=0,
             translated_files=0,
@@ -970,6 +1138,8 @@ def _persist_redacted_analysis(
     runner: ProjectMigrationRunner, state: _MigrationState, analysis: AnalysisResult
 ) -> None:
     persisted = dict(state.analysis)
+    if not isinstance(persisted.get("canonical_sha256"), str):
+        persisted["canonical_sha256"] = analysis.canonical_sha256
     persisted["result"] = _redacted_analysis_payload(analysis)
     state.analysis = persisted
     runner._write_state_from_phase(state)
@@ -1057,6 +1227,8 @@ def repair_generated_file(
     source_path: str,
     translator: RepairingProjectTranslator,
     verification_feedback: str,
+    *,
+    state_dir: Path,
 ) -> TranslationResult:
     """Regenerate one target file from source evidence and a local failure.
 
@@ -1066,7 +1238,29 @@ def repair_generated_file(
     instead of turning it into an untracked hand edit.
     """
 
+    source = source.expanduser().resolve()
+    target = target.expanduser().resolve()
+    state_dir = state_dir.expanduser().resolve()
+    if _is_relative_to(state_dir, source):
+        raise ValueError("repair state directory must not be inside source")
+    try:
+        snapshot = ProjectMigrationRunner()._preflight(source, target)
+        state = _MigrationState.from_dict(_read_json(state_dir / "state.json"))
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ValueError("repair source snapshot checkpoint is unavailable") from exc
+    if state.source_digest != snapshot.digest:
+        raise ValueError("source snapshot no longer matches the migration checkpoint")
+    item = next((entry for entry in state.files if entry.source_path == source_path), None)
+    if item is None or item.kind != "translate":
+        raise ValueError("repair source path is not a translated checkpoint file")
+    source_bytes = snapshot.contents.get(source_path)
+    if source_bytes is None:
+        raise ValueError("repair source path is not present in the frozen source snapshot")
+    if item.source_sha256 != _sha256_bytes(source_bytes):
+        raise ValueError("source snapshot file hash does not match the migration checkpoint")
     expected_target = _target_path(source_path)
+    if item.target_path != expected_target:
+        raise ValueError("repair target path does not match the migration checkpoint")
     source_root = SecureRoot("repair-source", source)
     target_root = SecureRoot("repair-target", target)
     try:
@@ -1079,7 +1273,23 @@ def repair_generated_file(
             verification_feedback,
         )
         content = _validated_translation(result, expected_target)
-        target_root.write_atomic(expected_target, content.encode("utf-8"))
+        content_bytes = content.encode("utf-8")
+        target_root.write_atomic(expected_target, content_bytes)
+        record_generated_repairs(
+            state_dir,
+            [
+                {
+                    "source_path": source_path,
+                    "target_path": expected_target,
+                    "status": "APPLIED",
+                    "method": "CodeMigrator.repair_generated_file",
+                    "source_sha256": item.source_sha256,
+                    "target_sha256": _sha256_bytes(content_bytes),
+                    "feedback_sha256": _sha256_text(verification_feedback),
+                    "repair_count": item.attempts + 1,
+                }
+            ],
+        )
         return TranslationResult(content=content, target_path=result.target_path)
     finally:
         target_root.close()
@@ -1089,24 +1299,47 @@ def repair_generated_file(
 def record_generated_repairs(state_dir: Path, repairs: Sequence[Mapping[str, object]]) -> None:
     """Persist redacted file-repair facts in the verification stage ledger."""
 
-    normalized = [
-        {
-            key: value
-            for key, value in record.items()
-            if key
-            in {
+    normalized: list[dict[str, object]] = []
+    for record in repairs:
+        required = {
+            "source_path",
+            "target_path",
+            "status",
+            "method",
+            "source_sha256",
+            "target_sha256",
+        }
+        if not required.issubset(record):
+            raise ValueError("repair ledger entry is incomplete")
+        if any(
+            not isinstance(record.get(key), str)
+            for key in (
                 "source_path",
                 "target_path",
                 "status",
                 "method",
                 "source_sha256",
                 "target_sha256",
-                "feedback_sha256",
-                "repair_count",
+            )
+        ):
+            raise ValueError("repair ledger entry has invalid identity")
+        normalized.append(
+            {
+                key: value
+                for key, value in record.items()
+                if key
+                in {
+                    "source_path",
+                    "target_path",
+                    "status",
+                    "method",
+                    "source_sha256",
+                    "target_sha256",
+                    "feedback_sha256",
+                    "repair_count",
+                }
             }
-        }
-        for record in repairs
-    ]
+        )
     _write_stage_json(
         state_dir,
         "VERIFY_INTEGRATE",
@@ -1132,6 +1365,12 @@ def adopt_repaired_file(state_dir: Path, target: Path, target_path: str) -> None
     item = next((entry for entry in state.files if entry.target_path == target_path), None)
     if item is None or item.kind != "translate":
         raise ValueError("repaired target path is not a translated checkpoint file")
+    repairs_payload = _read_json(
+        state_dir / "stages" / _STAGE_DIRS["VERIFY_INTEGRATE"] / "repairs.json"
+    )
+    raw_repairs = repairs_payload.get("repairs")
+    if not isinstance(raw_repairs, list):
+        raise ValueError("repair provenance ledger is invalid")
     root = SecureRoot("repair-adoption", target)
     try:
         content = root.read_bytes(target_path)
@@ -1141,8 +1380,28 @@ def adopt_repaired_file(state_dir: Path, target: Path, target_path: str) -> None
         ast.parse(content.decode("utf-8"), filename=target_path)
     except (UnicodeError, SyntaxError) as exc:
         raise ValueError("repaired target is not valid Python") from exc
+    target_sha256 = _sha256_bytes(content)
+    receipt = next(
+        (
+            entry
+            for entry in raw_repairs
+            if isinstance(entry, dict)
+            and entry.get("source_path") == item.source_path
+            and entry.get("target_path") == target_path
+        ),
+        None,
+    )
+    if not isinstance(receipt, dict):
+        raise ValueError("repaired target has no CodeMigrator repair provenance")
+    if (
+        receipt.get("status") != "APPLIED"
+        or receipt.get("method") != "CodeMigrator.repair_generated_file"
+        or receipt.get("source_sha256") != item.source_sha256
+        or receipt.get("target_sha256") != target_sha256
+    ):
+        raise ValueError("repair provenance does not match the target checkpoint")
     item.status = "SUCCEEDED"
-    item.target_sha256 = _sha256_bytes(content)
+    item.target_sha256 = target_sha256
     item.error = None
     _write_json(state_dir / "state.json", state.as_dict())
 
@@ -1215,6 +1474,15 @@ def _analysis_counts(analysis: AnalysisResult) -> dict[str, int | str]:
         "relation_edges": len(analysis.relation_edges),
         "errors": len(analysis.errors),
     }
+
+
+def _rationale(content: str) -> DossierEntry:
+    return DossierEntry(
+        kind=DossierEntryKind("planner"),
+        content=content,
+        anchors=[],
+        advisory=True,
+    )
 
 
 def _module_files(
@@ -1621,7 +1889,9 @@ def _read_draft_artifacts(state_dir: Path) -> DraftArtifacts:
     )
 
 
-def _align_proposal_to_executor(proposal: PlanProposal, analysis: AnalysisResult) -> PlanProposal:
+def _align_proposal_to_executor(
+    proposal: PlanProposal, analysis: AnalysisResult, snapshot: _SourceSnapshot
+) -> PlanProposal:
     modules = {module.module_id: module for module in analysis.modules}
     updated: list[PlanSliceProposal] = []
     for slice_proposal in proposal.slices:
@@ -1662,7 +1932,54 @@ def _align_proposal_to_executor(proposal: PlanProposal, analysis: AnalysisResult
                     }
                 )
             )
-    return proposal.model_copy(update={"slices": updated})
+    planned_paths = {
+        _physical_plan_path(str(path)) for slice_ in updated for path in slice_.write_paths
+    }
+    unowned_source_paths = tuple(
+        sorted(
+            {_target_path(path) for path in snapshot.contents} - planned_paths,
+            key=lambda value: value.encode("utf-8"),
+        )
+    )
+    translated_paths = tuple(
+        path
+        for slice_ in updated
+        if slice_.kind.value in {"IMPLEMENTATION", "TEST_TRANSLATION"}
+        for path in slice_.write_paths
+        if str(path).endswith(".py")
+    )
+    scaffold_paths = _package_scaffold_paths(translated_paths)
+    reserved_paths = tuple(
+        sorted(
+            (set(unowned_source_paths) | set(scaffold_paths)) - planned_paths,
+            key=lambda value: value.encode("utf-8"),
+        )
+    )
+    if not reserved_paths:
+        return proposal.model_copy(update={"slices": updated})
+
+    contract_index = next(
+        (index for index, slice_ in enumerate(updated) if slice_.kind.value == "CONTRACT"),
+        None,
+    )
+    if contract_index is None:
+        updated.append(
+            PlanSliceProposal(
+                local_ref="CP",
+                kind=SliceKind.Contract,
+                write_paths=tuple(RepoRelativePath(path) for path in reserved_paths),
+                rationale=(_rationale("unclassified source artifacts remain in target scope"),),
+            )
+        )
+        ranks = dict(proposal.integration_ranks)
+        ranks["CP"] = max(ranks.values(), default=-1) + 1
+    else:
+        contract = updated[contract_index]
+        updated[contract_index] = contract.model_copy(
+            update={"write_paths": tuple(contract.write_paths) + reserved_paths}
+        )
+        ranks = dict(proposal.integration_ranks)
+    return proposal.model_copy(update={"slices": updated, "integration_ranks": ranks})
 
 
 def _physical_plan_path(path: str) -> str:
@@ -1675,6 +1992,7 @@ def _physical_plan_path(path: str) -> str:
 def _slice_results(
     frozen_plan: FrozenPlan, state: _MigrationState, snapshot: _SourceSnapshot
 ) -> dict[str, object]:
+    del snapshot
     files = {item.source_path: item for item in state.files}
     modules = {module.module_id: module for module in _analysis_from_state(state).modules}
     results: list[dict[str, object]] = []
@@ -1685,15 +2003,23 @@ def _slice_results(
             for path in modules[module_id].file_paths
         ]
         owned = [files[path] for path in source_paths if path in files]
+        materialized = slice_.kind.value != "TEST_GENERATION"
         results.append(
             {
                 "slice_id": str(slice_.id),
                 "kind": slice_.kind.value,
                 "integration_rank": slice_.integration_rank,
                 "source_paths": source_paths,
-                "status": "SUCCEEDED"
-                if owned and all(item.status == "SUCCEEDED" for item in owned)
-                else "PLANNED",
+                # TestGeneration is a frozen plan obligation, not an execution
+                # success claim.  This pipeline does not materialize generated
+                # tests, so it remains auditable as PLANNED until a real target
+                # artifact is produced and recorded.
+                "status": (
+                    "SUCCEEDED"
+                    if materialized and owned and all(item.status == "SUCCEEDED" for item in owned)
+                    else "PLANNED"
+                ),
+                "materialized": materialized and bool(owned),
                 "target_paths": [item.target_path for item in owned],
             }
         )
@@ -1731,8 +2057,108 @@ def _integration_manifest(
             }
             for slice_ in sorted(frozen_plan.slices, key=lambda item: item.integration_rank)
         ],
+        "generated_package_scaffolds": _package_scaffold_records(
+            target, _state_scaffold_paths(state)
+        ),
         "external_services": "not executed; adapters remain explicit boundaries",
     }
+
+
+def _state_scaffold_paths(state: _MigrationState) -> tuple[str, ...]:
+    raw_paths = state.plan.get("generated_package_scaffolds", [])
+    if not isinstance(raw_paths, list) or not all(isinstance(path, str) for path in raw_paths):
+        raise ValueError("execution scaffold ledger is invalid")
+    return tuple(sorted(raw_paths, key=lambda value: value.encode("utf-8")))
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _validate_frozen_plan_execution(frozen_plan: FrozenPlan, state: _MigrationState) -> None:
+    """Ensure every low-level file write is reserved by the frozen plan."""
+
+    state_plan_hash = state.plan.get("plan_hash")
+    if state_plan_hash is not None and state_plan_hash != frozen_plan.plan_hash:
+        raise ValueError("execution checkpoint plan hash does not match frozen plan")
+    planned_paths = {
+        _physical_plan_path(str(path))
+        for slice_ in frozen_plan.slices
+        for path in slice_.write_scope.out.write_paths
+    }
+    actual_paths = {item.target_path for item in state.files}
+    unplanned_paths = sorted(actual_paths - planned_paths, key=lambda value: value.encode("utf-8"))
+    if unplanned_paths:
+        raise ValueError(
+            "execution contains writes outside the frozen plan: " + ", ".join(unplanned_paths)
+        )
+
+
+def _scaffolds_from_summary(summary: Mapping[str, object]) -> tuple[str, ...]:
+    raw_paths = summary.get("generated_package_scaffolds", [])
+    if not isinstance(raw_paths, list) or not all(isinstance(path, str) for path in raw_paths):
+        raise ValueError("execution scaffold ledger is invalid")
+    return tuple(sorted(raw_paths, key=lambda value: value.encode("utf-8")))
+
+
+def _package_scaffold_paths(paths: Sequence[str]) -> tuple[str, ...]:
+    package_dirs: set[str] = set()
+    for path in paths:
+        if not path.endswith(".py") or "/" not in path:
+            continue
+        parent_parts = path.split("/")[:-1]
+        for index in range(1, len(parent_parts) + 1):
+            package_dirs.add("/".join(parent_parts[:index]))
+    return tuple(
+        sorted(
+            (f"{package_dir}/__init__.py" for package_dir in package_dirs),
+            key=lambda value: value.encode("utf-8"),
+        )
+    )
+
+
+def _package_scaffold_records(target: Path, paths: Sequence[str]) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    root = SecureRoot("package-scaffold-ledger", target)
+    try:
+        for path in sorted(set(paths), key=lambda value: value.encode("utf-8")):
+            content = root.read_bytes(path)
+            records.append({"path": path, "sha256": _sha256_bytes(content)})
+    finally:
+        root.close()
+    return records
+
+
+def _validate_integration_manifest(
+    state_dir: Path,
+    frozen_plan: FrozenPlan,
+    state: _MigrationState,
+    target: Path,
+) -> None:
+    payload = _read_json(
+        state_dir / "stages" / _STAGE_DIRS["VERIFY_INTEGRATE"] / "integration-manifest.json"
+    )
+    if payload.get("plan_hash") != frozen_plan.plan_hash or payload.get("target") != target.name:
+        raise ValueError("integration manifest identity does not match the frozen plan")
+    target_hashes: dict[str, str] = {}
+    raw_order = payload.get("order")
+    if not isinstance(raw_order, list):
+        raise ValueError("integration manifest order is invalid")
+    for entry in raw_order:
+        if not isinstance(entry, dict) or not isinstance(entry.get("target_hashes"), dict):
+            raise ValueError("integration manifest slice evidence is invalid")
+        for path, digest in entry["target_hashes"].items():
+            if not isinstance(path, str) or not isinstance(digest, str):
+                raise ValueError("integration manifest target hash is invalid")
+            target_hashes[path] = digest
+    for item in state.files:
+        if item.status != "SUCCEEDED" or item.target_sha256 is None:
+            raise ValueError("integration manifest is missing a completed file fact")
+        if target_hashes.get(item.target_path) != item.target_sha256:
+            raise ValueError(f"integration manifest hash is incomplete: {item.target_path}")
+    expected_scaffolds = _package_scaffold_records(target, _state_scaffold_paths(state))
+    if payload.get("generated_package_scaffolds") != expected_scaffolds:
+        raise ValueError("integration manifest scaffold evidence is incomplete")
 
 
 def _planner_advice(

@@ -101,3 +101,31 @@ def test_project_command_uses_full_pipeline_by_default(tmp_path: Path, monkeypat
 
     assert code == 0
     assert json.loads(output)["workflow"] == "V6_FULL_MIGRATION"
+
+
+def test_full_project_command_rejects_legacy_from_phase(tmp_path: Path, monkeypatch) -> None:
+    class UnexpectedTranslator:
+        @classmethod
+        def from_key_file(cls, path: Path) -> UnexpectedTranslator:
+            raise AssertionError(f"translator should not load: {path}")
+
+    monkeypatch.setattr(runtime, "OpenAIProjectTranslator", UnexpectedTranslator)
+    code, output = run_command(
+        [
+            "migrate",
+            "project",
+            str(tmp_path / "source"),
+            "--target",
+            str(tmp_path / "target"),
+            "--api-key-file",
+            str(tmp_path / "model.json"),
+            "--from-phase",
+            "VERIFY",
+            "--output",
+            "json",
+        ]
+    )
+
+    assert code == 5
+    payload = json.loads(output)
+    assert "only supported with --workflow legacy" in payload["errors"][0]
