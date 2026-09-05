@@ -108,6 +108,16 @@ from .memory import (
     govern_tool_error,
     repair_navigation_segments,
 )
+from .migration_pipeline import (
+    PlannerAdvisor,
+    ProjectMigrationPipeline,
+    ProjectMigrationPipelineReport,
+    ProjectMigrationPipelineRequest,
+    adopt_repaired_file,
+    record_generated_repairs,
+    redact_persisted_analysis,
+    repair_generated_file,
+)
 from .normalizer import ModelAction, NormalizationError, NormalizedTurn, normalize_response
 from .observability import (
     DEFAULT_SENTINEL_SINKS,
@@ -279,6 +289,14 @@ __all__ = [
     "ProjectMigrationReport",
     "ProjectMigrationRequest",
     "ProjectMigrationRunner",
+    "PlannerAdvisor",
+    "ProjectMigrationPipeline",
+    "ProjectMigrationPipelineReport",
+    "ProjectMigrationPipelineRequest",
+    "adopt_repaired_file",
+    "redact_persisted_analysis",
+    "record_generated_repairs",
+    "repair_generated_file",
     "ProviderError",
     "ProviderCallIdentity",
     "ProviderRegistry",
