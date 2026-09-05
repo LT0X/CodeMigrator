@@ -39,6 +39,12 @@ def _parser() -> argparse.ArgumentParser:
     project.add_argument("--state-dir", type=Path)
     project.add_argument("--resume", action="store_true")
     project.add_argument(
+        "--workflow",
+        choices=("full", "legacy"),
+        default="full",
+        help="选择完整 V6 起草-规划-执行流程，或显式使用兼容 runner",
+    )
+    project.add_argument(
         "--from-phase",
         choices=("PREFLIGHT", "ANALYSIS", "PLAN", "EXECUTE", "VERIFY", "REPORT"),
     )
@@ -101,7 +107,7 @@ def _render_project(report: dict[str, object], output: str) -> str:
     if output == "json":
         return json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
     status = report.get("status", "UNKNOWN")
-    phase = report.get("phase", "UNKNOWN")
+    phase = report.get("phase", report.get("stage", "UNKNOWN"))
     failed = report.get("failed_files", [])
     failed_count = len(failed) if isinstance(failed, list) else 0
     return (
@@ -114,6 +120,8 @@ def _render_project(report: dict[str, object], output: str) -> str:
 def _run_project_command(args: argparse.Namespace) -> tuple[int, str]:
     from codemigrator.runtime import (
         OpenAIProjectTranslator,
+        ProjectMigrationPipeline,
+        ProjectMigrationPipelineRequest,
         ProjectMigrationRequest,
         ProjectMigrationRunner,
     )
@@ -121,17 +129,29 @@ def _run_project_command(args: argparse.Namespace) -> tuple[int, str]:
     translator = None
     try:
         translator = OpenAIProjectTranslator.from_key_file(args.api_key_file)
-        report = ProjectMigrationRunner().run(
-            ProjectMigrationRequest(
-                source=args.source,
-                target=args.target,
-                state_dir=args.state_dir,
-                resume=args.resume,
-                from_phase=args.from_phase,
-                translator=translator,
-                max_parallelism=args.parallelism,
+        if args.workflow == "legacy":
+            report = ProjectMigrationRunner().run(
+                ProjectMigrationRequest(
+                    source=args.source,
+                    target=args.target,
+                    state_dir=args.state_dir,
+                    resume=args.resume,
+                    from_phase=args.from_phase,
+                    translator=translator,
+                    max_parallelism=args.parallelism,
+                )
             )
-        )
+        else:
+            report = ProjectMigrationPipeline().run(
+                ProjectMigrationPipelineRequest(
+                    source=args.source,
+                    target=args.target,
+                    state_dir=args.state_dir,
+                    resume=args.resume,
+                    translator=translator,
+                    max_parallelism=args.parallelism,
+                )
+            )
     except (OSError, ValueError, RuntimeError):
         return int(ExitCode.UNKNOWN), _render_project({"status": "UNKNOWN"}, args.output)
     finally:

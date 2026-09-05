@@ -6,12 +6,10 @@ from pathlib import Path
 from codemigrator_cli.__main__ import run_command
 
 import codemigrator.runtime as runtime
-from codemigrator.runtime import ProjectMigrationReport
+from codemigrator.runtime import ProjectMigrationPipelineReport, ProjectMigrationReport
 
 
-def test_project_command_delegates_to_local_runner(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_project_command_delegates_to_local_runner(tmp_path: Path, monkeypatch) -> None:
     class FakeTranslator:
         @classmethod
         def from_key_file(cls, path: Path) -> FakeTranslator:
@@ -47,6 +45,8 @@ def test_project_command_delegates_to_local_runner(
             str(tmp_path / "target"),
             "--api-key-file",
             str(tmp_path / "model.json"),
+            "--workflow",
+            "legacy",
             "--output",
             "json",
         ]
@@ -54,3 +54,50 @@ def test_project_command_delegates_to_local_runner(
 
     assert code == 0
     assert json.loads(output)["status"] == "COMPLETED"
+
+
+def test_project_command_uses_full_pipeline_by_default(tmp_path: Path, monkeypatch) -> None:
+    class FakeTranslator:
+        @classmethod
+        def from_key_file(cls, path: Path) -> FakeTranslator:
+            assert path.name == "model.json"
+            return cls()
+
+        def close(self) -> None:
+            return None
+
+    class FakePipeline:
+        def run(self, request: object) -> ProjectMigrationPipelineReport:
+            del request
+            return ProjectMigrationPipelineReport(
+                status="COMPLETED",
+                stage="COMPLETED",
+                source_digest="a" * 64,
+                target="target",
+                state_dir="state",
+                stage_dir="state/stages",
+                plan_hash="b" * 64,
+                included_files=1,
+                translated_files=1,
+                copied_files=0,
+            )
+
+    monkeypatch.setattr(runtime, "OpenAIProjectTranslator", FakeTranslator)
+    monkeypatch.setattr(runtime, "ProjectMigrationPipeline", FakePipeline)
+
+    code, output = run_command(
+        [
+            "migrate",
+            "project",
+            str(tmp_path / "source"),
+            "--target",
+            str(tmp_path / "target"),
+            "--api-key-file",
+            str(tmp_path / "model.json"),
+            "--output",
+            "json",
+        ]
+    )
+
+    assert code == 0
+    assert json.loads(output)["workflow"] == "V6_FULL_MIGRATION"

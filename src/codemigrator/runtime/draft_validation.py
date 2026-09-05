@@ -42,7 +42,9 @@ def build_domain_skeleton(
     domains: list[DomainSkeleton] = []
     seen_files: set[str] = set()
     for raw_module_path in sorted(module_files, key=lambda path: path.encode("utf-8")):
-        module_path = _validate_repo_relative_path(raw_module_path)
+        module_path = (
+            "." if raw_module_path == "." else _validate_repo_relative_path(raw_module_path)
+        )
         raw_files = module_files[raw_module_path]
         if isinstance(raw_files, (str, bytes)) or not isinstance(raw_files, Sequence):
             raise TypeError("module files must be a sequence")
@@ -51,9 +53,11 @@ def build_domain_skeleton(
             raise ValueError(f"module {module_path!r} must contain at least one file")
         if len(files) != len(raw_files):
             raise ValueError(f"module {module_path!r} contains duplicate files")
-        module_prefix = f"{module_path}/"
+        module_prefix = "" if module_path == "." else f"{module_path}/"
         if any(
-            file_path != module_path and not file_path.startswith(module_prefix)
+            module_path != "."
+            and file_path != module_path
+            and not file_path.startswith(module_prefix)
             for file_path in files
         ):
             raise ValueError(f"files must be under module {module_path!r}")
@@ -76,7 +80,13 @@ def build_domain_skeleton(
             relative = file_path.removeprefix(module_prefix)
             relative_parts = relative.split("/")
             child = relative_parts[0] if len(relative_parts) > 1 else None
-            domain_path = f"{module_path}/{child}" if child else module_path
+            domain_path = (
+                child
+                if module_path == "." and child
+                else f"{module_path}/{child}"
+                if child
+                else module_path
+            )
             grouped.setdefault(domain_path, []).append(file_path)
         domains.extend(
             DomainSkeleton(
