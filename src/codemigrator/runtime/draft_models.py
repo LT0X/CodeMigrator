@@ -95,7 +95,7 @@ class ExplorationReport(_FrozenDraftModel):
     @field_validator("domain_path", mode="before")
     @classmethod
     def domain_path_is_safe(cls, value: object) -> str:
-        return _validate_repo_relative_path(value)
+        return "." if value == "." else _validate_repo_relative_path(value)
 
     @field_validator("coverage", mode="before")
     @classmethod
@@ -112,7 +112,7 @@ class DomainSkeleton(_FrozenDraftModel):
     @field_validator("domain_path", mode="before")
     @classmethod
     def domain_path_is_safe(cls, value: object) -> str:
-        return _validate_repo_relative_path(value)
+        return "." if value == "." else _validate_repo_relative_path(value)
 
     @field_validator("files", mode="before")
     @classmethod

@@ -96,6 +96,49 @@ def test_project_migration_resumes_only_failed_files(tmp_path: Path) -> None:
     } == source_before
 
 
+def test_project_migration_resume_handles_missing_parent_for_failed_file(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    state = tmp_path / "state"
+    source.mkdir()
+    make_source(source)
+    (source / "nested").mkdir()
+    (source / "nested" / "feature.go").write_text(
+        "package nested\nfunc Feature() {}\n", encoding="utf-8"
+    )
+
+    first = RecordingTranslator(fail={"nested/feature.go"})
+    first_report = ProjectMigrationRunner().run(
+        ProjectMigrationRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            translator=first,
+        )
+    )
+
+    assert first_report.status == "FAILED"
+    assert first_report.failed_files == ("nested/feature.go",)
+    assert not (target / "nested").exists()
+
+    second = RecordingTranslator()
+    second_report = ProjectMigrationRunner().run(
+        ProjectMigrationRequest(
+            source=source,
+            target=target,
+            state_dir=state,
+            resume=True,
+            translator=second,
+        )
+    )
+
+    assert second_report.status == "COMPLETED"
+    assert second.calls == ["nested/feature.go"]
+    assert (target / "nested" / "feature.py").is_file()
+
+
 def test_project_migration_persists_completed_file_before_interruption(
     tmp_path: Path,
 ) -> None:
@@ -435,3 +478,82 @@ def test_openai_project_translator_retries_empty_and_invalid_content(monkeypatch
 
     assert result.content == "def migrated():\n    return True\n"
     assert all("test file" in request.messages[1].content for request in requests)
+    assert requests[0].binding.output_cap == 32_768
+    assert "complete syntactically valid module" in requests[1].messages[1].content
+
+
+def test_openai_project_translator_compacts_long_generated_rpc_files(monkeypatch) -> None:
+    requests = []
+
+    class FakeProvider:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def complete(self, request) -> ProviderResponse:
+            requests.append(request)
+            return ProviderResponse(
+                content="class VideoService:\n    pass",
+                tool_calls=(),
+                finish_reason="stop",
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "codemigrator.runtime.project_migration.OpenAICompatibleProvider", FakeProvider
+    )
+    translator = OpenAIProjectTranslator(
+        endpoint="https://provider.invalid/v1",
+        api_key="secret",
+        model="test-model",
+    )
+
+    translator.translate("rpc/video/video/video_grpc.pb.go", "package video\n" + "x" * 12_000)
+
+    prompt = requests[0].messages[1].content
+    assert "compact Python adapters" in prompt
+    assert "repetitive generated" in prompt
+
+
+def test_openai_project_translator_repairs_from_verification_feedback(monkeypatch) -> None:
+    requests = []
+
+    class FakeProvider:
+        def __init__(self, **kwargs) -> None:
+            del kwargs
+
+        async def complete(self, request) -> ProviderResponse:
+            requests.append(request)
+            return ProviderResponse(
+                content="def repaired():\n    return True",
+                tool_calls=(),
+                finish_reason="stop",
+                usage=TokenUsage(input_tokens=1, output_tokens=1),
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "codemigrator.runtime.project_migration.OpenAICompatibleProvider", FakeProvider
+    )
+    translator = OpenAIProjectTranslator(
+        endpoint="https://provider.invalid/v1",
+        api_key="secret",
+        model="test-model",
+    )
+
+    result = translator.repair(
+        "package/sensitive/trie.go",
+        "package sensitive\nfunc NewTrie() {}",
+        "def repaired():\n    return None",
+        "TypeError: generated output used a boolean as an iterable",
+    )
+
+    assert result.content == "def repaired():\n    return True\n"
+    prompt = requests[0].messages[1].content
+    assert "Original Go source" in prompt
+    assert "Current generated Python" in prompt
+    assert "TypeError" in prompt

@@ -278,9 +278,11 @@ class DraftFlow:
         if len(report_domains) != len(self._reports):
             raise DraftConflictError("each exploration domain must have one merged report")
         for report in self._reports:
-            domain_prefix = f"{report.domain_path}/"
+            domain_prefix = "" if report.domain_path == "." else f"{report.domain_path}/"
             if any(
-                file_path != report.domain_path and not file_path.startswith(domain_prefix)
+                report.domain_path != "."
+                and file_path != report.domain_path
+                and not file_path.startswith(domain_prefix)
                 for file_path in report.coverage
             ):
                 raise DraftConflictError(
