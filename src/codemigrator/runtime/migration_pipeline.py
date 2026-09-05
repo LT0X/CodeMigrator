@@ -1297,7 +1297,7 @@ def repair_generated_file(
 
 
 def record_generated_repairs(state_dir: Path, repairs: Sequence[Mapping[str, object]]) -> None:
-    """Persist redacted file-repair facts in the verification stage ledger."""
+    """Append redacted file-repair facts to the verification stage ledger."""
 
     normalized: list[dict[str, object]] = []
     for record in repairs:
@@ -1340,11 +1340,21 @@ def record_generated_repairs(state_dir: Path, repairs: Sequence[Mapping[str, obj
                 }
             }
         )
+    ledger_path = state_dir / "stages" / _STAGE_DIRS["VERIFY_INTEGRATE"] / "repairs.json"
+    existing: list[dict[str, object]] = []
+    if ledger_path.exists():
+        payload = _read_json(ledger_path)
+        raw_existing = payload.get("repairs")
+        if not isinstance(raw_existing, list) or not all(
+            isinstance(entry, dict) for entry in raw_existing
+        ):
+            raise ValueError("repair provenance ledger is invalid")
+        existing = [dict(entry) for entry in raw_existing]
     _write_stage_json(
         state_dir,
         "VERIFY_INTEGRATE",
         "repairs.json",
-        {"schema_version": 1, "repairs": normalized},
+        {"schema_version": 1, "repairs": [*existing, *normalized]},
     )
     checkpoint_path = state_dir / "pipeline.json"
     if checkpoint_path.exists():
