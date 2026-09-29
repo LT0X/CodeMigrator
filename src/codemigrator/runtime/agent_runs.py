@@ -52,6 +52,18 @@ class AgentRun:
             raise ValueError("AgentRun identities must be UUIDs")
         if self.owner_kind not in {"run", "draft"}:
             raise ValueError("AgentRun owner kind must be run or draft")
+        if not isinstance(self.phase, Phase) or not isinstance(self.session_kind, SessionKind):
+            raise ValueError("AgentRun phase and session kind must use core enums")
+        if self.slice_ref is not None and not isinstance(self.slice_ref, SliceGenerationRef):
+            raise ValueError("AgentRun slice ref must use the core typed reference")
+        for name in ("retry_of", "continuation_of", "restarted_from"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, UUID):
+                raise ValueError(f"AgentRun {name} must be a UUID reference")
+        if not isinstance(self.state, SessionState) or (
+            self.exit is not None and not isinstance(self.exit, SessionExit)
+        ):
+            raise ValueError("AgentRun state and exit must use session enums")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", self.logical_task_key):
             raise ValueError("AgentRun task key must be an opaque token")
         try:
@@ -69,7 +81,9 @@ class AgentRun:
         ):
             value = getattr(self, name)
             if value is not None and (
-                len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
             ):
                 raise ValueError(f"AgentRun {name} digest must be SHA-256")
         expected = _TERMINAL_EXITS.get(self.state)

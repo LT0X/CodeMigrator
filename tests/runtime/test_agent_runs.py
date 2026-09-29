@@ -87,6 +87,7 @@ def test_record_metadata_round_trip_and_lifecycle_spec_omit_private_refs():
 async def test_logical_key_is_idempotent_within_owner_only():
     store = InMemoryRuntimeStore()
     first = run_record()
+    await store.create(RunState(run_id=first.owner_id), ())
     assert await store.create_or_get_agent_run(first) == first
     assert (
         await store.create_or_get_agent_run(replace(first, agent_run_id=AgentRunId(uuid4())))
@@ -94,6 +95,7 @@ async def test_logical_key_is_idempotent_within_owner_only():
     )
     assert await store.load_agent_run(first.agent_run_id) == first
     other_owner = run_record(key=first.logical_task_key)
+    await store.create(RunState(run_id=other_owner.owner_id), ())
     assert await store.create_or_get_agent_run(other_owner) == other_owner
     with pytest.raises(StoreCommitError, match="identity mismatch"):
         await store.create_or_get_agent_run(
@@ -101,6 +103,53 @@ async def test_logical_key_is_idempotent_within_owner_only():
         )
     with pytest.raises(StoreCommitError, match="identity mismatch"):
         await store.create_or_get_agent_run(replace(first, thread_id=str(uuid4())))
+
+
+@pytest.mark.asyncio
+async def test_run_agent_run_requires_existing_owner_run():
+    store = InMemoryRuntimeStore()
+    run_owned = run_record()
+    with pytest.raises(StoreCommitError, match="owner Run does not exist"):
+        await store.create_or_get_agent_run(run_owned)
+    assert await store.load_agent_run(run_owned.agent_run_id) is None
+    draft_owned = replace(run_owned, owner_kind="draft")
+    assert await store.create_or_get_agent_run(draft_owned) == draft_owned
+
+
+@pytest.mark.asyncio
+async def test_distinct_logical_tasks_cannot_share_agent_thread():
+    store = InMemoryRuntimeStore()
+    first = run_record()
+    await store.create(RunState(run_id=first.owner_id), ())
+    await store.create_or_get_agent_run(first)
+    duplicate_thread = replace(first, agent_run_id=AgentRunId(uuid4()), logical_task_key="plan:2")
+    with pytest.raises(StoreCommitError, match="thread"):
+        await store.create_or_get_agent_run(duplicate_thread)
+    assert await store.load_agent_run(duplicate_thread.agent_run_id) is None
+    assert (
+        await store.create_or_get_agent_run(replace(first, agent_run_id=AgentRunId(uuid4())))
+        == first
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("phase", "PLAN"),
+        ("session_kind", "PLAN_AUXILIARY"),
+        ("slice_ref", {"source": "raw payload"}),
+        ("retry_of", "raw transcript"),
+        ("continuation_of", {"tool_payload": "secret"}),
+        ("restarted_from", "raw prompt"),
+        ("model_binding_sha256", {"prompt": "secret"}),
+        ("checkpoint_sha256", {"source": "secret"}),
+        ("state", "CREATED"),
+        ("exit", "COMPLETED"),
+    ],
+)
+def test_record_rejects_payload_shaped_values_for_typed_fields(field, value):
+    with pytest.raises(ValueError):
+        replace(run_record(), **{field: value})
 
 
 @pytest.mark.asyncio

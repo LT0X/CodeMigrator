@@ -152,12 +152,15 @@ class InMemoryRuntimeStore:
         self.secret_registry = secret_registry or SecretRegistry()
         self._agent_runs: dict[AgentRunId, AgentRun] = {}
         self._agent_run_keys: dict[tuple[str, UUID, str], AgentRunId] = {}
+        self._agent_threads: dict[UUID, AgentRunId] = {}
         self._agent_receipts: dict[AgentRunId, AgentRunReceipt] = {}
         self._agent_lock = asyncio.Lock()
 
     async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
         _validate_new_agent_run(record)
         async with self._agent_lock:
+            if record.owner_kind == "run" and RunId(record.owner_id) not in self._snapshots:
+                raise StoreCommitError("AgentRun owner Run does not exist")
             existing_id = self._agent_run_keys.get(record.owner_key)
             if existing_id is not None:
                 existing = self._agent_runs[existing_id]
@@ -166,8 +169,11 @@ class InMemoryRuntimeStore:
                 return existing
             if record.agent_run_id in self._agent_runs:
                 raise StoreCommitError("AgentRun ID already exists")
+            if UUID(record.thread_id) in self._agent_threads:
+                raise StoreCommitError("AgentRun thread already exists")
             self._agent_runs[record.agent_run_id] = record
             self._agent_run_keys[record.owner_key] = record.agent_run_id
+            self._agent_threads[UUID(record.thread_id)] = record.agent_run_id
             return record
 
     async def load_agent_run(self, agent_run_id: AgentRunId) -> AgentRun | None:
@@ -313,27 +319,41 @@ class PostgreSQLRuntimeStore:
         _validate_new_agent_run(record)
         async with self.pool.acquire() as connection:
             async with connection.transaction():
-                await connection.execute(
-                    """INSERT INTO agent_runs(
-                        agent_run_id, owner_kind, owner_id, logical_task_key, phase,
-                        session_kind, model_binding_sha256, context_sha256,
-                        toolset_sha256, template_sha256, state, exit, metadata
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
-                    ON CONFLICT (owner_kind, owner_id, logical_task_key) DO NOTHING""",
-                    record.agent_run_id,
-                    record.owner_kind,
-                    record.owner_id,
-                    record.logical_task_key,
-                    record.phase.value,
-                    record.session_kind.value,
-                    record.model_binding_sha256,
-                    record.context_sha256,
-                    record.toolset_sha256,
-                    record.template_sha256,
-                    record.state.value,
-                    None,
-                    _dump_agent_run(record),
-                )
+                if record.owner_kind == "run":
+                    owner_row = await connection.fetchrow(
+                        "SELECT run_id FROM runtime_runs WHERE run_id = $1",
+                        record.owner_id,
+                    )
+                    if owner_row is None:
+                        raise StoreCommitError("AgentRun owner Run does not exist")
+                try:
+                    await connection.execute(
+                        """INSERT INTO agent_runs(
+                            agent_run_id, owner_kind, owner_id, logical_task_key,
+                            thread_id, phase, session_kind, model_binding_sha256,
+                            context_sha256, toolset_sha256, template_sha256,
+                            state, exit, metadata
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
+                        ON CONFLICT (owner_kind, owner_id, logical_task_key) DO NOTHING""",
+                        record.agent_run_id,
+                        record.owner_kind,
+                        record.owner_id,
+                        record.logical_task_key,
+                        UUID(record.thread_id),
+                        record.phase.value,
+                        record.session_kind.value,
+                        record.model_binding_sha256,
+                        record.context_sha256,
+                        record.toolset_sha256,
+                        record.template_sha256,
+                        record.state.value,
+                        None,
+                        _dump_agent_run(record),
+                    )
+                except Exception as exc:
+                    if getattr(exc, "constraint_name", None) == "agent_runs_thread_id_unique":
+                        raise StoreCommitError("AgentRun thread already exists") from exc
+                    raise
                 row = await connection.fetchrow(
                     """SELECT metadata FROM agent_runs
                     WHERE owner_kind = $1 AND owner_id = $2 AND logical_task_key = $3""",

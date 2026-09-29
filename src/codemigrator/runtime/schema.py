@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     owner_kind text NOT NULL CHECK (owner_kind IN ('run', 'draft')),
     owner_id uuid NOT NULL,
     logical_task_key text NOT NULL CHECK (length(btrim(logical_task_key)) > 0),
+    thread_id uuid NOT NULL,
     phase text NOT NULL,
     session_kind text NOT NULL,
     model_binding_sha256 char(64) NOT NULL CHECK (model_binding_sha256 ~ '^[0-9a-f]{64}$'),
@@ -30,7 +31,8 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     metadata jsonb NOT NULL,
     created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (owner_kind, owner_id, logical_task_key)
+    UNIQUE (owner_kind, owner_id, logical_task_key),
+    CONSTRAINT agent_runs_thread_id_unique UNIQUE (thread_id)
 );
 
 CREATE TABLE IF NOT EXISTS agent_run_receipts (
