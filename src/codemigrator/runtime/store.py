@@ -24,6 +24,7 @@ from codemigrator.core import (
 
 from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from .budget import BudgetUsage
+from .cas import CasObject, CheckpointIndex, PendingWriteIndex
 from .contracts import EventSpec, RunState, RuntimeEvent, RuntimeSnapshot
 from .loop_contracts import SessionExit, SessionState
 from .memory import EvolutionSegment, EvolutionSegmentDraft
@@ -155,6 +156,156 @@ class InMemoryRuntimeStore:
         self._agent_threads: dict[UUID, AgentRunId] = {}
         self._agent_receipts: dict[AgentRunId, AgentRunReceipt] = {}
         self._agent_lock = asyncio.Lock()
+        self._cas_refs: dict[tuple[str, UUID, str], CasObject] = {}
+        self._checkpoints: dict[tuple[str, str, str], CheckpointIndex] = {}
+        self._pending_writes: dict[tuple[str, str, str, str, int], PendingWriteIndex] = {}
+
+    async def add_cas_reference(
+        self, object_ref: CasObject, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> None:
+        async with self._agent_lock:
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            key = (owner_kind, owner_id, reference_key)
+            previous = self._cas_refs.get(key)
+            if previous is not None and previous != object_ref:
+                raise StoreCommitError("CAS reference key already points to another object")
+            if any(
+                value.digest == object_ref.digest and value.size != object_ref.size
+                for value in self._cas_refs.values()
+            ):
+                raise StoreCommitError("CAS object size mismatch")
+            self._cas_refs[key] = object_ref
+
+    async def get_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        return self._cas_refs.get((owner_kind, owner_id, reference_key))
+
+    async def release_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        async with self._agent_lock:
+            object_ref = self._cas_refs.pop((owner_kind, owner_id, reference_key), None)
+            if object_ref is None or any(
+                value.digest == object_ref.digest for value in self._cas_refs.values()
+            ):
+                return None
+            return object_ref
+
+    async def referenced_digests(self) -> frozenset[str]:
+        return frozenset(value.digest for value in self._cas_refs.values())
+
+    async def publish_checkpoint_index(self, index: CheckpointIndex) -> None:
+        key = (index.thread_id, index.namespace, index.checkpoint_id)
+        async with self._agent_lock:
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            existing = self._checkpoints.get(key)
+            if existing is not None:
+                if existing != index:
+                    raise StoreCommitError("checkpoint identity collision")
+                return
+            if any(
+                item.thread_id == index.thread_id
+                and (item.owner_kind, item.owner_id, item.graph_family)
+                != (index.owner_kind, index.owner_id, index.graph_family)
+                for item in self._checkpoints.values()
+            ) or any(
+                item.thread_id == index.thread_id
+                and (item.owner_kind, item.owner_id, item.graph_family)
+                != (index.owner_kind, index.owner_id, index.graph_family)
+                for item in self._pending_writes.values()
+            ):
+                raise StoreCommitError("checkpoint thread belongs to another owner")
+            self._checkpoints[key] = index
+            self._cas_refs[(index.owner_kind, index.owner_id, index.reference_key)] = index.object
+
+    async def list_checkpoint_indexes(
+        self, thread_id: str | None = None, namespace: str | None = None
+    ) -> tuple[CheckpointIndex, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in self._checkpoints.values()
+                    if (thread_id is None or item.thread_id == thread_id)
+                    and (namespace is None or item.namespace == namespace)
+                ),
+                key=lambda item: item.checkpoint_id,
+                reverse=True,
+            )
+        )
+
+    async def publish_pending_write_index(self, index: PendingWriteIndex) -> None:
+        write_key = (
+            index.thread_id,
+            index.namespace,
+            index.checkpoint_id,
+            index.task_id,
+            index.write_index,
+        )
+        async with self._agent_lock:
+            owner_mismatch = any(
+                item.thread_id == index.thread_id
+                and (item.owner_kind, item.owner_id) != (index.owner_kind, index.owner_id)
+                for item in self._checkpoints.values()
+            ) or any(
+                item.thread_id == index.thread_id
+                and (item.owner_kind, item.owner_id) != (index.owner_kind, index.owner_id)
+                for item in self._pending_writes.values()
+            )
+            if owner_mismatch:
+                raise StoreCommitError("pending write thread belongs to another owner")
+            existing = self._pending_writes.get(write_key)
+            if existing is not None and index.write_index >= 0:
+                return
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            if existing is not None:
+                self._cas_refs.pop((existing.owner_kind, existing.owner_id, existing.reference_key))
+            self._pending_writes[write_key] = index
+            self._cas_refs[(index.owner_kind, index.owner_id, index.reference_key)] = index.object
+
+    async def list_pending_write_indexes(
+        self, thread_id: str, namespace: str, checkpoint_id: str
+    ) -> tuple[PendingWriteIndex, ...]:
+        return tuple(
+            item
+            for key, item in self._pending_writes.items()
+            if key[:3] == (thread_id, namespace, checkpoint_id)
+        )
+
+    async def delete_checkpoint_thread(self, thread_id: str) -> tuple[CasObject, ...]:
+        async with self._agent_lock:
+            indexes: list[CheckpointIndex | PendingWriteIndex] = []
+            indexes.extend(
+                item for item in self._checkpoints.values() if item.thread_id == thread_id
+            )
+            indexes.extend(
+                item for item in self._pending_writes.values() if item.thread_id == thread_id
+            )
+            for item in indexes:
+                self._cas_refs.pop((item.owner_kind, item.owner_id, item.reference_key), None)
+            self._checkpoints = {
+                key: item for key, item in self._checkpoints.items() if item.thread_id != thread_id
+            }
+            self._pending_writes = {
+                key: item
+                for key, item in self._pending_writes.items()
+                if item.thread_id != thread_id
+            }
+            live = {value.digest for value in self._cas_refs.values()}
+            return tuple(
+                {
+                    item.object.digest: item.object
+                    for item in indexes
+                    if item.object.digest not in live
+                }.values()
+            )
 
     async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
         _validate_new_agent_run(record)
@@ -465,6 +616,271 @@ class PostgreSQLRuntimeStore:
                 )
                 return receipt
 
+    async def add_cas_reference(
+        self, object_ref: CasObject, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> None:
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await _add_cas_reference_with_connection(
+                    connection, object_ref, owner_kind, owner_id, reference_key
+                )
+
+    async def get_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT r.digest, o.size_bytes FROM cas_object_refs r
+                JOIN cas_objects o ON o.digest = r.digest
+                WHERE r.owner_kind = $1 AND r.owner_id = $2 AND r.reference_key = $3""",
+                owner_kind,
+                owner_id,
+                reference_key,
+            )
+        return _cas_object_from_row(row) if row is not None else None
+
+    async def release_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                return await _release_cas_reference_with_connection(
+                    connection, owner_kind, owner_id, reference_key
+                )
+
+    async def referenced_digests(self) -> frozenset[str]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch("SELECT DISTINCT digest FROM cas_object_refs")
+        return frozenset(str(_row_value(row, "digest")).strip() for row in rows)
+
+    async def publish_checkpoint_index(self, index: CheckpointIndex) -> None:
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """INSERT INTO graph_threads(thread_id, graph_family, owner_kind, owner_id)
+                    VALUES ($1,$2,$3,$4) ON CONFLICT (thread_id) DO NOTHING""",
+                    UUID(index.thread_id),
+                    index.graph_family,
+                    index.owner_kind,
+                    index.owner_id,
+                )
+                thread = await connection.fetchrow(
+                    """SELECT graph_family, owner_kind, owner_id FROM graph_threads
+                    WHERE thread_id = $1""",
+                    UUID(index.thread_id),
+                )
+                if (
+                    str(_row_value(thread, "graph_family")),
+                    str(_row_value(thread, "owner_kind")),
+                    _row_value(thread, "owner_id"),
+                ) != (index.graph_family, index.owner_kind, index.owner_id):
+                    raise StoreCommitError("checkpoint thread belongs to another owner")
+                await _add_cas_reference_with_connection(
+                    connection,
+                    index.object,
+                    index.owner_kind,
+                    index.owner_id,
+                    index.reference_key,
+                )
+                await connection.execute(
+                    """INSERT INTO graph_checkpoints(
+                        thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id,
+                        digest, size_bytes
+                    ) VALUES ($1,$2,$3,$4,$5,$6)
+                    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id) DO NOTHING""",
+                    UUID(index.thread_id),
+                    index.namespace,
+                    index.checkpoint_id,
+                    index.parent_checkpoint_id,
+                    index.object.digest,
+                    index.object.size,
+                )
+                row = await connection.fetchrow(
+                    """SELECT parent_checkpoint_id, digest, size_bytes
+                    FROM graph_checkpoints WHERE thread_id=$1 AND checkpoint_ns=$2
+                    AND checkpoint_id=$3""",
+                    UUID(index.thread_id),
+                    index.namespace,
+                    index.checkpoint_id,
+                )
+                if (
+                    _row_value(row, "parent_checkpoint_id"),
+                    str(_row_value(row, "digest")).strip(),
+                    int(_row_value(row, "size_bytes")),
+                ) != (index.parent_checkpoint_id, index.object.digest, index.object.size):
+                    raise StoreCommitError("checkpoint identity collision")
+
+    async def list_checkpoint_indexes(
+        self, thread_id: str | None = None, namespace: str | None = None
+    ) -> tuple[CheckpointIndex, ...]:
+        async with self.pool.acquire() as connection:
+            return await _list_checkpoint_indexes_with_connection(
+                connection, thread_id, namespace
+            )
+
+    async def publish_pending_write_index(self, index: PendingWriteIndex) -> None:
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """INSERT INTO graph_threads(thread_id, graph_family, owner_kind, owner_id)
+                    VALUES ($1,$2,$3,$4) ON CONFLICT (thread_id) DO NOTHING""",
+                    UUID(index.thread_id),
+                    index.graph_family,
+                    index.owner_kind,
+                    index.owner_id,
+                )
+                thread = await connection.fetchrow(
+                    """SELECT graph_family, owner_kind, owner_id FROM graph_threads
+                    WHERE thread_id=$1""",
+                    UUID(index.thread_id),
+                )
+                if (
+                    _row_value(thread, "graph_family"),
+                    _row_value(thread, "owner_kind"),
+                    _row_value(thread, "owner_id"),
+                ) != (index.graph_family, index.owner_kind, index.owner_id):
+                    raise StoreCommitError("pending write owner mismatch")
+                existing = await connection.fetchrow(
+                    """SELECT digest FROM graph_pending_writes WHERE thread_id=$1
+                    AND checkpoint_ns=$2 AND checkpoint_id=$3 AND task_id=$4
+                    AND write_index=$5 FOR UPDATE""",
+                    UUID(index.thread_id),
+                    index.namespace,
+                    index.checkpoint_id,
+                    index.task_id,
+                    index.write_index,
+                )
+                if existing is not None and index.write_index >= 0:
+                    return
+                if existing is not None:
+                    await connection.execute(
+                        """DELETE FROM cas_object_refs WHERE owner_kind=$1 AND owner_id=$2
+                        AND reference_key=$3""",
+                        index.owner_kind,
+                        index.owner_id,
+                        index.reference_key,
+                    )
+                await _add_cas_reference_with_connection(
+                    connection,
+                    index.object,
+                    index.owner_kind,
+                    index.owner_id,
+                    index.reference_key,
+                )
+                await connection.execute(
+                    """INSERT INTO graph_pending_writes(
+                        thread_id, checkpoint_ns, checkpoint_id, task_id, write_index,
+                        digest, size_bytes
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id, task_id, write_index)
+                    DO UPDATE SET digest=EXCLUDED.digest, size_bytes=EXCLUDED.size_bytes""",
+                    UUID(index.thread_id),
+                    index.namespace,
+                    index.checkpoint_id,
+                    index.task_id,
+                    index.write_index,
+                    index.object.digest,
+                    index.object.size,
+                )
+
+    async def list_pending_write_indexes(
+        self, thread_id: str, namespace: str, checkpoint_id: str
+    ) -> tuple[PendingWriteIndex, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT t.graph_family, t.owner_kind, t.owner_id, w.thread_id, w.checkpoint_ns,
+                       w.checkpoint_id, w.task_id, w.write_index, w.digest, w.size_bytes
+                FROM graph_pending_writes w JOIN graph_threads t ON t.thread_id=w.thread_id
+                WHERE w.thread_id=$1 AND w.checkpoint_ns=$2 AND w.checkpoint_id=$3
+                ORDER BY w.created_at, w.task_id, w.write_index""",
+                UUID(thread_id),
+                namespace,
+                checkpoint_id,
+            )
+        return tuple(
+            PendingWriteIndex(
+                str(_row_value(row, "graph_family")),
+                str(_row_value(row, "owner_kind")),
+                _row_value(row, "owner_id"),
+                str(_row_value(row, "thread_id")),
+                str(_row_value(row, "checkpoint_ns")),
+                str(_row_value(row, "checkpoint_id")),
+                str(_row_value(row, "task_id")),
+                int(_row_value(row, "write_index")),
+                _cas_object_from_row(row),
+            )
+            for row in rows
+        )
+
+    async def delete_checkpoint_thread(self, thread_id: str) -> tuple[CasObject, ...]:
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                thread = await connection.fetchrow(
+                    "SELECT owner_kind, owner_id FROM graph_threads WHERE thread_id=$1 FOR UPDATE",
+                    UUID(thread_id),
+                )
+                if thread is None:
+                    return ()
+                indexes = await _list_checkpoint_indexes_with_connection(
+                    connection, thread_id, None
+                )
+                writes = await self.list_pending_write_indexes_for_thread(connection, thread_id)
+                items: tuple[CheckpointIndex | PendingWriteIndex, ...] = (*indexes, *writes)
+                await connection.execute(
+                    "DELETE FROM graph_pending_writes WHERE thread_id=$1", UUID(thread_id)
+                )
+                await connection.execute(
+                    "DELETE FROM graph_checkpoints WHERE thread_id=$1", UUID(thread_id)
+                )
+                await connection.execute(
+                    "DELETE FROM graph_threads WHERE thread_id=$1", UUID(thread_id)
+                )
+                candidates = {item.object.digest: item.object for item in items}
+                for item in items:
+                    await connection.execute(
+                        """DELETE FROM cas_object_refs WHERE owner_kind=$1 AND owner_id=$2
+                        AND reference_key=$3""",
+                        item.owner_kind,
+                        item.owner_id,
+                        item.reference_key,
+                    )
+                unreferenced = []
+                for candidate in candidates.values():
+                    remaining = await connection.fetchrow(
+                        "SELECT 1 FROM cas_object_refs WHERE digest=$1 LIMIT 1", candidate.digest
+                    )
+                    if remaining is None:
+                        await connection.execute(
+                            "DELETE FROM cas_objects WHERE digest=$1", candidate.digest
+                        )
+                        unreferenced.append(candidate)
+                return tuple(unreferenced)
+
+    async def list_pending_write_indexes_for_thread(
+        self, connection: Any, thread_id: str
+    ) -> tuple[PendingWriteIndex, ...]:
+        rows = await connection.fetch(
+            """SELECT t.graph_family, t.owner_kind, t.owner_id, w.thread_id, w.checkpoint_ns,
+                   w.checkpoint_id, w.task_id, w.write_index, w.digest, w.size_bytes
+            FROM graph_pending_writes w JOIN graph_threads t ON t.thread_id=w.thread_id
+            WHERE w.thread_id=$1""",
+            UUID(thread_id),
+        )
+        return tuple(
+            PendingWriteIndex(
+                str(_row_value(row, "graph_family")),
+                str(_row_value(row, "owner_kind")),
+                _row_value(row, "owner_id"),
+                str(_row_value(row, "thread_id")),
+                str(_row_value(row, "checkpoint_ns")),
+                str(_row_value(row, "checkpoint_id")),
+                str(_row_value(row, "task_id")),
+                int(_row_value(row, "write_index")),
+                _cas_object_from_row(row),
+            )
+            for row in rows
+        )
+
     async def initialize(self) -> None:
         async with self.pool.acquire() as connection:
             await connection.execute(RUNTIME_SCHEMA_SQL)
@@ -683,6 +1099,114 @@ async def _append_evolution_with_connection(
     return EvolutionSegment(
         run_id, entry_index, draft.slice_id, draft.summary_text, draft.template_sha256
     )
+
+
+def _cas_object_from_row(row: Any) -> CasObject:
+    return CasObject(
+        str(_row_value(row, "digest")).strip(),
+        int(_row_value(row, "size_bytes")),
+    )
+
+
+async def _list_checkpoint_indexes_with_connection(
+    connection: Any, thread_id: str | None, namespace: str | None
+) -> tuple[CheckpointIndex, ...]:
+    rows = await connection.fetch(
+        """SELECT t.graph_family, t.owner_kind, t.owner_id,
+               c.thread_id, c.checkpoint_ns, c.checkpoint_id,
+               c.parent_checkpoint_id, c.digest, c.size_bytes
+        FROM graph_checkpoints c JOIN graph_threads t ON t.thread_id=c.thread_id
+        WHERE ($1::uuid IS NULL OR c.thread_id=$1)
+          AND ($2::text IS NULL OR c.checkpoint_ns=$2)
+        ORDER BY c.checkpoint_id DESC""",
+        UUID(thread_id) if thread_id is not None else None,
+        namespace,
+    )
+    return tuple(
+        CheckpointIndex(
+            str(_row_value(row, "graph_family")),
+            str(_row_value(row, "owner_kind")),
+            _row_value(row, "owner_id"),
+            str(_row_value(row, "thread_id")),
+            str(_row_value(row, "checkpoint_ns")),
+            str(_row_value(row, "checkpoint_id")),
+            _row_value(row, "parent_checkpoint_id"),
+            _cas_object_from_row(row),
+        )
+        for row in rows
+    )
+
+
+async def _add_cas_reference_with_connection(
+    connection: Any,
+    object_ref: CasObject,
+    owner_kind: str,
+    owner_id: UUID,
+    reference_key: str,
+) -> None:
+    await connection.execute(
+        """INSERT INTO cas_objects(digest, size_bytes) VALUES ($1,$2)
+        ON CONFLICT (digest) DO NOTHING""",
+        object_ref.digest,
+        object_ref.size,
+    )
+    object_row = await connection.fetchrow(
+        "SELECT size_bytes FROM cas_objects WHERE digest=$1 FOR UPDATE", object_ref.digest
+    )
+    if object_row is None or int(_row_value(object_row, "size_bytes")) != object_ref.size:
+        raise StoreCommitError("CAS object size mismatch")
+    await connection.execute(
+        """INSERT INTO cas_object_refs(owner_kind, owner_id, reference_key, digest)
+        VALUES ($1,$2,$3,$4)
+        ON CONFLICT (owner_kind, owner_id, reference_key) DO NOTHING""",
+        owner_kind,
+        owner_id,
+        reference_key,
+        object_ref.digest,
+    )
+    ref_row = await connection.fetchrow(
+        """SELECT digest FROM cas_object_refs WHERE owner_kind=$1 AND owner_id=$2
+        AND reference_key=$3""",
+        owner_kind,
+        owner_id,
+        reference_key,
+    )
+    if ref_row is None or str(_row_value(ref_row, "digest")).strip() != object_ref.digest:
+        raise StoreCommitError("CAS reference key already points to another object")
+
+
+async def _release_cas_reference_with_connection(
+    connection: Any,
+    owner_kind: str,
+    owner_id: UUID,
+    reference_key: str,
+) -> CasObject | None:
+    row = await connection.fetchrow(
+        """SELECT r.digest, o.size_bytes FROM cas_object_refs r
+        JOIN cas_objects o ON o.digest=r.digest
+        WHERE r.owner_kind=$1 AND r.owner_id=$2 AND r.reference_key=$3
+        FOR UPDATE OF r""",
+        owner_kind,
+        owner_id,
+        reference_key,
+    )
+    if row is None:
+        return None
+    object_ref = _cas_object_from_row(row)
+    await connection.execute(
+        """DELETE FROM cas_object_refs WHERE owner_kind=$1 AND owner_id=$2
+        AND reference_key=$3""",
+        owner_kind,
+        owner_id,
+        reference_key,
+    )
+    remaining = await connection.fetchrow(
+        "SELECT 1 FROM cas_object_refs WHERE digest=$1 LIMIT 1", object_ref.digest
+    )
+    if remaining is not None:
+        return None
+    await connection.execute("DELETE FROM cas_objects WHERE digest=$1", object_ref.digest)
+    return object_ref
 
 
 async def _insert_events(
