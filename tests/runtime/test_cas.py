@@ -22,6 +22,39 @@ def test_file_cas_is_content_addressed_and_survives_reopen(tmp_path: Path):
     assert len(list(tmp_path.rglob(ref.digest))) == 1
 
 
+def test_new_shard_fsyncs_cas_root_before_object_publication(tmp_path: Path, monkeypatch):
+    cas = FileHostCAS(tmp_path)
+    first_body = b"new shard"
+    prefix = hashlib.sha256(first_body).hexdigest()[:2]
+    existing_shard_body = next(
+        candidate
+        for index in range(4096)
+        if (candidate := f"another object {index}".encode())
+        and hashlib.sha256(candidate).hexdigest().startswith(prefix)
+    )
+    actions: list[tuple[str, Path]] = []
+    real_fsync, real_link = os.fsync, os.link
+
+    def observed_fsync(descriptor: int) -> None:
+        actions.append(("fsync", Path(os.readlink(f"/proc/self/fd/{descriptor}"))))
+        real_fsync(descriptor)
+
+    def observed_link(source: str, target: str) -> None:
+        actions.append(("link", Path(target)))
+        real_link(source, target)
+
+    monkeypatch.setattr(os, "fsync", observed_fsync)
+    monkeypatch.setattr(os, "link", observed_link)
+    cas.put(first_body)
+    assert ("fsync", tmp_path) in actions
+    assert actions.index(("fsync", tmp_path)) < next(
+        index for index, action in enumerate(actions) if action[0] == "link"
+    )
+    actions.clear()
+    cas.put(existing_shard_body)
+    assert ("fsync", tmp_path) not in actions
+
+
 def test_file_cas_rejects_tampered_body_before_decode(tmp_path: Path):
     cas = FileHostCAS(tmp_path)
     ref = cas.put(b"trusted")

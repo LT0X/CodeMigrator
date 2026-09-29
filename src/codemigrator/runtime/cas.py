@@ -81,12 +81,37 @@ class FileHostCAS:
             raise ValueError("CAS digest must be SHA-256")
         return self.root / digest[:2] / digest
 
+    def _ensure_shard(self, shard: Path) -> None:
+        lock_dir = self.root / ".locks"
+        lock_dir.mkdir(exist_ok=True)
+        descriptor = os.open(lock_dir / f"shard-{shard.name}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            try:
+                shard.mkdir()
+            except FileExistsError:
+                if not shard.is_dir():
+                    raise
+            else:
+                root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    try:
+                        os.fsync(root_fd)
+                    except OSError:
+                        shard.rmdir()
+                        raise
+                finally:
+                    os.close(root_fd)
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
     def put(self, body: bytes) -> CasObject:
         if not isinstance(body, bytes):
             raise TypeError("CAS body must be bytes")
         ref = CasObject(hashlib.sha256(body).hexdigest(), len(body))
         target = self.path_for(ref.digest)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_shard(target.parent)
         if target.exists():
             self.read(ref)
             return ref
