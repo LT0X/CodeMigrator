@@ -14,6 +14,7 @@ from codemigrator.core import (
     RunStatus,
 )
 
+from .agent_runs import AgentRun, AgentRunReceipt
 from .budget import BudgetUsage
 
 
@@ -86,6 +87,36 @@ class EventSpec:
     data: dict[str, object] = field(default_factory=dict)
 
 
+def agent_run_lifecycle_spec(
+    record: AgentRun,
+    receipt: AgentRunReceipt | None = None,
+) -> EventSpec:
+    """Build an internal low-sensitivity event for an owner ledger transaction."""
+    if receipt is None:
+        if record.is_terminal:
+            raise ValueError("terminal AgentRun event requires owner receipt")
+        return EventSpec(
+            "agent_run.started",
+            {
+                "agent_run_id": str(record.agent_run_id),
+                "phase": record.phase.value,
+                "session_kind": record.session_kind.value,
+            },
+        )
+    if not record.is_terminal or receipt.agent_run_id != record.agent_run_id:
+        raise ValueError("terminal event requires matching AgentRun receipt")
+    return EventSpec(
+        "agent_run.terminal",
+        {
+            "agent_run_id": str(record.agent_run_id),
+            "phase": record.phase.value,
+            "session_kind": record.session_kind.value,
+            "exit": record.exit.value if record.exit is not None else None,
+            "receipt_category": receipt.category,
+        },
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RunState:
     run_id: RunId
@@ -132,4 +163,5 @@ __all__ = [
     "RuntimeMessage",
     "RuntimeSnapshot",
     "SessionInputCommand",
+    "agent_run_lifecycle_spec",
 ]

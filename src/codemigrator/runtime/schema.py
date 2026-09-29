@@ -14,6 +14,32 @@ CREATE TABLE IF NOT EXISTS runtime_events (
     PRIMARY KEY (run_id, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS agent_runs (
+    agent_run_id uuid PRIMARY KEY,
+    owner_kind text NOT NULL CHECK (owner_kind IN ('run', 'draft')),
+    owner_id uuid NOT NULL,
+    logical_task_key text NOT NULL CHECK (length(btrim(logical_task_key)) > 0),
+    phase text NOT NULL,
+    session_kind text NOT NULL,
+    model_binding_sha256 char(64) NOT NULL CHECK (model_binding_sha256 ~ '^[0-9a-f]{64}$'),
+    context_sha256 char(64) NOT NULL CHECK (context_sha256 ~ '^[0-9a-f]{64}$'),
+    toolset_sha256 char(64) NOT NULL CHECK (toolset_sha256 ~ '^[0-9a-f]{64}$'),
+    template_sha256 char(64) NOT NULL CHECK (template_sha256 ~ '^[0-9a-f]{64}$'),
+    state text NOT NULL,
+    exit text,
+    metadata jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (owner_kind, owner_id, logical_task_key)
+);
+
+CREATE TABLE IF NOT EXISTS agent_run_receipts (
+    receipt_id uuid PRIMARY KEY,
+    agent_run_id uuid NOT NULL UNIQUE REFERENCES agent_runs(agent_run_id),
+    category text NOT NULL CHECK (length(btrim(category)) > 0),
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS context_evolution_segments (
     run_id uuid NOT NULL REFERENCES runtime_runs(run_id),
     entry_index bigint NOT NULL CHECK (entry_index >= 0),

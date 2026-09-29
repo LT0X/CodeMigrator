@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
@@ -13,13 +14,18 @@ from pydantic import BaseModel
 from codemigrator.core import (
     ActiveDispatch,
     FailureReason,
+    Phase,
     RunId,
     RunStatus,
     SecretRegistry,
+    SessionKind,
+    SliceGenerationRef,
 )
 
+from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from .budget import BudgetUsage
 from .contracts import EventSpec, RunState, RuntimeEvent, RuntimeSnapshot
+from .loop_contracts import SessionExit, SessionState
 from .memory import EvolutionSegment, EvolutionSegmentDraft
 from .schema import RUNTIME_SCHEMA_SQL
 
@@ -46,14 +52,63 @@ class RuntimeStore(Protocol):
     ) -> RuntimeSnapshot:
         """Commit state and events in one transaction."""
 
+    async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
+        """Create one session per owner logical task, or return its frozen identity."""
+
+    async def load_agent_run(self, agent_run_id: AgentRunId) -> AgentRun | None:
+        """Load private session metadata."""
+
+    async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
+        """Load the committed owner receipt, if any."""
+
+    async def commit_agent_run_receipt(
+        self,
+        record: AgentRun,
+        receipt: AgentRunReceipt,
+        *,
+        state: RunState | None = None,
+        events: Sequence[EventSpec] = (),
+    ) -> AgentRunReceipt:
+        """Commit terminal metadata and owner facts/events in one transaction."""
+
 
 class StoreCommitError(RuntimeError):
     """Raised when the persistence transaction cannot be committed."""
 
 
-def _validate_evolution_draft(
-    draft: EvolutionSegmentDraft, expected_run_id: object
+def _validate_new_agent_run(record: AgentRun) -> None:
+    if record.state is not SessionState.Created or record.exit is not None:
+        raise StoreCommitError("new AgentRun must be created without an exit")
+    if any(
+        getattr(record, name) is not None
+        for name in ("checkpoint_sha256", "result_sha256", "usage_sha256")
+    ):
+        raise StoreCommitError("new AgentRun cannot have terminal references")
+
+
+def _validate_agent_receipt(
+    current: AgentRun | None,
+    record: AgentRun,
+    receipt: AgentRunReceipt,
+    state: RunState | None,
+    events: Sequence[EventSpec],
 ) -> None:
+    if current is None:
+        raise StoreCommitError("AgentRun does not exist")
+    if not current.same_frozen_identity(record):
+        raise StoreCommitError("AgentRun frozen identity mismatch")
+    if current.is_terminal or not record.is_terminal:
+        raise StoreCommitError("AgentRun receipt requires a new terminal state")
+    if receipt.agent_run_id != record.agent_run_id:
+        raise StoreCommitError("AgentRun receipt identity mismatch")
+    if record.owner_kind == "run":
+        if state is None or state.run_id != record.owner_id:
+            raise StoreCommitError("Run owner receipt requires matching Run state")
+    elif state is not None or events:
+        raise StoreCommitError("Draft owner cannot write Run facts or events")
+
+
+def _validate_evolution_draft(draft: EvolutionSegmentDraft, expected_run_id: object) -> None:
     if draft.run_id != expected_run_id:
         raise StoreCommitError("context evolution run identity does not match state")
     if not isinstance(draft.summary_text, str) or not draft.summary_text.strip():
@@ -95,6 +150,81 @@ class InMemoryRuntimeStore:
         self.commit_count = 0
         self._fail_next = False
         self.secret_registry = secret_registry or SecretRegistry()
+        self._agent_runs: dict[AgentRunId, AgentRun] = {}
+        self._agent_run_keys: dict[tuple[str, UUID, str], AgentRunId] = {}
+        self._agent_receipts: dict[AgentRunId, AgentRunReceipt] = {}
+        self._agent_lock = asyncio.Lock()
+
+    async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
+        _validate_new_agent_run(record)
+        async with self._agent_lock:
+            existing_id = self._agent_run_keys.get(record.owner_key)
+            if existing_id is not None:
+                existing = self._agent_runs[existing_id]
+                if not existing.same_creation_identity(record):
+                    raise StoreCommitError("AgentRun logical task identity mismatch")
+                return existing
+            if record.agent_run_id in self._agent_runs:
+                raise StoreCommitError("AgentRun ID already exists")
+            self._agent_runs[record.agent_run_id] = record
+            self._agent_run_keys[record.owner_key] = record.agent_run_id
+            return record
+
+    async def load_agent_run(self, agent_run_id: AgentRunId) -> AgentRun | None:
+        return self._agent_runs.get(agent_run_id)
+
+    async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
+        return self._agent_receipts.get(agent_run_id)
+
+    async def commit_agent_run_receipt(
+        self,
+        record: AgentRun,
+        receipt: AgentRunReceipt,
+        *,
+        state: RunState | None = None,
+        events: Sequence[EventSpec] = (),
+    ) -> AgentRunReceipt:
+        async with self._agent_lock:
+            existing_receipt = self._agent_receipts.get(record.agent_run_id)
+            if existing_receipt is not None:
+                if (
+                    existing_receipt.category != receipt.category
+                    or existing_receipt.agent_run_id != receipt.agent_run_id
+                    or self._agent_runs[record.agent_run_id] != record
+                ):
+                    raise StoreCommitError("AgentRun receipt replay mismatch")
+                return existing_receipt
+            current = self._agent_runs.get(record.agent_run_id)
+            _validate_agent_receipt(current, record, receipt, state, events)
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            if state is not None:
+                previous = self._snapshots.get(state.run_id)
+                if previous is None:
+                    raise StoreCommitError("runtime run does not exist")
+                if state.version != previous.state.version + 1:
+                    raise StoreCommitError("Run owner state version is stale")
+                try:
+                    materialized = tuple(
+                        RuntimeEvent(
+                            sequence=len(previous.events) + index + 1,
+                            event_type=event.event_type,
+                            data=_redact_event_data(event.data, self.secret_registry),
+                        )
+                        for index, event in enumerate(events)
+                    )
+                except ValueError as exc:
+                    raise StoreCommitError("observation rejected") from exc
+                snapshot = RuntimeSnapshot(state=state, events=(*previous.events, *materialized))
+            else:
+                snapshot = None
+            if snapshot is not None:
+                self._snapshots[RunId(record.owner_id)] = snapshot
+            self._agent_runs[record.agent_run_id] = record
+            self._agent_receipts[record.agent_run_id] = receipt
+            self.commit_count += 1
+            return receipt
 
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         return self._snapshots.get(run_id)
@@ -178,6 +308,142 @@ class PostgreSQLRuntimeStore:
     def __init__(self, pool: Any, *, secret_registry: SecretRegistry | None = None) -> None:
         self.pool = pool
         self.secret_registry = secret_registry or SecretRegistry()
+
+    async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
+        _validate_new_agent_run(record)
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """INSERT INTO agent_runs(
+                        agent_run_id, owner_kind, owner_id, logical_task_key, phase,
+                        session_kind, model_binding_sha256, context_sha256,
+                        toolset_sha256, template_sha256, state, exit, metadata
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
+                    ON CONFLICT (owner_kind, owner_id, logical_task_key) DO NOTHING""",
+                    record.agent_run_id,
+                    record.owner_kind,
+                    record.owner_id,
+                    record.logical_task_key,
+                    record.phase.value,
+                    record.session_kind.value,
+                    record.model_binding_sha256,
+                    record.context_sha256,
+                    record.toolset_sha256,
+                    record.template_sha256,
+                    record.state.value,
+                    None,
+                    _dump_agent_run(record),
+                )
+                row = await connection.fetchrow(
+                    """SELECT metadata FROM agent_runs
+                    WHERE owner_kind = $1 AND owner_id = $2 AND logical_task_key = $3""",
+                    *record.owner_key,
+                )
+                if row is None:
+                    raise StoreCommitError("AgentRun creation disappeared")
+                existing = _decode_agent_run(_row_value(row, "metadata"))
+                if not existing.same_creation_identity(record):
+                    raise StoreCommitError("AgentRun logical task identity mismatch")
+                return existing
+
+    async def load_agent_run(self, agent_run_id: AgentRunId) -> AgentRun | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT metadata FROM agent_runs WHERE agent_run_id = $1",
+                agent_run_id,
+            )
+        return _decode_agent_run(_row_value(row, "metadata")) if row is not None else None
+
+    async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT receipt_id, category FROM agent_run_receipts WHERE agent_run_id = $1",
+                agent_run_id,
+            )
+        if row is None:
+            return None
+        return AgentRunReceipt(
+            _row_value(row, "receipt_id"), agent_run_id, str(_row_value(row, "category"))
+        )
+
+    async def commit_agent_run_receipt(
+        self,
+        record: AgentRun,
+        receipt: AgentRunReceipt,
+        *,
+        state: RunState | None = None,
+        events: Sequence[EventSpec] = (),
+    ) -> AgentRunReceipt:
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    "SELECT metadata FROM agent_runs WHERE agent_run_id = $1 FOR UPDATE",
+                    record.agent_run_id,
+                )
+                current = (
+                    _decode_agent_run(_row_value(row, "metadata")) if row is not None else None
+                )
+                receipt_row = await connection.fetchrow(
+                    "SELECT receipt_id, category FROM agent_run_receipts WHERE agent_run_id = $1",
+                    record.agent_run_id,
+                )
+                if receipt_row is not None:
+                    existing_receipt = AgentRunReceipt(
+                        _row_value(receipt_row, "receipt_id"),
+                        record.agent_run_id,
+                        str(_row_value(receipt_row, "category")),
+                    )
+                    if (
+                        existing_receipt.category != receipt.category
+                        or existing_receipt.agent_run_id != receipt.agent_run_id
+                        or current != record
+                    ):
+                        raise StoreCommitError("AgentRun receipt replay mismatch")
+                    return existing_receipt
+                _validate_agent_receipt(current, record, receipt, state, events)
+                if state is not None:
+                    locked = await connection.fetchrow(
+                        "SELECT state FROM runtime_runs WHERE run_id = $1 FOR UPDATE",
+                        state.run_id,
+                    )
+                    if locked is None:
+                        raise StoreCommitError("runtime run does not exist")
+                    previous_state = _decode_state(_row_value(locked, "state"))
+                    if state.version != previous_state.version + 1:
+                        raise StoreCommitError("Run owner state version is stale")
+                    sequence_row = await connection.fetchrow(
+                        """SELECT COALESCE(MAX(sequence), 0) AS last_sequence
+                        FROM runtime_events WHERE run_id = $1""",
+                        state.run_id,
+                    )
+                    await connection.execute(
+                        "UPDATE runtime_runs SET state = $2::jsonb WHERE run_id = $1",
+                        state.run_id,
+                        _dump_json(state),
+                    )
+                    await _insert_events(
+                        connection,
+                        state.run_id,
+                        events,
+                        first_sequence=int(_row_value(sequence_row, "last_sequence")) + 1,
+                        secret_registry=self.secret_registry,
+                    )
+                await connection.execute(
+                    """UPDATE agent_runs SET state = $2, exit = $3, metadata = $4::jsonb,
+                    updated_at = CURRENT_TIMESTAMP WHERE agent_run_id = $1""",
+                    record.agent_run_id,
+                    record.state.value,
+                    record.exit.value if record.exit is not None else None,
+                    _dump_agent_run(record),
+                )
+                await connection.execute(
+                    """INSERT INTO agent_run_receipts(receipt_id, agent_run_id, category)
+                    VALUES ($1,$2,$3)""",
+                    receipt.receipt_id,
+                    receipt.agent_run_id,
+                    receipt.category,
+                )
+                return receipt
 
     async def initialize(self) -> None:
         async with self.pool.acquire() as connection:
@@ -455,6 +721,44 @@ def _dump_json(state: RunState) -> str:
     return json.dumps(_json_value(state), sort_keys=True, separators=(",", ":"))
 
 
+def _dump_agent_run(record: AgentRun) -> str:
+    return json.dumps(_json_value(record), sort_keys=True, separators=(",", ":"))
+
+
+def _decode_agent_run(value: Any) -> AgentRun:
+    payload = json.loads(value) if isinstance(value, str) else dict(value)
+    return AgentRun(
+        agent_run_id=AgentRunId(UUID(payload["agent_run_id"])),
+        owner_kind=str(payload["owner_kind"]),
+        owner_id=UUID(payload["owner_id"]),
+        logical_task_key=str(payload["logical_task_key"]),
+        phase=Phase(payload["phase"]),
+        session_kind=SessionKind(payload["session_kind"]),
+        thread_id=str(payload["thread_id"]),
+        model_binding_sha256=str(payload["model_binding_sha256"]),
+        context_sha256=str(payload["context_sha256"]),
+        toolset_sha256=str(payload["toolset_sha256"]),
+        template_sha256=str(payload["template_sha256"]),
+        slice_ref=(
+            SliceGenerationRef.model_validate(payload["slice_ref"])
+            if payload.get("slice_ref") is not None
+            else None
+        ),
+        checkpoint_sha256=payload.get("checkpoint_sha256"),
+        result_sha256=payload.get("result_sha256"),
+        usage_sha256=payload.get("usage_sha256"),
+        retry_of=(AgentRunId(UUID(payload["retry_of"])) if payload.get("retry_of") else None),
+        continuation_of=(
+            AgentRunId(UUID(payload["continuation_of"])) if payload.get("continuation_of") else None
+        ),
+        restarted_from=(
+            AgentRunId(UUID(payload["restarted_from"])) if payload.get("restarted_from") else None
+        ),
+        state=SessionState(payload["state"]),
+        exit=SessionExit(payload["exit"]) if payload.get("exit") else None,
+    )
+
+
 def _decode_state(value: Any) -> RunState:
     payload = json.loads(value) if isinstance(value, str) else dict(value)
     return RunState(
@@ -480,6 +784,7 @@ def _decode_state(value: Any) -> RunState:
         adopted_advice_ids=tuple(payload.get("adopted_advice_ids", ())),
         pending_advice_ids=tuple(payload.get("pending_advice_ids", ())),
     )
+
 
 __all__ = [
     "InMemoryRuntimeStore",
