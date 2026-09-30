@@ -1,23 +1,41 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
 from langchain_core.messages import HumanMessage
+from langchain_core.tracers.context import tracing_v2_callback_var, tracing_v2_enabled
 from langgraph.checkpoint.memory import InMemorySaver
+from langsmith.utils import tracing_is_enabled
 
-from codemigrator.core import ContextPackIdentity, ModelProfile, Phase, SessionKind
+from codemigrator.core import (
+    ContextPackIdentity,
+    ModelProfile,
+    Phase,
+    SessionBudgetProfile,
+    SessionKind,
+)
 from codemigrator.runtime.agent_runs import AgentRun
 from codemigrator.runtime.binding import LockedModelBinding
 from codemigrator.runtime.context import ContextEnvelope, ContextSegment
-from codemigrator.runtime.langchain_agent import allowed_tool_names, create_bound_agent
+from codemigrator.runtime.langchain_agent import (
+    agent_context_digest,
+    agent_template_digest,
+    agent_toolset_digest,
+    allowed_tool_names,
+)
+from codemigrator.runtime.langchain_agent import (
+    create_bound_agent as _create_bound_agent,
+)
 from codemigrator.runtime.loop_contracts import SessionExit, SessionState
 from codemigrator.runtime.memory import (
     ContextBudgetError,
     ContextManager,
     DraftContextIdentity,
     FormulaNetInputCap,
+    SessionBudgetCatalog,
 )
 from codemigrator.runtime.provider import (
     ProviderRegistry,
@@ -40,9 +58,13 @@ class FakeProvider:
     def __init__(self, responses):
         self.responses = list(responses)
         self.requests: list[ProviderRequest] = []
+        self.tracing_enabled: list[bool] = []
+        self.trace_callbacks: list[object] = []
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         self.requests.append(request)
+        self.tracing_enabled.append(tracing_is_enabled())
+        self.trace_callbacks.append(tracing_v2_callback_var.get())
         return self.responses.pop(0)
 
 
@@ -58,6 +80,17 @@ class FakeGateway:
 class UsageSink:
     def __init__(self):
         self.receipts = []
+        self.calls = {}
+
+    async def reserve_round(self, agent_run_id, call_id, *, max_rounds):
+        per_run = self.calls.setdefault(agent_run_id, {})
+        if call_id in per_run:
+            return per_run[call_id]
+        if len(per_run) >= max_rounds:
+            return None
+        round_index = len(per_run) + 1
+        per_run[call_id] = round_index
+        return round_index
 
     async def record(self, agent_run_id, usage, receipt):
         self.receipts.append((agent_run_id, usage, receipt))
@@ -120,6 +153,72 @@ def _context_identity(run, binding):
         model_binding_sha256=binding.digest,
         phase_policy_sha256="2" * 64,
         contract_refs_sha256="3" * 64,
+    )
+
+
+_default_usage_sink = UsageSink()
+
+
+def _prepare_agent_kwargs(kwargs):
+    kwargs.setdefault("checkpointer", InMemorySaver())
+    kwargs.setdefault("usage_sink", _default_usage_sink)
+    run = kwargs["agent_run"]
+    context_identity = kwargs.get("context_identity")
+    if context_identity is not None:
+        template = kwargs.get("template", "plan role")
+        session = (
+            context_identity.session.value
+            if isinstance(context_identity, ContextPackIdentity)
+            else run.session_kind.value
+        )
+        template_sha256 = agent_template_digest(session=session, template=template)
+        if isinstance(context_identity, ContextPackIdentity):
+            context_identity = context_identity.model_copy(
+                update={"template_sha256": template_sha256}
+            )
+            kwargs["context_identity"] = context_identity
+        kwargs["agent_run"] = replace(
+            run,
+            context_sha256=agent_context_digest(
+                context_identity=context_identity,
+                envelope=kwargs.get("envelope", ContextEnvelope()),
+                phase=run.phase,
+                session_kind=run.session_kind,
+                template_sha256=template_sha256,
+                budget=kwargs["context_manager"].budget_catalog.profile(
+                    "DRAFTING" if run.owner_kind == "draft" else run.session_kind
+                ),
+            ),
+            toolset_sha256=agent_toolset_digest(
+                phase=run.phase,
+                session_kind=run.session_kind,
+                owner_kind=run.owner_kind,
+            ),
+            template_sha256=template_sha256,
+        )
+    return kwargs
+
+
+def create_bound_agent(**kwargs):
+    """Bind test records to the exact policy/context passed to the factory."""
+
+    kwargs = _prepare_agent_kwargs(kwargs)
+    return _create_bound_agent(**kwargs)
+
+
+def _context_manager_with_round_limit(max_rounds):
+    catalog = SessionBudgetCatalog.from_core()
+    profiles = dict(catalog.profiles)
+    profile = profiles[SessionKind.PlanAuxiliary.value]
+    profiles[SessionKind.PlanAuxiliary.value] = SessionBudgetProfile(
+        session=SessionKind.PlanAuxiliary,
+        max_rounds=max_rounds,
+        eviction_watermark_pct=profile.eviction_watermark_pct,
+    )
+    return ContextManager(
+        token_counter=ExactCounter(),
+        net_input_cap=FormulaNetInputCap(),
+        budget_catalog=SessionBudgetCatalog(profiles, catalog.resource_sha256),
     )
 
 
@@ -261,12 +360,20 @@ def test_draft_agent_requires_matching_draft_context_and_no_run_identity() -> No
         draft_id=run.owner_id, revision_id=uuid4(), agent_run_id=run.agent_run_id
     )
     bound = create_bound_agent(**kwargs, context_identity=draft_identity)
-    assert bound.agent_run == run
+    assert bound.agent_run.agent_run_id == run.agent_run_id
 
 
 def test_run_agent_rejects_missing_frozen_context_identity() -> None:
     binding = _binding()
     run = _run(binding)
+    run = replace(
+        run,
+        toolset_sha256=agent_toolset_digest(
+            phase=run.phase,
+            session_kind=run.session_kind,
+            owner_kind=run.owner_kind,
+        ),
+    )
     with pytest.raises(ValueError, match="Run ContextPack identity"):
         create_bound_agent(
             agent_run=run,
@@ -464,3 +571,148 @@ async def test_middleware_evicts_only_cas_backed_targeted_content() -> None:
     assert "x" * 1450 not in second
     assert "content externalized" in second
     assert len(audits) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("context_sha256", "context digest"),
+        ("toolset_sha256", "toolset digest"),
+        ("template_sha256", "template digest"),
+    ],
+)
+def test_factory_rejects_agent_run_digest_drift(field, message) -> None:
+    binding = _binding()
+    run = _run(binding)
+    kwargs = _prepare_agent_kwargs(
+        {
+            "agent_run": run,
+            "binding": binding,
+            "registry": ProviderRegistry({"openai-compatible": FakeProvider([_response()])}),
+            "context_manager": ContextManager(
+                token_counter=ExactCounter(), net_input_cap=FormulaNetInputCap()
+            ),
+            "template": "plan role",
+            "envelope": ContextEnvelope(stable=(ContextSegment("stable", "facts"),)),
+            "gateway": FakeGateway(),
+            "context_identity": _context_identity(run, binding),
+        }
+    )
+    kwargs["agent_run"] = replace(kwargs["agent_run"], **{field: "f" * 64})
+    with pytest.raises(ValueError, match=message):
+        _create_bound_agent(**kwargs)
+
+
+def test_factory_requires_checkpoint_and_durable_round_reservation() -> None:
+    binding = _binding()
+    run = _run(binding)
+    kwargs = _prepare_agent_kwargs(
+        {
+            "agent_run": run,
+            "binding": binding,
+            "registry": ProviderRegistry({"openai-compatible": FakeProvider([_response()])}),
+            "context_manager": ContextManager(
+                token_counter=ExactCounter(), net_input_cap=FormulaNetInputCap()
+            ),
+            "template": "plan role",
+            "envelope": ContextEnvelope(),
+            "gateway": FakeGateway(),
+            "context_identity": _context_identity(run, binding),
+        }
+    )
+    with pytest.raises(ValueError, match="requires a LangGraph checkpointer"):
+        _create_bound_agent(**{**kwargs, "checkpointer": None})
+    with pytest.raises(ValueError, match="durable model-call usage sink"):
+        _create_bound_agent(**{**kwargs, "usage_sink": None})
+
+
+@pytest.mark.asyncio
+async def test_agent_run_disables_inherited_langsmith_tracing(monkeypatch) -> None:
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    binding = _binding()
+    run = _run(binding)
+    provider = FakeProvider([_response()])
+    bound = create_bound_agent(
+        agent_run=run,
+        binding=binding,
+        registry=ProviderRegistry({"openai-compatible": provider}),
+        context_manager=ContextManager(
+            token_counter=ExactCounter(), net_input_cap=FormulaNetInputCap()
+        ),
+        template="plan role",
+        envelope=ContextEnvelope(),
+        gateway=FakeGateway(),
+        context_identity=_context_identity(run, binding),
+    )
+    with tracing_v2_enabled():
+        await bound.ainvoke(task="Propose a plan")
+    assert provider.tracing_enabled == [False]
+    assert provider.trace_callbacks == [None]
+
+
+@pytest.mark.asyncio
+async def test_model_call_budget_is_persistent_and_stops_after_limit() -> None:
+    binding = _binding()
+    run = _run(binding)
+    saver = InMemorySaver()
+    usage = UsageSink()
+    provider = FakeProvider([_response("proposal"), _response("unused")])
+    kwargs = {
+        "agent_run": run,
+        "binding": binding,
+        "registry": ProviderRegistry({"openai-compatible": provider}),
+        "context_manager": _context_manager_with_round_limit(1),
+        "template": "plan role",
+        "envelope": ContextEnvelope(),
+        "gateway": FakeGateway(),
+        "context_identity": _context_identity(run, binding),
+        "checkpointer": saver,
+        "usage_sink": usage,
+    }
+    first = create_bound_agent(**kwargs)
+    first_result = await first.ainvoke(task="Propose a plan")
+    assert first_result.exit is SessionExit.Completed
+    assert first_result.rounds == 1
+
+    recovered = create_bound_agent(**kwargs)
+    second_result = await recovered.ainvoke(task="Apply validator feedback")
+    assert second_result.exit is SessionExit.SegmentStopped
+    assert second_result.rounds == 1
+    assert len(provider.requests) == 1
+    assert len(usage.receipts) == 1
+    assert await saver.aget_tuple({"configurable": {"thread_id": run.thread_id}}) is not None
+
+
+@pytest.mark.asyncio
+async def test_model_round_limit_allows_langgraph_loop_beyond_default_recursion() -> None:
+    binding = _binding()
+    run = _run(binding)
+    round_limit = 16
+    responses = [
+        _response(
+            "",
+            tools=(
+                ProviderToolCall(
+                    "ReadFile", json.dumps({"path": f"file_{index}.py"}), f"call-{index}"
+                ),
+            ),
+        )
+        for index in range(round_limit)
+    ]
+    provider = FakeProvider(responses)
+    gateway = FakeGateway()
+    bound = create_bound_agent(
+        agent_run=run,
+        binding=binding,
+        registry=ProviderRegistry({"openai-compatible": provider}),
+        context_manager=_context_manager_with_round_limit(round_limit),
+        template="plan role",
+        envelope=ContextEnvelope(),
+        gateway=gateway,
+        context_identity=_context_identity(run, binding),
+    )
+    result = await bound.ainvoke(task="Inspect files in bounded steps")
+    assert result.exit is SessionExit.SegmentStopped
+    assert result.rounds == round_limit
+    assert len(provider.requests) == round_limit
+    assert len(gateway.calls) == round_limit

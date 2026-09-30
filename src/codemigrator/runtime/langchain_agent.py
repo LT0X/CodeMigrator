@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import inspect
 import json
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, cast
+from uuid import uuid4
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
@@ -22,9 +26,18 @@ from langchain_core.messages import (
 )
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import StructuredTool
+from langchain_core.tracers.context import tracing_v2_callback_var
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langsmith import tracing_context
 from pydantic import BaseModel, PrivateAttr
 
-from codemigrator.core import ContextPackIdentity, Phase, SessionKind, load_resource
+from codemigrator.core import (
+    ContextPackIdentity,
+    Phase,
+    SessionKind,
+    canonical_json_bytes,
+    load_resource,
+)
 from codemigrator.workspace.models import (
     EditFileCall,
     ExecCall,
@@ -41,6 +54,7 @@ from .loop import CancellationToken, SessionResult, ToolGatewayPort
 from .loop_contracts import SessionExit, SessionState
 from .memory import (
     CAS_URI_PATTERN,
+    BudgetProfile,
     ContextBudgetError,
     ContextManager,
     DraftContextIdentity,
@@ -66,12 +80,118 @@ _TOOL_MODELS = {
     "Exec": ExecCall,
 }
 _READ_TOOLS = frozenset(("ReadFile", "QuerySourceAst", "Exec"))
+_ROUND_LIMIT_MARKER = "codemigrator_round_limit"
+
+
+@contextmanager
+def _agent_run_tracing_boundary() -> Iterator[None]:
+    """Prevent environment and inherited LangChain tracing from exporting state."""
+
+    token = tracing_v2_callback_var.set(None)
+    try:
+        with tracing_context(enabled=False, parent=False, client=None, replicas=[]):
+            yield
+    finally:
+        tracing_v2_callback_var.reset(token)
 
 
 class AgentUsageSink(Protocol):
+    async def reserve_round(
+        self, agent_run_id: AgentRunId, call_id: str, *, max_rounds: int
+    ) -> int | None: ...
+
     async def record(
         self, agent_run_id: AgentRunId, usage: TokenUsage, receipt: UsageReceipt
     ) -> None: ...
+
+
+def agent_template_digest(*, session: str, template: str) -> str:
+    """Digest the exact session template using the ContextManager encoding."""
+
+    if not session or not template:
+        raise ValueError("session and template are required for the template digest")
+    return hashlib.sha256(
+        canonical_json_bytes({"session": session, "template": template})
+    ).hexdigest()
+
+
+def agent_toolset_digest(*, phase: Phase, session_kind: SessionKind, owner_kind: str) -> str:
+    """Digest the closed policy projection and the exact schemas given to LangChain."""
+
+    if owner_kind not in {"run", "draft"}:
+        raise ValueError("AgentRun owner kind must be run or draft")
+    toolset = tuple(
+        {
+            "name": definition.name,
+            "description": definition.description,
+            "parameters": dict(definition.parameters),
+        }
+        for definition in (
+            _tool_definition(name)
+            for name in allowed_tool_names(phase, session_kind, draft=owner_kind == "draft")
+        )
+    )
+    payload = {
+        "policy_resource": "core://phase-tool-policy/v2",
+        "owner_kind": owner_kind,
+        "phase": phase.value,
+        "session_kind": session_kind.value,
+        "tools": toolset,
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def agent_context_digest(
+    *,
+    context_identity: ContextPackIdentity | DraftContextIdentity,
+    envelope: ContextEnvelope,
+    phase: Phase,
+    session_kind: SessionKind,
+    template_sha256: str,
+    budget: BudgetProfile,
+) -> str:
+    """Digest the frozen identity and initial context envelope without storing its body."""
+
+    if isinstance(context_identity, ContextPackIdentity):
+        identity: dict[str, object] = context_identity.model_dump(mode="json", by_alias=True)
+        identity["template_sha256"] = template_sha256
+    elif isinstance(context_identity, DraftContextIdentity):
+        identity = {
+            "draft_id": str(context_identity.draft_id),
+            "revision_id": str(context_identity.revision_id),
+            "agent_run_id": str(context_identity.agent_run_id),
+        }
+    else:
+        raise TypeError("unsupported AgentRun context identity")
+    segments = {
+        kind: [
+            {
+                "content": segment.content,
+                "required": segment.required,
+                "evictable": segment.evictable,
+                "source_body": segment.source_body,
+                "source_ref": segment.source_ref,
+                "turn_index": segment.turn_index,
+            }
+            for segment in getattr(envelope, kind)
+        ]
+        for kind in ("stable", "evolving", "targeted")
+    }
+    payload = {
+        "phase": phase.value,
+        "session_kind": session_kind.value,
+        "template_sha256": template_sha256,
+        "context_identity": identity,
+        "envelope": segments,
+        "budget": {
+            "session": (
+                budget.session.value if isinstance(budget.session, SessionKind) else budget.session
+            ),
+            "max_rounds": budget.max_rounds,
+            "eviction_watermark_pct": budget.eviction_watermark_pct,
+        },
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
 def allowed_tool_names(phase: Phase, session_kind: SessionKind, *, draft: bool) -> tuple[str, ...]:
@@ -118,9 +238,10 @@ class ProviderChatModel(BaseChatModel):
     _provider: AsyncProvider = PrivateAttr()
     _binding: LockedModelBinding = PrivateAttr()
     _agent_run_id: AgentRunId = PrivateAttr()
-    _usage_sink: AgentUsageSink | None = PrivateAttr()
+    _usage_sink: AgentUsageSink = PrivateAttr()
     _cancellation: CancellationToken = PrivateAttr()
     _tools: tuple[ToolDefinition, ...] = PrivateAttr()
+    _max_rounds: int = PrivateAttr()
     _usages: list[TokenUsage] = PrivateAttr(default_factory=list)
     _calls: int = PrivateAttr(default=0)
 
@@ -131,8 +252,9 @@ class ProviderChatModel(BaseChatModel):
         binding: LockedModelBinding,
         agent_run_id: AgentRunId,
         tools: tuple[ToolDefinition, ...],
-        usage_sink: AgentUsageSink | None,
+        usage_sink: AgentUsageSink,
         cancellation: CancellationToken,
+        max_rounds: int,
     ) -> None:
         super().__init__()
         self._provider = provider
@@ -141,6 +263,7 @@ class ProviderChatModel(BaseChatModel):
         self._tools = tools
         self._usage_sink = usage_sink
         self._cancellation = cancellation
+        self._max_rounds = max_rounds
 
     @property
     def _llm_type(self) -> str:
@@ -149,6 +272,10 @@ class ProviderChatModel(BaseChatModel):
     @property
     def usages(self) -> tuple[TokenUsage, ...]:
         return tuple(self._usages)
+
+    @property
+    def rounds(self) -> int:
+        return self._calls
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> ProviderChatModel:
         if {tool.name for tool in tools} != {tool.name for tool in self._tools}:
@@ -172,6 +299,25 @@ class ProviderChatModel(BaseChatModel):
         **kwargs: Any,
     ) -> ChatResult:
         self._cancellation.raise_if_cancelled()
+        call_id = f"{self._agent_run_id}:{uuid4()}"
+        round_index = await self._usage_sink.reserve_round(
+            self._agent_run_id, call_id, max_rounds=self._max_rounds
+        )
+        if round_index is None:
+            self._calls = max(self._calls, self._max_rounds)
+            return ChatResult(
+                generations=[
+                    ChatGeneration(
+                        message=AIMessage(
+                            content="",
+                            response_metadata={_ROUND_LIMIT_MARKER: True},
+                        )
+                    )
+                ]
+            )
+        if type(round_index) is not int or not 1 <= round_index <= self._max_rounds:
+            raise RuntimeError("AgentRun round reservation is invalid")
+        self._calls = max(self._calls, round_index)
         response = await self._provider.complete(
             ProviderRequest(
                 binding=self._binding,
@@ -181,8 +327,6 @@ class ProviderChatModel(BaseChatModel):
             )
         )
         self._cancellation.raise_if_cancelled()
-        self._calls += 1
-        call_id = f"{self._agent_run_id}:{self._calls}"
         receipt = UsageReceipt(
             run_id=self._agent_run_id,
             call=ProviderCallIdentity(
@@ -195,8 +339,7 @@ class ProviderChatModel(BaseChatModel):
             usage=response.usage,
         )
         self._usages.append(response.usage)
-        if self._usage_sink is not None:
-            await self._usage_sink.record(self._agent_run_id, response.usage, receipt)
+        await self._usage_sink.record(self._agent_run_id, response.usage, receipt)
         tool_calls = []
         for index, call in enumerate(response.tool_calls):
             arguments = json.loads(call.arguments)
@@ -342,24 +485,40 @@ class BoundAgentRun:
     agent_run: AgentRun
     graph: Any
     model: ProviderChatModel
+    checkpointer: BaseCheckpointSaver[Any]
+    max_rounds: int
+    _invoke_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    _segment_stopped: bool = field(default=False, init=False, repr=False)
 
     async def ainvoke(self, *, task: str) -> SessionResult:
         if not isinstance(task, str) or not task.strip():
             raise ValueError("AgentRun owner task must be non-empty text")
-        messages = [HumanMessage(content=task, name="codemigrator_owner_task")]
-        output = await self.graph.ainvoke(
-            {"messages": messages},
-            config={"configurable": {"thread_id": self.agent_run.thread_id}},
-        )
-        last = output["messages"][-1]
-        return SessionResult(
-            state=SessionState.CheckpointPending,
-            exit=SessionExit.Completed,
-            assistant_texts=(str(last.content),),
-            usages=self.model.usages,
-            rounds=len(self.model.usages),
-            agent_run_id=self.agent_run.agent_run_id,
-        )
+        async with self._invoke_lock:
+            if self._segment_stopped:
+                raise RuntimeError("a segment-stopped AgentRun cannot be invoked again")
+            messages = [HumanMessage(content=task, name="codemigrator_owner_task")]
+            usage_start = len(self.model.usages)
+            config = {
+                "configurable": {"thread_id": self.agent_run.thread_id},
+                "callbacks": [],
+                "recursion_limit": max(25, self.max_rounds * 2 + 5),
+            }
+            with _agent_run_tracing_boundary():
+                output = await self.graph.ainvoke({"messages": messages}, config=config)
+            last = output["messages"][-1]
+            round_limited = bool(
+                isinstance(last, AIMessage)
+                and last.response_metadata.get(_ROUND_LIMIT_MARKER) is True
+            )
+            self._segment_stopped = round_limited
+            return SessionResult(
+                state=SessionState.CheckpointPending,
+                exit=SessionExit.SegmentStopped if round_limited else SessionExit.Completed,
+                assistant_texts=() if round_limited else (str(last.content),),
+                usages=self.model.usages[usage_start:],
+                rounds=self.model.rounds,
+                agent_run_id=self.agent_run.agent_run_id,
+            )
 
 
 def create_bound_agent(
@@ -374,9 +533,13 @@ def create_bound_agent(
     usage_sink: AgentUsageSink | None = None,
     cancellation: CancellationToken | None = None,
     context_identity: ContextPackIdentity | DraftContextIdentity | None = None,
-    checkpointer: Any = None,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
     eviction_audit_sink: EvictionAuditSink | None = None,
 ) -> BoundAgentRun:
+    if checkpointer is None:
+        raise ValueError("persistent AgentRun requires a LangGraph checkpointer")
+    if usage_sink is None:
+        raise ValueError("persistent AgentRun requires a durable model-call usage sink")
     if binding.digest != agent_run.model_binding_sha256:
         raise ValueError("AgentRun model binding digest changed")
     if agent_run.phase in (Phase.Verify, Phase.Report):
@@ -385,6 +548,15 @@ def create_bound_agent(
         agent_run.phase, agent_run.session_kind, draft=agent_run.owner_kind == "draft"
     )
     definitions = tuple(_tool_definition(name) for name in tool_names)
+    if (
+        agent_toolset_digest(
+            phase=agent_run.phase,
+            session_kind=agent_run.session_kind,
+            owner_kind=agent_run.owner_kind,
+        )
+        != agent_run.toolset_sha256
+    ):
+        raise ValueError("AgentRun toolset digest differs from the authorized tool schemas")
     counter = context_manager.token_counter
     count_schemas = getattr(counter, "count_tool_schemas", None)
     if definitions and not callable(count_schemas):
@@ -400,6 +572,7 @@ def create_bound_agent(
         raise ContextBudgetError(
             "exact provider tool schema count is invalid", code="CONTEXT_CAPABILITY_INVALID"
         )
+    frozen_context_identity: ContextPackIdentity | DraftContextIdentity
     if agent_run.owner_kind == "draft":
         if not isinstance(context_identity, DraftContextIdentity):
             raise ValueError("Draft AgentRun requires DraftContextIdentity")
@@ -418,6 +591,10 @@ def create_bound_agent(
             tool_schema_tokens=tool_schema_tokens,
             envelope_margin=0,
         )
+        frozen_context_identity = context_identity
+        frozen_template_sha256 = agent_template_digest(
+            session=agent_run.session_kind.value, template=template
+        )
     else:
         if (
             not isinstance(context_identity, ContextPackIdentity)
@@ -428,7 +605,7 @@ def create_bound_agent(
         ):
             raise ValueError("Run ContextPack identity differs from AgentRun")
         budget = context_manager.budget_catalog.profile(agent_run.session_kind)
-        context_manager.fit(
+        assembly = context_manager.fit(
             identity=context_identity,
             template=template,
             envelope=envelope,
@@ -437,6 +614,22 @@ def create_bound_agent(
             tool_schema_tokens=tool_schema_tokens,
             envelope_margin=0,
         )
+        frozen_context_identity = assembly.pack.identity
+        frozen_template_sha256 = str(assembly.pack.identity.template_sha256)
+    if frozen_template_sha256 != agent_run.template_sha256:
+        raise ValueError("AgentRun template digest differs from the selected session template")
+    if (
+        agent_context_digest(
+            context_identity=frozen_context_identity,
+            envelope=envelope,
+            phase=agent_run.phase,
+            session_kind=agent_run.session_kind,
+            template_sha256=frozen_template_sha256,
+            budget=budget,
+        )
+        != agent_run.context_sha256
+    ):
+        raise ValueError("AgentRun context digest differs from the frozen context envelope")
     token = cancellation or CancellationToken.create()
     model = ProviderChatModel(
         provider=registry.resolve(binding),
@@ -445,6 +638,7 @@ def create_bound_agent(
         tools=definitions,
         usage_sink=usage_sink,
         cancellation=token,
+        max_rounds=budget.max_rounds,
     )
     tools = []
     for definition in definitions:
@@ -477,13 +671,16 @@ def create_bound_agent(
         eviction_audit_sink=eviction_audit_sink,
     )
     graph = create_agent(model, tools, middleware=[middleware], checkpointer=checkpointer)
-    return BoundAgentRun(agent_run, graph, model)
+    return BoundAgentRun(agent_run, graph, model, checkpointer, budget.max_rounds)
 
 
 __all__ = [
     "BoundAgentRun",
     "GovernedContextMiddleware",
     "ProviderChatModel",
+    "agent_context_digest",
+    "agent_template_digest",
+    "agent_toolset_digest",
     "allowed_tool_names",
     "create_bound_agent",
 ]
