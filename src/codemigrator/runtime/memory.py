@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Protocol, cast
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -99,6 +100,31 @@ class DraftingBudgetProfile:
     session: str
     max_rounds: int
     eviction_watermark_pct: int
+
+
+@dataclass(frozen=True, slots=True)
+class DraftContextIdentity:
+    """Pre-Run identity; it cannot be mistaken for a Run ContextPack."""
+
+    draft_id: UUID
+    revision_id: UUID
+    agent_run_id: UUID
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, UUID)
+            for value in (self.draft_id, self.revision_id, self.agent_run_id)
+        ):
+            raise ValueError("draft context requires UUID-backed identities")
+
+
+@dataclass(frozen=True, slots=True)
+class DraftContextAssembly:
+    identity: DraftContextIdentity
+    budget: DraftingBudgetProfile
+    envelope: ContextEnvelope
+    messages: tuple[PromptMessage, ...]
+    assembled_tokens: int
 
 
 BudgetProfile = SessionBudgetProfile | DraftingBudgetProfile
@@ -269,6 +295,33 @@ class ContextManager:
 
     assemble = fit
 
+    def fit_draft(
+        self,
+        *,
+        identity: DraftContextIdentity,
+        template: str,
+        envelope: ContextEnvelope,
+        context_window: int,
+        reserved_output: int,
+        tool_schema_tokens: int,
+        envelope_margin: int,
+    ) -> DraftContextAssembly:
+        if not isinstance(identity, DraftContextIdentity):
+            raise TypeError("draft context requires DraftContextIdentity")
+        if any(segment.source_body for segment in self._segments(envelope)):
+            raise ValueError("initial draft context must not contain source body")
+        messages = render_prompt(template, envelope)
+        tokens = self.fit_messages(
+            messages,
+            context_window=context_window,
+            reserved_output=reserved_output,
+            tool_schema_tokens=tool_schema_tokens,
+            envelope_margin=envelope_margin,
+        )
+        budget = self.budget_catalog.profile("DRAFTING")
+        assert isinstance(budget, DraftingBudgetProfile)
+        return DraftContextAssembly(identity, budget, envelope, messages, tokens)
+
     def fit_triggered(
         self,
         *,
@@ -397,9 +450,7 @@ class ContextManager:
         self, identity: ContextPackIdentity, template_text: str
     ) -> ContextPackIdentity:
         digest = hashlib.sha256(
-            canonical_json_bytes(
-                {"session": identity.session.value, "template": template_text}
-            )
+            canonical_json_bytes({"session": identity.session.value, "template": template_text})
         ).hexdigest()
         if identity.template_sha256 == "0" * 64:
             return identity.model_copy(update={"template_sha256": digest})
@@ -620,17 +671,13 @@ def govern_shell_output(
     combined = f"[exit_code={exit_code}]\n[stdout]\n{stdout}\n[stderr]\n{stderr}".strip()
     total_bytes = len(combined.encode("utf-8"))
     truncated = total_bytes > MAX_CONTEXT_BLOCK_BYTES
-    reference = _owned_cas_ref(
-        artifact_ref, run_id=run_id, cas_ref_validator=cas_ref_validator
-    )
+    reference = _owned_cas_ref(artifact_ref, run_id=run_id, cas_ref_validator=cas_ref_validator)
     if truncated and reference is None:
         raise ValueError("oversized Shell output requires a CAS artifact reference")
     if truncated:
         prefix = "[truncated=true]\n[head]\n"
         separator = "\n[tail]\n"
-        payload_limit = MAX_CONTEXT_BLOCK_BYTES - len(
-            (prefix + separator).encode("utf-8")
-        )
+        payload_limit = MAX_CONTEXT_BLOCK_BYTES - len((prefix + separator).encode("utf-8"))
         head_limit = payload_limit // 2
         tail_limit = payload_limit - head_limit
         text = (
@@ -670,9 +717,7 @@ def govern_exec_result(
         len(error_message.encode("utf-8")) if error_message is not None else 0
     )
     truncated = total_bytes > MAX_CONTEXT_BLOCK_BYTES
-    reference = _owned_cas_ref(
-        artifact_ref, run_id=run_id, cas_ref_validator=cas_ref_validator
-    )
+    reference = _owned_cas_ref(artifact_ref, run_id=run_id, cas_ref_validator=cas_ref_validator)
     if truncated and reference is None:
         raise ValueError("oversized Exec summary requires a CAS artifact reference")
     # The full per-receipt result is audit-only. Only this bounded structural
@@ -688,9 +733,7 @@ def govern_exec_result(
             "[head]\n"
             + _byte_prefix(summary, half)
             + "\n[tail]\n"
-            + summary.encode("utf-8")[-(summary_limit - half) :].decode(
-                "utf-8", errors="ignore"
-            )
+            + summary.encode("utf-8")[-(summary_limit - half) :].decode("utf-8", errors="ignore")
         )
     payload: dict[str, object] = {
         "step_count": step_count,
@@ -721,9 +764,7 @@ def govern_complete_log(
 
     if type(total_bytes) is not int or total_bytes < 0:
         raise ValueError("complete log byte count is invalid")
-    reference = _owned_cas_ref(
-        artifact_ref, run_id=run_id, cas_ref_validator=cas_ref_validator
-    )
+    reference = _owned_cas_ref(artifact_ref, run_id=run_id, cas_ref_validator=cas_ref_validator)
     assert reference is not None
     text = json.dumps(
         {"artifact_ref": reference, "bytes": total_bytes},
@@ -1086,9 +1127,7 @@ def repair_navigation_segments(
         {
             "failure_facts": {
                 "failed_test_refs": list(getattr(failure_facts, "failed_test_refs")),
-                "diagnostic_summary": _jsonable(
-                    getattr(failure_facts, "diagnostic_summary")
-                ),
+                "diagnostic_summary": _jsonable(getattr(failure_facts, "diagnostic_summary")),
                 "cas_refs": list(getattr(failure_facts, "cas_refs")),
             },
             "attribution": _jsonable(getattr(brief, "attribution")),

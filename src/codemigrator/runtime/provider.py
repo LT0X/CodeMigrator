@@ -140,6 +140,16 @@ class ProviderRegistry:
             raise ProviderError("provider binding is unavailable", retryable=False) from exc
 
 
+def provider_adapter_id_for_label(label: str) -> str:
+    """Map a local OpenCode config label onto an existing locked adapter ID."""
+
+    if label == "OpenCode":
+        return "openai-compatible"
+    if label in {"openai", "openai-compatible", "anthropic"}:
+        return label
+    raise ValueError("unsupported provider label")
+
+
 def retry_delay_for_attempt(attempt: int) -> int:
     """Return the actor-facing retry hint for the 1st, 2nd, or later retry."""
 

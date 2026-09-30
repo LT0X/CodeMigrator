@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import uuid4
 
 import pytest
@@ -16,6 +16,7 @@ from codemigrator.core import (
     SessionKind,
     SliceGenerationRef,
 )
+from codemigrator.runtime.agent_runs import AgentRunReceipt
 from codemigrator.runtime.binding import BindingError, ContextOverflowError, LockedModelBinding
 from codemigrator.runtime.context import ContextEnvelope, ContextSegment
 from codemigrator.runtime.loop import (
@@ -175,6 +176,47 @@ async def test_loop_runs_in_one_session_task_and_closes_after_checkpoint() -> No
     assert usage.values == [TokenUsage(input_tokens=2, output_tokens=1)] * 2
     assert provider.tasks[0] is not asyncio.current_task()
     assert provider.tasks[0] is provider.tasks[1]
+
+
+@pytest.mark.asyncio
+async def test_agent_run_completion_waits_for_owner_receipt() -> None:
+    agent_run_id = uuid4()
+    spec = _spec()
+    spec = replace(spec, agent_run_id=agent_run_id)
+    result = await AgentLoop(
+        provider=FakeProvider([_response('{"completed":true}')]),
+        gateway=FakeGateway(),
+        checkpoint=FakeCheckpoint([CheckpointDecision(accepted=True, committed=True)]),
+    ).run(spec)
+    assert result.agent_run_id == agent_run_id
+    assert result.exit is SessionExit.Completed
+    assert result.state is SessionState.CheckpointPending
+    assert result.outcome_published is False
+
+
+@pytest.mark.asyncio
+async def test_agent_run_only_closes_with_matching_owner_receipt() -> None:
+    agent_run_id = uuid4()
+    spec = replace(_spec(), agent_run_id=agent_run_id)
+    wrong = AgentRunReceipt(uuid4(), uuid4(), "business")
+    result = await AgentLoop(
+        provider=FakeProvider([_response('{"completed":true}')]),
+        gateway=FakeGateway(),
+        checkpoint=FakeCheckpoint(
+            [CheckpointDecision(accepted=True, committed=True, owner_receipt=wrong)]
+        ),
+    ).run(spec)
+    assert result.state is SessionState.CheckpointPending
+    matching = AgentRunReceipt(uuid4(), agent_run_id, "business")
+    result = await AgentLoop(
+        provider=FakeProvider([_response('{"completed":true}')]),
+        gateway=FakeGateway(),
+        checkpoint=FakeCheckpoint(
+            [CheckpointDecision(accepted=True, committed=True, owner_receipt=matching)]
+        ),
+    ).run(spec)
+    assert result.state is SessionState.Closed
+    assert result.outcome_published is True
 
 
 @pytest.mark.asyncio

@@ -59,6 +59,13 @@ from .integration import (
     IntegrationStart,
     RepairRetryBudget,
 )
+from .langchain_agent import (
+    BoundAgentRun,
+    GovernedContextMiddleware,
+    ProviderChatModel,
+    allowed_tool_names,
+    create_bound_agent,
+)
 from .loop import (
     AgentLoop,
     BudgetGate,
@@ -85,6 +92,8 @@ from .memory import (
     ContextPackAssembler,
     ContextPackCache,
     DataBlockKind,
+    DraftContextAssembly,
+    DraftContextIdentity,
     DraftingBudgetProfile,
     EvictionAudit,
     EvictionEngine,
@@ -163,6 +172,7 @@ from .provider import (
     TokenUsage,
     ToolDefinition,
     UsageReceipt,
+    provider_adapter_id_for_label,
     retry_delay_for_attempt,
 )
 from .recovery import (
@@ -232,6 +242,14 @@ def main() -> None:
 
 
 __all__ = [
+    "BoundAgentRun",
+    "GovernedContextMiddleware",
+    "ProviderChatModel",
+    "allowed_tool_names",
+    "create_bound_agent",
+    "DraftContextAssembly",
+    "DraftContextIdentity",
+    "provider_adapter_id_for_label",
     "AgentLoop",
     "ActorRegistry",
     "ActorCheckpoint",

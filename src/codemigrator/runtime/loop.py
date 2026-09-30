@@ -6,10 +6,11 @@ import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from codemigrator.core import SessionKind
 
+from .agent_runs import AgentRunReceipt
 from .binding import ContextOverflowError, ensure_context_fits, validate_session_admission
 from .context import PromptMessage, prompt_text, render_prompt
 from .loop_contracts import SessionExit, SessionIdentity, SessionSpec, SessionState
@@ -24,6 +25,9 @@ from .provider import (
     TokenUsage,
     UsageReceipt,
 )
+
+if TYPE_CHECKING:
+    from .agent_runs import AgentRunId
 
 
 class SessionCancelled(RuntimeError):
@@ -81,6 +85,7 @@ class CheckpointDecision:
     accepted: bool
     committed: bool = False
     rejection_reasons: tuple[str, ...] = ()
+    owner_receipt: AgentRunReceipt | None = None
 
 
 class CheckpointPort(Protocol):
@@ -96,6 +101,7 @@ class UsageSink(Protocol):
 @dataclass(frozen=True, slots=True)
 class SessionProvenance:
     identity: SessionIdentity
+    agent_run_id: AgentRunId | None = None
 
     @property
     def generated(self) -> bool:
@@ -122,6 +128,7 @@ class SessionResult:
     rounds: int = 0
     failure: str | None = None
     provenance: SessionProvenance | None = None
+    agent_run_id: AgentRunId | None = None
 
     @property
     def generated(self) -> bool:
@@ -170,7 +177,7 @@ class AgentLoop:
 
     async def _run(self, spec: SessionSpec) -> SessionResult:
         validate_session_admission(spec)
-        provenance = SessionProvenance(spec.identity)
+        provenance = SessionProvenance(spec.identity, spec.agent_run_id)
         messages = list(render_prompt(spec.template, spec.context))
         self._ensure_context_fits(messages, spec)
         observations: list[ToolObservation] = []
@@ -343,7 +350,17 @@ class AgentLoop:
                             "CHECKPOINT_ERROR",
                             provenance,
                         )
-                if decision.accepted and decision.committed:
+                if (
+                    decision.accepted
+                    and decision.committed
+                    and (
+                        spec.agent_run_id is None
+                        or (
+                            decision.owner_receipt is not None
+                            and decision.owner_receipt.agent_run_id == spec.agent_run_id
+                        )
+                    )
+                ):
                     return self._result(
                         SessionState.Closed,
                         SessionExit.Completed,
@@ -399,9 +416,7 @@ class AgentLoop:
             provenance,
         )
 
-    def _ensure_context_fits(
-        self, messages: list[PromptMessage], spec: SessionSpec
-    ) -> int:
+    def _ensure_context_fits(self, messages: list[PromptMessage], spec: SessionSpec) -> int:
         if self.context_manager is not None:
             return self.context_manager.fit_messages(
                 messages,
@@ -542,6 +557,7 @@ class AgentLoop:
             outcome_published=outcome_published,
             rounds=rounds,
             provenance=provenance,
+            agent_run_id=provenance.agent_run_id,
         )
 
     @classmethod

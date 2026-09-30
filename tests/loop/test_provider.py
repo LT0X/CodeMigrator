@@ -15,6 +15,7 @@ from codemigrator.runtime.provider import (
     ProviderRegistry,
     ProviderRequest,
     TokenUsage,
+    provider_adapter_id_for_label,
     retry_delay_for_attempt,
 )
 
@@ -64,6 +65,14 @@ def test_provider_registry_resolves_only_the_locked_provider() -> None:
                 output_cap=200,
             )
         )
+
+
+def test_opencode_labeled_config_uses_existing_openai_compatible_adapter() -> None:
+    label = {"Provider": "OpenCode"}["Provider"]
+    assert provider_adapter_id_for_label(label) == "openai-compatible"
+    assert provider_adapter_id_for_label("openai-compatible") == "openai-compatible"
+    with pytest.raises(ValueError, match="unsupported provider label"):
+        provider_adapter_id_for_label("unknown")
 
 
 @pytest.mark.asyncio
