@@ -24,6 +24,7 @@ from codemigrator.runtime.advice import AdviceValidationContext, advice_proposal
 from codemigrator.runtime.agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from codemigrator.runtime.cas import CasObject
 from codemigrator.runtime.contracts import (
+    ActorPhaseReceipt,
     AdviceMessage,
     ApiCommand,
     CancelCommand,
@@ -63,7 +64,8 @@ class RecordingScheduler:
     def __init__(self) -> None:
         self.calls = []
 
-    async def advance_one_round(self, run_id, logical_key):
+    async def advance_one_round(self, run_id, logical_key, *, on_agent_run_started=None):
+        del on_agent_run_started
         self.calls.append((run_id, logical_key))
         return ExecutionRoundDecision(
             complete=len(self.calls) == 2,
@@ -130,6 +132,67 @@ async def test_run_created_receipt_is_recovered_from_committed_event(run_id):
 
 
 @pytest.mark.asyncio
+async def test_execute_agent_run_start_is_committed_while_scheduler_is_still_running(run_id):
+    class PausingScheduler:
+        def __init__(self, agent_run_id):
+            self.agent_run_id = agent_run_id
+            self.started = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def advance_one_round(self, owner_run_id, logical_key, *, on_agent_run_started):
+            receipt = await on_agent_run_started(owner_run_id, self.agent_run_id)
+            assert receipt.receipt_key == f"agent_run.started:{self.agent_run_id}"
+            self.started.set()
+            await self.resume.wait()
+            return ExecutionRoundDecision(complete=False, dispatch_count=1)
+
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(
+            run_id=run_id,
+            status=RunStatus.Executing,
+            version=1,
+            frozen_plan_sha256="c" * 64,
+        ),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    record = AgentRun(
+        agent_run_id=AgentRunId(uuid4()),
+        owner_kind="run",
+        owner_id=run_id,
+        logical_task_key="execute:slice-1:g0",
+        phase=Phase.Execute,
+        session_kind=SessionKind.Implementation,
+        thread_id=str(uuid4()),
+        model_binding_sha256="a" * 64,
+        context_sha256="b" * 64,
+        toolset_sha256="c" * 64,
+        template_sha256="d" * 64,
+    )
+    await store.create_or_get_agent_run(record)
+    scheduler = PausingScheduler(record.agent_run_id)
+    actor = RunActor(run_id, store, execution_scheduler=scheduler)
+    await actor.start()
+
+    round_task = asyncio.create_task(actor.advance_execution_round(run_id, "execute-round-0"))
+    await asyncio.wait_for(scheduler.started.wait(), timeout=1)
+    snapshot = await store.snapshot(run_id)
+    lifecycle = [event for event in snapshot.events if event.event_type == "agent_run.started"]
+    assert len(lifecycle) == 1
+    assert lifecycle[0].data["agent_run_id"] == str(record.agent_run_id)
+    assert snapshot.state.status is RunStatus.Executing
+    commits_after_start = store.commit_count
+    assert await actor.record_agent_run_started(run_id, record.agent_run_id) == ActorPhaseReceipt(
+        run_id, f"agent_run.started:{record.agent_run_id}", lifecycle[0].sequence
+    )
+    assert store.commit_count == commits_after_start
+
+    scheduler.resume.set()
+    await round_task
+    await actor.stop()
+
+
+@pytest.mark.asyncio
 async def test_plan_acceptance_atomically_commits_frozen_plan_agent_and_owner_receipts(run_id):
     store = InMemoryRuntimeStore()
     actor = RunActor(run_id, store)
@@ -149,6 +212,7 @@ async def test_plan_acceptance_atomically_commits_frozen_plan_agent_and_owner_re
         template_sha256="d" * 64,
     )
     await store.create_or_get_agent_run(created)
+    start_receipt = await actor.record_agent_run_started(run_id, created.agent_run_id)
     result_object = CasObject("e" * 64, 12)
     frozen_plan_payload = b"canonical frozen plan object"
     plan_object = CasObject(
@@ -180,9 +244,13 @@ async def test_plan_acceptance_atomically_commits_frozen_plan_agent_and_owner_re
     assert snapshot.state.status is RunStatus.Executing
     assert snapshot.state.frozen_plan_sha256 == frozen_plan_hash
     assert {event.event_type for event in snapshot.events} >= {
+        "agent_run.started",
         "agent_run.terminal",
         "run.plan.accepted",
     }
+    event_types = [event.event_type for event in snapshot.events]
+    assert event_types.index("agent_run.started") < event_types.index("agent_run.terminal")
+    assert start_receipt.receipt_key == f"agent_run.started:{created.agent_run_id}"
     assert await store.load_agent_run_receipt(completed.agent_run_id) == completion.receipt
     assert (
         await store.get_cas_reference("run", run_id, f"agent-result:{completed.agent_run_id}")

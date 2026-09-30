@@ -151,6 +151,13 @@ class WorkflowCommandMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionRoundFinishedMessage:
+    logical_key: str
+    decision: ExecutionRoundDecision | None = None
+    error: Exception | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CancelCommand:
     expected_version: int
 
@@ -205,6 +212,7 @@ RuntimeMessage: TypeAlias = (
     | RecoveryCommandMessage
     | AdviceMessage
     | WorkflowCommandMessage
+    | ExecutionRoundFinishedMessage
 )
 
 
@@ -222,26 +230,30 @@ def agent_run_lifecycle_spec(
     if receipt is None:
         if record.is_terminal:
             raise ValueError("terminal AgentRun event requires owner receipt")
-        return EventSpec(
-            "agent_run.started",
-            {
-                "agent_run_id": str(record.agent_run_id),
-                "phase": record.phase.value,
-                "session_kind": record.session_kind.value,
-            },
-        )
-    if not record.is_terminal or receipt.agent_run_id != record.agent_run_id:
-        raise ValueError("terminal event requires matching AgentRun receipt")
-    return EventSpec(
-        "agent_run.terminal",
-        {
+        data: dict[str, object] = {
+            "receipt_key": f"agent_run.started:{record.agent_run_id}",
             "agent_run_id": str(record.agent_run_id),
             "phase": record.phase.value,
             "session_kind": record.session_kind.value,
-            "exit": record.exit.value if record.exit is not None else None,
-            "receipt_category": receipt.category,
-        },
-    )
+        }
+        if record.slice_ref is not None:
+            data["slice_id"] = str(record.slice_ref.slice_id)
+            data["generation"] = record.slice_ref.generation
+        return EventSpec("agent_run.started", data)
+    if not record.is_terminal or receipt.agent_run_id != record.agent_run_id:
+        raise ValueError("terminal event requires matching AgentRun receipt")
+    data = {
+        "receipt_key": f"agent_run.terminal:{record.agent_run_id}",
+        "agent_run_id": str(record.agent_run_id),
+        "phase": record.phase.value,
+        "session_kind": record.session_kind.value,
+        "exit": record.exit.value if record.exit is not None else None,
+        "receipt_category": receipt.category,
+    }
+    if record.slice_ref is not None:
+        data["slice_id"] = str(record.slice_ref.slice_id)
+        data["generation"] = record.slice_ref.generation
+    return EventSpec("agent_run.terminal", data)
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +310,7 @@ __all__ = [
     "CandidateCheckpointFact",
     "CreateRunCommand",
     "EventSpec",
+    "ExecutionRoundFinishedMessage",
     "ExecuteRoundResult",
     "ExecutionRoundDecision",
     "ExecutionReceiptMessage",

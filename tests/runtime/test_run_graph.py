@@ -183,10 +183,19 @@ class FakePlanLedger:
 
 
 class FakePlanOwner:
-    def __init__(self, *, persist: bool = True) -> None:
+    def __init__(self, *, persist: bool = True, start_persist: bool | None = None) -> None:
         self.persist = persist
+        self.start_persist = persist if start_persist is None else start_persist
         self.accepted = []
         self.receipts: set[str] = set()
+        self.started: list[object] = []
+
+    async def record_agent_run_started(self, run_id, agent_run_id):
+        self.started.append(agent_run_id)
+        key = f"agent_run.started:{agent_run_id}"
+        if self.start_persist:
+            self.receipts.add(key)
+        return ActorPhaseReceipt(run_id, key, 2)
 
     async def accept_plan(self, run_id, completion, frozen_plan):
         self.accepted.append((run_id, completion, frozen_plan))
@@ -304,6 +313,29 @@ async def test_plan_feedback_reuses_one_agent_run_and_caps_retries_at_three(run_
     assert [len(feedback) for feedback in session.feedback] == [0, 1, 1, 1]
     assert len(set(session.identities)) == 1
     assert len(ledger.proposals) == len(owner.accepted) == 1
+    assert owner.started == [session.agent_run.agent_run_id]
+
+
+@pytest.mark.asyncio
+async def test_plan_does_not_call_provider_until_agent_run_start_receipt_is_committed(
+    run_id,
+) -> None:
+    from codemigrator.core.models.plan import PlanProposal
+
+    session = FakePlanSession(run_id, [PlanProposal.model_construct()])
+    owner = FakePlanOwner(persist=False)
+    workflow = PlanProposalWorkflow(
+        sessions=FakePlanSessionFactory(session),
+        validator=FakePlanValidator([True]),
+        ledger=FakePlanLedger(),
+        owner=owner,
+    )
+
+    with pytest.raises(ValueError, match="started AgentRun receipt"):
+        await workflow.run(run_id)
+
+    assert owner.started == [session.agent_run.agent_run_id]
+    assert session.feedback == []
 
 
 @pytest.mark.asyncio
@@ -311,7 +343,7 @@ async def test_plan_is_not_accepted_without_owner_receipt(run_id) -> None:
     from codemigrator.core.models.plan import PlanProposal
 
     session = FakePlanSession(run_id, [PlanProposal.model_construct()])
-    owner = FakePlanOwner(persist=False)
+    owner = FakePlanOwner(persist=False, start_persist=True)
     workflow = PlanProposalWorkflow(
         sessions=FakePlanSessionFactory(session),
         validator=FakePlanValidator([True]),

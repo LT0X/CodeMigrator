@@ -13,7 +13,10 @@ import asyncpg  # type: ignore[import-untyped]
 
 from codemigrator.core import SecretRegistry
 
+from .draft_graph import DraftOwnerPort, MigrationSessionGraph
+from .graph_composition import RuntimeGraphAssembly, RuntimeGraphConfigurationError
 from .observability import DEFAULT_SENTINEL_SINKS, SentinelSuite
+from .run_graph import RunGraphActorPort, RunWorkflowGraph
 
 
 class PostgreSQLUnavailable(ConnectionError):
@@ -235,12 +238,14 @@ class RuntimeApplication:
     """Small production composition root; adapters are supplied at construction."""
 
     lifecycle: AsyncAppLifecycle
+    graph_assembly: RuntimeGraphAssembly | None = None
 
     @classmethod
     def from_dsn(
         cls,
         dsn: str,
         *,
+        graph_assembly: RuntimeGraphAssembly | None = None,
         secret_registry: SecretRegistry | None = None,
         sentinel_outputs: Mapping[str, object] | None = None,
     ) -> RuntimeApplication:
@@ -259,8 +264,19 @@ class RuntimeApplication:
             AsyncAppLifecycle(
                 PostgreSQLAdvisoryLock(dsn),
                 readiness_check=readiness_check,
-            )
+            ),
+            graph_assembly,
         )
+
+    def build_run_graph(self, actor: RunGraphActorPort) -> RunWorkflowGraph:
+        if self.graph_assembly is None:
+            raise RuntimeGraphConfigurationError("runtime graph assembly is not configured")
+        return self.graph_assembly.build_run_graph(actor)
+
+    def build_draft_graph(self, owner: DraftOwnerPort) -> MigrationSessionGraph:
+        if self.graph_assembly is None:
+            raise RuntimeGraphConfigurationError("runtime graph assembly is not configured")
+        return self.graph_assembly.build_draft_graph(owner)
 
     async def run(self) -> int:
         await self.lifecycle.start()

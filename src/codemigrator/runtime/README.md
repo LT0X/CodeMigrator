@@ -16,6 +16,16 @@ Run actor、事务编排、调度、集成、恢复、观测装配和唯一 app 
 
 唯一 console script `codemigrator-app = codemigrator.runtime:main`。
 
+## V7 图与 AgentRun
+
+`RuntimeGraphAssembly` 在 runtime 组合根注入 ProviderRegistry、ContextManager、ToolGateway、RuntimeStore、CAS、usage sink 与图 checkpointer，并编译独立的 `MigrationSessionGraph` 和 `RunWorkflowGraph`。Run、Draft、AgentRun 使用彼此隔离的 checkpointer；缺少依赖、阶段工厂或 saver 隔离时 fail closed。该 assembly 不改变八子包边界，也不提供绕过现有 API/owner port 的写入口。
+
+该 assembly 是显式注入 seam：当前没有默认 production PLAN/VERIFY/REPORT/Draft runner factories；`RuntimeApplication.from_dsn()` 不会自行创建该 assembly。API 的 `ApiBackend` 也仍为 host-supplied Protocol，因此组件/API fake 测试不等同于真实后端到 Web 的 E2E。
+
+每个完整模型会话由一个持久 AgentRun 标识，`create_agent` 只承载会话内部模型/工具循环。固定模型绑定由 ProviderRegistry 提供，工具仅暴露授权的 ToolGateway wrapper，每次模型调用前由 M-14 middleware 组装受预算上下文。PlanAgentRun 必须在 provider 调用前取得 RunActor 提交的启动回执；EXECUTE scheduler 将启动与结果命令交回 RunActor mailbox。Actor 提交 PlanValidation/FrozenPlan 或 M-08 候选 checkpoint 等 owner 事实后，图才能消费回执并推进。VERIFY/REPORT 保持确定性。
+
+外层图 checkpoint、AgentRun checkpoint 和候选代码 checkpoint 属于不同恢复边界。LangGraph checkpoint 正文经 host CAS 保存，PG 只保留索引与引用；Draft/只读会话可恢复既有 thread，EXECUTE/Repair 写会话从 M-08 候选代码 checkpoint 重建并创建新 AgentRun/thread。
+
 ## 观测装配
 
 `codemigrator.runtime.observability` 提供运行时观测组合件：事件经统一的 `SecretRegistry` 脱敏后，以 structlog JSONL、进程内核心指标、60 秒快照、固定名称 trace span 和可选的有界 exporter 投影。JSONL 按 64 MiB 分段并写 SHA-256 校验；事件正文上限为 64 KiB，超限只能外置为受控 ArtifactRef。exporter 队列容量为 4096，故障或积压只增加 dropped 计数，不反向修改 Run 状态。

@@ -16,8 +16,10 @@ from codemigrator.runtime.provider import (
     ProviderRegistry,
     ProviderRequest,
     TokenUsage,
+    decode_concatenated_json_objects,
     provider_adapter_id_for_label,
     retry_delay_for_attempt,
+    select_unique_provider_config,
 )
 
 
@@ -71,9 +73,33 @@ def test_provider_registry_resolves_only_the_locked_provider() -> None:
 def test_opencode_labeled_config_uses_existing_openai_compatible_adapter() -> None:
     label = {"Provider": "OpenCode"}["Provider"]
     assert provider_adapter_id_for_label(label) == "openai-compatible"
+    assert provider_adapter_id_for_label("opencode") == "openai-compatible"
     assert provider_adapter_id_for_label("openai-compatible") == "openai-compatible"
     with pytest.raises(ValueError, match="unsupported provider label"):
         provider_adapter_id_for_label("unknown")
+
+
+def test_provider_config_parser_reads_adjacent_json_objects_and_rejects_trailing_garbage() -> None:
+    values = decode_concatenated_json_objects('{"Provider":"opencode"}\n{"model":"safe"}')
+
+    assert values == ({"Provider": "opencode"}, {"model": "safe"})
+    with pytest.raises(ValueError, match="concatenated JSON objects"):
+        decode_concatenated_json_objects('{"Provider":"opencode"} unexpected')
+
+
+def test_provider_config_selection_requires_exactly_one_matching_provider() -> None:
+    payload = '{"Provider":"OpenAI"}{"Provider":"OpenCode","模型":"synthetic"}'
+    assert select_unique_provider_config(payload, "opencode") == {
+        "Provider": "OpenCode",
+        "模型": "synthetic",
+    }
+
+    with pytest.raises(ValueError, match="exactly one matching provider"):
+        select_unique_provider_config(
+            '{"Provider":"OpenCode"}{"Provider":"opencode"}', "OpenCode"
+        )
+    with pytest.raises(ValueError, match="exactly one matching provider"):
+        select_unique_provider_config('{"Provider":"OpenAI"}', "OpenCode")
 
 
 @pytest.mark.asyncio

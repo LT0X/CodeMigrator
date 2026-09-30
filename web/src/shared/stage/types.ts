@@ -32,6 +32,18 @@ export interface SliceProjection {
   readonly lastSequence: number;
 }
 
+export interface AgentRunProjection {
+  readonly id: string;
+  readonly phase: string;
+  readonly sessionKind: string;
+  readonly sliceId: string | null;
+  readonly generation: number | null;
+  readonly state: "RUNNING" | "TERMINAL";
+  readonly exit: string | null;
+  readonly receiptCategory: string | null;
+  readonly lastSequence: number;
+}
+
 export interface TimelineEntry {
   readonly sequence: number;
   readonly type: string;
@@ -59,6 +71,7 @@ export interface StageState {
   readonly connection: ConnectionState;
   readonly runStatus: string;
   readonly slices: Readonly<Record<string, SliceProjection>>;
+  readonly agentRuns: Readonly<Record<string, AgentRunProjection>>;
   readonly timeline: readonly TimelineEntry[];
   readonly celebrations: readonly Celebration[];
   readonly completedIntegrations: readonly string[];

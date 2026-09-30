@@ -76,6 +76,11 @@ from .draft_graph import (
     exploration_task_key,
     trial_translation_task_key,
 )
+from .graph_composition import (
+    AgentGraphInfrastructure,
+    RuntimeGraphAssembly,
+    RuntimeGraphConfigurationError,
+)
 from .integration import (
     IntegrationCoordinator,
     IntegrationItem,
@@ -198,6 +203,7 @@ from .provider import (
     TokenUsage,
     ToolDefinition,
     UsageReceipt,
+    decode_concatenated_json_objects,
     provider_adapter_id_for_label,
     retry_delay_for_attempt,
 )
@@ -281,6 +287,9 @@ def main() -> None:
 
 __all__ = [
     "BoundAgentRun",
+    "AgentGraphInfrastructure",
+    "RuntimeGraphAssembly",
+    "RuntimeGraphConfigurationError",
     "GovernedContextMiddleware",
     "ProviderChatModel",
     "agent_context_digest",
@@ -300,6 +309,7 @@ __all__ = [
     "exploration_task_key",
     "trial_translation_task_key",
     "provider_adapter_id_for_label",
+    "decode_concatenated_json_objects",
     "AgentLoop",
     "ActorRegistry",
     "ActorPhaseReceipt",

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Protocol, cast
+from uuid import UUID
 
 from codemigrator.core import (
     ActiveDispatch,
@@ -23,6 +25,7 @@ from codemigrator.planning import FrozenPlan
 from codemigrator.workspace import CheckpointReceipt, checkpoint_receipt_digest
 
 from .advice import AdviceValidationContext, evaluate_advice
+from .agent_runs import AgentRunId
 from .budget import BudgetLimits, evaluate_budget
 from .contracts import (
     ActorPhaseReceipt,
@@ -37,6 +40,7 @@ from .contracts import (
     ExecuteRoundResult,
     ExecutionReceiptMessage,
     ExecutionRoundDecision,
+    ExecutionRoundFinishedMessage,
     RecoveryCommandMessage,
     ReportSummary,
     RunCreatedReceipt,
@@ -82,7 +86,13 @@ class RepairAdvicePort(Protocol):
 
 
 class ExecutionSchedulerPort(Protocol):
-    async def advance_one_round(self, run_id: RunId, logical_key: str) -> ExecutionRoundDecision:
+    async def advance_one_round(
+        self,
+        run_id: RunId,
+        logical_key: str,
+        *,
+        on_agent_run_started: Callable[[RunId, AgentRunId], Awaitable[ActorPhaseReceipt]],
+    ) -> ExecutionRoundDecision:
         """Idempotently schedule ready Slice AgentRuns and return round status."""
 
 
@@ -133,6 +143,8 @@ class RunActor:
         self.last_error: Exception | None = None
         self._last_dispatch_acceptance: bool | None = None
         self._create_receipt: RunCreatedReceipt | None = None
+        self._execution_round_responses: dict[str, list[asyncio.Future[object]]] = {}
+        self._execution_round_tasks: dict[str, asyncio.Task[None]] = {}
 
     @property
     def state(self) -> RunState | None:
@@ -185,6 +197,22 @@ class RunActor:
                 (completion, frozen_plan),
             ),
         )
+
+    async def record_agent_run_started(
+        self, run_id: RunId, agent_run_id: AgentRunId
+    ) -> ActorPhaseReceipt:
+        receipt = cast(
+            ActorPhaseReceipt,
+            await self._workflow_command(
+                "agent_run_started",
+                run_id,
+                f"agent_run.started:{agent_run_id}",
+                agent_run_id,
+            ),
+        )
+        if receipt.run_id != run_id or not await self.has_receipt(run_id, receipt.receipt_key):
+            raise StoreCommitError("AgentRun cannot proceed without its committed start receipt")
+        return receipt
 
     async def advance_execution_round(self, run_id: RunId, logical_key: str) -> ExecuteRoundResult:
         return cast(
@@ -247,6 +275,8 @@ class RunActor:
                 self.last_error = exc
                 if isinstance(message, WorkflowCommandMessage) and not message.response.done():
                     message.response.set_exception(exc)
+                elif isinstance(message, ExecutionRoundFinishedMessage):
+                    self._finish_execution_round(message.logical_key, error=exc)
             finally:
                 self._queue.task_done()
 
@@ -263,6 +293,8 @@ class RunActor:
             await self._handle_advice(message.advice)
         elif isinstance(message, WorkflowCommandMessage):
             await self._handle_workflow_command(message)
+        elif isinstance(message, ExecutionRoundFinishedMessage):
+            await self._handle_execution_round_finished(message)
 
     async def _handle_workflow_command(self, command: WorkflowCommandMessage) -> None:
         if command.run_id != self.run_id:
@@ -284,13 +316,41 @@ class RunActor:
         if command.kind == "accept_plan":
             await self._accept_plan(command, state)
         elif command.kind == "execute_round":
-            await self._advance_execution(command, state)
+            self._schedule_execution_round(command, state)
+        elif command.kind == "agent_run_started":
+            await self._record_agent_run_started(command, state)
         elif command.kind == "verification":
             await self._commit_verification(command, state)
         elif command.kind == "report":
             await self._commit_report(command, state)
         else:
             raise ValueError("unsupported Run workflow command")
+
+    async def _record_agent_run_started(
+        self, command: WorkflowCommandMessage, state: RunState
+    ) -> None:
+        if not isinstance(command.payload, UUID):
+            raise ValueError("AgentRun start payload is invalid")
+        agent_run_id = AgentRunId(command.payload)
+        record = await self.store.load_agent_run(agent_run_id)
+        if (
+            record is None
+            or record.owner_kind != "run"
+            or record.owner_id != self.run_id
+            or record.phase not in {Phase.Plan, Phase.Execute}
+            or record.is_terminal
+            or state.status not in {RunStatus.Planning, RunStatus.Executing}
+        ):
+            raise StoreCommitError("AgentRun start facts do not match the active Run owner")
+        next_state = replace(state, version=state.version + 1)
+        if not await self._commit(next_state, (agent_run_lifecycle_spec(record),)):
+            raise StoreCommitError("AgentRun start receipt could not be committed")
+        event = _event_for_receipt(await self.store.load(self.run_id), command.logical_key)
+        if event is None:
+            raise StoreCommitError("committed AgentRun start receipt cannot be reloaded")
+        command.response.set_result(
+            ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
+        )
 
     async def _accept_plan(self, command: WorkflowCommandMessage, state: RunState) -> None:
         if not isinstance(command.payload, tuple) or len(command.payload) != 2:
@@ -304,6 +364,7 @@ class RunActor:
         plan_object = completion.plan_object
         plan_hash = frozen_plan.plan_hash
         validation = frozen_plan.validation
+        owner_snapshot = await self.store.load(self.run_id)
         if (
             state.status is not RunStatus.Planning
             or record is None
@@ -316,6 +377,7 @@ class RunActor:
             or agent_receipt.agent_run_id != record.agent_run_id
             or agent_receipt.category != "plan.accepted"
             or record.result_sha256 != result_object.digest
+            or not _has_agent_run_event(owner_snapshot, "agent_run.started", record.agent_run_id)
             or hashlib.sha256(frozen_plan.canonical_payload()).hexdigest() != plan_object.digest
             or not validation.accepted
         ):
@@ -357,18 +419,86 @@ class RunActor:
             ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
         )
 
-    async def _advance_execution(self, command: WorkflowCommandMessage, state: RunState) -> None:
+    def _schedule_execution_round(self, command: WorkflowCommandMessage, state: RunState) -> None:
         if (
             state.status is not RunStatus.Executing
             or state.frozen_plan_sha256 is None
             or self.execution_scheduler is None
         ):
             raise StoreCommitError("EXECUTE requires an active Run and Actor scheduler")
-        decision = await self.execution_scheduler.advance_one_round(
-            self.run_id, command.logical_key
+        self._execution_round_responses.setdefault(command.logical_key, []).append(
+            command.response
         )
+        if command.logical_key in self._execution_round_tasks:
+            return
+        self._execution_round_tasks[command.logical_key] = asyncio.create_task(
+            self._run_execution_scheduler(command.logical_key),
+            name=f"codemigrator-execute-{self.run_id}-{command.logical_key}",
+        )
+
+    async def _run_execution_scheduler(self, logical_key: str) -> None:
+        try:
+            if self.execution_scheduler is None:
+                raise StoreCommitError("EXECUTE scheduler is unavailable")
+            decision = await self.execution_scheduler.advance_one_round(
+                self.run_id,
+                logical_key,
+                on_agent_run_started=self.record_agent_run_started,
+            )
+            if not isinstance(decision, ExecutionRoundDecision):
+                raise TypeError("Actor scheduler returned an invalid execution round")
+            await self.submit(ExecutionRoundFinishedMessage(logical_key, decision=decision))
+        except Exception as exc:
+            await self.submit(ExecutionRoundFinishedMessage(logical_key, error=exc))
+
+    async def _handle_execution_round_finished(
+        self, message: ExecutionRoundFinishedMessage
+    ) -> None:
+        if message.error is not None:
+            self._finish_execution_round(message.logical_key, error=message.error)
+            return
+        state = self._state
+        if state is None or message.decision is None:
+            self._finish_execution_round(
+                message.logical_key,
+                error=StoreCommitError("EXECUTE round completion is missing its Run facts"),
+            )
+            return
+        try:
+            result = await self._commit_execution_round(
+                message.logical_key, state, message.decision
+            )
+        except Exception as exc:
+            self._finish_execution_round(message.logical_key, error=exc)
+        else:
+            self._finish_execution_round(message.logical_key, result=result)
+
+    def _finish_execution_round(
+        self,
+        logical_key: str,
+        *,
+        result: ExecuteRoundResult | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        responses = self._execution_round_responses.pop(logical_key, [])
+        self._execution_round_tasks.pop(logical_key, None)
+        for response in responses:
+            if response.done():
+                continue
+            if error is not None:
+                response.set_exception(error)
+            elif result is not None:
+                response.set_result(result)
+            else:
+                response.set_exception(StoreCommitError("EXECUTE round has no durable result"))
+
+    async def _commit_execution_round(
+        self, logical_key: str, state: RunState, decision: ExecutionRoundDecision
+    ) -> ExecuteRoundResult:
         if not isinstance(decision, ExecutionRoundDecision):
             raise TypeError("Actor scheduler returned an invalid execution round")
+        if state.status is not RunStatus.Executing or state.frozen_plan_sha256 is None:
+            raise StoreCommitError("EXECUTE result arrived after its Run stopped executing")
         completed_ids = set(decision.completed_write_agent_run_ids)
         claimed_ids = {claim.agent_run_id for claim in decision.candidate_claims}
         if (
@@ -379,8 +509,17 @@ class RunActor:
             raise StoreCommitError("EXECUTE candidate checkpoint claim set is incomplete")
         candidate_facts = list(state.candidate_checkpoints)
         candidate_events: list[EventSpec] = []
+        snapshot = await self.store.load(self.run_id)
         for claim in decision.candidate_claims:
             fact = await self._validate_candidate_claim(claim, candidate_facts)
+            record = await self.store.load_agent_run(claim.agent_run_id)
+            terminal_receipt = await self.store.load_agent_run_receipt(claim.agent_run_id)
+            if record is None or terminal_receipt is None:
+                raise StoreCommitError("completed EXECUTE AgentRun has no terminal receipt")
+            if not _has_agent_run_event(snapshot, "agent_run.started", claim.agent_run_id):
+                raise StoreCommitError("completed EXECUTE AgentRun has no committed start receipt")
+            if not _has_agent_run_event(snapshot, "agent_run.terminal", claim.agent_run_id):
+                candidate_events.append(agent_run_lifecycle_spec(record, terminal_receipt))
             current = next(
                 (
                     item
@@ -418,7 +557,7 @@ class RunActor:
                 EventSpec(
                     "run.execute.round",
                     {
-                        "receipt_key": command.logical_key,
+                        "receipt_key": logical_key,
                         "complete": decision.complete,
                         "dispatch_count": decision.dispatch_count,
                     },
@@ -427,13 +566,11 @@ class RunActor:
         )
         if not committed:
             raise StoreCommitError("EXECUTE actor receipt could not be committed")
-        event = _event_for_receipt(await self.store.load(self.run_id), command.logical_key)
+        event = _event_for_receipt(await self.store.load(self.run_id), logical_key)
         assert event is not None
-        command.response.set_result(
-            ExecuteRoundResult(
-                ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence),
-                decision.complete,
-            )
+        return ExecuteRoundResult(
+            ActorPhaseReceipt(self.run_id, logical_key, event.sequence),
+            decision.complete,
         )
 
     async def _validate_candidate_claim(
@@ -1015,6 +1152,20 @@ def _event_for_receipt(snapshot: RuntimeSnapshot | None, receipt_key: str) -> Ru
             if event.data.get("receipt_key") == receipt_key
         ),
         None,
+    )
+
+
+def _has_agent_run_event(
+    snapshot: RuntimeSnapshot | None,
+    event_type: str,
+    agent_run_id: AgentRunId,
+) -> bool:
+    if snapshot is None:
+        return False
+    return any(
+        event.event_type == event_type
+        and event.data.get("agent_run_id") == str(agent_run_id)
+        for event in snapshot.events
     )
 
 

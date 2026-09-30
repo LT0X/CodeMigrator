@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from codemigrator.core import Phase, SessionKind
+from codemigrator.core import Phase, SessionKind, SliceGenerationRef, SliceId
 from codemigrator.runtime.agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from codemigrator.runtime.cas import CasObject
 from codemigrator.runtime.contracts import EventSpec, RunState, agent_run_lifecycle_spec
@@ -75,6 +75,7 @@ def test_record_metadata_round_trip_and_lifecycle_spec_omit_private_refs():
     started = agent_run_lifecycle_spec(record)
     assert started.event_type == "agent_run.started"
     assert started.data == {
+        "receipt_key": f"agent_run.started:{record.agent_run_id}",
         "agent_run_id": str(record.agent_run_id),
         "phase": "PLAN",
         "session_kind": "PLAN_AUXILIARY",
@@ -88,6 +89,22 @@ def test_record_metadata_round_trip_and_lifecycle_spec_omit_private_refs():
     assert "candidate_checkpoint_sha256" not in finished.data
     with pytest.raises(ValueError, match="category"):
         AgentRunReceipt(uuid4(), terminal.agent_run_id, "tool output: secret")
+
+
+def test_execution_lifecycle_event_carries_only_slice_generation_identity():
+    record = replace(
+        run_record(),
+        phase=Phase.Execute,
+        session_kind=SessionKind.Implementation,
+        slice_ref=SliceGenerationRef(
+            slice_id=SliceId(uid()), generation=1, baseline_candidate_oid=None
+        ),
+        candidate_checkpoint_sha256="e" * 64,
+    )
+    started = agent_run_lifecycle_spec(record)
+    assert started.data["slice_id"] == str(record.slice_ref.slice_id)
+    assert started.data["generation"] == 1
+    assert "candidate_checkpoint_sha256" not in started.data
 
 
 @pytest.mark.asyncio

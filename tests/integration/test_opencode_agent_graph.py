@@ -1,0 +1,233 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from codemigrator.core import ModelProfile, Phase, SessionKind, canonical_json_bytes
+from codemigrator.core.ids import new_uuid7
+from codemigrator.runtime.agent_runs import AgentRun, AgentRunId, AgentRunReceipt
+from codemigrator.runtime.binding import LockedModelBinding
+from codemigrator.runtime.cas import FileHostCAS
+from codemigrator.runtime.checkpointer import CasCheckpointSaver
+from codemigrator.runtime.context import ContextEnvelope, ContextSegment
+from codemigrator.runtime.draft import DraftFlow
+from codemigrator.runtime.draft_graph import (
+    DraftAgentCompletion,
+    DraftFlowOwner,
+    MigrationSessionGraph,
+)
+from codemigrator.runtime.langchain_agent import (
+    agent_context_digest,
+    agent_template_digest,
+    agent_toolset_digest,
+    create_bound_agent,
+)
+from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+from codemigrator.runtime.memory import ContextManager, DraftContextIdentity, FormulaNetInputCap
+from codemigrator.runtime.provider import (
+    OpenAICompatibleProvider,
+    ProviderRegistry,
+    provider_adapter_id_for_label,
+    select_unique_provider_config,
+)
+from codemigrator.runtime.store import InMemoryRuntimeStore
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("CODEMIGRATOR_REAL_OPENCODE", "").casefold() not in {"1", "true"},
+    reason="set CODEMIGRATOR_REAL_OPENCODE=1 to make one billed provider call",
+)
+
+
+class _ConservativeCounter:
+    """Bound prompt size by UTF-8 bytes for this one-call transport smoke test."""
+
+    def count(self, messages) -> int:
+        return sum(max(1, len(message.content.encode("utf-8"))) for message in messages)
+
+    def count_tool_schemas(self, tools) -> int:
+        return sum(
+            len(json.dumps(dict(tool.parameters), ensure_ascii=False).encode("utf-8"))
+            for tool in tools
+        )
+
+
+class _UsageSink:
+    def __init__(self) -> None:
+        self._rounds: dict[AgentRunId, dict[str, int]] = {}
+        self.receipts: list[object] = []
+
+    async def reserve_round(self, agent_run_id, call_id: str, *, max_rounds: int):
+        calls = self._rounds.setdefault(agent_run_id, {})
+        if call_id in calls:
+            return calls[call_id]
+        if len(calls) >= max_rounds:
+            return None
+        calls[call_id] = len(calls) + 1
+        return calls[call_id]
+
+    async def record(self, agent_run_id, usage, receipt) -> None:
+        self.receipts.append((agent_run_id, usage, receipt))
+
+
+class _NoToolGateway:
+    def dispatch(self, raw_call, *, cancellation_token=None):
+        raise AssertionError("the live smoke task must not dispatch tools")
+
+
+def _opencode_config() -> dict[str, object]:
+    configured_path = os.environ.get("CODEMIGRATOR_OPENCODE_CONFIG")
+    candidates = (
+        [Path(configured_path)]
+        if configured_path
+        else [
+            Path(__file__).resolve().parents[2] / "my_space/model_api_key.json",
+            Path("/home/xtc/project/CodeM/CodeMigrator/my_space/model_api_key.json"),
+        ]
+    )
+    config_path = next((path for path in candidates if path.is_file()), None)
+    if config_path is None:
+        pytest.fail("local OpenCode provider config is unavailable")
+    return select_unique_provider_config(
+        config_path.read_text(encoding="utf-8"), "OpenCode"
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> None:
+    config = _opencode_config()
+    provider_id = provider_adapter_id_for_label(str(config["Provider"]))
+    model_id = str(config["模型"])
+    binding = LockedModelBinding(
+        provider_id=provider_id,
+        model_id=model_id,
+        profile=ModelProfile.Reasoning,
+        config_revision=hashlib.sha256(
+            json.dumps(
+                {key: value for key, value in config.items() if key != "API Key"},
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+        context_window=int(config["Context Window"]),
+        output_cap=min(32, int(config["模型输出上限"])),
+    )
+    provider = OpenAICompatibleProvider(
+        endpoint=str(config["Base URL"]), api_key=str(config["API Key"])
+    )
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    revision_id = new_uuid7()
+    context_manager = ContextManager(
+        token_counter=_ConservativeCounter(), net_input_cap=FormulaNetInputCap()
+    )
+    envelope = ContextEnvelope(
+        stable=(ContextSegment("stable", "No source snapshot is attached."),)
+    )
+    template = (
+        "You are a read-only CodeMigrator exploration assistant. "
+        "Return exactly OK and do not call tools."
+    )
+    usage_sink = _UsageSink()
+
+    with tempfile.TemporaryDirectory(prefix="codemigrator-opencode-agent-") as temp_dir:
+        cas = FileHostCAS(Path(temp_dir) / "cas")
+        draft_checkpointer = CasCheckpointSaver(
+            cas, store, graph_family="draft", owner_kind="draft", owner_id=draft_id
+        )
+        agent_checkpointer = CasCheckpointSaver(
+            cas, store, graph_family="agent", owner_kind="draft", owner_id=draft_id
+        )
+
+        class Runner:
+            async def run(self, owner_id, logical_task_key, task):
+                agent_run_id = AgentRunId(new_uuid7())
+                context_identity = DraftContextIdentity(owner_id, revision_id, agent_run_id)
+                template_sha = agent_template_digest(
+                    session=SessionKind.ExploreCoordinator.value, template=template
+                )
+                record = AgentRun(
+                    agent_run_id=agent_run_id,
+                    owner_kind="draft",
+                    owner_id=owner_id,
+                    logical_task_key=logical_task_key,
+                    phase=Phase.Plan,
+                    session_kind=SessionKind.ExploreCoordinator,
+                    thread_id=str(new_uuid7()),
+                    model_binding_sha256=binding.digest,
+                    context_sha256=agent_context_digest(
+                        context_identity=context_identity,
+                        envelope=envelope,
+                        phase=Phase.Plan,
+                        session_kind=SessionKind.ExploreCoordinator,
+                        template_sha256=template_sha,
+                        budget=context_manager.budget_catalog.profile("DRAFTING"),
+                    ),
+                    toolset_sha256=agent_toolset_digest(
+                        phase=Phase.Plan,
+                        session_kind=SessionKind.ExploreCoordinator,
+                        owner_kind="draft",
+                    ),
+                    template_sha256=template_sha,
+                )
+                record = await store.create_or_get_agent_run(record)
+                bound = create_bound_agent(
+                    agent_run=record,
+                    binding=binding,
+                    registry=ProviderRegistry({provider_id: provider}),
+                    context_manager=context_manager,
+                    template=template,
+                    envelope=envelope,
+                    gateway=_NoToolGateway(),
+                    usage_sink=usage_sink,
+                    context_identity=context_identity,
+                    checkpointer=agent_checkpointer,
+                )
+                result = await bound.ainvoke(task=task)
+                if result.exit is not SessionExit.Completed or not result.assistant_texts:
+                    raise AssertionError("live OpenCode AgentRun did not complete")
+                result_sha = hashlib.sha256(
+                    canonical_json_bytes(
+                        {
+                            "answer_sha256": hashlib.sha256(
+                                result.assistant_texts[0].encode("utf-8")
+                            ).hexdigest()
+                        }
+                    )
+                ).hexdigest()
+                indexes = await store.list_checkpoint_indexes(record.thread_id)
+                terminal = replace(
+                    record,
+                    state=SessionState.Closed,
+                    exit=SessionExit.Completed,
+                    result_sha256=result_sha,
+                    checkpoint_sha256=indexes[0].object.digest if indexes else None,
+                )
+                receipt = AgentRunReceipt(
+                    new_uuid7(), terminal.agent_run_id, "draft.exploration.completed"
+                )
+                await store.commit_agent_run_receipt(terminal, receipt)
+                return DraftAgentCompletion(terminal, receipt, {"digest": result_sha})
+
+        graph = MigrationSessionGraph(
+            owner=DraftFlowOwner(draft_id=draft_id, flow=DraftFlow(), store=store),
+            agent_runs=store,
+            checkpointer=draft_checkpointer,
+            agent_checkpointer=agent_checkpointer,
+            agent_runner=Runner(),
+        )
+        try:
+            completion = await graph.explore_domain(".", "Respond with the word OK.")
+            assert usage_sink.receipts
+            assert await store.load_agent_run(completion.record.agent_run_id) == completion.record
+            assert (
+                await store.load_agent_run_receipt(completion.record.agent_run_id)
+                == completion.receipt
+            )
+        finally:
+            await provider.aclose()

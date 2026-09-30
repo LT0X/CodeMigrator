@@ -19,7 +19,7 @@ from codemigrator.planning import (
     PlanValidator,
 )
 
-from .agent_runs import AgentRun, AgentRunReceipt
+from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from .cas import CasObject
 from .contracts import ActorPhaseReceipt, ExecuteRoundResult, RunCreatedReceipt
 from .loop_contracts import SessionExit, SessionState
@@ -81,6 +81,10 @@ class PlanAgentSessionFactory(Protocol):
 
 
 class PlanOwnerPort(Protocol):
+    async def record_agent_run_started(
+        self, run_id: RunId, agent_run_id: AgentRunId
+    ) -> ActorPhaseReceipt: ...
+
     async def accept_plan(
         self, run_id: RunId, completion: PlanAgentCompletion, frozen_plan: FrozenPlan
     ) -> ActorPhaseReceipt: ...
@@ -121,6 +125,15 @@ class PlanProposalWorkflow:
             or agent_run.logical_task_key != logical_task_key
         ):
             raise ValueError("PLAN AgentRun identity does not match its Run owner")
+        started = await self.owner.record_agent_run_started(run_id, agent_run.agent_run_id)
+        if (
+            started.run_id != run_id
+            or started.receipt_key != f"agent_run.started:{agent_run.agent_run_id}"
+            or not await self.owner.has_receipt(run_id, started.receipt_key)
+        ):
+            raise ValueError(
+                "PLAN cannot call provider without its committed started AgentRun receipt"
+            )
         feedback: tuple[object, ...] = ()
         for attempt in range(self.feedback_limit + 1):
             proposal = await session.propose(feedback)

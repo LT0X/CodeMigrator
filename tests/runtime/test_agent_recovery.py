@@ -123,7 +123,8 @@ class _OneRoundScheduler:
     def __init__(self, decision: ExecutionRoundDecision) -> None:
         self.decision = decision
 
-    async def advance_one_round(self, run_id, logical_key):
+    async def advance_one_round(self, run_id, logical_key, *, on_agent_run_started=None):
+        del on_agent_run_started
         return self.decision
 
 
@@ -150,11 +151,16 @@ async def _store_with_terminal_agent(
             candidate_checkpoint_sha256=None,
         )
     )
+    started = replace(created, state=SessionState.Running)
+    await store.commit(
+        replace((await store.snapshot(run_id)).state, version=2),
+        (agent_run_lifecycle_spec(started),),
+    )
     terminal_receipt = AgentRunReceipt(uuid4(), record.agent_run_id, "session.terminal")
     await store.commit_agent_run_receipt(
         record,
         terminal_receipt,
-        state=replace((await store.snapshot(run_id)).state, version=2),
+        state=replace((await store.snapshot(run_id)).state, version=3),
         events=(agent_run_lifecycle_spec(record, terminal_receipt),),
     )
     assert created.agent_run_id == record.agent_run_id
