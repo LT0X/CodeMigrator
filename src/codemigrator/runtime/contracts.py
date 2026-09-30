@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TypeAlias
 from uuid import UUID
 
@@ -221,6 +222,21 @@ RuntimeMessage: TypeAlias = (
 class EventSpec:
     event_type: str
     data: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class DraftSessionEventSpec:
+    event_type: str
+    data: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class DraftSessionEvent:
+    draft_id: UUID
+    sequence: int
+    event_type: str
+    data: dict[str, object]
+    timestamp_utc: datetime
 
 
 def agent_run_lifecycle_spec(

@@ -138,6 +138,10 @@ async def test_draft_graph_interrupts_and_resumes_after_durable_answer_receipt(
     )
 
     question_receipt = await graph.ask_user(question)
+    question_events = await store.read_draft_session_events(draft_id, 0)
+    assert [(event.event_type, event.data) for event in question_events] == [
+        ("session.question.asked", {"question_id": str(question.question_id)})
+    ]
     paused = await graph._graph.aget_state(graph.config)
     assert paused is not None
     assert paused.values["draft_id"] == str(draft_id)
@@ -169,6 +173,10 @@ async def test_draft_graph_interrupts_and_resumes_after_durable_answer_receipt(
         selected_option="keep",
     )
     answer_receipt = await resumed_graph.answer_user(answer)
+    answer_events = await store.read_draft_session_events(draft_id, 1)
+    assert [(event.sequence, event.event_type, event.data) for event in answer_events] == [
+        (2, "session.question.answered", {"question_id": str(question.question_id)})
+    ]
     completed = await resumed_graph._graph.aget_state(resumed_graph.config)
     assert completed is not None and completed.next == ()
     assert completed.values["answer_receipt_key"] == answer_receipt.receipt_key
@@ -321,6 +329,13 @@ async def test_close_releases_draft_checkpoint_only_after_last_cas_reference(
     await store.add_cas_reference(checkpoint, "run", shared_owner, "held-by-run")
 
     closed_receipt = await graph.close()
+    assert (await store.read_draft_session_events(draft_id, 0))[-1].event_type == "session.closed"
+    assert (
+        await store.is_draft_session_terminal(
+            draft_id, (await store.read_draft_session_events(draft_id, 0))[-1].sequence
+        )
+        is True
+    )
 
     assert await store.list_checkpoint_indexes(graph.thread_id) == ()
     assert await store.list_checkpoint_indexes(agent_thread) == ()
@@ -451,6 +466,7 @@ async def test_successful_attach_commits_once_then_releases_draft_threads(
 
     request = _create_request(freeze.frozen_artifact_bundle)
     attached = await graph.attach_to_run(run_id, request)
+    assert (await store.read_draft_session_events(draft_id, 0))[-1].data == {"run_id": str(run_id)}
 
     assert attached == receipt
     assert actor.calls == starter.calls == 1

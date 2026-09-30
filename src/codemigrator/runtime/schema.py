@@ -52,6 +52,18 @@ CREATE TABLE IF NOT EXISTS draft_owner_facts (
     PRIMARY KEY (draft_id, receipt_key)
 );
 
+CREATE TABLE IF NOT EXISTS draft_session_events (
+    draft_id uuid NOT NULL,
+    receipt_key text NOT NULL,
+    sequence bigint NOT NULL CHECK (sequence > 0),
+    event_type text NOT NULL,
+    data jsonb NOT NULL,
+    timestamp_utc timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (draft_id, sequence)
+);
+
+ALTER TABLE draft_session_events ADD COLUMN IF NOT EXISTS receipt_key text;
+
 CREATE TABLE IF NOT EXISTS cas_objects (
     digest char(64) PRIMARY KEY CHECK (digest ~ '^[0-9a-f]{64}$'),
     size_bytes bigint NOT NULL CHECK (size_bytes >= 0),

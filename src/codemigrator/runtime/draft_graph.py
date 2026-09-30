@@ -17,7 +17,7 @@ from codemigrator.core import CreateRun, RunId, canonical_json_bytes
 from codemigrator.core.paths import normalize_repo_relative_paths
 
 from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
-from .contracts import DraftOwnerReceipt, RunCreatedReceipt
+from .contracts import DraftOwnerReceipt, DraftSessionEventSpec, RunCreatedReceipt
 from .create_run import CreateRunService
 from .draft import DraftConflictError, DraftFlow
 from .draft_models import AskUserAnswer, AskUserQuestion, DraftFreezeReceipt
@@ -91,7 +91,15 @@ class DraftFlowOwner:
         if previous is not None:
             return previous[0]
         return await self.store.commit_draft_owner_fact(
-            self.draft_id, receipt_key, "draft.ask_user.question", body
+            self.draft_id,
+            receipt_key,
+            "draft.ask_user.question",
+            body,
+            events=(
+                DraftSessionEventSpec(
+                    "session.question.asked", {"question_id": str(question.question_id)}
+                ),
+            ),
         )
 
     async def load_question(self, question_id: str) -> AskUserQuestion | None:
@@ -131,6 +139,11 @@ class DraftFlowOwner:
             _answer_receipt_key(answer.question_id),
             "draft.ask_user.answer",
             answer.model_dump(mode="json"),
+            events=(
+                DraftSessionEventSpec(
+                    "session.question.answered", {"question_id": str(answer.question_id)}
+                ),
+            ),
         )
 
     async def has_receipt(self, receipt_key: str) -> bool:
@@ -139,7 +152,14 @@ class DraftFlowOwner:
     async def commit_lifecycle_fact(
         self, receipt_key: str, category: str, fact: Mapping[str, object]
     ) -> DraftOwnerReceipt:
-        return await self.store.commit_draft_owner_fact(self.draft_id, receipt_key, category, fact)
+        events: tuple[DraftSessionEventSpec, ...] = ()
+        if category == "draft.attached_to_run":
+            events = (DraftSessionEventSpec("session.attached_to_run", {"run_id": fact["run_id"]}),)
+        elif category == "draft.closed":
+            events = (DraftSessionEventSpec("session.closed", {"status": "CLOSED"}),)
+        return await self.store.commit_draft_owner_fact(
+            self.draft_id, receipt_key, category, fact, events=events
+        )
 
 
 class DraftAgentRunStore(Protocol):

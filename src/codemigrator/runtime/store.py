@@ -7,6 +7,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from uuid import UUID
 
@@ -32,6 +33,8 @@ from .cas import CasObject, CheckpointIndex, PendingWriteIndex
 from .contracts import (
     CandidateCheckpointFact,
     DraftOwnerReceipt,
+    DraftSessionEvent,
+    DraftSessionEventSpec,
     EventSpec,
     RunState,
     RuntimeEvent,
@@ -81,6 +84,8 @@ class RuntimeStore(Protocol):
         receipt_key: str,
         category: str,
         fact: Mapping[str, object],
+        *,
+        events: Sequence[DraftSessionEventSpec] = (),
     ) -> DraftOwnerReceipt:
         """Persist an immutable Draft fact and its idempotency receipt."""
 
@@ -91,6 +96,14 @@ class RuntimeStore(Protocol):
     async def list_draft_owner_facts(
         self, draft_id: UUID
     ) -> tuple[tuple[DraftOwnerReceipt, dict[str, object]], ...]: ...
+
+    async def read_draft_session_events(
+        self, draft_id: UUID, after_sequence: int
+    ) -> tuple[DraftSessionEvent, ...]: ...
+
+    async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None: ...
+
+    async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool: ...
 
     async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
         """Load the committed owner receipt, if any."""
@@ -209,6 +222,12 @@ class InMemoryRuntimeStore:
         self._agent_receipts: dict[AgentRunId, AgentRunReceipt] = {}
         self._agent_lock = asyncio.Lock()
         self._draft_facts: dict[tuple[UUID, str], tuple[DraftOwnerReceipt, dict[str, object]]] = {}
+        self._draft_events: dict[UUID, list[DraftSessionEvent]] = {}
+        self._draft_event_specs: dict[
+            tuple[UUID, str], tuple[tuple[str, dict[str, object]], ...]
+        ] = {}
+        self._draft_conditions: dict[UUID, asyncio.Condition] = {}
+        self._draft_terminals: dict[UUID, int] = {}
         self._cas_refs: dict[tuple[str, UUID, str], CasObject] = {}
         self._checkpoints: dict[tuple[str, str, str], CheckpointIndex] = {}
         self._pending_writes: dict[tuple[str, str, str, str, int], PendingWriteIndex] = {}
@@ -242,20 +261,63 @@ class InMemoryRuntimeStore:
         receipt_key: str,
         category: str,
         fact: Mapping[str, object],
+        *,
+        events: Sequence[DraftSessionEventSpec] = (),
     ) -> DraftOwnerReceipt:
         receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
+        event_data = _prepare_draft_events(events, self.secret_registry)
         async with self._agent_lock:
             key = (draft_id, receipt_key)
             previous = self._draft_facts.get(key)
             if previous is not None:
-                if previous[0] != receipt or previous[1] != payload:
+                if (
+                    previous[0] != receipt
+                    or previous[1] != payload
+                    or self._draft_event_specs[key] != event_data
+                ):
                     raise StoreCommitError("Draft owner fact replay mismatch")
                 return previous[0]
             if self._fail_next:
                 self._fail_next = False
                 raise StoreCommitError("injected commit failure")
             self._draft_facts[key] = (receipt, payload)
+            self._draft_event_specs[key] = event_data
+            ledger = self._draft_events.setdefault(draft_id, [])
+            first_sequence = len(ledger) + 1
+            ledger.extend(
+                DraftSessionEvent(
+                    draft_id, first_sequence + index, event_type, data, datetime.now(UTC)
+                )
+                for index, (event_type, data) in enumerate(event_data)
+            )
+            if category in {"draft.attached_to_run", "draft.closed"}:
+                self._draft_terminals[draft_id] = len(ledger)
+            condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
+            async with condition:
+                condition.notify_all()
             return receipt
+
+    async def read_draft_session_events(
+        self, draft_id: UUID, after_sequence: int
+    ) -> tuple[DraftSessionEvent, ...]:
+        return tuple(
+            event
+            for event in self._draft_events.get(draft_id, ())
+            if event.sequence > after_sequence
+        )
+
+    async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None:
+        condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
+        async with condition:
+            await condition.wait_for(
+                lambda: (
+                    len(self._draft_events.get(draft_id, ())) > after_sequence
+                    or self._draft_terminals.get(draft_id, float("inf")) <= after_sequence
+                )
+            )
+
+    async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool:
+        return self._draft_terminals.get(draft_id, float("inf")) <= after_sequence
 
     async def load_draft_owner_fact(
         self, draft_id: UUID, receipt_key: str
@@ -604,15 +666,22 @@ class PostgreSQLRuntimeStore:
         receipt_key: str,
         category: str,
         fact: Mapping[str, object],
+        *,
+        events: Sequence[DraftSessionEventSpec] = (),
     ) -> DraftOwnerReceipt:
         receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
+        event_data = _prepare_draft_events(events, self.secret_registry)
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", str(draft_id)
+                )
+                inserted = await connection.fetchval(
                     """INSERT INTO draft_owner_facts(
                         draft_id, receipt_key, category, fact_sha256, fact
                     ) VALUES ($1,$2,$3,$4,$5::jsonb)
-                    ON CONFLICT (draft_id, receipt_key) DO NOTHING""",
+                    ON CONFLICT (draft_id, receipt_key) DO NOTHING
+                    RETURNING receipt_key""",
                     draft_id,
                     receipt_key,
                     category,
@@ -636,7 +705,105 @@ class PostgreSQLRuntimeStore:
                 )
                 if stored_receipt != receipt or stored != payload:
                     raise StoreCommitError("Draft owner fact replay mismatch")
+                if inserted is not None:
+                    first_sequence = await connection.fetchval(
+                        """SELECT COALESCE(MAX(sequence), 0) + 1
+                        FROM draft_session_events WHERE draft_id=$1""",
+                        draft_id,
+                    )
+                    for index, (event_type, data) in enumerate(event_data):
+                        await connection.execute(
+                            """INSERT INTO draft_session_events
+                            (draft_id, receipt_key, sequence, event_type, data)
+                            VALUES ($1,$2,$3,$4,$5::jsonb)""",
+                            draft_id,
+                            receipt_key,
+                            first_sequence + index,
+                            event_type,
+                            json.dumps(data, sort_keys=True, separators=(",", ":")),
+                        )
+                    if event_data or category in {"draft.attached_to_run", "draft.closed"}:
+                        await connection.execute(
+                            "SELECT pg_notify('draft_session_events', $1)", str(draft_id)
+                        )
+                else:
+                    replay_rows = await connection.fetch(
+                        """SELECT event_type, data FROM draft_session_events
+                        WHERE draft_id=$1 AND receipt_key=$2 ORDER BY sequence""",
+                        draft_id,
+                        receipt_key,
+                    )
+                    replay_events = tuple(
+                        (
+                            str(_row_value(row, "event_type")),
+                            _decode_draft_fact(_row_value(row, "data")),
+                        )
+                        for row in replay_rows
+                    )
+                    if replay_events != event_data:
+                        raise StoreCommitError("Draft owner fact replay mismatch")
                 return stored_receipt
+
+    async def read_draft_session_events(
+        self, draft_id: UUID, after_sequence: int
+    ) -> tuple[DraftSessionEvent, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT sequence, event_type, data, timestamp_utc FROM draft_session_events
+                WHERE draft_id=$1 AND sequence>$2 ORDER BY sequence""",
+                draft_id,
+                after_sequence,
+            )
+        return tuple(
+            DraftSessionEvent(
+                draft_id,
+                int(_row_value(row, "sequence")),
+                str(_row_value(row, "event_type")),
+                _decode_draft_fact(_row_value(row, "data")),
+                _row_value(row, "timestamp_utc").astimezone(UTC),
+            )
+            for row in rows
+        )
+
+    async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None:
+        loop = asyncio.get_running_loop()
+        wake = loop.create_future()
+
+        def listener(_connection: Any, _pid: int, _channel: str, payload: str) -> None:
+            if payload == str(draft_id) and not wake.done():
+                wake.set_result(None)
+
+        async with self.pool.acquire() as connection:
+            await connection.add_listener("draft_session_events", listener)
+            try:
+                latest = await connection.fetchval(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM draft_session_events WHERE draft_id=$1",
+                    draft_id,
+                )
+                terminal = await connection.fetchval(
+                    """SELECT EXISTS (SELECT 1 FROM draft_owner_facts WHERE draft_id=$1
+                    AND category IN ('draft.attached_to_run', 'draft.closed'))""",
+                    draft_id,
+                )
+                if latest > after_sequence or (terminal and latest <= after_sequence):
+                    return
+                await wake
+            finally:
+                await connection.remove_listener("draft_session_events", listener)
+
+    async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool:
+        async with self.pool.acquire() as connection:
+            return bool(
+                await connection.fetchval(
+                    """SELECT EXISTS (
+                    SELECT 1 FROM draft_owner_facts
+                    WHERE draft_id=$1 AND category IN ('draft.attached_to_run', 'draft.closed')
+                ) AND (SELECT COALESCE(MAX(sequence), 0)
+                       FROM draft_session_events WHERE draft_id=$1) <= $2""",
+                    draft_id,
+                    after_sequence,
+                )
+            )
 
     async def load_draft_owner_fact(
         self, draft_id: UUID, receipt_key: str
@@ -1515,6 +1682,80 @@ def _redact_event_data(value: dict[str, object], registry: SecretRegistry) -> di
     if not result.accepted or not isinstance(result.value, dict):
         raise ValueError("observation rejected")
     return cast(dict[str, object], result.value)
+
+
+_DRAFT_EVENT_FIELDS: dict[str, frozenset[str]] = {
+    "session.question.asked": frozenset({"question_id"}),
+    "session.question.answered": frozenset({"question_id"}),
+    "session.attached_to_run": frozenset({"run_id"}),
+    "session.closed": frozenset({"status"}),
+    "agent_run.started": frozenset(
+        {"agent_run_id", "phase", "session_kind", "slice_id", "generation"}
+    ),
+    "agent_run.terminal": frozenset(
+        {
+            "agent_run_id",
+            "phase",
+            "session_kind",
+            "slice_id",
+            "generation",
+            "exit",
+            "receipt_category",
+        }
+    ),
+}
+
+
+def _prepare_draft_events(
+    events: Sequence[DraftSessionEventSpec], registry: SecretRegistry
+) -> tuple[tuple[str, dict[str, object]], ...]:
+    prepared = []
+    for event in events:
+        fields = _DRAFT_EVENT_FIELDS.get(event.event_type)
+        if fields is None:
+            raise StoreCommitError("Draft session event type is not durable")
+        if event.event_type in {"session.question.asked", "session.question.answered"}:
+            required = {"question_id"}
+        elif event.event_type == "session.attached_to_run":
+            required = {"run_id"}
+        elif event.event_type == "session.closed":
+            required = {"status"}
+        else:
+            required = {"agent_run_id", "phase", "session_kind"}
+            if event.event_type == "agent_run.terminal":
+                required |= {"exit", "receipt_category"}
+        if not required <= event.data.keys():
+            raise StoreCommitError("Draft session event fields are incomplete")
+        projected = {key: value for key, value in event.data.items() if key in fields}
+        if event.event_type == "session.closed" and projected != {"status": "CLOSED"}:
+            raise StoreCommitError("Draft close event status is invalid")
+        try:
+            if event.event_type.startswith("agent_run."):
+                if projected["phase"] not in {item.value for item in Phase} or projected[
+                    "session_kind"
+                ] not in {item.value for item in SessionKind}:
+                    raise ValueError("AgentRun public enum is invalid")
+                if event.event_type == "agent_run.terminal" and (
+                    projected["exit"] not in {item.value for item in SessionExit}
+                    or not isinstance(projected["receipt_category"], str)
+                    or not projected["receipt_category"]
+                ):
+                    raise ValueError("AgentRun terminal summary is invalid")
+            for key in ("question_id", "run_id", "agent_run_id", "slice_id"):
+                if key in projected:
+                    UUID(str(projected[key]))
+            if ("slice_id" in projected) != ("generation" in projected):
+                raise ValueError("slice fields must be paired")
+            if "generation" in projected and (
+                type(projected["generation"]) is not int or projected["generation"] < 0
+            ):
+                raise ValueError("slice generation is invalid")
+            projected = _redact_event_data(projected, registry)
+            projected = _decode_draft_fact(canonical_json_bytes(projected))
+        except (TypeError, ValueError) as exc:
+            raise StoreCommitError("Draft session event data is invalid") from exc
+        prepared.append((event.event_type, projected))
+    return tuple(prepared)
 
 
 def _make_draft_receipt(
