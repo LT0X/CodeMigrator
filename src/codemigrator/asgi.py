@@ -31,8 +31,14 @@ def create_production_app(
 ) -> FastAPI:
     """Bind API ports to PostgreSQLRuntimeStore and the RunActor owner adapter."""
 
-    def store_factory(pool: asyncpg.Pool[asyncpg.Record]) -> ApiCommandStorePort:
-        return cast(ApiCommandStorePort, PostgreSQLRuntimeStore(pool))
+    def store_factory(
+        pool: asyncpg.Pool[asyncpg.Record],
+        write_connection: asyncpg.Connection[asyncpg.Record],
+    ) -> ApiCommandStorePort:
+        return cast(
+            ApiCommandStorePort,
+            PostgreSQLRuntimeStore(pool, write_connection=write_connection),
+        )
 
     def owner_factory(store: ApiCommandStorePort) -> RunCreationOwnerPort | None:
         if preflight is None or graph_starter is None:

@@ -6,7 +6,8 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -862,11 +863,34 @@ class PostgreSQLRuntimeStore:
 
     The pool/connection object is deliberately accepted at the adapter boundary;
     runtime logic never imports or manages a database connection directly.
+    Production composition supplies the advisory-lock connection for every write;
+    standalone stores may omit it and use the pool for isolated tests and tools.
     """
 
-    def __init__(self, pool: Any, *, secret_registry: SecretRegistry | None = None) -> None:
+    def __init__(
+        self,
+        pool: Any,
+        *,
+        secret_registry: SecretRegistry | None = None,
+        write_connection: Any | None = None,
+    ) -> None:
         self.pool = pool
         self.secret_registry = secret_registry or SecretRegistry()
+        self._write_connection = write_connection
+        self._write_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def _acquire_write_connection(self) -> AsyncIterator[Any]:
+        """Serialize writes on the lock session so lock loss aborts active writes."""
+        if self._write_connection is None:
+            async with self.pool.acquire() as connection:
+                yield connection
+            return
+
+        async with self._write_lock:
+            if self._write_connection.is_closed():
+                raise StoreCommitError("application write connection is closed")
+            yield self._write_connection
 
     async def commit_draft_owner_fact(
         self,
@@ -879,7 +903,7 @@ class PostgreSQLRuntimeStore:
     ) -> DraftOwnerReceipt:
         receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
         event_data = _prepare_draft_events(events, self.secret_registry)
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 await connection.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", str(draft_id)
@@ -1061,7 +1085,7 @@ class PostgreSQLRuntimeStore:
 
     async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
         _validate_new_agent_run(record)
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 if record.owner_kind == "run":
                     owner_row = await connection.fetchrow(
@@ -1151,7 +1175,7 @@ class PostgreSQLRuntimeStore:
         events: Sequence[EventSpec] = (),
         cas_references: Sequence[tuple[str, CasObject]] = (),
     ) -> AgentRunReceipt:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
                     "SELECT metadata FROM agent_runs WHERE agent_run_id = $1 FOR UPDATE",
@@ -1271,7 +1295,7 @@ class PostgreSQLRuntimeStore:
     async def add_cas_reference(
         self, object_ref: CasObject, owner_kind: str, owner_id: UUID, reference_key: str
     ) -> None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 await _add_cas_reference_with_connection(
                     connection, object_ref, owner_kind, owner_id, reference_key
@@ -1294,7 +1318,7 @@ class PostgreSQLRuntimeStore:
     async def release_cas_reference(
         self, owner_kind: str, owner_id: UUID, reference_key: str
     ) -> CasObject | None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 return await _release_cas_reference_with_connection(
                     connection, owner_kind, owner_id, reference_key
@@ -1306,7 +1330,7 @@ class PostgreSQLRuntimeStore:
         return frozenset(str(_row_value(row, "digest")).strip() for row in rows)
 
     async def publish_checkpoint_index(self, index: CheckpointIndex) -> None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 await connection.execute(
                     """INSERT INTO graph_threads(thread_id, graph_family, owner_kind, owner_id)
@@ -1369,7 +1393,7 @@ class PostgreSQLRuntimeStore:
             return await _list_checkpoint_indexes_with_connection(connection, thread_id, namespace)
 
     async def publish_pending_write_index(self, index: PendingWriteIndex) -> None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 await connection.execute(
                     """INSERT INTO graph_threads(thread_id, graph_family, owner_kind, owner_id)
@@ -1463,7 +1487,7 @@ class PostgreSQLRuntimeStore:
         )
 
     async def delete_checkpoint_thread(self, thread_id: str) -> tuple[CasObject, ...]:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 thread = await connection.fetchrow(
                     "SELECT owner_kind, owner_id FROM graph_threads WHERE thread_id=$1 FOR UPDATE",
@@ -1532,7 +1556,7 @@ class PostgreSQLRuntimeStore:
         )
 
     async def initialize(self) -> None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             await connection.execute(RUNTIME_SCHEMA_SQL)
 
     async def execute_api_command(
@@ -1560,7 +1584,7 @@ class PostgreSQLRuntimeStore:
         transaction_context: RuntimeStoreTransaction | None = None
         outcome: dict[str, object]
         try:
-            async with self.pool.acquire() as connection:
+            async with self._acquire_write_connection() as connection:
                 async with connection.transaction():
                     await connection.fetchval(
                         "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
@@ -1683,7 +1707,7 @@ class PostgreSQLRuntimeStore:
         )
 
     async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             updated = await connection.execute(
                 """UPDATE run_graph_start_handoffs SET status='STARTED',
                 started_at=COALESCE(started_at, clock_timestamp())
@@ -1797,7 +1821,7 @@ class PostgreSQLRuntimeStore:
             return await self._create_with_connection(
                 transaction.connection, state, events, evolution=evolution
             )
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 await self._create_with_connection(connection, state, events, evolution=evolution)
             snapshot = await self.load(state.run_id)
@@ -1860,7 +1884,7 @@ class PostgreSQLRuntimeStore:
         *,
         evolution: EvolutionSegmentDraft | None = None,
     ) -> RuntimeSnapshot:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 locked = await connection.fetchrow(
                     "SELECT run_id FROM runtime_runs WHERE run_id = $1 FOR UPDATE",
@@ -1916,7 +1940,7 @@ class PostgreSQLRuntimeStore:
             character not in "0123456789abcdef" for character in template_sha256
         ):
             raise ValueError("template digest must be SHA-256")
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 locked = await connection.fetchrow(
                     "SELECT run_id FROM runtime_runs WHERE run_id = $1 FOR UPDATE",

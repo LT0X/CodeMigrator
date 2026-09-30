@@ -91,8 +91,9 @@ class _BackendSlot:
 
 
 class _PostgreSQLApplicationLock:
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, *, server_settings: Mapping[str, str] | None = None) -> None:
         self._dsn = dsn
+        self._server_settings = dict(server_settings) if server_settings is not None else None
         self._connection: asyncpg.Connection[asyncpg.Record] | None = None
         self._termination_callback: Callable[[], None] | None = None
         self._intentional_release = False
@@ -105,7 +106,7 @@ class _PostgreSQLApplicationLock:
         self._termination_callback = callback
 
     async def acquire(self) -> bool:
-        connection = await asyncpg.connect(self._dsn)
+        connection = await asyncpg.connect(self._dsn, server_settings=self._server_settings)
         try:
             acquired = bool(
                 await connection.fetchval(
@@ -165,7 +166,10 @@ def create_production_app(
     dsn: str,
     *,
     config: ApiConfig,
-    store_factory: Callable[[asyncpg.Pool[asyncpg.Record]], ApiCommandStorePort],
+    store_factory: Callable[
+        [asyncpg.Pool[asyncpg.Record], asyncpg.Connection[asyncpg.Record]],
+        ApiCommandStorePort,
+    ],
     owner_factory: Callable[[ApiCommandStorePort], RunCreationOwnerPort | None],
     stop_server: Callable[[], Awaitable[None]],
     shutdown: Callable[[], Awaitable[None]] | None = None,
@@ -183,7 +187,8 @@ def create_production_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         lifespan_loop = asyncio.get_running_loop()
         pool: asyncpg.Pool[asyncpg.Record] | None = None
-        lock = _PostgreSQLApplicationLock(dsn)
+        settings = dict(pool_server_settings) if pool_server_settings is not None else None
+        lock = _PostgreSQLApplicationLock(dsn, server_settings=settings)
         backend: ProductionApiBackend | None = None
         lock_acquired = False
         lock_lost = False
@@ -235,13 +240,15 @@ def create_production_app(
                     app.state.runtime_shutdown_error = "ServerStopFailed"
 
         try:
-            settings = dict(pool_server_settings) if pool_server_settings is not None else None
             pool = await asyncpg.create_pool(dsn, server_settings=settings)
             lock.set_termination_callback(on_lock_termination)
             lock_acquired = await lock.acquire()
             if not lock_acquired:
                 raise RuntimeError("another CodeMigrator application instance is active")
-            store = store_factory(pool)
+            lock_connection = lock.connection
+            if lock_connection is None:
+                raise RuntimeError("application lock connection is unavailable")
+            store = store_factory(pool, lock_connection)
             await store.initialize()
             async with pool.acquire() as connection:
                 if await connection.fetchval("SELECT 1") != 1:
