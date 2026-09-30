@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -120,6 +121,36 @@ async def test_openai_compatible_provider_maps_request_and_usage() -> None:
         ],
         "max_tokens": 200,
     }
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_maps_langchain_any_tool_choice_to_required() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-structured",
+                "model": "test-model",
+                "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    request = replace(_request(_binding()), tool_choice="any")
+    await OpenAICompatibleProvider(
+        endpoint="https://provider.invalid/v1",
+        api_key="secret",
+        client=client,
+    ).complete(request)
+    await client.aclose()
+
+    payload = seen["payload"]
+    assert isinstance(payload, dict)
+    assert payload["tool_choice"] == "required"
 
 
 @pytest.mark.asyncio

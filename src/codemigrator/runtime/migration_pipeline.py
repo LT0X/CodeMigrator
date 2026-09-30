@@ -110,7 +110,7 @@ _STAGE_DIRS = {
 
 
 class PlannerAdvisor(Protocol):
-    """A bounded advisory port; machine validation remains authoritative."""
+    """Legacy V6 file-pipeline hint; it never supplies a V7 PlanProposal."""
 
     def advise(
         self, analysis: AnalysisResult, artifacts: DraftArtifacts
@@ -275,7 +275,12 @@ def _validate_stage_progression(stages: Mapping[str, str]) -> None:
 
 
 class ProjectMigrationPipeline:
-    """Run the complete pre-Run drafting and post-freeze migration workflow."""
+    """Run the V6 file-level compatibility workflow, not the production Run graph.
+
+    The V7 RunWorkflowGraph uses PlanProposalWorkflow and the Actor receipt gate.
+    This prototype keeps its deterministic local derivation and records optional
+    planner advice as advisory rationale only.
+    """
 
     def run(self, request: ProjectMigrationPipelineRequest) -> ProjectMigrationPipelineReport:
         source = request.source.expanduser().resolve()
@@ -634,6 +639,8 @@ class ProjectMigrationPipeline:
             snapshot_oid=analysis.snapshot_oid,
             limits=limits,
         )
+        # This compatibility pipeline's local derivation remains separate from
+        # the V7 structured PlanAgentRun proposal path.
         proposal = _align_proposal_to_executor(derive_plan_proposal(inputs), analysis, snapshot)
         rationale = list(proposal.planner_rationale)
         advice = planner_payload.get("advice")

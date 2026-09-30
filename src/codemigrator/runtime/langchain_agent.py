@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
+from langchain.agents.structured_output import ToolStrategy
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
@@ -115,7 +116,13 @@ def agent_template_digest(*, session: str, template: str) -> str:
     ).hexdigest()
 
 
-def agent_toolset_digest(*, phase: Phase, session_kind: SessionKind, owner_kind: str) -> str:
+def agent_toolset_digest(
+    *,
+    phase: Phase,
+    session_kind: SessionKind,
+    owner_kind: str,
+    response_format: type[BaseModel] | None = None,
+) -> str:
     """Digest the closed policy projection and the exact schemas given to LangChain."""
 
     if owner_kind not in {"run", "draft"}:
@@ -138,7 +145,31 @@ def agent_toolset_digest(*, phase: Phase, session_kind: SessionKind, owner_kind:
         "session_kind": session_kind.value,
         "tools": toolset,
     }
-    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+    digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+    if response_format is None:
+        return digest
+    output_tool = _structured_output_tool_definition(response_format)
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "toolset_sha256": digest,
+                "structured_output": {
+                    "name": output_tool.name,
+                    "description": output_tool.description,
+                    "parameters": dict(output_tool.parameters),
+                },
+            }
+        )
+    ).hexdigest()
+
+
+def _structured_output_tool_definition(schema: type[BaseModel]) -> ToolDefinition:
+    json_schema = schema.model_json_schema()
+    return ToolDefinition(
+        name=schema.__name__,
+        description=schema.__doc__ or "",
+        parameters=json_schema,
+    )
 
 
 def agent_context_digest(
@@ -241,6 +272,9 @@ class ProviderChatModel(BaseChatModel):
     _usage_sink: AgentUsageSink = PrivateAttr()
     _cancellation: CancellationToken = PrivateAttr()
     _tools: tuple[ToolDefinition, ...] = PrivateAttr()
+    _request_tools: tuple[ToolDefinition, ...] = PrivateAttr()
+    _request_tool_choice: str | None = PrivateAttr(default=None)
+    _structured_output: type[BaseModel] | None = PrivateAttr(default=None)
     _max_rounds: int = PrivateAttr()
     _usages: list[TokenUsage] = PrivateAttr(default_factory=list)
     _calls: int = PrivateAttr(default=0)
@@ -255,12 +289,15 @@ class ProviderChatModel(BaseChatModel):
         usage_sink: AgentUsageSink,
         cancellation: CancellationToken,
         max_rounds: int,
+        structured_output: type[BaseModel] | None = None,
     ) -> None:
         super().__init__()
         self._provider = provider
         self._binding = binding
         self._agent_run_id = agent_run_id
         self._tools = tools
+        self._request_tools = tools
+        self._structured_output = structured_output
         self._usage_sink = usage_sink
         self._cancellation = cancellation
         self._max_rounds = max_rounds
@@ -278,8 +315,37 @@ class ProviderChatModel(BaseChatModel):
         return self._calls
 
     def bind_tools(self, tools: Sequence[Any], **kwargs: Any) -> ProviderChatModel:
-        if {tool.name for tool in tools} != {tool.name for tool in self._tools}:
+        names = {tool.name for tool in tools}
+        authorized_names = {tool.name for tool in self._tools}
+        output_name = self._structured_output.__name__ if self._structured_output else None
+        expected_names = authorized_names | ({output_name} if output_name else set())
+        if names != expected_names:
             raise ValueError("LangChain tool set differs from frozen AgentRun policy")
+        definitions = list(self._tools)
+        if output_name is not None:
+            output_tool = next(tool for tool in tools if tool.name == output_name)
+            schema = output_tool.args_schema
+            if hasattr(schema, "model_json_schema"):
+                parameters = schema.model_json_schema()
+            elif isinstance(schema, dict):
+                parameters = schema
+            else:
+                raise ValueError("structured output tool has no closed JSON schema")
+            expected_schema = _structured_output_tool_definition(
+                cast(type[BaseModel], self._structured_output)
+            ).parameters
+            if parameters.get("properties") != expected_schema.get("properties"):
+                raise ValueError("structured output schema differs from the frozen AgentRun schema")
+            definitions.append(
+                ToolDefinition(
+                    name=output_name,
+                    description=str(output_tool.description or ""),
+                    parameters=parameters,
+                )
+            )
+        self._request_tools = tuple(definitions)
+        tool_choice = kwargs.get("tool_choice")
+        self._request_tool_choice = str(tool_choice) if isinstance(tool_choice, str) else None
         return self
 
     def _generate(
@@ -322,7 +388,8 @@ class ProviderChatModel(BaseChatModel):
             ProviderRequest(
                 binding=self._binding,
                 messages=tuple(_prompt_message(message) for message in messages),
-                tools=self._tools,
+                tools=self._request_tools,
+                tool_choice=self._request_tool_choice,
                 cancellation=self._cancellation,
             )
         )
@@ -518,6 +585,7 @@ class BoundAgentRun:
                 usages=self.model.usages[usage_start:],
                 rounds=self.model.rounds,
                 agent_run_id=self.agent_run.agent_run_id,
+                structured_response=output.get("structured_response"),
             )
 
 
@@ -535,6 +603,7 @@ def create_bound_agent(
     context_identity: ContextPackIdentity | DraftContextIdentity | None = None,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     eviction_audit_sink: EvictionAuditSink | None = None,
+    response_format: type[BaseModel] | None = None,
 ) -> BoundAgentRun:
     if checkpointer is None:
         raise ValueError("persistent AgentRun requires a LangGraph checkpointer")
@@ -548,24 +617,31 @@ def create_bound_agent(
         agent_run.phase, agent_run.session_kind, draft=agent_run.owner_kind == "draft"
     )
     definitions = tuple(_tool_definition(name) for name in tool_names)
+    if response_format is not None and not isinstance(response_format, type):
+        raise TypeError("structured response format must be a Pydantic model class")
     if (
         agent_toolset_digest(
             phase=agent_run.phase,
             session_kind=agent_run.session_kind,
             owner_kind=agent_run.owner_kind,
+            response_format=response_format,
         )
         != agent_run.toolset_sha256
     ):
         raise ValueError("AgentRun toolset digest differs from the authorized tool schemas")
     counter = context_manager.token_counter
     count_schemas = getattr(counter, "count_tool_schemas", None)
-    if definitions and not callable(count_schemas):
+    structured_definition = (
+        _structured_output_tool_definition(response_format) if response_format is not None else None
+    )
+    schema_definitions = definitions + ((structured_definition,) if structured_definition else ())
+    if schema_definitions and not callable(count_schemas):
         raise ContextBudgetError(
             "exact provider tool schema counter is required", code="CONTEXT_CAPABILITY_INVALID"
         )
     tool_schema_tokens = (
-        cast(Callable[[tuple[ToolDefinition, ...]], int], count_schemas)(definitions)
-        if definitions
+        cast(Callable[[tuple[ToolDefinition, ...]], int], count_schemas)(schema_definitions)
+        if schema_definitions
         else 0
     )
     if type(tool_schema_tokens) is not int or tool_schema_tokens < 0:
@@ -639,6 +715,7 @@ def create_bound_agent(
         usage_sink=usage_sink,
         cancellation=token,
         max_rounds=budget.max_rounds,
+        structured_output=response_format,
     )
     tools = []
     for definition in definitions:
@@ -670,7 +747,13 @@ def create_bound_agent(
         watermark_pct=budget.eviction_watermark_pct,
         eviction_audit_sink=eviction_audit_sink,
     )
-    graph = create_agent(model, tools, middleware=[middleware], checkpointer=checkpointer)
+    graph = create_agent(
+        model,
+        tools,
+        middleware=[middleware],
+        checkpointer=checkpointer,
+        response_format=ToolStrategy(response_format) if response_format is not None else None,
+    )
     return BoundAgentRun(agent_run, graph, model, checkpointer, budget.max_rounds)
 
 

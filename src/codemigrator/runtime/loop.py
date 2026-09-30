@@ -129,6 +129,7 @@ class SessionResult:
     failure: str | None = None
     provenance: SessionProvenance | None = None
     agent_run_id: AgentRunId | None = None
+    structured_response: object | None = None
 
     @property
     def generated(self) -> bool:

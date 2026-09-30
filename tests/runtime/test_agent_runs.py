@@ -7,6 +7,7 @@ import pytest
 
 from codemigrator.core import Phase, SessionKind
 from codemigrator.runtime.agent_runs import AgentRun, AgentRunId, AgentRunReceipt
+from codemigrator.runtime.cas import CasObject
 from codemigrator.runtime.contracts import EventSpec, RunState, agent_run_lifecycle_spec
 from codemigrator.runtime.loop_contracts import SessionExit, SessionState
 from codemigrator.runtime.store import (
@@ -165,13 +166,22 @@ async def test_owner_receipt_replay_and_run_event_are_atomic():
         receipt_id=uuid4(), agent_run_id=record.agent_run_id, category="plan.accepted"
     )
     event = EventSpec("plan.accepted", {"agent_run_id": str(record.agent_run_id)})
+    cas_references = ((f"agent-result:{record.agent_run_id}", CasObject("e" * 64, 12)),)
     committed = await store.commit_agent_run_receipt(
-        terminal, receipt, state=RunState(run_id=record.owner_id, version=1), events=(event,)
+        terminal,
+        receipt,
+        state=RunState(run_id=record.owner_id, version=1),
+        events=(event,),
+        cas_references=cas_references,
     )
     assert committed == receipt
     assert await store.load_agent_run(record.agent_run_id) == terminal
     assert await store.load_agent_run_receipt(record.agent_run_id) == receipt
     assert (await store.load(record.owner_id)).events[0].event_type == "plan.accepted"
+    assert (
+        await store.get_cas_reference("run", record.owner_id, cas_references[0][0])
+        == cas_references[0][1]
+    )
     retried_receipt = replace(receipt, receipt_id=uuid4())
     assert (
         await store.commit_agent_run_receipt(
@@ -179,6 +189,7 @@ async def test_owner_receipt_replay_and_run_event_are_atomic():
             retried_receipt,
             state=RunState(run_id=record.owner_id, version=1),
             events=(event,),
+            cas_references=cas_references,
         )
         == receipt
     )
@@ -191,7 +202,12 @@ async def test_owner_receipt_failed_commit_rolls_back_record_and_event():
     record = run_record()
     await store.create(RunState(run_id=record.owner_id), ())
     await store.create_or_get_agent_run(record)
-    terminal = replace(record, state=SessionState.Closed, exit=SessionExit.Completed)
+    terminal = replace(
+        record,
+        state=SessionState.Closed,
+        exit=SessionExit.Completed,
+        result_sha256="e" * 64,
+    )
     receipt = AgentRunReceipt(
         receipt_id=uuid4(), agent_run_id=record.agent_run_id, category="plan.accepted"
     )
@@ -202,10 +218,15 @@ async def test_owner_receipt_failed_commit_rolls_back_record_and_event():
             receipt,
             state=RunState(run_id=record.owner_id, version=1),
             events=(EventSpec("plan.accepted"),),
+            cas_references=((f"agent-result:{record.agent_run_id}", CasObject("e" * 64, 12)),),
         )
     assert await store.load_agent_run(record.agent_run_id) == record
     assert await store.load_agent_run_receipt(record.agent_run_id) is None
     assert (await store.load(record.owner_id)).events == ()
+    assert (
+        await store.get_cas_reference("run", record.owner_id, f"agent-result:{record.agent_run_id}")
+        is None
+    )
 
 
 @pytest.mark.asyncio

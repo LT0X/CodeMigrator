@@ -17,6 +17,7 @@ from codemigrator.core import (
     SessionBudgetProfile,
     SessionKind,
 )
+from codemigrator.core.models.plan import PlanProposal
 from codemigrator.runtime.agent_runs import AgentRun
 from codemigrator.runtime.binding import LockedModelBinding
 from codemigrator.runtime.context import ContextEnvelope, ContextSegment
@@ -193,6 +194,7 @@ def _prepare_agent_kwargs(kwargs):
                 phase=run.phase,
                 session_kind=run.session_kind,
                 owner_kind=run.owner_kind,
+                response_format=kwargs.get("response_format"),
             ),
             template_sha256=template_sha256,
         )
@@ -277,6 +279,61 @@ async def test_create_agent_keeps_binding_and_records_each_provider_receipt() ->
         "receipt-1",
         "receipt-2",
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_agent_returns_structured_output_without_gateway_dispatch() -> None:
+    binding = _binding()
+    run = _run(binding)
+    provider = FakeProvider(
+        [
+            _response(
+                "",
+                tools=(
+                    ProviderToolCall(
+                        "PlanProposal",
+                        json.dumps(
+                            {
+                                "slices": [],
+                                "edges": [],
+                                "integration_ranks": {},
+                                "planner_rationale": [],
+                            }
+                        ),
+                        "plan-1",
+                    ),
+                ),
+            )
+        ]
+    )
+    gateway = FakeGateway()
+    bound = create_bound_agent(
+        agent_run=run,
+        binding=binding,
+        registry=ProviderRegistry({"openai-compatible": provider}),
+        context_manager=ContextManager(
+            token_counter=ExactCounter(), net_input_cap=FormulaNetInputCap()
+        ),
+        template="plan role",
+        envelope=ContextEnvelope(stable=(ContextSegment("stable", "frozen facts"),)),
+        gateway=gateway,
+        context_identity=_context_identity(run, binding),
+        response_format=PlanProposal,
+    )
+
+    result = await bound.ainvoke(task="Return a structured plan")
+
+    assert result.structured_response == PlanProposal(
+        slices=[], edges=[], integration_ranks={}, planner_rationale=[]
+    )
+    assert [tool.name for tool in provider.requests[0].tools] == [
+        "ReadFile",
+        "QuerySourceAst",
+        "Exec",
+        "PlanProposal",
+    ]
+    assert provider.requests[0].tool_choice == "any"
+    assert gateway.calls == []
 
 
 @pytest.mark.asyncio

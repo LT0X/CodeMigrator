@@ -70,6 +70,7 @@ class ProviderRequest:
     binding: LockedModelBinding
     messages: tuple[PromptMessage, ...]
     tools: tuple[ToolDefinition, ...] = DEFAULT_TOOL_DEFINITIONS
+    tool_choice: str | None = None
     cancellation: CancellationSignal | None = None
 
 
@@ -278,6 +279,10 @@ class OpenAICompatibleProvider:
             "tools": _openai_tools(request.tools),
             "max_tokens": request.binding.output_cap,
         }
+        if request.tool_choice is not None:
+            payload["tool_choice"] = (
+                "required" if request.tool_choice == "any" else request.tool_choice
+            )
         decoded = await _post_json(
             self._client,
             f"{self.endpoint}/chat/completions",
@@ -352,6 +357,7 @@ class AnthropicProvider:
                 "system": system_parts,
                 "messages": messages,
                 "tools": _anthropic_tools(request.tools),
+                **({"tool_choice": {"type": "any"}} if request.tool_choice == "any" else {}),
                 "max_tokens": request.binding.output_cap,
             },
             cancellation=request.cancellation,

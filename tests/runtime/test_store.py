@@ -15,9 +15,9 @@ from codemigrator.runtime.store import (
 
 
 def test_runtime_state_round_trips_through_json_for_durable_store():
-    from .conftest import uid
+    from .conftest import create_run, uid
 
-    state = RunState(run_id=uid())
+    state = RunState(run_id=uid(), create_request=create_run(), frozen_plan_sha256="a" * 64)
     assert _decode_state(_dump_json(state)) == state
 
 

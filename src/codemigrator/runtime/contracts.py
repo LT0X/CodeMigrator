@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import TypeAlias
 
@@ -22,6 +23,80 @@ from .budget import BudgetUsage
 class CreateRunCommand:
     run_id: RunId
     create_run: CreateRun
+
+
+@dataclass(frozen=True, slots=True)
+class RunCreatedReceipt:
+    """Durable acknowledgement derived from the committed ``run.created`` event."""
+
+    run_id: RunId
+    receipt_key: str
+    event_sequence: int
+    state_version: int
+
+    def __post_init__(self) -> None:
+        if self.event_sequence != 1 or self.state_version != 1:
+            raise ValueError("RunCreated receipt must identify the initial Run commit")
+        if self.receipt_key != f"run.created:{self.run_id}":
+            raise ValueError("RunCreated receipt key does not match its Run")
+
+
+@dataclass(frozen=True, slots=True)
+class ActorPhaseReceipt:
+    run_id: RunId
+    receipt_key: str
+    event_sequence: int
+
+    def __post_init__(self) -> None:
+        if not self.receipt_key or self.event_sequence < 1:
+            raise ValueError("actor phase receipt is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ExecuteRoundResult:
+    receipt: ActorPhaseReceipt
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionRoundDecision:
+    complete: bool
+    dispatch_count: int
+
+    def __post_init__(self) -> None:
+        if type(self.dispatch_count) is not int or self.dispatch_count < 0:
+            raise ValueError("execution dispatch count must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationSummary:
+    passed: bool
+    result_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.passed) is not bool or not _is_sha256(self.result_sha256):
+            raise ValueError("verification summary is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ReportSummary:
+    result_sha256: str
+    status: RunStatus
+
+    def __post_init__(self) -> None:
+        if not _is_sha256(self.result_sha256):
+            raise ValueError("report summary digest is invalid")
+        if self.status not in {RunStatus.Completed, RunStatus.PartiallyCompleted}:
+            raise ValueError("report status must be terminal and successful")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowCommandMessage:
+    kind: str
+    run_id: RunId
+    logical_key: str
+    payload: object
+    response: asyncio.Future[object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +153,7 @@ RuntimeMessage: TypeAlias = (
     | BudgetEventMessage
     | RecoveryCommandMessage
     | AdviceMessage
+    | WorkflowCommandMessage
 )
 
 
@@ -133,6 +209,8 @@ class RunState:
     adopted_advice_ids: tuple[str, ...] = ()
     pending_advice_ids: tuple[str, ...] = ()
     reporting_halted: bool = False
+    create_request: CreateRun | None = None
+    frozen_plan_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,20 +226,35 @@ class RuntimeSnapshot:
     events: tuple[RuntimeEvent, ...]
 
 
+def _is_sha256(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 __all__ = [
     "AdviceMessage",
     "ApiCommand",
     "ApiCommandPayload",
+    "ActorPhaseReceipt",
     "BudgetEventMessage",
     "CancelCommand",
     "CreateRunCommand",
     "EventSpec",
+    "ExecuteRoundResult",
+    "ExecutionRoundDecision",
     "ExecutionReceiptMessage",
     "RecoveryCommandMessage",
     "RunState",
     "RuntimeEvent",
     "RuntimeMessage",
     "RuntimeSnapshot",
+    "RunCreatedReceipt",
+    "ReportSummary",
     "SessionInputCommand",
+    "VerificationSummary",
+    "WorkflowCommandMessage",
     "agent_run_lifecycle_spec",
 ]

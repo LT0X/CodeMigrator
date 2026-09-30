@@ -1,27 +1,43 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from dataclasses import replace
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
 from codemigrator.core import (
     Advice,
     AdviceKind,
+    BranchPrefix,
     FailureReason,
+    Phase,
     ResidentRole,
     RunStatus,
+    SessionKind,
     Sha256,
 )
 from codemigrator.runtime.actor import ActorRegistry, RunActor
 from codemigrator.runtime.advice import AdviceValidationContext, advice_proposal_hash
+from codemigrator.runtime.agent_runs import AgentRun, AgentRunId, AgentRunReceipt
+from codemigrator.runtime.cas import CasObject
 from codemigrator.runtime.contracts import (
     AdviceMessage,
     ApiCommand,
     CancelCommand,
     CreateRunCommand,
+    EventSpec,
+    ExecutionRoundDecision,
+    ReportSummary,
+    RunState,
     SessionInputCommand,
+    VerificationSummary,
 )
 from codemigrator.runtime.integration import IntegrationCoordinator, IntegrationItem
+from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+from codemigrator.runtime.run_graph import PlanAgentCompletion
 from codemigrator.runtime.store import InMemoryRuntimeStore
 
 from .conftest import create_run, uid
@@ -41,6 +57,18 @@ class RecordingRepairDispatch:
 
     async def dispatch_adopted(self, advice):
         self.advices.append(advice)
+
+
+class RecordingScheduler:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def advance_one_round(self, run_id, logical_key):
+        self.calls.append((run_id, logical_key))
+        return ExecutionRoundDecision(
+            complete=len(self.calls) == 2,
+            dispatch_count=2 if len(self.calls) == 1 else 0,
+        )
 
 
 async def start_actor(run_id):
@@ -65,6 +93,155 @@ async def test_one_actor_serializes_mailbox_and_commits_state_with_events(run_id
     assert snapshot.state.version == 3
     assert [event.sequence for event in snapshot.events] == [1, 2, 3]
     assert store.commit_count == 3
+    await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_run_created_receipt_is_recovered_from_committed_event(run_id):
+    store = InMemoryRuntimeStore()
+    actor = RunActor(run_id, store)
+    await actor.start()
+
+    receipt = await actor.create(create_run())
+
+    assert receipt is not None
+    snapshot = await store.snapshot(run_id)
+    assert receipt.run_id == run_id
+    assert receipt.event_sequence == 1
+    assert receipt.state_version == snapshot.state.version == 1
+    assert snapshot.state.create_request == create_run()
+    assert snapshot.events[0].data["receipt_key"] == receipt.receipt_key
+    await actor.submit(ApiCommand(SessionInputCommand(kind="advance", payload={})))
+    await actor.join()
+    await actor.stop()
+
+    recovered = RunActor(run_id, store)
+    await recovered.start()
+    commit_count = store.commit_count
+    assert await recovered.create(create_run()) == receipt
+    assert (
+        await recovered.create(
+            create_run().model_copy(update={"branch_prefix": BranchPrefix("other")})
+        )
+        is None
+    )
+    assert store.commit_count == commit_count
+    await recovered.stop()
+
+
+@pytest.mark.asyncio
+async def test_plan_acceptance_atomically_commits_frozen_plan_agent_and_owner_receipts(run_id):
+    store = InMemoryRuntimeStore()
+    actor = RunActor(run_id, store)
+    await actor.start()
+    assert await actor.create(create_run()) is not None
+    created = AgentRun(
+        agent_run_id=AgentRunId(uuid4()),
+        owner_kind="run",
+        owner_id=run_id,
+        logical_task_key=f"plan:{run_id}",
+        phase=Phase.Plan,
+        session_kind=SessionKind.PlanAuxiliary,
+        thread_id=str(uuid4()),
+        model_binding_sha256="a" * 64,
+        context_sha256="b" * 64,
+        toolset_sha256="c" * 64,
+        template_sha256="d" * 64,
+    )
+    await store.create_or_get_agent_run(created)
+    result_object = CasObject("e" * 64, 12)
+    frozen_plan_payload = b"canonical frozen plan object"
+    plan_object = CasObject(
+        hashlib.sha256(frozen_plan_payload).hexdigest(), len(frozen_plan_payload)
+    )
+    frozen_plan_hash = "f" * 64
+    completed = replace(
+        created,
+        state=SessionState.Closed,
+        exit=SessionExit.Completed,
+        result_sha256=result_object.digest,
+    )
+    completion = PlanAgentCompletion(
+        record=completed,
+        receipt=AgentRunReceipt(uuid4(), completed.agent_run_id, "plan.accepted"),
+        result_object=result_object,
+        plan_object=plan_object,
+    )
+    frozen_plan = SimpleNamespace(
+        plan_hash=frozen_plan_hash,
+        validation=SimpleNamespace(accepted=True),
+        canonical_payload=lambda: frozen_plan_payload,
+    )
+
+    receipt = await actor.accept_plan(run_id, completion, frozen_plan)
+
+    snapshot = await store.snapshot(run_id)
+    assert receipt.receipt_key == f"run.plan.accepted:{run_id}"
+    assert snapshot.state.status is RunStatus.Executing
+    assert snapshot.state.frozen_plan_sha256 == frozen_plan_hash
+    assert {event.event_type for event in snapshot.events} >= {
+        "agent_run.terminal",
+        "run.plan.accepted",
+    }
+    assert await store.load_agent_run_receipt(completed.agent_run_id) == completion.receipt
+    assert (
+        await store.get_cas_reference("run", run_id, f"agent-result:{completed.agent_run_id}")
+        == result_object
+    )
+    assert await store.get_cas_reference("run", run_id, "frozen-plan") == plan_object
+    commits = store.commit_count
+    assert await actor.accept_plan(run_id, completion, frozen_plan) == receipt
+    assert store.commit_count == commits
+    await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_execute_round_receipts_are_actor_idempotent_and_verify_report_are_deterministic(
+    run_id,
+):
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(
+            run_id=run_id,
+            status=RunStatus.Executing,
+            version=1,
+            frozen_plan_sha256="c" * 64,
+        ),
+        (
+            EventSpec(
+                "run.created",
+                {"receipt_key": f"run.created:{run_id}", "status": RunStatus.Executing.value},
+            ),
+        ),
+    )
+    scheduler = RecordingScheduler()
+    actor = RunActor(run_id, store, execution_scheduler=scheduler)
+    await actor.start()
+
+    first = await actor.advance_execution_round(run_id, f"execute:{run_id}:0")
+    replay = await actor.advance_execution_round(run_id, f"execute:{run_id}:0")
+    second = await actor.advance_execution_round(run_id, f"execute:{run_id}:1")
+    verification = await actor.commit_verification(
+        run_id,
+        VerificationSummary(passed=True, result_sha256="a" * 64),
+        f"verify:{run_id}",
+    )
+    report = await actor.commit_report(
+        run_id,
+        ReportSummary(result_sha256="b" * 64, status=RunStatus.Completed),
+        f"report:{run_id}",
+    )
+
+    assert first == replay
+    assert first.complete is False and second.complete is True
+    assert len(scheduler.calls) == 2
+    assert verification.receipt_key == f"verify:{run_id}"
+    assert report.receipt_key == f"report:{run_id}"
+    snapshot = await store.snapshot(run_id)
+    assert snapshot.state.status is RunStatus.Completed
+    assert [event.event_type for event in snapshot.events].count("run.execute.round") == 2
+    assert [event.event_type for event in snapshot.events].count("run.verify.completed") == 1
+    assert [event.event_type for event in snapshot.events].count("run.report.completed") == 1
     await actor.stop()
 
 

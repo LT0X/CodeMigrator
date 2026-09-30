@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from codemigrator.core import (
     ActiveDispatch,
+    CreateRun,
     FailureReason,
     Phase,
     RunId,
@@ -69,6 +70,7 @@ class RuntimeStore(Protocol):
         *,
         state: RunState | None = None,
         events: Sequence[EventSpec] = (),
+        cas_references: Sequence[tuple[str, CasObject]] = (),
     ) -> AgentRunReceipt:
         """Commit terminal metadata and owner facts/events in one transaction."""
 
@@ -93,6 +95,7 @@ def _validate_agent_receipt(
     receipt: AgentRunReceipt,
     state: RunState | None,
     events: Sequence[EventSpec],
+    cas_references: Sequence[tuple[str, CasObject]] = (),
 ) -> None:
     if current is None:
         raise StoreCommitError("AgentRun does not exist")
@@ -107,6 +110,18 @@ def _validate_agent_receipt(
             raise StoreCommitError("Run owner receipt requires matching Run state")
     elif state is not None or events:
         raise StoreCommitError("Draft owner cannot write Run facts or events")
+    if record.owner_kind != "run" and cas_references:
+        raise StoreCommitError("Run receipt CAS refs require a Run owner")
+    if any(
+        not reference_key
+        or len(reference_key) > 256
+        or any(
+            character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+            for character in reference_key
+        )
+        for reference_key, _ in cas_references
+    ):
+        raise StoreCommitError("CAS reference key is invalid")
 
 
 def _validate_evolution_draft(draft: EvolutionSegmentDraft, expected_run_id: object) -> None:
@@ -340,6 +355,7 @@ class InMemoryRuntimeStore:
         *,
         state: RunState | None = None,
         events: Sequence[EventSpec] = (),
+        cas_references: Sequence[tuple[str, CasObject]] = (),
     ) -> AgentRunReceipt:
         async with self._agent_lock:
             existing_receipt = self._agent_receipts.get(record.agent_run_id)
@@ -348,11 +364,26 @@ class InMemoryRuntimeStore:
                     existing_receipt.category != receipt.category
                     or existing_receipt.agent_run_id != receipt.agent_run_id
                     or self._agent_runs[record.agent_run_id] != record
+                    or any(
+                        self._cas_refs.get((record.owner_kind, record.owner_id, key)) != obj
+                        for key, obj in cas_references
+                    )
                 ):
                     raise StoreCommitError("AgentRun receipt replay mismatch")
                 return existing_receipt
             current = self._agent_runs.get(record.agent_run_id)
-            _validate_agent_receipt(current, record, receipt, state, events)
+            _validate_agent_receipt(current, record, receipt, state, events, cas_references)
+            for reference_key, object_ref in cas_references:
+                existing_ref = self._cas_refs.get(
+                    (record.owner_kind, record.owner_id, reference_key)
+                )
+                if existing_ref is not None and existing_ref != object_ref:
+                    raise StoreCommitError("CAS reference key already points to another object")
+                if any(
+                    value.digest == object_ref.digest and value.size != object_ref.size
+                    for value in self._cas_refs.values()
+                ):
+                    raise StoreCommitError("CAS object size mismatch")
             if self._fail_next:
                 self._fail_next = False
                 raise StoreCommitError("injected commit failure")
@@ -380,6 +411,8 @@ class InMemoryRuntimeStore:
                 self._snapshots[RunId(record.owner_id)] = snapshot
             self._agent_runs[record.agent_run_id] = record
             self._agent_receipts[record.agent_run_id] = receipt
+            for reference_key, object_ref in cas_references:
+                self._cas_refs[(record.owner_kind, record.owner_id, reference_key)] = object_ref
             self.commit_count += 1
             return receipt
 
@@ -544,6 +577,7 @@ class PostgreSQLRuntimeStore:
         *,
         state: RunState | None = None,
         events: Sequence[EventSpec] = (),
+        cas_references: Sequence[tuple[str, CasObject]] = (),
     ) -> AgentRunReceipt:
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -570,8 +604,23 @@ class PostgreSQLRuntimeStore:
                         or current != record
                     ):
                         raise StoreCommitError("AgentRun receipt replay mismatch")
+                    for reference_key, object_ref in cas_references:
+                        ref = await connection.fetchrow(
+                            """SELECT r.digest, o.size_bytes FROM cas_object_refs r
+                            JOIN cas_objects o ON o.digest=r.digest
+                            WHERE r.owner_kind=$1 AND r.owner_id=$2 AND r.reference_key=$3""",
+                            record.owner_kind,
+                            record.owner_id,
+                            reference_key,
+                        )
+                        if (
+                            ref is None
+                            or str(_row_value(ref, "digest")) != object_ref.digest
+                            or int(_row_value(ref, "size_bytes")) != object_ref.size
+                        ):
+                            raise StoreCommitError("AgentRun receipt CAS ref replay mismatch")
                     return existing_receipt
-                _validate_agent_receipt(current, record, receipt, state, events)
+                _validate_agent_receipt(current, record, receipt, state, events, cas_references)
                 if state is not None:
                     locked = await connection.fetchrow(
                         "SELECT state FROM runtime_runs WHERE run_id = $1 FOR UPDATE",
@@ -607,6 +656,37 @@ class PostgreSQLRuntimeStore:
                     record.exit.value if record.exit is not None else None,
                     _dump_agent_run(record),
                 )
+                for reference_key, object_ref in cas_references:
+                    await connection.execute(
+                        """INSERT INTO cas_objects(digest,size_bytes) VALUES($1,$2)
+                        ON CONFLICT (digest) DO NOTHING""",
+                        object_ref.digest,
+                        object_ref.size,
+                    )
+                    object_row = await connection.fetchrow(
+                        "SELECT size_bytes FROM cas_objects WHERE digest=$1 FOR UPDATE",
+                        object_ref.digest,
+                    )
+                    if int(_row_value(object_row, "size_bytes")) != object_ref.size:
+                        raise StoreCommitError("CAS object size mismatch")
+                    await connection.execute(
+                        """INSERT INTO cas_object_refs(owner_kind,owner_id,reference_key,digest)
+                        VALUES($1,$2,$3,$4) ON CONFLICT(owner_kind,owner_id,reference_key)
+                        DO NOTHING""",
+                        record.owner_kind,
+                        record.owner_id,
+                        reference_key,
+                        object_ref.digest,
+                    )
+                    ref_row = await connection.fetchrow(
+                        """SELECT digest FROM cas_object_refs WHERE owner_kind=$1
+                        AND owner_id=$2 AND reference_key=$3""",
+                        record.owner_kind,
+                        record.owner_id,
+                        reference_key,
+                    )
+                    if str(_row_value(ref_row, "digest")) != object_ref.digest:
+                        raise StoreCommitError("CAS reference key already has another digest")
                 await connection.execute(
                     """INSERT INTO agent_run_receipts(receipt_id, agent_run_id, category)
                     VALUES ($1,$2,$3)""",
@@ -714,9 +794,7 @@ class PostgreSQLRuntimeStore:
         self, thread_id: str | None = None, namespace: str | None = None
     ) -> tuple[CheckpointIndex, ...]:
         async with self.pool.acquire() as connection:
-            return await _list_checkpoint_indexes_with_connection(
-                connection, thread_id, namespace
-            )
+            return await _list_checkpoint_indexes_with_connection(connection, thread_id, namespace)
 
     async def publish_pending_write_index(self, index: PendingWriteIndex) -> None:
         async with self.pool.acquire() as connection:
@@ -1327,6 +1405,12 @@ def _decode_state(value: Any) -> RunState:
         terminal_slice_failures=tuple(payload["terminal_slice_failures"]),
         adopted_advice_ids=tuple(payload.get("adopted_advice_ids", ())),
         pending_advice_ids=tuple(payload.get("pending_advice_ids", ())),
+        create_request=(
+            CreateRun.model_validate(payload["create_request"])
+            if payload.get("create_request") is not None
+            else None
+        ),
+        frozen_plan_sha256=payload.get("frozen_plan_sha256"),
     )
 
 

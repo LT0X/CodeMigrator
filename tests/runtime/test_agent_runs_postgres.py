@@ -12,6 +12,7 @@ import asyncpg
 import pytest
 
 from codemigrator.runtime.agent_runs import AgentRunId, AgentRunReceipt
+from codemigrator.runtime.cas import CasObject
 from codemigrator.runtime.contracts import EventSpec, RunState
 from codemigrator.runtime.loop_contracts import SessionExit, SessionState
 from codemigrator.runtime.store import PostgreSQLRuntimeStore, StoreCommitError
@@ -74,26 +75,39 @@ async def test_postgres_receipt_failure_rolls_back_run_agent_and_event():
         record = run_record()
         await store.create(RunState(run_id=record.owner_id), ())
         await store.create_or_get_agent_run(record)
-        terminal = replace(record, state=SessionState.Closed, exit=SessionExit.Completed)
+        terminal = replace(
+            record,
+            state=SessionState.Closed,
+            exit=SessionExit.Completed,
+            result_sha256="e" * 64,
+        )
         receipt = AgentRunReceipt(uuid4(), record.agent_run_id, "plan.accepted")
+        cas_references = ((f"agent-result:{record.agent_run_id}", CasObject("e" * 64, 12)),)
         with pytest.raises(StoreCommitError, match="observation rejected"):
             await store.commit_agent_run_receipt(
                 terminal,
                 receipt,
                 state=RunState(run_id=record.owner_id, version=1),
                 events=(EventSpec("plan.accepted", {"content": "raw source"}),),
+                cas_references=cas_references,
             )
         assert (await store.load(record.owner_id)).state.version == 0
         assert (await store.load(record.owner_id)).events == ()
         assert await store.load_agent_run(record.agent_run_id) == record
         assert await store.load_agent_run_receipt(record.agent_run_id) is None
+        assert await store.get_cas_reference("run", record.owner_id, cas_references[0][0]) is None
         assert (
             await store.commit_agent_run_receipt(
                 terminal,
                 receipt,
                 state=RunState(run_id=record.owner_id, version=1),
                 events=(EventSpec("plan.accepted", {"category": "plan"}),),
+                cas_references=cas_references,
             )
             == receipt
         )
         assert await store.load_agent_run_receipt(record.agent_run_id) == receipt
+        assert (
+            await store.get_cas_reference("run", record.owner_id, cas_references[0][0])
+            == cas_references[0][1]
+        )

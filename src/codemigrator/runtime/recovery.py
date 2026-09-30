@@ -3,16 +3,27 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
 from codemigrator.core import canonical_json_bytes
+
+from .contracts import RuntimeEvent
 
 
 class RecoveryTrigger(str, Enum):
     Startup = "startup"
     Interruption = "interruption"
     IntentGap = "intent_gap"
+
+
+def has_committed_owner_receipt(events: Sequence[RuntimeEvent], receipt_key: str) -> bool:
+    """Treat only an append-only owner event as recovery evidence for a graph cursor."""
+
+    if not receipt_key:
+        return False
+    return any(event.data.get("receipt_key") == receipt_key for event in events)
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,5 +128,6 @@ __all__ = [
     "RecoveryCoordinator",
     "RecoveryPlan",
     "RecoveryTrigger",
+    "has_committed_owner_receipt",
     "restore_checkpoint",
 ]

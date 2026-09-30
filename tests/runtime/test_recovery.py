@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from codemigrator.runtime.contracts import RuntimeEvent
 from codemigrator.runtime.recovery import (
     ActorCheckpoint,
     CheckpointPolicy,
     RecoveryCoordinator,
     RecoveryTrigger,
+    has_committed_owner_receipt,
     restore_checkpoint,
 )
 
@@ -41,3 +43,14 @@ def test_checkpoint_policy_is_task_or_time_triggered_without_polling():
     assert policy.due(completed_tasks=10, elapsed_seconds=0) is True
     assert policy.due(completed_tasks=1, elapsed_seconds=60) is True
     assert policy.due(completed_tasks=1, elapsed_seconds=1) is False
+
+
+def test_graph_recovery_advances_only_from_a_committed_owner_event():
+    committed = RuntimeEvent(
+        sequence=7,
+        event_type="run.plan.accepted",
+        data={"receipt_key": "run.plan.accepted:opaque-run-id"},
+    )
+    assert has_committed_owner_receipt((committed,), "run.plan.accepted:opaque-run-id")
+    assert not has_committed_owner_receipt((), "run.plan.accepted:opaque-run-id")
+    assert not has_committed_owner_receipt((committed,), "run.execute.round:opaque-run-id:1")

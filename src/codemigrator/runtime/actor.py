@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import replace
-from typing import Protocol
+from typing import Protocol, cast
 
 from codemigrator.core import (
     ActiveDispatch,
@@ -12,28 +13,43 @@ from codemigrator.core import (
     AdviceKind,
     CreateRun,
     FailureReason,
+    Phase,
     RunId,
     RunStatus,
+    SessionKind,
     canonical_json_bytes,
 )
+from codemigrator.planning import FrozenPlan
 
 from .advice import AdviceValidationContext, evaluate_advice
 from .budget import BudgetLimits, evaluate_budget
 from .contracts import (
+    ActorPhaseReceipt,
     AdviceMessage,
     ApiCommand,
     BudgetEventMessage,
     CancelCommand,
     CreateRunCommand,
     EventSpec,
+    ExecuteRoundResult,
     ExecutionReceiptMessage,
+    ExecutionRoundDecision,
     RecoveryCommandMessage,
+    ReportSummary,
+    RunCreatedReceipt,
     RunState,
+    RuntimeEvent,
     RuntimeMessage,
+    RuntimeSnapshot,
     SessionInputCommand,
+    VerificationSummary,
+    WorkflowCommandMessage,
+    agent_run_lifecycle_spec,
 )
 from .integration import IntegrationCoordinator
-from .recovery import RecoveryCoordinator, RecoveryTrigger
+from .loop_contracts import SessionExit, SessionState
+from .recovery import RecoveryCoordinator, RecoveryTrigger, has_committed_owner_receipt
+from .run_graph import PlanAgentCompletion
 from .store import RuntimeStore, StoreCommitError
 
 
@@ -62,6 +78,11 @@ class RepairAdvicePort(Protocol):
         """Materialize and dispatch an adopted global repair decision."""
 
 
+class ExecutionSchedulerPort(Protocol):
+    async def advance_one_round(self, run_id: RunId, logical_key: str) -> ExecutionRoundDecision:
+        """Idempotently schedule ready Slice AgentRuns and return round status."""
+
+
 class _Stop:
     pass
 
@@ -84,6 +105,7 @@ class RunActor:
         archive_port: ArchivePort | None = None,
         integration_coordinator: IntegrationCoordinator | None = None,
         repair_advice_port: RepairAdvicePort | None = None,
+        execution_scheduler: ExecutionSchedulerPort | None = None,
     ) -> None:
         self.run_id = run_id
         self.store = store
@@ -95,11 +117,13 @@ class RunActor:
         self.archive_port = archive_port
         self.integration_coordinator = integration_coordinator
         self.repair_advice_port = repair_advice_port
+        self.execution_scheduler = execution_scheduler
         self._state: RunState | None = None
         self._queue: asyncio.Queue[RuntimeMessage | _Stop] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
         self.last_error: Exception | None = None
         self._last_dispatch_acceptance: bool | None = None
+        self._create_receipt: RunCreatedReceipt | None = None
 
     @property
     def state(self) -> RunState | None:
@@ -110,6 +134,7 @@ class RunActor:
             return
         snapshot = await self.store.load(self.run_id)
         self._state = snapshot.state if snapshot is not None else None
+        self._create_receipt = _run_created_receipt(snapshot, self.run_id)
         self._task = asyncio.create_task(self._run(), name=f"codemigrator-run-{self.run_id}")
 
     async def stop(self) -> None:
@@ -127,12 +152,60 @@ class RunActor:
     async def join(self) -> None:
         await self._queue.join()
 
-    async def create(self, create_run: CreateRun) -> bool:
-        await self.submit(
-            ApiCommand(CreateRunCommand(run_id=self.run_id, create_run=create_run))
-        )
+    async def create(self, create_run: CreateRun) -> RunCreatedReceipt | None:
+        self._create_receipt = None
+        await self.submit(ApiCommand(CreateRunCommand(run_id=self.run_id, create_run=create_run)))
         await self.join()
-        return self._state is not None
+        return self._create_receipt
+
+    async def has_receipt(self, run_id: RunId, receipt_key: str) -> bool:
+        if run_id != self.run_id:
+            return False
+        snapshot = await self.store.load(run_id)
+        return snapshot is not None and has_committed_owner_receipt(snapshot.events, receipt_key)
+
+    async def accept_plan(
+        self, run_id: RunId, completion: PlanAgentCompletion, frozen_plan: FrozenPlan
+    ) -> ActorPhaseReceipt:
+        return cast(
+            ActorPhaseReceipt,
+            await self._workflow_command(
+                "accept_plan",
+                run_id,
+                f"run.plan.accepted:{run_id}",
+                (completion, frozen_plan),
+            ),
+        )
+
+    async def advance_execution_round(self, run_id: RunId, logical_key: str) -> ExecuteRoundResult:
+        return cast(
+            ExecuteRoundResult,
+            await self._workflow_command("execute_round", run_id, logical_key, None),
+        )
+
+    async def commit_verification(
+        self, run_id: RunId, result: VerificationSummary, logical_key: str
+    ) -> ActorPhaseReceipt:
+        return cast(
+            ActorPhaseReceipt,
+            await self._workflow_command("verification", run_id, logical_key, result),
+        )
+
+    async def commit_report(
+        self, run_id: RunId, result: ReportSummary, logical_key: str
+    ) -> ActorPhaseReceipt:
+        return cast(
+            ActorPhaseReceipt,
+            await self._workflow_command("report", run_id, logical_key, result),
+        )
+
+    async def _workflow_command(
+        self, kind: str, run_id: RunId, logical_key: str, payload: object
+    ) -> object:
+        loop = asyncio.get_running_loop()
+        response: asyncio.Future[object] = loop.create_future()
+        await self.submit(WorkflowCommandMessage(kind, run_id, logical_key, payload, response))
+        return await response
 
     async def dispatch_started(self, dispatch: ActiveDispatch | None) -> bool:
         if dispatch is None:
@@ -163,6 +236,8 @@ class RunActor:
                 await self._handle(message)
             except Exception as exc:  # Keep the mailbox alive; the failed commit is observable.
                 self.last_error = exc
+                if isinstance(message, WorkflowCommandMessage) and not message.response.done():
+                    message.response.set_exception(exc)
             finally:
                 self._queue.task_done()
 
@@ -177,6 +252,198 @@ class RunActor:
             await self._handle_recovery(message)
         elif isinstance(message, AdviceMessage):
             await self._handle_advice(message.advice)
+        elif isinstance(message, WorkflowCommandMessage):
+            await self._handle_workflow_command(message)
+
+    async def _handle_workflow_command(self, command: WorkflowCommandMessage) -> None:
+        if command.run_id != self.run_id:
+            raise ValueError("workflow command Run identity mismatch")
+        snapshot = await self.store.load(self.run_id)
+        event = _event_for_receipt(snapshot, command.logical_key)
+        if event is not None:
+            receipt = ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
+            if command.kind == "execute_round":
+                command.response.set_result(
+                    ExecuteRoundResult(receipt, event.data.get("complete") is True)
+                )
+            else:
+                command.response.set_result(receipt)
+            return
+        state = self._state
+        if state is None or snapshot is None:
+            raise StoreCommitError("workflow owner Run does not exist")
+        if command.kind == "accept_plan":
+            await self._accept_plan(command, state)
+        elif command.kind == "execute_round":
+            await self._advance_execution(command, state)
+        elif command.kind == "verification":
+            await self._commit_verification(command, state)
+        elif command.kind == "report":
+            await self._commit_report(command, state)
+        else:
+            raise ValueError("unsupported Run workflow command")
+
+    async def _accept_plan(self, command: WorkflowCommandMessage, state: RunState) -> None:
+        if not isinstance(command.payload, tuple) or len(command.payload) != 2:
+            raise ValueError("PLAN acceptance payload is invalid")
+        completion, frozen_plan = command.payload
+        completion = cast(PlanAgentCompletion, completion)
+        frozen_plan = cast(FrozenPlan, frozen_plan)
+        record = completion.record
+        agent_receipt = completion.receipt
+        result_object = completion.result_object
+        plan_object = completion.plan_object
+        plan_hash = frozen_plan.plan_hash
+        validation = frozen_plan.validation
+        if (
+            state.status is not RunStatus.Planning
+            or record is None
+            or record.owner_kind != "run"
+            or record.owner_id != self.run_id
+            or record.phase is not Phase.Plan
+            or record.session_kind is not SessionKind.PlanAuxiliary
+            or record.state is not SessionState.Closed
+            or record.exit is not SessionExit.Completed
+            or agent_receipt.agent_run_id != record.agent_run_id
+            or agent_receipt.category != "plan.accepted"
+            or record.result_sha256 != result_object.digest
+            or hashlib.sha256(frozen_plan.canonical_payload()).hexdigest() != plan_object.digest
+            or not validation.accepted
+        ):
+            raise ValueError("PLAN acceptance facts failed deterministic owner checks")
+        terminal_event = agent_run_lifecycle_spec(record, agent_receipt)
+        events = (
+            terminal_event,
+            EventSpec(
+                "run.plan.accepted",
+                {
+                    "receipt_key": command.logical_key,
+                    "agent_run_id": str(record.agent_run_id),
+                    "plan_sha256": plan_hash,
+                },
+            ),
+        )
+        next_state = replace(
+            state,
+            status=RunStatus.Executing,
+            frozen_plan_sha256=plan_hash,
+            version=state.version + 1,
+        )
+        await self.store.commit_agent_run_receipt(
+            record,
+            agent_receipt,
+            state=next_state,
+            events=events,
+            cas_references=(
+                (f"agent-result:{record.agent_run_id}", result_object),
+                ("frozen-plan", plan_object),
+            ),
+        )
+        self._state = next_state
+        snapshot = await self.store.load(self.run_id)
+        event = _event_for_receipt(snapshot, command.logical_key)
+        if event is None:
+            raise StoreCommitError("committed PLAN owner receipt cannot be reloaded")
+        command.response.set_result(
+            ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
+        )
+
+    async def _advance_execution(self, command: WorkflowCommandMessage, state: RunState) -> None:
+        if (
+            state.status is not RunStatus.Executing
+            or state.frozen_plan_sha256 is None
+            or self.execution_scheduler is None
+        ):
+            raise StoreCommitError("EXECUTE requires an active Run and Actor scheduler")
+        decision = await self.execution_scheduler.advance_one_round(
+            self.run_id, command.logical_key
+        )
+        if not isinstance(decision, ExecutionRoundDecision):
+            raise TypeError("Actor scheduler returned an invalid execution round")
+        next_state = replace(
+            state,
+            status=RunStatus.Verifying if decision.complete else RunStatus.Executing,
+            version=state.version + 1,
+        )
+        committed = await self._commit(
+            next_state,
+            (
+                EventSpec(
+                    "run.execute.round",
+                    {
+                        "receipt_key": command.logical_key,
+                        "complete": decision.complete,
+                        "dispatch_count": decision.dispatch_count,
+                    },
+                ),
+            ),
+        )
+        if not committed:
+            raise StoreCommitError("EXECUTE actor receipt could not be committed")
+        event = _event_for_receipt(await self.store.load(self.run_id), command.logical_key)
+        assert event is not None
+        command.response.set_result(
+            ExecuteRoundResult(
+                ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence),
+                decision.complete,
+            )
+        )
+
+    async def _commit_verification(self, command: WorkflowCommandMessage, state: RunState) -> None:
+        result = command.payload
+        if state.status is not RunStatus.Verifying or not isinstance(result, VerificationSummary):
+            raise StoreCommitError("VERIFY requires deterministic verification facts")
+        next_state = replace(state, status=RunStatus.Reporting, version=state.version + 1)
+        committed = await self._commit(
+            next_state,
+            (
+                EventSpec(
+                    "run.verify.completed",
+                    {
+                        "receipt_key": command.logical_key,
+                        "passed": result.passed,
+                        "result_sha256": result.result_sha256,
+                    },
+                ),
+            ),
+        )
+        if not committed:
+            raise StoreCommitError("VERIFY actor receipt could not be committed")
+        event = _event_for_receipt(await self.store.load(self.run_id), command.logical_key)
+        assert event is not None
+        command.response.set_result(
+            ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
+        )
+
+    async def _commit_report(self, command: WorkflowCommandMessage, state: RunState) -> None:
+        result = command.payload
+        if state.status is not RunStatus.Reporting or not isinstance(result, ReportSummary):
+            raise StoreCommitError("REPORT requires deterministic report facts")
+        next_state = replace(
+            state,
+            status=result.status,
+            version=state.version + 1,
+        )
+        committed = await self._commit(
+            next_state,
+            (
+                EventSpec(
+                    "run.report.completed",
+                    {
+                        "receipt_key": command.logical_key,
+                        "status": result.status.value,
+                        "result_sha256": result.result_sha256,
+                    },
+                ),
+            ),
+        )
+        if not committed:
+            raise StoreCommitError("REPORT actor receipt could not be committed")
+        event = _event_for_receipt(await self.store.load(self.run_id), command.logical_key)
+        assert event is not None
+        command.response.set_result(
+            ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
+        )
 
     async def _handle_api(self, command: object) -> None:
         if isinstance(command, CreateRunCommand):
@@ -187,14 +454,36 @@ class RunActor:
             await self._handle_session_input(command)
 
     async def _handle_create(self, command: CreateRunCommand) -> None:
-        if command.run_id != self.run_id or self._state is not None:
+        if command.run_id != self.run_id:
             return
-        state = RunState(run_id=self.run_id, status=RunStatus.Planning, version=1)
+        if self._state is not None:
+            if self._state.create_request != command.create_run:
+                self._create_receipt = None
+                return
+            snapshot = await self.store.load(self.run_id)
+            self._create_receipt = _run_created_receipt(snapshot, self.run_id)
+            return
+        state = RunState(
+            run_id=self.run_id,
+            status=RunStatus.Planning,
+            version=1,
+            create_request=command.create_run,
+        )
         snapshot = await self.store.create(
             state,
-            (EventSpec("run.created", {"status": state.status.value}),),
+            (
+                EventSpec(
+                    "run.created",
+                    {
+                        "status": state.status.value,
+                        "receipt_key": f"run.created:{self.run_id}",
+                        "state_version": state.version,
+                    },
+                ),
+            ),
         )
         self._state = snapshot.state
+        self._create_receipt = _run_created_receipt(snapshot, self.run_id)
 
     async def _handle_cancel(self, command: CancelCommand) -> None:
         state = self._state
@@ -272,9 +561,7 @@ class RunActor:
         current_counts = dict(state.continuation_counts)
         current = current_counts.get(generation, 0)
         eligible = (
-            state.new_calls_enabled
-            and progress
-            and current < self.max_continuations_per_generation
+            state.new_calls_enabled and progress and current < self.max_continuations_per_generation
         )
         current_counts[generation] = current + 1 if eligible else current
         slice_id = str(payload.get("slice_id", "unknown"))
@@ -562,6 +849,41 @@ def _dispatch_key(dispatch: ActiveDispatch, run_id: RunId) -> tuple[str, bytes, 
     return str(run_id), canonical_json_bytes(subject), str(dispatch.check_id)
 
 
+def _run_created_receipt(
+    snapshot: RuntimeSnapshot | None, run_id: RunId
+) -> RunCreatedReceipt | None:
+    if snapshot is None:
+        return None
+    events = getattr(snapshot, "events", ())
+    state = getattr(snapshot, "state", None)
+    for event in events:
+        if (
+            event.event_type == "run.created"
+            and event.data.get("receipt_key") == f"run.created:{run_id}"
+            and state is not None
+        ):
+            return RunCreatedReceipt(
+                run_id=run_id,
+                receipt_key=f"run.created:{run_id}",
+                event_sequence=event.sequence,
+                state_version=int(event.data.get("state_version", 1)),
+            )
+    return None
+
+
+def _event_for_receipt(snapshot: RuntimeSnapshot | None, receipt_key: str) -> RuntimeEvent | None:
+    if snapshot is None:
+        return None
+    return next(
+        (
+            event
+            for event in reversed(getattr(snapshot, "events", ()))
+            if event.data.get("receipt_key") == receipt_key
+        ),
+        None,
+    )
+
+
 class ActorRegistry:
     """Keep exactly one in-memory actor for each non-terminal Run."""
 
@@ -605,6 +927,7 @@ __all__ = [
     "CancellationPort",
     "CheckpointWriter",
     "ContinuationPort",
+    "ExecutionSchedulerPort",
     "RepairAdvicePort",
     "RunActor",
 ]

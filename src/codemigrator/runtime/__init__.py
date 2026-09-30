@@ -6,6 +6,7 @@ from .actor import (
     CancellationPort,
     CheckpointWriter,
     ContinuationPort,
+    ExecutionSchedulerPort,
     RepairAdvicePort,
     RunActor,
 )
@@ -38,6 +39,7 @@ from .binding import (
 from .budget import BudgetEvaluation, BudgetLimits, BudgetUsage, RunWallet, evaluate_budget
 from .context import ContextEnvelope, ContextSegment, PromptMessage, prompt_text, render_prompt
 from .contracts import (
+    ActorPhaseReceipt,
     AdviceMessage,
     ApiCommand,
     ApiCommandPayload,
@@ -45,14 +47,21 @@ from .contracts import (
     CancelCommand,
     CreateRunCommand,
     EventSpec,
+    ExecuteRoundResult,
     ExecutionReceiptMessage,
+    ExecutionRoundDecision,
     RecoveryCommandMessage,
+    ReportSummary,
+    RunCreatedReceipt,
     RunState,
     RuntimeEvent,
     RuntimeMessage,
     RuntimeSnapshot,
     SessionInputCommand,
+    VerificationSummary,
+    WorkflowCommandMessage,
 )
+from .create_run import CreateRunPreflightPort, CreateRunRejected, CreateRunService
 from .integration import (
     IntegrationCoordinator,
     IntegrationItem,
@@ -219,6 +228,12 @@ from .repair import (
     evaluate_joint_repair_dispatch,
 )
 from .report import build_report
+from .run_graph import (
+    PlanAgentCompletion,
+    PlanProposalRejected,
+    PlanProposalWorkflow,
+    RunWorkflowGraph,
+)
 from .scheduler import FairScheduler, ReadySlice, ResourcePool
 from .store import InMemoryRuntimeStore, PostgreSQLRuntimeStore, RuntimeStore, StoreCommitError
 from .supervisor import (
@@ -258,6 +273,7 @@ __all__ = [
     "provider_adapter_id_for_label",
     "AgentLoop",
     "ActorRegistry",
+    "ActorPhaseReceipt",
     "ActorCheckpoint",
     "ArchivePort",
     "AdviceMessage",
@@ -294,9 +310,15 @@ __all__ = [
     "ContextOverflowError",
     "ContextSegment",
     "CreateRunCommand",
+    "CreateRunPreflightPort",
+    "CreateRunRejected",
+    "CreateRunService",
     "ContinuationPort",
     "EventSpec",
+    "ExecuteRoundResult",
+    "ExecutionRoundDecision",
     "ExecutionReceiptMessage",
+    "ExecutionSchedulerPort",
     "FairScheduler",
     "InMemoryAdvisoryLock",
     "InMemoryRuntimeStore",
@@ -314,6 +336,9 @@ __all__ = [
     "ProjectMigrationRequest",
     "ProjectMigrationRunner",
     "PlannerAdvisor",
+    "PlanAgentCompletion",
+    "PlanProposalRejected",
+    "PlanProposalWorkflow",
     "ProjectMigrationPipeline",
     "ProjectMigrationPipelineReport",
     "ProjectMigrationPipelineRequest",
@@ -366,7 +391,10 @@ __all__ = [
     "build_repair_session_dispatch",
     "evaluate_joint_repair_dispatch",
     "RunActor",
+    "RunCreatedReceipt",
     "RunState",
+    "RunWorkflowGraph",
+    "ReportSummary",
     "RuntimeEvent",
     "RuntimeMessage",
     "RuntimeSnapshot",
@@ -381,6 +409,8 @@ __all__ = [
     "SessionProvenance",
     "SessionSpec",
     "SessionState",
+    "VerificationSummary",
+    "WorkflowCommandMessage",
     "StaticTemplateCatalog",
     "StoreCommitError",
     "SupervisorAdviceKind",
