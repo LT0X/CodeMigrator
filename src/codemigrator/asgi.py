@@ -25,6 +25,7 @@ def create_production_app(
     config: ApiConfig,
     preflight: CreateRunPreflightPort | None = None,
     graph_starter: RunGraphStarter | None = None,
+    stop_server: Callable[[], Awaitable[None]],
     shutdown: Callable[[], Awaitable[None]] | None = None,
     pool_server_settings: Mapping[str, str] | None = None,
 ) -> FastAPI:
@@ -52,6 +53,7 @@ def create_production_app(
         store_factory=store_factory,
         owner_factory=owner_factory,
         shutdown=shutdown,
+        stop_server=stop_server,
         pool_server_settings=pool_server_settings,
     )
 

@@ -63,7 +63,11 @@ async def test_postgres_concurrent_replay_and_unique_thread():
             store.create_or_get_agent_run(replay),
         )
         assert records[0] == records[1]
-        different_task = replace(first, agent_run_id=AgentRunId(uuid4()), logical_task_key="plan:2")
+        different_task = replace(
+            records[0],
+            agent_run_id=AgentRunId(uuid4()),
+            logical_task_key="plan:2",
+        )
         with pytest.raises(StoreCommitError, match="thread"):
             await store.create_or_get_agent_run(different_task)
         assert await store.load_agent_run(different_task.agent_run_id) is None

@@ -201,6 +201,7 @@ class ExecutionRoundFinishedMessage:
 @dataclass(frozen=True, slots=True)
 class CancelCommand:
     expected_version: int
+    response: asyncio.Future[RunState] | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,18 +2,32 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+import asyncio
+from collections.abc import Callable
+from typing import Literal, Protocol, cast
 from uuid import UUID, uuid4
 
-from codemigrator.core import CreateRun, RunId
+from codemigrator.core import CreateRun, FailureReason, RunId, StableErrorCode
 
-from .actor import RunActor
-from .contracts import RunCreatedReceipt, RuntimeStoreTransaction
+from .actor import ActorRegistry, RunActor, RunCommandRejected
+from .contracts import RunCreatedReceipt, RunState, RuntimeStoreTransaction
+from .run_graph import RunWorkflowGraph
 from .store import RuntimeStore, StoreCommitError
 
 
 class CreateRunRejected(RuntimeError):
     """A safe, low-sensitivity rejection from preflight or owner admission."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        code: StableErrorCode | FailureReason | None = None,
+    ) -> None:
+        super().__init__(detail)
+        self.create_run_rejection_code = (
+            code.value if isinstance(code, (StableErrorCode, FailureReason)) else None
+        )
 
 
 class CreateRunPreflightPort(Protocol):
@@ -29,7 +43,49 @@ class RunCreationActor(Protocol):
 
 
 class RunGraphStarter(Protocol):
-    async def start(self, run_id: RunId, receipt: RunCreatedReceipt) -> None: ...
+    receipt_idempotent: Literal[True]
+
+    async def start(self, run_id: RunId, receipt: RunCreatedReceipt) -> None:
+        """Replay a committed receipt safely after process recovery."""
+
+
+class ActorBoundRunGraphStarter(Protocol):
+    receipt_idempotent: Literal[True]
+
+    async def start_for_actor(
+        self, run_id: RunId, receipt: RunCreatedReceipt, actor: RunActor
+    ) -> None:
+        """Start or resume a receipt-keyed graph against this Run's single actor."""
+
+
+class RunWorkflowGraphStarter:
+    """Bind RunWorkflowGraph to the owner's actor and injected durable checkpointer.
+
+    ``durable_checkpointer`` is an explicit host attestation: the graph factory must
+    return graphs sharing the same durable checkpoint namespace across restarts.
+    """
+
+    receipt_idempotent: Literal[True] = True
+
+    def __init__(
+        self,
+        graph_factory: Callable[[RunActor], RunWorkflowGraph],
+        *,
+        durable_checkpointer: Literal[True],
+    ) -> None:
+        if durable_checkpointer is not True:
+            raise ValueError("Run graph recovery requires a durable checkpointer")
+        self._graph_factory = graph_factory
+
+    async def start(self, run_id: RunId, receipt: RunCreatedReceipt) -> None:
+        raise RuntimeError("RunWorkflowGraphStarter requires its durable RunActor")
+
+    async def start_for_actor(
+        self, run_id: RunId, receipt: RunCreatedReceipt, actor: RunActor
+    ) -> None:
+        if run_id != receipt.run_id or actor.run_id != run_id:
+            raise CreateRunRejected("Run graph receipt owner mismatch")
+        await self._graph_factory(actor).start(receipt)
 
 
 class CreateRunService:
@@ -60,16 +116,34 @@ class CreateRunService:
 class RunCreationOwner:
     """Runtime adapter that applies CreateRun gates and writes through RunActor."""
 
+    recovery_safe = True
+
     def __init__(
         self,
         *,
         store: RuntimeStore,
         preflight: CreateRunPreflightPort,
-        graph_starter: RunGraphStarter,
+        graph_starter: RunGraphStarter | ActorBoundRunGraphStarter,
     ) -> None:
+        if getattr(graph_starter, "receipt_idempotent", None) is not True:
+            raise ValueError("Run graph starter must guarantee receipt-idempotent recovery")
         self.store = store
         self.preflight = preflight
         self.graph_starter = graph_starter
+        self._actors = ActorRegistry(store)
+        self._pending_committed_actors: dict[RunId, RunActor] = {}
+        self._actor_selection_lock = asyncio.Lock()
+
+    @property
+    def active_actor_count(self) -> int:
+        return self._actors.active_actor_count
+
+    async def close(self) -> None:
+        async with self._actor_selection_lock:
+            pending = tuple(self._pending_committed_actors.values())
+            self._pending_committed_actors.clear()
+            await self._actors.close()
+        await asyncio.gather(*(actor.stop() for actor in pending), return_exceptions=True)
 
     async def create_run(
         self, request: CreateRun, transaction: object
@@ -82,19 +156,50 @@ class RunCreationOwner:
 
         run_id = RunId(uuid4())
         actor = RunActor(run_id, self.store)
-        await actor.start()
+        await actor.start_new()
         try:
             receipt = await actor.create(request, transaction=transaction)
-        finally:
+        except Exception:
             await actor.stop()
+            raise
         if receipt is None or receipt.run_id != run_id:
+            await actor.stop()
             raise CreateRunRejected("missing RunCreated receipt")
+        transaction.after_commit(
+            lambda: self._pending_committed_actors.__setitem__(run_id, actor)
+        )
+        transaction.after_rollback(lambda: self._actors.stop_after_rollback(actor))
         return receipt
 
+    async def cancel_run(self, run_id: UUID, expected_version: int) -> RunState:
+        typed_run_id = RunId(run_id)
+        actor = await self._get_actor(typed_run_id)
+        if actor is None:
+            snapshot = await self.store.load(typed_run_id)
+            if snapshot is None:
+                raise KeyError(str(run_id))
+            raise RunCommandRejected(StableErrorCode.PHASE_STATUS_MISMATCH.value)
+        return await actor.cancel(expected_version)
+
     async def start_graph(self, run_id: UUID, receipt: RunCreatedReceipt) -> None:
-        if receipt.run_id != RunId(run_id):
+        typed_run_id = RunId(run_id)
+        if receipt.run_id != typed_run_id:
             raise CreateRunRejected("RunCreated receipt owner mismatch")
-        await self.graph_starter.start(RunId(run_id), receipt)
+        actor = await self._get_actor(typed_run_id)
+        if actor is None:
+            return
+        start_for_actor = getattr(self.graph_starter, "start_for_actor", None)
+        if callable(start_for_actor):
+            await start_for_actor(typed_run_id, receipt, actor)
+        else:
+            await cast(RunGraphStarter, self.graph_starter).start(typed_run_id, receipt)
+
+    async def _get_actor(self, run_id: RunId) -> RunActor | None:
+        async with self._actor_selection_lock:
+            pending = self._pending_committed_actors.pop(run_id, None)
+            if pending is not None:
+                return await self._actors.register_committed(pending)
+            return await self._actors.get_or_create(run_id)
 
     async def load_run_created_receipt(
         self, run_id: UUID, receipt_key: str
@@ -118,8 +223,11 @@ class RunCreationOwner:
 
 
 __all__ = [
+    "ActorBoundRunGraphStarter",
     "CreateRunPreflightPort",
     "CreateRunRejected",
     "CreateRunService",
     "RunCreationOwner",
+    "RunGraphStarter",
+    "RunWorkflowGraphStarter",
 ]

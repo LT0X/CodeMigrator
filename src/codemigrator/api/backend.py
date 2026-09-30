@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Protocol, cast
 from uuid import UUID
 
-from codemigrator.core import CreateRun, RunStatus
+from codemigrator.core import CreateRun, FailureReason, RunStatus, StableErrorCode
 
 from .deps import ApiRequest, EventRecord, PersistedEvent
 from .problems import ApiError
@@ -17,6 +17,12 @@ class RunCreatedProjection(Protocol):
     run_id: UUID
     receipt_key: str
     state_version: int
+
+
+class RunStateProjection(Protocol):
+    run_id: UUID
+    status: RunStatus
+    version: int
 
 
 class ApiCommandStorePort(Protocol):
@@ -57,7 +63,11 @@ class ApiCommandStorePort(Protocol):
 
 
 class RunCreationOwnerPort(Protocol):
+    recovery_safe: bool
+
     async def create_run(self, request: CreateRun, transaction: object) -> RunCreatedProjection: ...
+
+    async def cancel_run(self, run_id: UUID, expected_version: int) -> RunStateProjection: ...
 
     async def start_graph(self, run_id: UUID, receipt: RunCreatedProjection) -> None: ...
 
@@ -75,19 +85,79 @@ class ProductionApiBackend:
         *,
         run_owner: RunCreationOwnerPort | None = None,
         shutdown: Callable[[], Awaitable[None]] | None = None,
+        health_check: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
     ) -> None:
         self._store = store
         self._run_owner = run_owner
         self._shutdown = shutdown
+        self._health_check = health_check
         self._handoff_lock = asyncio.Lock()
+        self._closed = False
+        if run_owner is not None and getattr(run_owner, "recovery_safe", None) is not True:
+            raise ValueError("Run owner does not guarantee graph receipt recovery")
 
     async def close(self) -> None:
         """Release host-owned graph managers after request handling stops."""
 
-        if self._shutdown is not None:
-            await self._shutdown()
+        if self._closed:
+            return
+        self._closed = True
+        failures = False
+        close_owner = getattr(self._run_owner, "close", None)
+        for close_resource in (close_owner, self._shutdown):
+            if close_resource is None:
+                continue
+            try:
+                await close_resource()
+            except Exception:
+                failures = True
+        if failures:
+            raise RuntimeError("API backend shutdown failed")
 
     async def execute(self, request: ApiRequest) -> object:
+        if request.operation == "health":
+            if self._health_check is None:
+                raise _unavailable()
+            try:
+                return await self._health_check()
+            except ApiError:
+                raise
+            except Exception:
+                raise _unavailable() from None
+        if request.operation == "cancel_run":
+            owner = self._run_owner
+            run_id = request.resource_id
+            expected_version = request.expected_version
+            if owner is None or run_id is None or expected_version is None:
+                raise _unavailable()
+            try:
+                state = await owner.cancel_run(run_id, expected_version)
+            except ApiError:
+                raise
+            except KeyError:
+                raise ApiError(404, "resource not found", "NOT_FOUND") from None
+            except Exception as error:
+                code = getattr(error, "api_error_code", None)
+                if code == StableErrorCode.STALE_VERSION.value:
+                    raise ApiError(
+                        409,
+                        "Run version no longer matches If-Match",
+                        StableErrorCode.STALE_VERSION.value,
+                        retryable=False,
+                    ) from None
+                if code in {
+                    StableErrorCode.PHASE_STATUS_MISMATCH.value,
+                    "NOT_FOUND",
+                }:
+                    status = 404 if code == "NOT_FOUND" else 409
+                    detail = "resource not found" if status == 404 else "Run cannot be cancelled"
+                    raise ApiError(status, detail, str(code), retryable=False) from None
+                raise _unavailable() from None
+            return {
+                "run_id": str(state.run_id),
+                "status": state.status.value,
+                "version": state.version,
+            }
         if request.operation == "create_run":
             raise ApiError(
                 422,
@@ -140,7 +210,15 @@ class ProductionApiBackend:
             )
         except ApiError:
             raise
-        except Exception:
+        except Exception as error:
+            gate_code = _create_run_gate_code(error)
+            if gate_code is not None:
+                raise ApiError(
+                    422,
+                    "CreateRun was rejected by deterministic preflight",
+                    gate_code,
+                    retryable=False,
+                ) from None
             raise _unavailable() from None
 
         if outcome.get("conflict") is True:
@@ -186,6 +264,11 @@ class ProductionApiBackend:
         pending = await self._store.list_pending_graph_starts()
         if pending and self._run_owner is None:
             raise RuntimeError("Run graph-start recovery is not configured")
+        if (
+            self._run_owner is not None
+            and getattr(self._run_owner, "recovery_safe", None) is not True
+        ):
+            raise RuntimeError("Run graph starter does not guarantee receipt recovery")
         for run_id, receipt_key in pending:
             await self._start_pending_graph(run_id, receipt_key, fail_closed=True)
 
@@ -223,6 +306,22 @@ def _unavailable() -> ApiError:
         "DEPENDENCY_UNAVAILABLE",
         retryable=True,
     )
+
+
+def _create_run_gate_code(error: Exception) -> str | None:
+    value = getattr(error, "create_run_rejection_code", None)
+    if isinstance(value, StableErrorCode):
+        value = value.value
+    if isinstance(value, FailureReason):
+        value = value.value
+    if not isinstance(value, str) or value == StableErrorCode.DEPENDENCY_UNAVAILABLE.value:
+        return None
+    try:
+        return StableErrorCode(value).value
+    except ValueError:
+        if value == FailureReason.DossierInconsistent.value:
+            return value
+    return None
 
 
 __all__ = [

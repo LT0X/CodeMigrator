@@ -393,12 +393,18 @@ def test_failure_reason_contract_is_used_without_runtime_duplication():
 
 @pytest.mark.asyncio
 async def test_actor_registry_race_returns_one_actor(run_id):
-    registry = ActorRegistry(InMemoryRuntimeStore())
+    store = InMemoryRuntimeStore()
+    seed = RunActor(run_id, store)
+    await seed.start()
+    await seed.create(create_run())
+    await seed.stop()
+    registry = ActorRegistry(store)
     actors = await asyncio.gather(
         registry.get_or_create(run_id),
         registry.get_or_create(run_id),
     )
     assert actors[0] is actors[1]
+    assert actors[0] is not None
     await registry.close()
 
 

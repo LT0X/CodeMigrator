@@ -19,6 +19,7 @@ from codemigrator.core import (
     RunId,
     RunStatus,
     SessionKind,
+    StableErrorCode,
     canonical_json_bytes,
 )
 from codemigrator.planning import FrozenPlan
@@ -101,6 +102,14 @@ class CandidateCheckpointVerifierPort(Protocol):
     def is_committed_receipt(self, receipt: CheckpointReceipt) -> bool: ...
 
 
+class RunCommandRejected(RuntimeError):
+    """A safe command rejection that the API can map to an existing public code."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.api_error_code = code
+
+
 class _Stop:
     pass
 
@@ -152,9 +161,17 @@ class RunActor:
         return self._state
 
     async def start(self) -> None:
+        await self._start(load_existing=True)
+
+    async def start_new(self) -> None:
+        """Start a fresh actor without loading through a second store connection."""
+
+        await self._start(load_existing=False)
+
+    async def _start(self, *, load_existing: bool) -> None:
         if self._task is not None:
             return
-        snapshot = await self.store.load(self.run_id)
+        snapshot = await self.store.load(self.run_id) if load_existing else None
         self._state = snapshot.state if snapshot is not None else None
         self._create_receipt = _run_created_receipt(snapshot, self.run_id)
         self._task = asyncio.create_task(self._run(), name=f"codemigrator-run-{self.run_id}")
@@ -192,6 +209,11 @@ class RunActor:
         )
         await self.join()
         return self._create_receipt
+
+    async def cancel(self, expected_version: int) -> RunState:
+        response: asyncio.Future[RunState] = asyncio.get_running_loop().create_future()
+        await self.submit(ApiCommand(CancelCommand(expected_version, response)))
+        return await response
 
     async def has_receipt(self, run_id: RunId, receipt_key: str) -> bool:
         if run_id != self.run_id:
@@ -289,6 +311,13 @@ class RunActor:
                 self.last_error = exc
                 if isinstance(message, WorkflowCommandMessage) and not message.response.done():
                     message.response.set_exception(exc)
+                elif (
+                    isinstance(message, ApiCommand)
+                    and isinstance(message.command, CancelCommand)
+                    and message.command.response is not None
+                    and not message.command.response.done()
+                ):
+                    message.command.response.set_exception(exc)
                 elif isinstance(message, ExecutionRoundFinishedMessage):
                     self._finish_execution_round(message.logical_key, error=exc)
             finally:
@@ -800,9 +829,22 @@ class RunActor:
 
     async def _handle_cancel(self, command: CancelCommand) -> None:
         state = self._state
-        if state is None or state.status in _TERMINAL_STATUSES:
+        response = command.response
+        if state is None:
+            if response is not None and not response.done():
+                response.set_exception(RunCommandRejected("NOT_FOUND"))
             return
         if command.expected_version != state.version:
+            if response is not None and not response.done():
+                response.set_exception(
+                    RunCommandRejected(StableErrorCode.STALE_VERSION.value)
+                )
+            return
+        if state.status in _TERMINAL_STATUSES:
+            if response is not None and not response.done():
+                response.set_exception(
+                    RunCommandRejected(StableErrorCode.PHASE_STATUS_MISMATCH.value)
+                )
             return
         next_state = replace(
             state,
@@ -812,7 +854,8 @@ class RunActor:
             active_dispatches=(),
             version=state.version + 1,
         )
-        if await self._commit(next_state, (EventSpec("run.cancelled"),)):
+        committed = await self._commit(next_state, (EventSpec("run.cancelled"),))
+        if committed:
             if self.integration_coordinator is not None:
                 self.integration_coordinator.cancel_run(str(self.run_id))
             if self.cancellation_port is not None:
@@ -820,6 +863,10 @@ class RunActor:
                     await self.cancellation_port.cancel(self.run_id)
                 except Exception as exc:
                     self.last_error = exc
+            if response is not None and not response.done():
+                response.set_result(next_state)
+        elif response is not None and not response.done():
+            response.set_exception(StoreCommitError("Run cancellation was not committed"))
 
     async def _handle_session_input(self, command: SessionInputCommand) -> None:
         state = self._state
@@ -1218,6 +1265,34 @@ class ActorRegistry:
         self.store = store
         self._actors: dict[RunId, RunActor] = {}
         self._lock = asyncio.Lock()
+        self._retiring_tasks: set[asyncio.Task[None]] = set()
+
+    @property
+    def active_actor_count(self) -> int:
+        return len(self._actors)
+
+    async def register_committed(self, actor: RunActor) -> RunActor:
+        """Keep the actor whose CreateRun facts committed in the shared transaction."""
+
+        async with self._lock:
+            existing = self._actors.get(actor.run_id)
+            if existing is None:
+                self._actors[actor.run_id] = actor
+                return actor
+            if existing is actor:
+                return actor
+        await actor.stop()
+        assert existing is not None
+        return existing
+
+    def stop_after_rollback(self, actor: RunActor) -> None:
+        task = asyncio.get_running_loop().create_task(actor.stop())
+        self._retiring_tasks.add(task)
+        task.add_done_callback(self._retirement_finished)
+
+    def _retirement_finished(self, task: asyncio.Task[None]) -> None:
+        self._retiring_tasks.discard(task)
+        _consume_task_exception(task)
 
     async def get_or_create(self, run_id: RunId) -> RunActor | None:
         async with self._lock:
@@ -1225,7 +1300,7 @@ class ActorRegistry:
             if actor is not None:
                 return actor
             snapshot = await self.store.load(run_id)
-            if snapshot is not None and snapshot.state.status in _TERMINAL_STATUSES:
+            if snapshot is None or snapshot.state.status in _TERMINAL_STATUSES:
                 return None
             actor = RunActor(run_id, self.store)
             await actor.start()
@@ -1233,10 +1308,16 @@ class ActorRegistry:
             return actor
 
     async def close(self) -> None:
-        actors = tuple(self._actors.values())
-        self._actors.clear()
-        for actor in actors:
-            await actor.stop()
+        async with self._lock:
+            actors = tuple(self._actors.values())
+            self._actors.clear()
+            retiring_tasks = tuple(self._retiring_tasks)
+        results = await asyncio.gather(
+            *(actor.stop() for actor in actors), *retiring_tasks, return_exceptions=True
+        )
+        results = await asyncio.gather(*(actor.stop() for actor in actors), return_exceptions=True)
+        if any(isinstance(result, BaseException) for result in results):
+            raise RuntimeError("Run actor shutdown failed")
 
     async def rebuild(self, run_id: RunId) -> RunActor | None:
         """Replace one actor from durable facts after an explicit recovery trigger."""
@@ -1258,3 +1339,8 @@ __all__ = [
     "RepairAdvicePort",
     "RunActor",
 ]
+
+
+def _consume_task_exception(task: asyncio.Task[None]) -> None:
+    if not task.cancelled():
+        task.exception()

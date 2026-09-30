@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import cast
@@ -27,6 +28,10 @@ class _BackendSlot:
 
     def bind(self, backend: ProductionApiBackend | None) -> None:
         self._backend = backend
+
+    def unbind(self) -> ProductionApiBackend | None:
+        backend, self._backend = self._backend, None
+        return backend
 
     def _require_backend(self) -> ProductionApiBackend:
         if self._backend is None:
@@ -85,6 +90,15 @@ class _PostgreSQLApplicationLock:
     def __init__(self, dsn: str) -> None:
         self._dsn = dsn
         self._connection: asyncpg.Connection[asyncpg.Record] | None = None
+        self._termination_callback: Callable[[], None] | None = None
+        self._intentional_release = False
+
+    @property
+    def connection(self) -> asyncpg.Connection[asyncpg.Record] | None:
+        return self._connection
+
+    def set_termination_callback(self, callback: Callable[[], None]) -> None:
+        self._termination_callback = callback
 
     async def acquire(self) -> bool:
         connection = await asyncpg.connect(self._dsn)
@@ -101,18 +115,46 @@ class _PostgreSQLApplicationLock:
             await connection.close()
             return False
         self._connection = connection
+        connection.add_termination_listener(self._on_connection_termination)
         return True
+
+    def _on_connection_termination(
+        self, connection: asyncpg.Connection[asyncpg.Record]
+    ) -> None:
+        if (
+            connection is self._connection
+            and not self._intentional_release
+            and self._termination_callback is not None
+        ):
+            self._termination_callback()
 
     async def release(self) -> None:
         connection, self._connection = self._connection, None
         if connection is None:
             return
+        self._intentional_release = True
+        failure = False
         try:
-            await connection.fetchval(
-                "SELECT pg_advisory_unlock($1::bigint)", _APPLICATION_LOCK_KEY
-            )
+            try:
+                connection.remove_termination_listener(self._on_connection_termination)
+            except Exception:
+                failure = True
         finally:
-            await connection.close()
+            try:
+                if not connection.is_closed():
+                    await connection.fetchval(
+                        "SELECT pg_advisory_unlock($1::bigint)", _APPLICATION_LOCK_KEY
+                    )
+            except Exception:
+                failure = True
+            finally:
+                if not connection.is_closed():
+                    try:
+                        await connection.close()
+                    except Exception:
+                        failure = True
+        if failure:
+            raise RuntimeError("application lock release failed") from None
 
 
 def create_production_app(
@@ -121,6 +163,7 @@ def create_production_app(
     config: ApiConfig,
     store_factory: Callable[[asyncpg.Pool[asyncpg.Record]], ApiCommandStorePort],
     owner_factory: Callable[[ApiCommandStorePort], RunCreationOwnerPort | None],
+    stop_server: Callable[[], Awaitable[None]],
     shutdown: Callable[[], Awaitable[None]] | None = None,
     pool_server_settings: Mapping[str, str] | None = None,
 ) -> FastAPI:
@@ -134,13 +177,62 @@ def create_production_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        lifespan_loop = asyncio.get_running_loop()
         pool: asyncpg.Pool[asyncpg.Record] | None = None
         lock = _PostgreSQLApplicationLock(dsn)
         backend: ProductionApiBackend | None = None
         lock_acquired = False
+        lock_lost = False
+        lock_loss_task: asyncio.Task[None] | None = None
+        lock_loss_event = asyncio.Event()
+
+        def on_lock_termination() -> None:
+            nonlocal lock_lost, lock_loss_task
+            try:
+                lock_lost = True
+                app.state.runtime_ready = False
+                app.state.runtime_shutdown_requested = True
+                detached_backend = backend_slot.unbind()
+                try:
+                    lock_loss_event.set()
+                except RuntimeError:
+                    app.state.runtime_shutdown_error = "EventLoopUnavailable"
+                if detached_backend is not None and lock_loss_task is None:
+                    if lifespan_loop.is_closed():
+                        app.state.runtime_shutdown_error = "EventLoopUnavailable"
+                    else:
+                        shutdown_coroutine = close_after_lock_loss(detached_backend)
+                        try:
+                            lock_loss_task = lifespan_loop.create_task(
+                                shutdown_coroutine,
+                                name="codemigrator-lock-loss-shutdown",
+                            )
+                            app.state.lock_loss_task = lock_loss_task
+                        except RuntimeError:
+                            shutdown_coroutine.close()
+                            app.state.runtime_shutdown_error = "EventLoopUnavailable"
+            except Exception:
+                # Termination callbacks run on the driver boundary and must not
+                # surface callback failures or leave the API accepting requests.
+                app.state.runtime_ready = False
+                app.state.runtime_shutdown_requested = True
+                backend_slot.unbind()
+
+        async def close_after_lock_loss(lost_backend: ProductionApiBackend) -> None:
+            try:
+                await lost_backend.close()
+            except Exception:
+                app.state.runtime_shutdown_error = "ResourceShutdownFailed"
+            finally:
+                try:
+                    await stop_server()
+                except Exception:
+                    app.state.runtime_shutdown_error = "ServerStopFailed"
+
         try:
             settings = dict(pool_server_settings) if pool_server_settings is not None else None
             pool = await asyncpg.create_pool(dsn, server_settings=settings)
+            lock.set_termination_callback(on_lock_termination)
             lock_acquired = await lock.acquire()
             if not lock_acquired:
                 raise RuntimeError("another CodeMigrator application instance is active")
@@ -150,29 +242,67 @@ def create_production_app(
                 if await connection.fetchval("SELECT 1") != 1:
                     raise RuntimeError("PostgreSQL readiness query failed")
             owner = owner_factory(store)
-            backend = ProductionApiBackend(store, run_owner=owner, shutdown=shutdown)
+
+            async def check_health() -> Mapping[str, object]:
+                if not app.state.runtime_ready or pool is None or pool.is_closing():
+                    raise ApiError(
+                        503,
+                        "application is not ready",
+                        "DEPENDENCY_UNAVAILABLE",
+                        retryable=True,
+                    )
+                async with pool.acquire(timeout=1.0) as connection:
+                    if await connection.fetchval("SELECT 1") != 1:
+                        raise ApiError(
+                            503,
+                            "PostgreSQL is unavailable",
+                            "DEPENDENCY_UNAVAILABLE",
+                            retryable=True,
+                        )
+                return {
+                    "app": "READY",
+                    "postgres": "READY",
+                    "sandbox": "NOT_CONFIGURED",
+                    "optional_profiles": {},
+                }
+
+            backend = ProductionApiBackend(
+                store,
+                run_owner=owner,
+                shutdown=shutdown,
+                health_check=check_health,
+            )
             await backend.recover_pending_graph_starts()
             async with pool.acquire() as connection:
                 if await connection.fetchval("SELECT 1") != 1:
                     raise RuntimeError("PostgreSQL readiness query failed")
 
+            if lock_lost:
+                raise RuntimeError("application lock was lost during startup")
             backend_slot.bind(backend)
             app.state.runtime_ready = True
+            app.state.runtime_shutdown_requested = False
             app.state.runtime_pool = pool
+            app.state.runtime_lock = lock
+            app.state.runtime_lock_loss_event = lock_loss_event
             yield
         except Exception:
             raise RuntimeError("production API startup failed") from None
         finally:
             app.state.runtime_ready = False
             app.state.runtime_pool = None
-            backend_slot.bind(None)
+            backend_slot.unbind()
             try:
-                if backend is not None:
-                    await backend.close()
+                if lock_loss_task is not None:
+                    await lock_loss_task
             finally:
                 try:
-                    if lock_acquired:
-                        await lock.release()
+                    try:
+                        if backend is not None:
+                            await backend.close()
+                    finally:
+                        if lock_acquired:
+                            await lock.release()
                 finally:
                     if pool is not None:
                         await pool.close()
@@ -184,6 +314,11 @@ def create_production_app(
     )
     app.state.runtime_ready = False
     app.state.runtime_pool = None
+    app.state.runtime_lock = None
+    app.state.runtime_lock_loss_event = None
+    app.state.runtime_shutdown_requested = False
+    app.state.runtime_shutdown_error = None
+    app.state.lock_loss_task = None
     return app
 
 
