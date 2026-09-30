@@ -242,10 +242,9 @@ class AskUserAnswer(_FrozenDraftModel):
 class DraftExecRequest(_FrozenDraftModel):
     """Closed input accepted by the draft Exec orchestration boundary."""
 
-    operation: Literal["ReadFile", "QuerySourceAst", "AskUser"]
+    operation: Literal["ReadFile", "QuerySourceAst"]
     path: RepoRelativePath | None = None
     query: str | None = Field(default=None, min_length=1, max_length=4096)
-    question_id: QuestionId | None = None
 
     @field_validator("path", mode="before")
     @classmethod
@@ -255,13 +254,10 @@ class DraftExecRequest(_FrozenDraftModel):
     @model_validator(mode="after")
     def operation_has_exactly_read_only_arguments(self) -> DraftExecRequest:
         if self.operation == "ReadFile":
-            if self.path is None or self.query is not None or self.question_id is not None:
+            if self.path is None or self.query is not None:
                 raise ValueError("ReadFile Exec requires only one repository path")
-        elif self.operation == "QuerySourceAst":
-            if self.path is None or self.query is None or self.question_id is not None:
-                raise ValueError("QuerySourceAst Exec requires a path and query")
-        elif self.question_id is None or self.path is not None or self.query is not None:
-            raise ValueError("AskUser Exec requires only a question id")
+        elif self.path is None or self.query is None:
+            raise ValueError("QuerySourceAst Exec requires a path and query")
         return self
 
 

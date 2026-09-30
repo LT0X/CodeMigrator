@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from enum import Enum
 from typing import Annotated, Any, Literal, TypeAlias
+from uuid import UUID
 
 from pydantic import ConfigDict, Field, StrictInt, field_validator, model_validator
 
@@ -205,7 +206,9 @@ class AuditEvent(CoreModel):
     model_config = ConfigDict(frozen=True)
 
     point: Literal["tool.call.pre", "tool.call.post", "checkpoint.pre"]
-    run_id: RunId | None
+    run_id: RunId | None = None
+    draft_id: UUID | None = None
+    agent_run_id: UUID | None = None
     slice_id: SliceId | None
     generation: int | None
     phase: Phase | None
@@ -232,6 +235,16 @@ class AuditEvent(CoreModel):
     scope_check_passed: bool | None = None
     changed_paths: tuple[str, ...] = ()
 
+    @model_validator(mode="after")
+    def has_one_owner_identity(self) -> AuditEvent:
+        if (self.run_id is None) == (self.draft_id is None):
+            raise ValueError("tool audit event must identify exactly one Run or Draft owner")
+        if self.draft_id is not None and self.agent_run_id is None:
+            raise ValueError("Draft tool audit event requires its AgentRun identity")
+        if self.run_id is not None and self.agent_run_id is not None:
+            raise ValueError("Run tool audit event cannot use a Draft AgentRun identity")
+        return self
+
 
 class WorkspaceFileOperation(CoreModel):
     model_config = ConfigDict(frozen=True)
@@ -256,12 +269,26 @@ class WorkspaceState(str, Enum):
 class GatewayContext(CoreModel):
     model_config = ConfigDict(frozen=True)
 
-    run_id: RunId
+    run_id: RunId | None = None
+    draft_id: UUID | None = None
+    agent_run_id: UUID | None = None
     phase_policy_sha256: Sha256 = Field(pattern=r"^[0-9a-f]{64}$")
     phase: Phase
     session_kind: SessionKind
     slice_id: SliceId | None = None
     generation: int | None = Field(default=None, ge=0, le=2)
+
+    @model_validator(mode="after")
+    def has_exactly_one_owner(self) -> GatewayContext:
+        if (self.run_id is None) == (self.draft_id is None):
+            raise ValueError("gateway context must identify exactly one Run or Draft owner")
+        if self.draft_id is not None and (
+            self.agent_run_id is None or self.slice_id is not None or self.generation is not None
+        ):
+            raise ValueError("Draft gateway context requires AgentRunId and forbids Slice identity")
+        if self.run_id is not None and self.agent_run_id is not None:
+            raise ValueError("Run gateway context cannot use a Draft AgentRun identity")
+        return self
 
 
 class WorkspaceHandle(CoreModel):

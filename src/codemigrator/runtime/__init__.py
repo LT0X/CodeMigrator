@@ -49,6 +49,7 @@ from .contracts import (
     CandidateCheckpointClaim,
     CandidateCheckpointFact,
     CreateRunCommand,
+    DraftOwnerReceipt,
     EventSpec,
     ExecuteRoundResult,
     ExecutionReceiptMessage,
@@ -65,6 +66,16 @@ from .contracts import (
     WorkflowCommandMessage,
 )
 from .create_run import CreateRunPreflightPort, CreateRunRejected, CreateRunService
+from .draft_graph import (
+    DraftAgentCompletion,
+    DraftAgentRunnerPort,
+    DraftFlowOwner,
+    DraftOwnerPort,
+    MigrationSessionGraph,
+    coordinator_task_key,
+    exploration_task_key,
+    trial_translation_task_key,
+)
 from .integration import (
     IntegrationCoordinator,
     IntegrationItem,
@@ -279,6 +290,15 @@ __all__ = [
     "create_bound_agent",
     "DraftContextAssembly",
     "DraftContextIdentity",
+    "DraftAgentCompletion",
+    "DraftAgentRunnerPort",
+    "DraftFlowOwner",
+    "DraftOwnerPort",
+    "DraftOwnerReceipt",
+    "MigrationSessionGraph",
+    "coordinator_task_key",
+    "exploration_task_key",
+    "trial_translation_task_key",
     "provider_adapter_id_for_label",
     "AgentLoop",
     "ActorRegistry",

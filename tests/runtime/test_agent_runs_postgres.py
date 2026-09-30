@@ -111,3 +111,25 @@ async def test_postgres_receipt_failure_rolls_back_run_agent_and_event():
             await store.get_cas_reference("run", record.owner_id, cas_references[0][0])
             == cas_references[0][1]
         )
+
+
+@pytest.mark.asyncio
+async def test_postgres_draft_owner_fact_receipt_is_idempotent():
+    async with isolated_store() as store:
+        draft_id = uuid4()
+        key = "draft.answer:question-1"
+        fact = {"question_id": "question-1", "selected_option": "preserve"}
+        receipt = await store.commit_draft_owner_fact(draft_id, key, "draft.ask_user.answer", fact)
+        assert (
+            await store.commit_draft_owner_fact(draft_id, key, "draft.ask_user.answer", fact)
+            == receipt
+        )
+        assert await store.load_draft_owner_fact(draft_id, key) == (receipt, fact)
+        assert await store.list_draft_owner_facts(draft_id) == ((receipt, fact),)
+        with pytest.raises(StoreCommitError, match="replay mismatch"):
+            await store.commit_draft_owner_fact(
+                draft_id,
+                key,
+                "draft.ask_user.answer",
+                {"question_id": "question-1", "selected_option": "merge"},
+            )

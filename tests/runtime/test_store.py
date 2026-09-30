@@ -39,6 +39,7 @@ def test_runtime_state_round_trips_through_json_for_durable_store():
 def test_runtime_schema_contains_separate_run_and_append_only_event_tables():
     assert "CREATE TABLE IF NOT EXISTS runtime_runs" in RUNTIME_SCHEMA_SQL
     assert "CREATE TABLE IF NOT EXISTS runtime_events" in RUNTIME_SCHEMA_SQL
+    assert "CREATE TABLE IF NOT EXISTS draft_owner_facts" in RUNTIME_SCHEMA_SQL
     assert "PRIMARY KEY (run_id, sequence)" in RUNTIME_SCHEMA_SQL
     assert "UNIQUE (run_id, slice_id)" in RUNTIME_SCHEMA_SQL
     assert "context evolution template is frozen per Run" in RUNTIME_SCHEMA_SQL

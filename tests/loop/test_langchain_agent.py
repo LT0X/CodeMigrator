@@ -393,8 +393,10 @@ def test_closed_phase_session_policy_excludes_draft_ask_user_and_deterministic_p
     )
     assert allowed_tool_names(Phase.Verify, SessionKind.Implementation, draft=False) == ()
     assert allowed_tool_names(Phase.Report, SessionKind.Implementation, draft=False) == ()
-    assert "AskUser" not in allowed_tool_names(
-        Phase.Plan, SessionKind.ExploreCoordinator, draft=True
+    assert allowed_tool_names(Phase.Plan, SessionKind.ExploreCoordinator, draft=True) == (
+        "ReadFile",
+        "QuerySourceAst",
+        "Exec",
     )
 
 

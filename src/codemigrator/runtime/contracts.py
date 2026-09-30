@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import TypeAlias
+from uuid import UUID
 
 from codemigrator.core import (
     ActiveDispatch,
@@ -42,6 +43,28 @@ class RunCreatedReceipt:
             raise ValueError("RunCreated receipt must identify the initial Run commit")
         if self.receipt_key != f"run.created:{self.run_id}":
             raise ValueError("RunCreated receipt key does not match its Run")
+
+
+@dataclass(frozen=True, slots=True)
+class DraftOwnerReceipt:
+    """Durable acknowledgement for one immutable Draft-owned fact."""
+
+    draft_id: UUID
+    receipt_key: str
+    category: str
+    fact_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.draft_id, UUID):
+            raise ValueError("Draft receipt owner must be a UUID")
+        if not self.receipt_key or len(self.receipt_key) > 256:
+            raise ValueError("Draft receipt key must be non-empty and bounded")
+        if not self.category or len(self.category) > 64:
+            raise ValueError("Draft receipt category must be non-empty and bounded")
+        if len(self.fact_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.fact_sha256
+        ):
+            raise ValueError("Draft receipt fact digest must be SHA-256")
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +287,7 @@ def _is_sha256(value: str) -> bool:
 
 
 __all__ = [
+    "DraftOwnerReceipt",
     "AdviceMessage",
     "ApiCommand",
     "ApiCommandPayload",

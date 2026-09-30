@@ -42,6 +42,16 @@ CREATE TABLE IF NOT EXISTS agent_run_receipts (
     created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS draft_owner_facts (
+    draft_id uuid NOT NULL,
+    receipt_key text NOT NULL CHECK (length(receipt_key) BETWEEN 1 AND 256),
+    category text NOT NULL CHECK (length(category) BETWEEN 1 AND 64),
+    fact_sha256 char(64) NOT NULL CHECK (fact_sha256 ~ '^[0-9a-f]{64}$'),
+    fact jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (draft_id, receipt_key)
+);
+
 CREATE TABLE IF NOT EXISTS cas_objects (
     digest char(64) PRIMARY KEY CHECK (digest ~ '^[0-9a-f]{64}$'),
     size_bytes bigint NOT NULL CHECK (size_bytes >= 0),

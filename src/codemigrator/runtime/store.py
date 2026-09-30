@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
@@ -22,6 +23,7 @@ from codemigrator.core import (
     SessionKind,
     SliceGenerationRef,
     SliceId,
+    canonical_json_bytes,
 )
 
 from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
@@ -29,6 +31,7 @@ from .budget import BudgetUsage
 from .cas import CasObject, CheckpointIndex, PendingWriteIndex
 from .contracts import (
     CandidateCheckpointFact,
+    DraftOwnerReceipt,
     EventSpec,
     RunState,
     RuntimeEvent,
@@ -66,6 +69,28 @@ class RuntimeStore(Protocol):
 
     async def load_agent_run(self, agent_run_id: AgentRunId) -> AgentRun | None:
         """Load private session metadata."""
+
+    async def list_agent_runs_by_owner(
+        self, owner_kind: str, owner_id: UUID
+    ) -> tuple[AgentRun, ...]:
+        """Load private session metadata for one owner during retention cleanup."""
+
+    async def commit_draft_owner_fact(
+        self,
+        draft_id: UUID,
+        receipt_key: str,
+        category: str,
+        fact: Mapping[str, object],
+    ) -> DraftOwnerReceipt:
+        """Persist an immutable Draft fact and its idempotency receipt."""
+
+    async def load_draft_owner_fact(
+        self, draft_id: UUID, receipt_key: str
+    ) -> tuple[DraftOwnerReceipt, dict[str, object]] | None: ...
+
+    async def list_draft_owner_facts(
+        self, draft_id: UUID
+    ) -> tuple[tuple[DraftOwnerReceipt, dict[str, object]], ...]: ...
 
     async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
         """Load the committed owner receipt, if any."""
@@ -183,6 +208,7 @@ class InMemoryRuntimeStore:
         self._agent_threads: dict[UUID, AgentRunId] = {}
         self._agent_receipts: dict[AgentRunId, AgentRunReceipt] = {}
         self._agent_lock = asyncio.Lock()
+        self._draft_facts: dict[tuple[UUID, str], tuple[DraftOwnerReceipt, dict[str, object]]] = {}
         self._cas_refs: dict[tuple[str, UUID, str], CasObject] = {}
         self._checkpoints: dict[tuple[str, str, str], CheckpointIndex] = {}
         self._pending_writes: dict[tuple[str, str, str, str, int], PendingWriteIndex] = {}
@@ -209,6 +235,53 @@ class InMemoryRuntimeStore:
         self, owner_kind: str, owner_id: UUID, reference_key: str
     ) -> CasObject | None:
         return self._cas_refs.get((owner_kind, owner_id, reference_key))
+
+    async def commit_draft_owner_fact(
+        self,
+        draft_id: UUID,
+        receipt_key: str,
+        category: str,
+        fact: Mapping[str, object],
+    ) -> DraftOwnerReceipt:
+        receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
+        async with self._agent_lock:
+            key = (draft_id, receipt_key)
+            previous = self._draft_facts.get(key)
+            if previous is not None:
+                if previous[0] != receipt or previous[1] != payload:
+                    raise StoreCommitError("Draft owner fact replay mismatch")
+                return previous[0]
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            self._draft_facts[key] = (receipt, payload)
+            return receipt
+
+    async def load_draft_owner_fact(
+        self, draft_id: UUID, receipt_key: str
+    ) -> tuple[DraftOwnerReceipt, dict[str, object]] | None:
+        value = self._draft_facts.get((draft_id, receipt_key))
+        if value is None:
+            return None
+        receipt, fact = value
+        _verify_draft_fact_digest(receipt, fact)
+        return receipt, _decode_draft_fact(canonical_json_bytes(fact))
+
+    async def list_draft_owner_facts(
+        self, draft_id: UUID
+    ) -> tuple[tuple[DraftOwnerReceipt, dict[str, object]], ...]:
+        values = tuple(
+            value
+            for (owner_id, _), value in sorted(
+                self._draft_facts.items(), key=lambda item: item[0][1]
+            )
+            if owner_id == draft_id
+        )
+        for receipt, fact in values:
+            _verify_draft_fact_digest(receipt, fact)
+        return tuple(
+            (receipt, _decode_draft_fact(canonical_json_bytes(fact))) for receipt, fact in values
+        )
 
     async def release_cas_reference(
         self, owner_kind: str, owner_id: UUID, reference_key: str
@@ -356,6 +429,20 @@ class InMemoryRuntimeStore:
 
     async def load_agent_run(self, agent_run_id: AgentRunId) -> AgentRun | None:
         return self._agent_runs.get(agent_run_id)
+
+    async def list_agent_runs_by_owner(
+        self, owner_kind: str, owner_id: UUID
+    ) -> tuple[AgentRun, ...]:
+        return tuple(
+            sorted(
+                (
+                    record
+                    for record in self._agent_runs.values()
+                    if record.owner_kind == owner_kind and record.owner_id == owner_id
+                ),
+                key=lambda record: record.logical_task_key,
+            )
+        )
 
     async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
         return self._agent_receipts.get(agent_run_id)
@@ -511,6 +598,93 @@ class PostgreSQLRuntimeStore:
         self.pool = pool
         self.secret_registry = secret_registry or SecretRegistry()
 
+    async def commit_draft_owner_fact(
+        self,
+        draft_id: UUID,
+        receipt_key: str,
+        category: str,
+        fact: Mapping[str, object],
+    ) -> DraftOwnerReceipt:
+        receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """INSERT INTO draft_owner_facts(
+                        draft_id, receipt_key, category, fact_sha256, fact
+                    ) VALUES ($1,$2,$3,$4,$5::jsonb)
+                    ON CONFLICT (draft_id, receipt_key) DO NOTHING""",
+                    draft_id,
+                    receipt_key,
+                    category,
+                    receipt.fact_sha256,
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                )
+                row = await connection.fetchrow(
+                    """SELECT category, fact_sha256, fact FROM draft_owner_facts
+                    WHERE draft_id=$1 AND receipt_key=$2""",
+                    draft_id,
+                    receipt_key,
+                )
+                if row is None:
+                    raise StoreCommitError("Draft owner fact commit disappeared")
+                stored = _decode_draft_fact(_row_value(row, "fact"))
+                stored_receipt = DraftOwnerReceipt(
+                    draft_id,
+                    receipt_key,
+                    str(_row_value(row, "category")),
+                    str(_row_value(row, "fact_sha256")).strip(),
+                )
+                if stored_receipt != receipt or stored != payload:
+                    raise StoreCommitError("Draft owner fact replay mismatch")
+                return stored_receipt
+
+    async def load_draft_owner_fact(
+        self, draft_id: UUID, receipt_key: str
+    ) -> tuple[DraftOwnerReceipt, dict[str, object]] | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT category, fact_sha256, fact FROM draft_owner_facts
+                WHERE draft_id=$1 AND receipt_key=$2""",
+                draft_id,
+                receipt_key,
+            )
+        if row is None:
+            return None
+        receipt = DraftOwnerReceipt(
+            draft_id,
+            receipt_key,
+            str(_row_value(row, "category")),
+            str(_row_value(row, "fact_sha256")).strip(),
+        )
+        fact = _decode_draft_fact(_row_value(row, "fact"))
+        _verify_draft_fact_digest(receipt, fact)
+        return receipt, fact
+
+    async def list_draft_owner_facts(
+        self, draft_id: UUID
+    ) -> tuple[tuple[DraftOwnerReceipt, dict[str, object]], ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT receipt_key, category, fact_sha256, fact
+                FROM draft_owner_facts WHERE draft_id=$1 ORDER BY receipt_key""",
+                draft_id,
+            )
+        values = tuple(
+            (
+                DraftOwnerReceipt(
+                    draft_id,
+                    str(_row_value(row, "receipt_key")),
+                    str(_row_value(row, "category")),
+                    str(_row_value(row, "fact_sha256")).strip(),
+                ),
+                _decode_draft_fact(_row_value(row, "fact")),
+            )
+            for row in rows
+        )
+        for receipt, fact in values:
+            _verify_draft_fact_digest(receipt, fact)
+        return values
+
     async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
         _validate_new_agent_run(record)
         async with self.pool.acquire() as connection:
@@ -569,6 +743,18 @@ class PostgreSQLRuntimeStore:
                 agent_run_id,
             )
         return _decode_agent_run(_row_value(row, "metadata")) if row is not None else None
+
+    async def list_agent_runs_by_owner(
+        self, owner_kind: str, owner_id: UUID
+    ) -> tuple[AgentRun, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT metadata FROM agent_runs
+                WHERE owner_kind=$1 AND owner_id=$2 ORDER BY logical_task_key""",
+                owner_kind,
+                owner_id,
+            )
+        return tuple(_decode_agent_run(_row_value(row, "metadata")) for row in rows)
 
     async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
         async with self.pool.acquire() as connection:
@@ -1329,6 +1515,50 @@ def _redact_event_data(value: dict[str, object], registry: SecretRegistry) -> di
     if not result.accepted or not isinstance(result.value, dict):
         raise ValueError("observation rejected")
     return cast(dict[str, object], result.value)
+
+
+def _make_draft_receipt(
+    draft_id: UUID,
+    receipt_key: str,
+    category: str,
+    fact: Mapping[str, object],
+) -> tuple[DraftOwnerReceipt, dict[str, object]]:
+    if not isinstance(draft_id, UUID) or not isinstance(fact, Mapping):
+        raise StoreCommitError("Draft owner fact identity or body is invalid")
+    if not isinstance(receipt_key, str) or not receipt_key or len(receipt_key) > 256:
+        raise StoreCommitError("Draft owner fact receipt key is invalid")
+    if not isinstance(category, str) or not category or len(category) > 64:
+        raise StoreCommitError("Draft owner fact category is invalid")
+    try:
+        encoded = canonical_json_bytes(dict(fact))
+        payload = json.loads(encoded)
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("Draft owner fact is not canonical JSON") from exc
+    if not isinstance(payload, dict):
+        raise StoreCommitError("Draft owner fact must be a JSON object")
+    receipt = DraftOwnerReceipt(
+        draft_id=draft_id,
+        receipt_key=receipt_key,
+        category=category,
+        fact_sha256=hashlib.sha256(encoded).hexdigest(),
+    )
+    return receipt, cast(dict[str, object], payload)
+
+
+def _decode_draft_fact(value: Any) -> dict[str, object]:
+    try:
+        payload = json.loads(value) if isinstance(value, (str, bytes, bytearray)) else dict(value)
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored Draft owner fact is invalid") from exc
+    if not isinstance(payload, dict):
+        raise StoreCommitError("stored Draft owner fact is not an object")
+    return cast(dict[str, object], payload)
+
+
+def _verify_draft_fact_digest(receipt: DraftOwnerReceipt, fact: Mapping[str, object]) -> None:
+    digest = hashlib.sha256(canonical_json_bytes(dict(fact))).hexdigest()
+    if digest != receipt.fact_sha256:
+        raise StoreCommitError("stored Draft owner fact digest mismatch")
 
 
 def _row_value(row: Any, key: str) -> Any:
