@@ -47,10 +47,17 @@ class ApiRequest:
 
 
 class PersistedEvent(Protocol):
-    sequence: int
-    event_type: str
-    data: dict[str, object]
-    timestamp_utc: datetime
+    @property
+    def sequence(self) -> int: ...
+
+    @property
+    def event_type(self) -> str: ...
+
+    @property
+    def data(self) -> dict[str, object]: ...
+
+    @property
+    def timestamp_utc(self) -> datetime: ...
 
 
 @dataclass(frozen=True, slots=True)

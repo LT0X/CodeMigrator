@@ -48,6 +48,7 @@ from .contracts import (
     RuntimeEvent,
     RuntimeMessage,
     RuntimeSnapshot,
+    RuntimeStoreTransaction,
     SessionInputCommand,
     VerificationSummary,
     WorkflowCommandMessage,
@@ -173,9 +174,22 @@ class RunActor:
     async def join(self) -> None:
         await self._queue.join()
 
-    async def create(self, create_run: CreateRun) -> RunCreatedReceipt | None:
+    async def create(
+        self,
+        create_run: CreateRun,
+        *,
+        transaction: RuntimeStoreTransaction | None = None,
+    ) -> RunCreatedReceipt | None:
         self._create_receipt = None
-        await self.submit(ApiCommand(CreateRunCommand(run_id=self.run_id, create_run=create_run)))
+        await self.submit(
+            ApiCommand(
+                CreateRunCommand(
+                    run_id=self.run_id,
+                    create_run=create_run,
+                    transaction=transaction,
+                )
+            )
+        )
         await self.join()
         return self._create_receipt
 
@@ -757,6 +771,9 @@ class RunActor:
             version=1,
             create_request=command.create_run,
         )
+        transaction = command.transaction
+        if transaction is not None and not isinstance(transaction, RuntimeStoreTransaction):
+            raise StoreCommitError("RunActor received an unsupported store transaction")
         snapshot = await self.store.create(
             state,
             (
@@ -769,9 +786,17 @@ class RunActor:
                     },
                 ),
             ),
+            transaction=transaction,
         )
         self._state = snapshot.state
         self._create_receipt = _run_created_receipt(snapshot, self.run_id)
+        if transaction is not None:
+            transaction.after_rollback(self._rollback_uncommitted_create)
+
+    def _rollback_uncommitted_create(self) -> None:
+        if self._state is not None and self._state.run_id == self.run_id:
+            self._state = None
+            self._create_receipt = None
 
     async def _handle_cancel(self, command: CancelCommand) -> None:
         state = self._state

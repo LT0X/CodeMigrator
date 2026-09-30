@@ -6,9 +6,10 @@ import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any, Protocol, cast
 from uuid import UUID
 
@@ -40,6 +41,7 @@ from .contracts import (
     RunState,
     RuntimeEvent,
     RuntimeSnapshot,
+    RuntimeStoreTransaction,
 )
 from .loop_contracts import SessionExit, SessionState
 from .memory import EvolutionSegment, EvolutionSegmentDraft
@@ -66,8 +68,27 @@ class RuntimeStore(Protocol):
         events: Sequence[EventSpec],
         *,
         evolution: EvolutionSegmentDraft | None = None,
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> RuntimeSnapshot:
         """Insert a new Run atomically with its first events."""
+
+    async def execute_api_command(
+        self,
+        *,
+        principal_id: str,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+        command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
+        project_response: Callable[[object], object],
+        owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+    ) -> Mapping[str, object]:
+        """Commit an API receipt with its owner command in one transaction."""
+
+    async def list_pending_graph_starts(self) -> tuple[tuple[RunId, str], ...]: ...
+
+    async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None: ...
 
     async def commit(
         self,
@@ -257,6 +278,11 @@ class InMemoryRuntimeStore:
         self._cas_refs: dict[tuple[str, UUID, str], CasObject] = {}
         self._checkpoints: dict[tuple[str, str, str], CheckpointIndex] = {}
         self._pending_writes: dict[tuple[str, str, str, str, int], PendingWriteIndex] = {}
+        self._api_command_lock = asyncio.Lock()
+        self._api_commands: dict[
+            tuple[str, str, str], tuple[str, Mapping[str, object], datetime]
+        ] = {}
+        self._graph_start_handoffs: dict[RunId, str] = {}
 
     async def add_cas_reference(
         self, object_ref: CasObject, owner_kind: str, owner_id: UUID, reference_key: str
@@ -675,10 +701,99 @@ class InMemoryRuntimeStore:
         events: Sequence[EventSpec],
         *,
         evolution: EvolutionSegmentDraft | None = None,
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> RuntimeSnapshot:
+        if transaction is not None:
+            if transaction.store is not self or not transaction.active:
+                raise StoreCommitError("runtime transaction does not belong to this store")
+            snapshot = await self._write(state, events, evolution=evolution)
+            transaction.after_rollback(lambda: self._snapshots.pop(state.run_id, None))
+            return snapshot
         if state.run_id in self._snapshots:
             raise StoreCommitError("run already exists")
         return await self._write(state, events, evolution=evolution)
+
+    async def execute_api_command(
+        self,
+        *,
+        principal_id: str,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+        command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
+        project_response: Callable[[object], object],
+        owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+    ) -> Mapping[str, object]:
+        scope = (principal_id, route, key)
+        body_digest = sha256(canonical_body).hexdigest()
+        now = datetime.now(UTC)
+        async with self._api_command_lock:
+            previous = self._api_commands.get(scope)
+            expired = previous is not None and previous[2] <= now
+            if previous is not None:
+                if not expired and previous[0] != body_digest:
+                    return {"conflict": True, "replayed": False}
+                if not expired:
+                    return {**previous[1], "replayed": True}
+            transaction = RuntimeStoreTransaction(self, None)
+            try:
+                value = await command(transaction)
+                response = project_response(value)
+                owner = owner_receipt(value)
+                self._record_in_memory_graph_handoff(owner)
+                outcome: dict[str, object] = {
+                    "response": response,
+                    "status_code": status_code,
+                    "owner_kind": owner[0] if owner else None,
+                    "owner_id": str(owner[1]) if owner else None,
+                    "owner_receipt_key": owner[2] if owner else None,
+                    "replayed": False,
+                }
+                if expired:
+                    del self._api_commands[scope]
+                self._api_commands[scope] = (
+                    body_digest,
+                    outcome,
+                    now + timedelta(hours=24),
+                )
+                if owner is not None:
+                    self._graph_start_handoffs[RunId(owner[1])] = owner[2]
+                transaction.after_rollback(lambda: self._api_commands.pop(scope, None))
+                if owner is not None:
+                    transaction.after_rollback(
+                        lambda: self._graph_start_handoffs.pop(RunId(owner[1]), None)
+                    )
+            except Exception:
+                transaction.finish(committed=False)
+                raise
+            transaction.finish(committed=True)
+            return outcome
+
+    def _record_in_memory_graph_handoff(
+        self, owner: tuple[str, UUID, str] | None
+    ) -> None:
+        if owner is None:
+            return
+        owner_kind, owner_id, receipt_key = owner
+        if owner_kind != "run":
+            raise StoreCommitError("unsupported API command owner receipt")
+        run_id = RunId(owner_id)
+        snapshot = self._snapshots.get(run_id)
+        if snapshot is None or not any(
+            event.event_type == "run.created"
+            and event.data.get("receipt_key") == receipt_key
+            for event in snapshot.events
+        ):
+            raise StoreCommitError("API command has no committed RunCreated receipt")
+
+    async def list_pending_graph_starts(self) -> tuple[tuple[RunId, str], ...]:
+        return tuple(self._graph_start_handoffs.items())
+
+    async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None:
+        if self._graph_start_handoffs.get(run_id) != receipt_key:
+            raise StoreCommitError("Run graph-start handoff is not pending")
+        del self._graph_start_handoffs[run_id]
 
     async def commit(
         self,
@@ -1420,6 +1535,165 @@ class PostgreSQLRuntimeStore:
         async with self.pool.acquire() as connection:
             await connection.execute(RUNTIME_SCHEMA_SQL)
 
+    async def execute_api_command(
+        self,
+        *,
+        principal_id: str,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+        command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
+        project_response: Callable[[object], object],
+        owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+    ) -> Mapping[str, object]:
+        """Run one owner command and persist its replay result on the same connection."""
+
+        if not principal_id.strip() or not route.startswith("/") or not key.strip():
+            raise ValueError("API idempotency scope is invalid")
+        if len(key) > 256:
+            raise ValueError("API idempotency key is too long")
+        body_digest = sha256(canonical_body).hexdigest()
+        scope_key = json.dumps(
+            [principal_id, route, key], ensure_ascii=True, separators=(",", ":")
+        )
+        transaction_context: RuntimeStoreTransaction | None = None
+        outcome: dict[str, object]
+        try:
+            async with self.pool.acquire() as connection:
+                async with connection.transaction():
+                    await connection.fetchval(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+                        scope_key,
+                    )
+                    existing = await connection.fetchrow(
+                        """SELECT body_sha256, status_code, response_body, owner_kind,
+                        owner_id, owner_receipt_key,
+                        expires_at > clock_timestamp() AS active
+                        FROM api_command_receipts
+                        WHERE principal_id=$1 AND route=$2 AND idempotency_key=$3""",
+                        principal_id,
+                        route,
+                        key,
+                    )
+                    expired = existing is not None and not bool(_row_value(existing, "active"))
+                    if expired:
+                        existing = None
+                    if existing is not None:
+                        if str(_row_value(existing, "body_sha256")).strip() != body_digest:
+                            outcome = {"conflict": True, "replayed": False}
+                        else:
+                            outcome = {
+                                "response": _decode_json_value(
+                                    _row_value(existing, "response_body")
+                                ),
+                                "status_code": int(_row_value(existing, "status_code")),
+                                "owner_kind": _row_value(existing, "owner_kind"),
+                                "owner_id": _row_value(existing, "owner_id"),
+                                "owner_receipt_key": _row_value(
+                                    existing, "owner_receipt_key"
+                                ),
+                                "replayed": True,
+                            }
+                    else:
+                        transaction_context = RuntimeStoreTransaction(self, connection)
+                        value = await command(transaction_context)
+                        response = project_response(value)
+                        response_json = json.dumps(
+                            response, sort_keys=True, separators=(",", ":")
+                        )
+                        owner = owner_receipt(value)
+                        owner_kind: str | None = None
+                        owner_id: UUID | None = None
+                        receipt_key: str | None = None
+                        if owner is not None:
+                            owner_kind, owner_id, receipt_key = owner
+                            if owner_kind != "run" or not receipt_key:
+                                raise StoreCommitError(
+                                    "API command owner receipt is unsupported"
+                                )
+                            committed_receipt = await connection.fetchval(
+                                """SELECT 1 FROM runtime_events WHERE run_id=$1
+                                AND sequence=1 AND event_type='run.created'
+                                AND data->>'receipt_key'=$2""",
+                                owner_id,
+                                receipt_key,
+                            )
+                            if committed_receipt is None:
+                                raise StoreCommitError(
+                                    "API command has no committed RunCreated receipt"
+                                )
+                            await connection.execute(
+                                """INSERT INTO run_graph_start_handoffs
+                                (run_id, receipt_key, status) VALUES ($1,$2,'PENDING')""",
+                                owner_id,
+                                receipt_key,
+                            )
+                        if expired:
+                            await connection.execute(
+                                """DELETE FROM api_command_receipts
+                                WHERE principal_id=$1 AND route=$2 AND idempotency_key=$3
+                                AND expires_at <= clock_timestamp()""",
+                                principal_id,
+                                route,
+                                key,
+                            )
+                        await connection.execute(
+                            """INSERT INTO api_command_receipts(
+                            principal_id, route, idempotency_key, body_sha256, status_code,
+                            response_body, owner_kind, owner_id, owner_receipt_key,
+                            expires_at
+                            ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,
+                                clock_timestamp() + INTERVAL '24 hours')""",
+                            principal_id,
+                            route,
+                            key,
+                            body_digest,
+                            status_code,
+                            response_json,
+                            owner_kind,
+                            owner_id,
+                            receipt_key,
+                        )
+                        outcome = {
+                            "response": response,
+                            "status_code": status_code,
+                            "owner_kind": owner_kind,
+                            "owner_id": owner_id,
+                            "owner_receipt_key": receipt_key,
+                            "replayed": False,
+                        }
+        except Exception:
+            if transaction_context is not None:
+                transaction_context.finish(committed=False)
+            raise
+        if transaction_context is not None:
+            transaction_context.finish(committed=True)
+        return outcome
+
+    async def list_pending_graph_starts(self) -> tuple[tuple[RunId, str], ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT run_id, receipt_key FROM run_graph_start_handoffs
+                WHERE status='PENDING' ORDER BY created_at, run_id"""
+            )
+        return tuple(
+            (RunId(_row_value(row, "run_id")), str(_row_value(row, "receipt_key")))
+            for row in rows
+        )
+
+    async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None:
+        async with self.pool.acquire() as connection:
+            updated = await connection.execute(
+                """UPDATE run_graph_start_handoffs SET status='STARTED',
+                started_at=COALESCE(started_at, clock_timestamp())
+                WHERE run_id=$1 AND receipt_key=$2""",
+                run_id,
+                receipt_key,
+            )
+        if updated.split()[-1] != "1":
+            raise StoreCommitError("Run graph-start handoff does not exist")
+
     async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
         async with self.pool.acquire() as connection:
             rows = await connection.fetch(
@@ -1515,30 +1789,69 @@ class PostgreSQLRuntimeStore:
         events: Sequence[EventSpec],
         *,
         evolution: EvolutionSegmentDraft | None = None,
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> RuntimeSnapshot:
+        if transaction is not None:
+            if transaction.store is not self or not transaction.active:
+                raise StoreCommitError("runtime transaction does not belong to this store")
+            return await self._create_with_connection(
+                transaction.connection, state, events, evolution=evolution
+            )
         async with self.pool.acquire() as connection:
             async with connection.transaction():
-                try:
-                    await connection.execute(
-                        "INSERT INTO runtime_runs(run_id, state) VALUES ($1, $2::jsonb)",
-                        state.run_id,
-                        _dump_json(state),
-                    )
-                except Exception as exc:
-                    raise StoreCommitError("unable to create runtime run") from exc
-                await _insert_events(
-                    connection,
-                    state.run_id,
-                    events,
-                    first_sequence=1,
-                    secret_registry=self.secret_registry,
-                )
-                if evolution is not None:
-                    await _append_evolution_with_connection(connection, evolution, state.run_id)
-        snapshot = await self.load(state.run_id)
-        if snapshot is None:
+                await self._create_with_connection(connection, state, events, evolution=evolution)
+            snapshot = await self.load(state.run_id)
+            if snapshot is None:
+                raise StoreCommitError("created runtime run disappeared")
+            return snapshot
+
+    async def _create_with_connection(
+        self,
+        connection: Any,
+        state: RunState,
+        events: Sequence[EventSpec],
+        *,
+        evolution: EvolutionSegmentDraft | None,
+    ) -> RuntimeSnapshot:
+        try:
+            await connection.execute(
+                "INSERT INTO runtime_runs(run_id, state) VALUES ($1, $2::jsonb)",
+                state.run_id,
+                _dump_json(state),
+            )
+        except Exception as exc:
+            raise StoreCommitError("unable to create runtime run") from exc
+        await _insert_events(
+            connection,
+            state.run_id,
+            events,
+            first_sequence=1,
+            secret_registry=self.secret_registry,
+        )
+        if evolution is not None:
+            await _append_evolution_with_connection(connection, evolution, state.run_id)
+        row = await connection.fetchrow(
+            "SELECT state FROM runtime_runs WHERE run_id=$1", state.run_id
+        )
+        event_rows = await connection.fetch(
+            """SELECT sequence, event_type, data, timestamp_utc FROM runtime_events
+            WHERE run_id=$1 ORDER BY sequence""",
+            state.run_id,
+        )
+        if row is None:
             raise StoreCommitError("created runtime run disappeared")
-        return snapshot
+        return RuntimeSnapshot(
+            state=_decode_state(_row_value(row, "state")),
+            events=tuple(
+                RuntimeEvent(
+                    sequence=int(_row_value(event, "sequence")),
+                    event_type=str(_row_value(event, "event_type")),
+                    data=_decode_event_data(_row_value(event, "data")),
+                    timestamp_utc=_row_value(event, "timestamp_utc"),
+                )
+                for event in event_rows
+            ),
+        )
 
     async def commit(
         self,
@@ -1839,6 +2152,13 @@ def _decode_event_data(value: Any) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise StoreCommitError("stored Run event data is not an object")
     return cast(dict[str, object], payload)
+
+
+def _decode_json_value(value: Any) -> object:
+    try:
+        return json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored API response is invalid JSON") from exc
 
 
 def _event_status(data: Mapping[str, object]) -> object:
