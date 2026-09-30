@@ -239,10 +239,8 @@ class AuditEvent(CoreModel):
     def has_one_owner_identity(self) -> AuditEvent:
         if (self.run_id is None) == (self.draft_id is None):
             raise ValueError("tool audit event must identify exactly one Run or Draft owner")
-        if self.draft_id is not None and self.agent_run_id is None:
-            raise ValueError("Draft tool audit event requires its AgentRun identity")
-        if self.run_id is not None and self.agent_run_id is not None:
-            raise ValueError("Run tool audit event cannot use a Draft AgentRun identity")
+        if self.point.startswith("tool.call.") and self.agent_run_id is None:
+            raise ValueError("tool audit event requires its AgentRun identity")
         return self
 
 
@@ -282,12 +280,10 @@ class GatewayContext(CoreModel):
     def has_exactly_one_owner(self) -> GatewayContext:
         if (self.run_id is None) == (self.draft_id is None):
             raise ValueError("gateway context must identify exactly one Run or Draft owner")
-        if self.draft_id is not None and (
-            self.agent_run_id is None or self.slice_id is not None or self.generation is not None
-        ):
-            raise ValueError("Draft gateway context requires AgentRunId and forbids Slice identity")
-        if self.run_id is not None and self.agent_run_id is not None:
-            raise ValueError("Run gateway context cannot use a Draft AgentRun identity")
+        if self.agent_run_id is None:
+            raise ValueError("gateway context requires its AgentRun identity")
+        if self.draft_id is not None and (self.slice_id is not None or self.generation is not None):
+            raise ValueError("Draft gateway context forbids Slice identity")
         return self
 
 

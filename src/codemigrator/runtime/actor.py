@@ -501,25 +501,41 @@ class RunActor:
             raise StoreCommitError("EXECUTE result arrived after its Run stopped executing")
         completed_ids = set(decision.completed_write_agent_run_ids)
         claimed_ids = {claim.agent_run_id for claim in decision.candidate_claims}
+        terminal_ids = set(decision.terminal_agent_run_ids)
         if (
             len(claimed_ids) != len(decision.candidate_claims)
             or len(completed_ids) != len(decision.completed_write_agent_run_ids)
+            or len(terminal_ids) != len(decision.terminal_agent_run_ids)
             or completed_ids != claimed_ids
+            or not completed_ids.issubset(terminal_ids)
         ):
-            raise StoreCommitError("EXECUTE candidate checkpoint claim set is incomplete")
+            raise StoreCommitError(
+                "EXECUTE terminal or candidate checkpoint claim set is incomplete"
+            )
         candidate_facts = list(state.candidate_checkpoints)
+        terminal_events: list[EventSpec] = []
         candidate_events: list[EventSpec] = []
         snapshot = await self.store.load(self.run_id)
+        for agent_run_id in decision.terminal_agent_run_ids:
+            record = await self.store.load_agent_run(agent_run_id)
+            receipt = await self.store.load_agent_run_receipt(agent_run_id)
+            if (
+                record is None
+                or record.owner_kind != "run"
+                or record.owner_id != self.run_id
+                or record.phase is not Phase.Execute
+                or not record.is_terminal
+                or receipt is None
+                or receipt.agent_run_id != record.agent_run_id
+                or receipt.category != "session.terminal"
+            ):
+                raise StoreCommitError("EXECUTE terminal AgentRun has no matching terminal receipt")
+            if not _has_agent_run_event(snapshot, "agent_run.started", agent_run_id):
+                raise StoreCommitError("terminal EXECUTE AgentRun has no committed start receipt")
+            if not _has_agent_run_event(snapshot, "agent_run.terminal", agent_run_id):
+                terminal_events.append(agent_run_lifecycle_spec(record, receipt))
         for claim in decision.candidate_claims:
             fact = await self._validate_candidate_claim(claim, candidate_facts)
-            record = await self.store.load_agent_run(claim.agent_run_id)
-            terminal_receipt = await self.store.load_agent_run_receipt(claim.agent_run_id)
-            if record is None or terminal_receipt is None:
-                raise StoreCommitError("completed EXECUTE AgentRun has no terminal receipt")
-            if not _has_agent_run_event(snapshot, "agent_run.started", claim.agent_run_id):
-                raise StoreCommitError("completed EXECUTE AgentRun has no committed start receipt")
-            if not _has_agent_run_event(snapshot, "agent_run.terminal", claim.agent_run_id):
-                candidate_events.append(agent_run_lifecycle_spec(record, terminal_receipt))
             current = next(
                 (
                     item
@@ -553,6 +569,7 @@ class RunActor:
         committed = await self._commit(
             next_state,
             (
+                *terminal_events,
                 *candidate_events,
                 EventSpec(
                     "run.execute.round",

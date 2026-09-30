@@ -96,6 +96,7 @@ class ExecutionRoundDecision:
     dispatch_count: int
     completed_write_agent_run_ids: tuple[AgentRunId, ...] = ()
     candidate_claims: tuple[CandidateCheckpointClaim, ...] = ()
+    terminal_agent_run_ids: tuple[AgentRunId, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.dispatch_count) is not int or self.dispatch_count < 0:

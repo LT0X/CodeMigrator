@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from codemigrator.core import ModelProfile, Phase, SessionKind, canonical_json_bytes
+from codemigrator.core import ModelProfile, Phase, SessionKind, canonical_json_bytes, load_resource
 from codemigrator.core.ids import new_uuid7
 from codemigrator.runtime.agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from codemigrator.runtime.binding import LockedModelBinding
@@ -37,6 +37,7 @@ from codemigrator.runtime.provider import (
     select_unique_provider_config,
 )
 from codemigrator.runtime.store import InMemoryRuntimeStore
+from codemigrator.workspace import GatewayContext
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("CODEMIGRATOR_REAL_OPENCODE", "").casefold() not in {"1", "true"},
@@ -76,6 +77,9 @@ class _UsageSink:
 
 
 class _NoToolGateway:
+    def __init__(self, context: GatewayContext) -> None:
+        self.context = context
+
     def dispatch(self, raw_call, *, cancellation_token=None):
         raise AssertionError("the live smoke task must not dispatch tools")
 
@@ -183,7 +187,17 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                     context_manager=context_manager,
                     template=template,
                     envelope=envelope,
-                    gateway=_NoToolGateway(),
+                        gateway=_NoToolGateway(
+                            GatewayContext(
+                                draft_id=owner_id,
+                                agent_run_id=agent_run_id,
+                                phase_policy_sha256=load_resource(
+                                    "core://phase-tool-policy/v2"
+                                ).sha256,
+                                phase=Phase.Plan,
+                                session_kind=SessionKind.ExploreCoordinator,
+                            )
+                        ),
                     usage_sink=usage_sink,
                     context_identity=context_identity,
                     checkpointer=agent_checkpointer,

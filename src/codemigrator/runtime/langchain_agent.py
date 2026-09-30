@@ -39,6 +39,7 @@ from codemigrator.core import (
     canonical_json_bytes,
     load_resource,
 )
+from codemigrator.workspace import GatewayContext
 from codemigrator.workspace.models import (
     EditFileCall,
     ExecCall,
@@ -611,6 +612,30 @@ def create_bound_agent(
         raise ValueError("persistent AgentRun requires a durable model-call usage sink")
     if binding.digest != agent_run.model_binding_sha256:
         raise ValueError("AgentRun model binding digest changed")
+    gateway_context = getattr(gateway, "context", None)
+    slice_ref = agent_run.slice_ref
+    if not isinstance(gateway_context, GatewayContext) or (
+        gateway_context.agent_run_id != agent_run.agent_run_id
+        or gateway_context.phase is not agent_run.phase
+        or gateway_context.session_kind is not agent_run.session_kind
+        or gateway_context.slice_id != (slice_ref.slice_id if slice_ref is not None else None)
+        or gateway_context.generation != (slice_ref.generation if slice_ref is not None else None)
+        or (
+            agent_run.owner_kind == "run"
+            and (
+                gateway_context.run_id != agent_run.owner_id
+                or gateway_context.draft_id is not None
+            )
+        )
+        or (
+            agent_run.owner_kind == "draft"
+            and (
+                gateway_context.draft_id != agent_run.owner_id
+                or gateway_context.run_id is not None
+            )
+        )
+    ):
+        raise ValueError("gateway context differs from AgentRun")
     if agent_run.phase in (Phase.Verify, Phase.Report):
         raise ValueError("deterministic phases cannot create an AgentRun model")
     tool_names = allowed_tool_names(

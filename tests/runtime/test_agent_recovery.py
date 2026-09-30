@@ -131,6 +131,8 @@ class _OneRoundScheduler:
 async def _store_with_terminal_agent(
     run_id: RunId,
     record: AgentRun,
+    *,
+    publish_terminal_event: bool = True,
 ) -> InMemoryRuntimeStore:
     store = InMemoryRuntimeStore()
     await store.create(
@@ -161,7 +163,9 @@ async def _store_with_terminal_agent(
         record,
         terminal_receipt,
         state=replace((await store.snapshot(run_id)).state, version=3),
-        events=(agent_run_lifecycle_spec(record, terminal_receipt),),
+        events=(agent_run_lifecycle_spec(record, terminal_receipt),)
+        if publish_terminal_event
+        else (),
     )
     assert created.agent_run_id == record.agent_run_id
     return store
@@ -180,6 +184,7 @@ async def test_session_completed_without_m08_receipt_cannot_advance_actor_round(
                 complete=True,
                 dispatch_count=0,
                 completed_write_agent_run_ids=(record.agent_run_id,),
+                terminal_agent_run_ids=(record.agent_run_id,),
                 candidate_claims=(CandidateCheckpointClaim(record.agent_run_id, None),),
             )
         ),
@@ -211,6 +216,7 @@ async def test_actor_accepts_only_matching_persisted_candidate_checkpoint() -> N
                 complete=True,
                 dispatch_count=0,
                 completed_write_agent_run_ids=(record.agent_run_id,),
+                terminal_agent_run_ids=(record.agent_run_id,),
                 candidate_claims=(CandidateCheckpointClaim(record.agent_run_id, receipt),),
             )
         ),
@@ -247,6 +253,7 @@ async def test_actor_rejects_candidate_receipt_that_is_not_persisted_by_m08() ->
                 complete=True,
                 dispatch_count=0,
                 completed_write_agent_run_ids=(record.agent_run_id,),
+                terminal_agent_run_ids=(record.agent_run_id,),
                 candidate_claims=(CandidateCheckpointClaim(record.agent_run_id, receipt),),
             )
         ),
@@ -274,6 +281,7 @@ async def test_failed_actor_commit_leaves_candidate_for_idempotent_replay() -> N
         complete=True,
         dispatch_count=0,
         completed_write_agent_run_ids=(record.agent_run_id,),
+        terminal_agent_run_ids=(record.agent_run_id,),
         candidate_claims=(CandidateCheckpointClaim(record.agent_run_id, receipt),),
     )
     actor = RunActor(
@@ -296,6 +304,44 @@ async def test_failed_actor_commit_leaves_candidate_for_idempotent_replay() -> N
     after_replay = await store.snapshot(run_id)
     assert result.complete is True
     assert after_replay.state.candidate_checkpoints[0].candidate_oid == CANDIDATE_OID
+    await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_actor_projects_failed_execute_agentrun_terminal_without_candidate() -> None:
+    run_id, slice_id = RunId(uuid4()), SliceId(uuid4())
+    record = replace(
+        _agent_run(run_id, slice_id),
+        state=SessionState.Failed,
+        exit=SessionExit.BudgetExhausted,
+    )
+    store = await _store_with_terminal_agent(
+        run_id, record, publish_terminal_event=False
+    )
+    actor = RunActor(
+        run_id,
+        store,
+        execution_scheduler=_OneRoundScheduler(
+            ExecutionRoundDecision(
+                complete=False,
+                dispatch_count=1,
+                terminal_agent_run_ids=(record.agent_run_id,),
+            )
+        ),
+    )
+    await actor.start()
+
+    await actor.advance_execution_round(run_id, f"run.execute.round:{run_id}:failed")
+
+    snapshot = await store.snapshot(run_id)
+    terminal_events = [
+        event for event in snapshot.events if event.event_type == "agent_run.terminal"
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].data["agent_run_id"] == str(record.agent_run_id)
+    assert terminal_events[0].data["exit"] == SessionExit.BudgetExhausted.value
+    assert terminal_events[0].data["receipt_category"] == "session.terminal"
+    assert snapshot.state.candidate_checkpoints == ()
     await actor.stop()
 
 

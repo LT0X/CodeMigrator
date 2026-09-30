@@ -27,6 +27,8 @@ from .provider import (
 )
 
 if TYPE_CHECKING:
+    from codemigrator.workspace import GatewayContext
+
     from .agent_runs import AgentRunId
 
 
@@ -35,6 +37,9 @@ class SessionCancelled(RuntimeError):
 
 
 class ToolGatewayPort(Protocol):
+    @property
+    def context(self) -> GatewayContext: ...
+
     def dispatch(
         self,
         raw_call: Mapping[str, object],

@@ -16,6 +16,7 @@ from codemigrator.core import (
     Phase,
     SessionBudgetProfile,
     SessionKind,
+    load_resource,
 )
 from codemigrator.core.models.plan import PlanProposal
 from codemigrator.runtime.agent_runs import AgentRun
@@ -45,6 +46,7 @@ from codemigrator.runtime.provider import (
     ProviderToolCall,
     TokenUsage,
 )
+from codemigrator.workspace import GatewayContext
 
 
 class ExactCounter:
@@ -72,6 +74,7 @@ class FakeProvider:
 class FakeGateway:
     def __init__(self):
         self.calls = []
+        self.context: GatewayContext | None = None
 
     def dispatch(self, raw_call, *, cancellation_token=None):
         self.calls.append(raw_call)
@@ -198,6 +201,32 @@ def _prepare_agent_kwargs(kwargs):
             ),
             template_sha256=template_sha256,
         )
+    if kwargs["gateway"].context is None:
+        run = kwargs["agent_run"]
+        if run.owner_kind == "draft":
+            gateway_context = GatewayContext(
+                draft_id=run.owner_id,
+                agent_run_id=run.agent_run_id,
+                phase_policy_sha256=load_resource("core://phase-tool-policy/v2").sha256,
+                phase=run.phase,
+                session_kind=run.session_kind,
+            )
+        else:
+            phase_policy_sha256 = (
+                context_identity.phase_policy_sha256
+                if isinstance(context_identity, ContextPackIdentity)
+                else load_resource("core://phase-tool-policy/v2").sha256
+            )
+            gateway_context = GatewayContext(
+                run_id=run.owner_id,
+                agent_run_id=run.agent_run_id,
+                phase_policy_sha256=phase_policy_sha256,
+                phase=run.phase,
+                session_kind=run.session_kind,
+                slice_id=run.slice_ref.slice_id if run.slice_ref is not None else None,
+                generation=run.slice_ref.generation if run.slice_ref is not None else None,
+            )
+        kwargs["gateway"].context = gateway_context
     return kwargs
 
 
@@ -334,6 +363,42 @@ async def test_create_agent_returns_structured_output_without_gateway_dispatch()
     ]
     assert provider.requests[0].tool_choice == "any"
     assert gateway.calls == []
+
+
+def test_factory_rejects_gateway_bound_to_another_agentrun() -> None:
+    binding = _binding()
+    run = _run(binding)
+    kwargs = _prepare_agent_kwargs(
+        {
+            "agent_run": run,
+            "binding": binding,
+            "registry": ProviderRegistry(
+                {"openai-compatible": FakeProvider([_response()])}
+            ),
+            "context_manager": ContextManager(
+                token_counter=ExactCounter(), net_input_cap=FormulaNetInputCap()
+            ),
+            "template": "plan role",
+            "envelope": ContextEnvelope(),
+            "gateway": FakeGateway(),
+            "context_identity": _context_identity(run, binding),
+        }
+    )
+    gateway = kwargs["gateway"]
+    context = gateway.context
+    assert context is not None
+    mismatches = (
+        {"agent_run_id": uuid4()},
+        {"run_id": uuid4()},
+        {"phase": Phase.Execute},
+        {"session_kind": SessionKind.Contract},
+        {"slice_id": uuid4()},
+        {"generation": 0},
+    )
+    for mismatch in mismatches:
+        gateway.context = context.model_copy(update=mismatch)
+        with pytest.raises(ValueError, match="gateway context differs from AgentRun"):
+            _create_bound_agent(**kwargs)
 
 
 @pytest.mark.asyncio

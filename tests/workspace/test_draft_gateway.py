@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 from codemigrator.core import Phase, SessionKind, StableErrorCode, load_resource
 from codemigrator.workspace import (
     CallbackExecEngine,
@@ -68,6 +70,48 @@ def test_gateway_context_requires_exactly_one_owner() -> None:
         pass
     else:
         raise AssertionError("gateway context cannot have two owners")
+
+
+def test_run_gateway_audit_binds_run_and_agent_run_identity(tmp_path) -> None:
+    snapshot = tmp_path / "snapshot"
+    workspace = tmp_path / "workspace"
+    snapshot.mkdir()
+    workspace.mkdir()
+    (snapshot / "source.py").write_text("answer = 42\n", encoding="utf-8")
+    run_id = uuid.uuid4()
+    agent_run_id = uuid.uuid4()
+    audit = []
+    gateway = ToolGateway(
+        context=GatewayContext(
+            run_id=run_id,
+            agent_run_id=agent_run_id,
+            phase_policy_sha256=load_resource("core://phase-tool-policy/v2").sha256,
+            phase=Phase.Plan,
+            session_kind=SessionKind.PlanAuxiliary,
+        ),
+        roots=GatewayRoots(
+            snapshot=SecureRoot("snapshot", snapshot),
+            workspace=SecureRoot("workspace", workspace),
+        ),
+        audit_sink=audit.append,
+    )
+
+    result = gateway.dispatch({"tool": "ReadFile", "path": "source.py"})
+
+    assert not isinstance(result, ToolError)
+    assert len(audit) == 2
+    assert all(event.run_id == run_id for event in audit)
+    assert all(event.agent_run_id == agent_run_id for event in audit)
+
+
+def test_run_gateway_context_requires_agent_run_identity() -> None:
+    with pytest.raises(ValueError, match="AgentRun"):
+        GatewayContext(
+            run_id=uuid.uuid4(),
+            phase_policy_sha256=load_resource("core://phase-tool-policy/v2").sha256,
+            phase=Phase.Plan,
+            session_kind=SessionKind.PlanAuxiliary,
+        )
 
 
 def test_draft_exec_only_has_the_read_only_gateway_bridge(tmp_path) -> None:
