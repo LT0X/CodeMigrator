@@ -7,6 +7,8 @@ from enum import Enum
 
 class RunEventType(str, Enum):
     RunStatusChanged = "run.status_changed"
+    AgentRunStarted = "agent_run.started"
+    AgentRunTerminal = "agent_run.terminal"
     SliceStatusChanged = "slice.status_changed"
     ContractWaveCompleted = "execute.contract_wave_completed"
     CandidateGenerationStarted = "candidate.generation_started"

@@ -200,6 +200,12 @@ class CheckpointReceipt(CoreModel):
     idempotency_key: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+def checkpoint_receipt_digest(receipt: CheckpointReceipt) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(receipt.model_dump(mode="json", by_alias=True))
+    ).hexdigest()
+
+
 class CheckpointIntent(CoreModel):
     """Durable commit intent used to finish a checkpoint after a restart."""
 
@@ -357,9 +363,7 @@ class CheckpointService:
                     key=lambda item: item.encode("utf-8"),
                 )
             )
-            files = tuple(
-                file for file in diff.files if not self._excluded(file.path, excluded)
-            )
+            files = tuple(file for file in diff.files if not self._excluded(file.path, excluded))
             self._emit_checkpoint(
                 current,
                 passed=not violations and not structured_violation,
@@ -495,15 +499,42 @@ class CheckpointService:
                 infrastructure_failure=True,
             )
 
+    def is_committed_receipt(self, receipt: CheckpointReceipt) -> bool:
+        candidate = receipt.manifest.slice_candidate
+        key = self._store_key_for(
+            receipt.run_id,
+            receipt.slice_id,
+            receipt.generation,
+            str(candidate.base_verified_oid),
+            receipt.expected_candidate_oid,
+        )
+        return self.store.get_receipt(key) == receipt
+
     @staticmethod
     def _store_key(handle: WorkspaceHandle, expected_candidate_oid: str) -> str:
+        return CheckpointService._store_key_for(
+            handle.run_id,
+            handle.slice_id,
+            handle.generation,
+            handle.base_verified_oid,
+            expected_candidate_oid,
+        )
+
+    @staticmethod
+    def _store_key_for(
+        run_id: object,
+        slice_id: object,
+        generation: int,
+        base_verified_oid: str,
+        expected_candidate_oid: str,
+    ) -> str:
         return hashlib.sha256(
             canonical_json_bytes(
                 {
-                    "run_id": str(handle.run_id),
-                    "slice_id": str(handle.slice_id),
-                    "generation": handle.generation,
-                    "base_verified_oid": handle.base_verified_oid,
+                    "run_id": str(run_id),
+                    "slice_id": str(slice_id),
+                    "generation": generation,
+                    "base_verified_oid": base_verified_oid,
                     "expected_candidate_oid": expected_candidate_oid,
                 }
             )
@@ -629,4 +660,5 @@ __all__ = [
     "WorkspaceDiff",
     "WorkspaceDiffPort",
     "WorkspaceFileFact",
+    "checkpoint_receipt_digest",
 ]

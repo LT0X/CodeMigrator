@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -15,7 +16,10 @@ from codemigrator.runtime.provider import (
     ProviderRegistry,
     ProviderRequest,
     TokenUsage,
+    decode_concatenated_json_objects,
+    provider_adapter_id_for_label,
     retry_delay_for_attempt,
+    select_unique_provider_config,
 )
 
 
@@ -66,6 +70,38 @@ def test_provider_registry_resolves_only_the_locked_provider() -> None:
         )
 
 
+def test_opencode_labeled_config_uses_existing_openai_compatible_adapter() -> None:
+    label = {"Provider": "OpenCode"}["Provider"]
+    assert provider_adapter_id_for_label(label) == "openai-compatible"
+    assert provider_adapter_id_for_label("opencode") == "openai-compatible"
+    assert provider_adapter_id_for_label("openai-compatible") == "openai-compatible"
+    with pytest.raises(ValueError, match="unsupported provider label"):
+        provider_adapter_id_for_label("unknown")
+
+
+def test_provider_config_parser_reads_adjacent_json_objects_and_rejects_trailing_garbage() -> None:
+    values = decode_concatenated_json_objects('{"Provider":"opencode"}\n{"model":"safe"}')
+
+    assert values == ({"Provider": "opencode"}, {"model": "safe"})
+    with pytest.raises(ValueError, match="concatenated JSON objects"):
+        decode_concatenated_json_objects('{"Provider":"opencode"} unexpected')
+
+
+def test_provider_config_selection_requires_exactly_one_matching_provider() -> None:
+    payload = '{"Provider":"OpenAI"}{"Provider":"OpenCode","模型":"synthetic"}'
+    assert select_unique_provider_config(payload, "opencode") == {
+        "Provider": "OpenCode",
+        "模型": "synthetic",
+    }
+
+    with pytest.raises(ValueError, match="exactly one matching provider"):
+        select_unique_provider_config(
+            '{"Provider":"OpenCode"}{"Provider":"opencode"}', "OpenCode"
+        )
+    with pytest.raises(ValueError, match="exactly one matching provider"):
+        select_unique_provider_config('{"Provider":"OpenAI"}', "OpenCode")
+
+
 @pytest.mark.asyncio
 async def test_openai_compatible_provider_maps_request_and_usage() -> None:
     binding = _binding()
@@ -111,6 +147,36 @@ async def test_openai_compatible_provider_maps_request_and_usage() -> None:
         ],
         "max_tokens": 200,
     }
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_maps_langchain_any_tool_choice_to_required() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-structured",
+                "model": "test-model",
+                "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    request = replace(_request(_binding()), tool_choice="any")
+    await OpenAICompatibleProvider(
+        endpoint="https://provider.invalid/v1",
+        api_key="secret",
+        client=client,
+    ).complete(request)
+    await client.aclose()
+
+    payload = seen["payload"]
+    assert isinstance(payload, dict)
+    assert payload["tool_choice"] == "required"
 
 
 @pytest.mark.asyncio

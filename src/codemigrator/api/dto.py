@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Literal, cast
 from uuid import UUID
@@ -11,8 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from codemigrator.core import (
     CheckAction,
     DeliveryChannelStatus,
+    Phase,
     RunStatus,
     SecretRegistry,
+    SessionKind,
     SliceAttemptStatus,
     SliceKind,
 )
@@ -222,6 +225,7 @@ class MigrationEvent(ApiModel):
 
     @model_validator(mode="after")
     def event_data_is_redacted(self) -> MigrationEvent:
+        self.data = _project_agent_run_event_data(self.type, self.data)
         _assert_redacted(self.data)
         return self
 
@@ -246,6 +250,7 @@ class MigrationEvent(ApiModel):
         if not isinstance(record, EventRecord):
             raise TypeError("record must use EventRecord")
         event_data = record.data if data is None else data
+        event_data = _project_agent_run_event_data(record.event_type, event_data)
         if secret_registry is not None:
             event_data = _redact_event_data(event_data, secret_registry)
         return cls(
@@ -290,6 +295,7 @@ class SessionEvent(ApiModel):
 
     @model_validator(mode="after")
     def event_data_is_redacted(self) -> SessionEvent:
+        self.data = _project_agent_run_event_data(self.type, self.data)
         _assert_redacted(self.data)
         return self
 
@@ -314,6 +320,7 @@ class SessionEvent(ApiModel):
         if not isinstance(record, EventRecord):
             raise TypeError("record must use EventRecord")
         event_data = record.data if data is None else data
+        event_data = _project_agent_run_event_data(record.event_type, event_data)
         if secret_registry is not None:
             event_data = _redact_event_data(event_data, secret_registry)
         return cls(
@@ -340,6 +347,58 @@ def _redact_event_data(
     if not result.accepted or not isinstance(result.value, dict):
         raise ValueError("event data must be redacted")
     return cast(dict[str, object], result.value)
+
+
+_AGENT_RUN_EVENT_FIELDS: dict[str, tuple[str, ...]] = {
+    "agent_run.started": ("agent_run_id", "phase", "session_kind", "slice_id", "generation"),
+    "agent_run.terminal": (
+        "agent_run_id",
+        "phase",
+        "session_kind",
+        "slice_id",
+        "generation",
+        "exit",
+        "receipt_category",
+    ),
+}
+_AGENT_RUN_EXITS = frozenset(
+    {"COMPLETED", "FAILED", "BUDGET_EXHAUSTED", "SEGMENT_STOPPED", "INVALIDATED"}
+)
+_RECEIPT_CATEGORY = re.compile(r"[a-z][a-z0-9._-]{0,63}")
+
+
+def _project_agent_run_event_data(event_type: str, value: dict[str, object]) -> dict[str, object]:
+    fields = _AGENT_RUN_EVENT_FIELDS.get(event_type)
+    if fields is None:
+        return value
+    try:
+        projected = {key: value[key] for key in fields if key in value}
+        if str(UUID(str(projected.get("agent_run_id", "")))) != projected.get("agent_run_id"):
+            raise ValueError
+        if projected.get("phase") not in {item.value for item in Phase}:
+            raise ValueError
+        if projected.get("session_kind") not in {item.value for item in SessionKind}:
+            raise ValueError
+        has_slice_id = "slice_id" in projected
+        has_generation = "generation" in projected
+        if has_slice_id != has_generation:
+            raise ValueError
+        if has_slice_id:
+            if (
+                str(UUID(str(projected["slice_id"]))) != projected["slice_id"]
+                or type(projected["generation"]) is not int
+                or projected["generation"] < 0
+            ):
+                raise ValueError
+        if event_type == "agent_run.terminal" and (
+            projected.get("exit") not in _AGENT_RUN_EXITS
+            or not isinstance(projected.get("receipt_category"), str)
+            or _RECEIPT_CATEGORY.fullmatch(str(projected["receipt_category"])) is None
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("AgentRun event summary is invalid") from exc
+    return projected
 
 
 __all__ = [

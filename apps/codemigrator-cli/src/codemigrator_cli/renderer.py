@@ -17,6 +17,22 @@ def _jsonable(projection: Projection) -> dict[str, Any]:
         "cursor": projection.cursor,
         "connection": projection.connection,
         "run_status": projection.run_status,
+        "agent_runs": [
+            {
+                "agent_run_id": item.agent_run_id,
+                "phase": item.phase,
+                "session_kind": item.session_kind,
+                "state": item.state,
+                "slice_id": item.slice_id,
+                "generation": item.generation,
+                "exit": item.exit,
+                "receipt_category": item.receipt_category,
+                "last_sequence": item.last_sequence,
+            }
+            for item in sorted(
+                projection.agent_runs.values(), key=lambda item: (item.phase, item.agent_run_id)
+            )
+        ],
         "active_slices": [
             {
                 "slice_id": item.slice_id,
@@ -47,6 +63,22 @@ def render_human(projection: Projection) -> str:
         width=120,
     )
     console.print(f"CodeMigrator · Run 状态 {projection.run_status} · sequence {projection.cursor}")
+    active_agent_runs = [
+        item for item in projection.agent_runs.values() if item.state == "RUNNING"
+    ]
+    if projection.agent_runs:
+        console.print(
+            f"AgentRun 活动 {len(active_agent_runs)}/{len(projection.agent_runs)} · "
+            + ", ".join(
+                f"{item.phase}/{item.session_kind}"
+                + (
+                    f" · Slice {item.slice_id} generation {item.generation}"
+                    if item.slice_id is not None and item.generation is not None
+                    else ""
+                )
+                for item in active_agent_runs[:4]
+            )
+        )
     table = Table(show_header=True, header_style="bold")
     table.add_column("Slice")
     table.add_column("动作")

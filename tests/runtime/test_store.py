@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from codemigrator.core import SecretRegistry
-from codemigrator.runtime.contracts import EventSpec, RunState
+from codemigrator.runtime.agent_runs import AgentRunId
+from codemigrator.runtime.contracts import CandidateCheckpointFact, EventSpec, RunState
 from codemigrator.runtime.memory import EvolutionSegmentDraft
 from codemigrator.runtime.schema import RUNTIME_SCHEMA_SQL
 from codemigrator.runtime.store import (
@@ -15,15 +16,30 @@ from codemigrator.runtime.store import (
 
 
 def test_runtime_state_round_trips_through_json_for_durable_store():
-    from .conftest import uid
+    from .conftest import create_run, uid
 
-    state = RunState(run_id=uid())
+    state = RunState(
+        run_id=uid(),
+        create_request=create_run(),
+        frozen_plan_sha256="a" * 64,
+        candidate_checkpoints=(
+            CandidateCheckpointFact(
+                agent_run_id=AgentRunId(uid()),
+                slice_id=uid(),
+                generation=1,
+                expected_candidate_oid="b" * 40,
+                candidate_oid="c" * 40,
+                receipt_sha256="d" * 64,
+            ),
+        ),
+    )
     assert _decode_state(_dump_json(state)) == state
 
 
 def test_runtime_schema_contains_separate_run_and_append_only_event_tables():
     assert "CREATE TABLE IF NOT EXISTS runtime_runs" in RUNTIME_SCHEMA_SQL
     assert "CREATE TABLE IF NOT EXISTS runtime_events" in RUNTIME_SCHEMA_SQL
+    assert "CREATE TABLE IF NOT EXISTS draft_owner_facts" in RUNTIME_SCHEMA_SQL
     assert "PRIMARY KEY (run_id, sequence)" in RUNTIME_SCHEMA_SQL
     assert "UNIQUE (run_id, slice_id)" in RUNTIME_SCHEMA_SQL
     assert "context evolution template is frozen per Run" in RUNTIME_SCHEMA_SQL

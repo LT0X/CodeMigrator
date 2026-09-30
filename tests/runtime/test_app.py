@@ -12,6 +12,7 @@ from codemigrator.runtime.app import (
     RuntimeApplication,
     run_from_environment,
 )
+from codemigrator.runtime.graph_composition import RuntimeGraphConfigurationError
 
 
 class AsyncLock:
@@ -99,6 +100,16 @@ def test_production_composition_root_always_binds_observation_readiness():
 
     assert application.lifecycle.readiness_check is not None
     assert application.lifecycle.readiness_check() is False
+
+
+def test_application_fails_closed_when_workflow_graphs_are_not_configured():
+    application = RuntimeApplication.from_dsn("postgresql://localhost/codemigrator")
+
+    with pytest.raises(RuntimeGraphConfigurationError, match="graph assembly is not configured"):
+        application.build_run_graph(object())
+
+    with pytest.raises(RuntimeGraphConfigurationError, match="graph assembly is not configured"):
+        application.build_draft_graph(object())
 
 
 def test_entrypoint_requires_environment_dsn(monkeypatch):

@@ -1,6 +1,6 @@
 import type { StageAction, StageZone } from "./types";
 
-export type MappingKind = "slice" | "run" | "notice" | "noop";
+export type MappingKind = "slice" | "run" | "agent_run" | "notice" | "noop";
 
 export interface EventMapping {
   readonly kind: MappingKind;
@@ -11,6 +11,8 @@ export interface EventMapping {
 
 export const ALL_EVENT_TYPES = [
   "run.status_changed",
+  "agent_run.started",
+  "agent_run.terminal",
   "slice.status_changed",
   "execute.contract_wave_completed",
   "candidate.generation_started",
@@ -43,6 +45,8 @@ export const ALL_EVENT_TYPES = [
 
 export const eventMapping: Readonly<Record<string, EventMapping>> = {
   "run.status_changed": { kind: "run", label: "Run 状态变化" },
+  "agent_run.started": { kind: "agent_run", label: "AgentRun 开始" },
+  "agent_run.terminal": { kind: "agent_run", label: "AgentRun 结束" },
   "slice.status_changed": { kind: "slice", label: "Slice 状态变化" },
   "execute.contract_wave_completed": { kind: "notice", label: "契约波次完成" },
   "candidate.generation_started": { kind: "slice", zone: "regeneration", action: "error", label: "重生成代次开始" },

@@ -87,4 +87,40 @@ describe("stage reducer", () => {
     expect(state.slices["slice-a"].status).toBe("REGENERATING");
     expect(state.celebrations).toHaveLength(0);
   });
+
+  it("projects AgentRun lifecycle without changing Run or Slice status", () => {
+    let state = reduceStage(
+      createInitialStageState(),
+      event(1, "agent_run.started", {
+        agent_run_id: "agent-1",
+        phase: "EXECUTE",
+        session_kind: "IMPLEMENTATION",
+        slice_id: "slice-a",
+        generation: 1,
+      }),
+    );
+    state = reduceStage(
+      state,
+      event(2, "agent_run.terminal", {
+        agent_run_id: "agent-1",
+        phase: "EXECUTE",
+        session_kind: "IMPLEMENTATION",
+        exit: "COMPLETED",
+        receipt_category: "session.terminal",
+        slice_id: "slice-a",
+        generation: 1,
+      }),
+    );
+
+    expect(state.agentRuns["agent-1"]).toMatchObject({
+      state: "TERMINAL",
+      phase: "EXECUTE",
+      sessionKind: "IMPLEMENTATION",
+      sliceId: "slice-a",
+      generation: 1,
+      exit: "COMPLETED",
+    });
+    expect(state.runStatus).toBe("UNKNOWN");
+    expect(state.slices).toEqual({});
+  });
 });

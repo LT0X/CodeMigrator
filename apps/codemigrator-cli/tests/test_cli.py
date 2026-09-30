@@ -94,6 +94,51 @@ def test_safe_jsonl_projection_is_whitelist_and_secret_resistant() -> None:
     assert "hidden" not in rendered
 
 
+def test_agent_run_lifecycle_is_projected_without_changing_run_or_slice_state() -> None:
+    projection = project_events(
+        [
+            event(
+                1,
+                "agent_run.started",
+                {
+                    "agent_run_id": "agent-1",
+                    "phase": "EXECUTE",
+                    "session_kind": "IMPLEMENTATION",
+                    "slice_id": "slice-a",
+                    "generation": 1,
+                    "thread_id": "private-thread",
+                    "prompt": "private prompt",
+                },
+            ),
+            event(
+                2,
+                "agent_run.terminal",
+                {
+                    "agent_run_id": "agent-1",
+                    "phase": "EXECUTE",
+                    "session_kind": "IMPLEMENTATION",
+                    "slice_id": "slice-a",
+                    "generation": 1,
+                    "exit": "COMPLETED",
+                    "receipt_category": "session.terminal",
+                    "checkpoint_uri": "cas://private",
+                },
+            ),
+        ]
+    )
+
+    assert projection.run_status == "UNKNOWN"
+    assert projection.slices == {}
+    assert projection.agent_runs["agent-1"].state == "TERMINAL"
+    assert projection.agent_runs["agent-1"].exit == "COMPLETED"
+    assert projection.agent_runs["agent-1"].slice_id == "slice-a"
+    assert projection.agent_runs["agent-1"].generation == 1
+    rendered = render_json(projection)
+    assert "private-thread" not in rendered
+    assert "private prompt" not in rendered
+    assert "cas://private" not in rendered
+
+
 def test_exit_codes_are_stable() -> None:
     assert ExitCode.COMPLETED == 0
     assert ExitCode.PARTIALLY_COMPLETED == 2

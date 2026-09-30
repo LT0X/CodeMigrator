@@ -111,6 +111,67 @@ async def test_sse_reconnect_after_terminal_cursor_closes_immediately() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sse_replays_agent_run_lifecycle_without_treating_it_as_run_terminal() -> None:
+    backend = FakeBackend()
+    run_id = uuid4()
+    agent_run_id = uuid4()
+    backend.events = [
+        EventRecord(
+            run_id=run_id,
+            sequence=1,
+            event_type="agent_run.started",
+            data={
+                "agent_run_id": str(agent_run_id),
+                "phase": "EXECUTE",
+                "session_kind": "IMPLEMENTATION",
+            },
+            timestamp_utc=datetime.now(UTC),
+        ),
+        EventRecord(
+            run_id=run_id,
+            sequence=2,
+            event_type="agent_run.terminal",
+            data={
+                "agent_run_id": str(agent_run_id),
+                "phase": "EXECUTE",
+                "session_kind": "IMPLEMENTATION",
+                "exit": "COMPLETED",
+                "receipt_category": "session.terminal",
+            },
+            timestamp_utc=datetime.now(UTC),
+        ),
+        EventRecord(
+            run_id=run_id,
+            sequence=3,
+            event_type="run.status_changed",
+            data={"run_status": "COMPLETED"},
+            timestamp_utc=datetime.now(UTC),
+        ),
+    ]
+
+    stream = sse_events(backend, run_id, after_sequence=0)
+    first = await anext(stream)
+    second = await anext(stream)
+    terminal = await anext(stream)
+    assert '"sequence":1' in first.encode().decode()
+    assert '"type":"agent_run.started"' in first.encode().decode()
+    assert '"sequence":2' in second.encode().decode()
+    assert '"type":"agent_run.terminal"' in second.encode().decode()
+    assert '"sequence":3' in terminal.encode().decode()
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    await stream.aclose()
+
+    resumed = sse_events(backend, run_id, after_sequence=1)
+    replayed = [await anext(resumed), await anext(resumed)]
+    assert '"sequence":2' in replayed[0].encode().decode()
+    assert '"sequence":3' in replayed[1].encode().decode()
+    with pytest.raises(StopAsyncIteration):
+        await anext(resumed)
+    await resumed.aclose()
+
+
+@pytest.mark.asyncio
 async def test_session_sse_uses_session_event_envelope() -> None:
     backend = FakeBackend()
     session_id = uuid4()

@@ -16,9 +16,7 @@ from codemigrator.runtime.draft_models import (
 def test_focus_brief_and_reassignment_are_closed_contracts() -> None:
     brief = FocusBrief(
         domain_paths=["src/z", "src/a", "src/a"],
-        highlights=[
-            FocusHighlight(path="src/z.py", kind="risk_hotspot", reason="dynamic import")
-        ],
+        highlights=[FocusHighlight(path="src/z.py", kind="risk_hotspot", reason="dynamic import")],
         budget_hint="deep review",
     )
     advice = ExploreReassignment(
@@ -82,13 +80,21 @@ def test_draft_tool_boundary_only_allows_read_only_orchestration() -> None:
     }
 
 
+def test_ask_user_is_not_a_draft_exec_operation() -> None:
+    with pytest.raises(ValidationError):
+        DraftExecRequest(operation="AskUser", question_id="018f0d00-0000-7000-8000-000000000001")
+
+
 def test_question_options_require_one_recommendation_and_impact() -> None:
-    assert QuestionOption(
-        key="preserve",
-        label="Preserve boundary",
-        impact="Limits cross-domain changes.",
-        recommended=True,
-    ).recommended is True
+    assert (
+        QuestionOption(
+            key="preserve",
+            label="Preserve boundary",
+            impact="Limits cross-domain changes.",
+            recommended=True,
+        ).recommended
+        is True
+    )
     with pytest.raises(ValidationError):
         QuestionOption(
             key="preserve",

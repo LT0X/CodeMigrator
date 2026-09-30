@@ -4,7 +4,7 @@ import re
 from collections.abc import Iterable
 from typing import Any, cast
 
-from .models import Projection, RunEvent, SliceProjection
+from .models import AgentRunProjection, Projection, RunEvent, SliceProjection
 from .sequence import SequenceCursor
 
 _PUBLIC_KEYS = frozenset(
@@ -12,7 +12,7 @@ _PUBLIC_KEYS = frozenset(
         "slice_id", "sliceid", "generation", "status", "run_status", "outcome", "local",
         "integration_rank", "commit_oid", "summary", "decision", "route", "session_kind",
         "error_code", "warning_code", "check_id", "test", "module", "count", "total",
-        "passed", "failed", "phase", "kind",
+        "passed", "failed", "phase", "kind", "agent_run_id", "exit", "receipt_category",
     }
 )
 _SENSITIVE_TEXT = re.compile(
@@ -114,8 +114,50 @@ def _apply(projection: Projection, event: RunEvent) -> None:
         "verified.advanced": "verified 主线推进",
         "test.failure_attributed": "失败归因",
         "candidate.generation_started": "重生成代次开始",
+        "agent_run.started": "AgentRun 开始",
+        "agent_run.terminal": "AgentRun 结束",
     }
-    if event.type == "run.status_changed":
+    if event.type in {"agent_run.started", "agent_run.terminal"}:
+        agent_run_id = data.get("agent_run_id")
+        if isinstance(agent_run_id, str) and agent_run_id and len(agent_run_id) <= 64:
+            agent_current = projection.agent_runs.get(agent_run_id)
+            if agent_current is None or event.sequence > agent_current.last_sequence:
+                slice_id = data.get("slice_id", agent_current.slice_id if agent_current else None)
+                generation = data.get(
+                    "generation", agent_current.generation if agent_current else None
+                )
+                projection.agent_runs[agent_run_id] = AgentRunProjection(
+                    agent_run_id=agent_run_id,
+                    phase=str(
+                        data.get("phase", agent_current.phase if agent_current else "UNKNOWN")
+                    ),
+                    session_kind=str(
+                        data.get(
+                            "session_kind",
+                            agent_current.session_kind if agent_current else "UNKNOWN",
+                        )
+                    ),
+                    state="TERMINAL" if event.type == "agent_run.terminal" else "RUNNING",
+                    slice_id=slice_id if isinstance(slice_id, str) else None,
+                    generation=(
+                        generation
+                        if type(generation) is int and generation >= 0
+                        else None
+                    ),
+                    exit=(
+                        str(data["exit"])
+                        if event.type == "agent_run.terminal" and data.get("exit") is not None
+                        else None
+                    ),
+                    receipt_category=(
+                        str(data["receipt_category"])
+                        if event.type == "agent_run.terminal"
+                        and data.get("receipt_category") is not None
+                        else None
+                    ),
+                    last_sequence=event.sequence,
+                )
+    elif event.type == "run.status_changed":
         projection.run_status = str(
             data.get("run_status", data.get("status", projection.run_status))
         )

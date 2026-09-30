@@ -63,7 +63,7 @@ def _load_phase_policy() -> ResourceDocument:
 @dataclass(frozen=True)
 class GatewayRoots:
     snapshot: SecureRoot
-    workspace: SecureRoot
+    workspace: SecureRoot | None = None
     contract_roots: tuple[SecureRoot, ...] = ()
     verified: SecureRoot | None = None
     cas: CasStore | None = None
@@ -118,6 +118,10 @@ class ToolGateway:
         self.audit_sink = audit_sink
         self.operation_sink = operation_sink
         self._policy_document = _policy_document or _load_phase_policy()
+        if self.context.run_id is not None and self.roots.workspace is None:
+            raise ValueError("Run gateway requires a candidate workspace root")
+        if self.context.draft_id is not None and self.roots.workspace is not None:
+            raise ValueError("Draft gateway cannot bind a writable workspace root")
         if self.context.phase_policy_sha256 != self._policy_document.sha256:
             raise ValueError("phase policy digest does not match the frozen run context")
         self._policy = {
@@ -250,6 +254,8 @@ class ToolGateway:
         allowed = self._policy.get(phase, frozenset())
         if tool_name not in allowed:
             return False
+        if self.context.draft_id is not None:
+            return tool_name in {"ReadFile", "QuerySourceAst", "Exec"}
         if self.context.session_kind is SessionKind.ExploreCoordinator:
             return tool_name in {"ReadFile", "QuerySourceAst", "Exec"}
         if self.context.session_kind is SessionKind.ExecuteSupervisor:
@@ -323,8 +329,11 @@ class ToolGateway:
         return None
 
     def _read_roots(self) -> tuple[SecureRoot, ...]:
+        if self.context.draft_id is not None:
+            return (*self.roots.contract_roots, self.roots.snapshot)
         if self.context.phase is Phase.Plan:
             return (self.roots.snapshot,)
+        assert self.roots.workspace is not None
         roots = (self.roots.workspace, *self.roots.contract_roots, self.roots.snapshot)
         if (
             self.context.session_kind is SessionKind.RepairSession
@@ -361,6 +370,12 @@ class ToolGateway:
 
     def _write(self, call: WriteFileCall) -> ToolResult:
         workspace = self.roots.workspace
+        if workspace is None or self.context.draft_id is not None:
+            return self._error(
+                StableErrorCode.TOOL_PHASE_DENIED,
+                "Draft sessions cannot write candidate files",
+                retryable=False,
+            )
         try:
             workspace.validate(call.path)
             existed = workspace.exists(call.path)
@@ -395,6 +410,12 @@ class ToolGateway:
 
     def _edit(self, call: EditFileCall) -> ToolResult:
         workspace = self.roots.workspace
+        if workspace is None or self.context.draft_id is not None:
+            return self._error(
+                StableErrorCode.TOOL_PHASE_DENIED,
+                "Draft sessions cannot edit candidate files",
+                retryable=False,
+            )
         try:
             workspace.validate(call.path)
             if not workspace.exists(call.path):
@@ -524,6 +545,12 @@ class ToolGateway:
         return StableErrorCode.ANALYSIS_INFRA_ERROR
 
     def _shell(self, call: ShellCall) -> ToolResult:
+        if self.context.draft_id is not None or self.roots.workspace is None:
+            return self._error(
+                StableErrorCode.TOOL_PHASE_DENIED,
+                "Draft sessions cannot run Shell",
+                retryable=False,
+            )
         if self.shell_runner is None:
             return self._error(
                 StableErrorCode.DEPENDENCY_UNAVAILABLE, "sandbox Shell runner is not bound"
@@ -592,8 +619,13 @@ class ToolGateway:
         return ExecOutput(tool="Exec", result=execution.result, step_count=execution.step_count)
 
     def _record_operation(self, tool: str, path: str, bytes_written: int, disposition: str) -> None:
-        if self.context.slice_id is None or self.context.generation is None:
+        if (
+            self.context.run_id is None
+            or self.context.slice_id is None
+            or self.context.generation is None
+        ):
             return
+        assert self.roots.workspace is not None
         operation = WorkspaceFileOperation(
             run_id=self.context.run_id,
             slice_id=self.context.slice_id,
@@ -612,6 +644,8 @@ class ToolGateway:
             AuditEvent(
                 point="tool.call.pre",
                 run_id=self.context.run_id,
+                draft_id=self.context.draft_id,
+                agent_run_id=self.context.agent_run_id,
                 slice_id=self.context.slice_id,
                 generation=self.context.generation,
                 phase=self.context.phase,
@@ -651,6 +685,8 @@ class ToolGateway:
             AuditEvent(
                 point="tool.call.post",
                 run_id=self.context.run_id,
+                draft_id=self.context.draft_id,
+                agent_run_id=self.context.agent_run_id,
                 slice_id=self.context.slice_id,
                 generation=self.context.generation,
                 phase=self.context.phase,

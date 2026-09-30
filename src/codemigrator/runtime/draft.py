@@ -67,6 +67,10 @@ class DraftLedger:
     def answers(self) -> tuple[AskUserAnswer, ...]:
         return tuple(sorted(self._answers.values(), key=lambda answer: str(answer.question_id)))
 
+    @property
+    def freeze_receipt(self) -> DraftFreezeReceipt | None:
+        return self._freeze_receipt
+
     def create_revision(self, artifacts: DraftArtifacts) -> TaskDraftRevision:
         """Create the first revision, or revise the current one when already initialized."""
 
@@ -87,7 +91,10 @@ class DraftLedger:
 
     def append_question(self, question: AskUserQuestion) -> AskUserQuestion:
         self._require_current_revision(question.revision_id)
-        if question.question_id in self._questions:
+        previous = self._questions.get(question.question_id)
+        if previous is not None:
+            if previous == question:
+                return previous
             raise DraftConflictError("question id already exists")
         self._questions[question.question_id] = question
         return question

@@ -26,6 +26,7 @@ const workspaceState = () => [
   event(5, "integration.completed", { slice_id: "slice-verified", generation: 0 }),
   event(6, "verified.advanced", { slice_id: "slice-verified", generation: 0, commit_oid: "7f2a91c" }),
   event(7, "slice.status_changed", { slice_id: "slice-waiting", kind: "IMPLEMENTATION", status: "INTEGRATION_QUEUED", generation: 0, integration_rank: 1 }),
+  event(8, "agent_run.started", { agent_run_id: "agent-1", phase: "EXECUTE", session_kind: "IMPLEMENTATION", slice_id: "slice-running", generation: 0 }),
 ].reduce(reduceStage, createInitialStageState());
 
 describe("WorkspaceShell", () => {
@@ -41,6 +42,9 @@ describe("WorkspaceShell", () => {
     expect(html).toContain('data-persona-key="slice-regenerating:1"');
     expect(html).toContain("等待契约集成");
     expect(html).toContain("未提供");
+    expect(html).toContain('aria-label="AgentRun 执行摘要"');
+    expect(html).toContain("EXECUTE · IMPLEMENTATION · 运行中");
+    expect(html).toContain("slice-running · generation 0");
     expect(html).toContain('data-visual-state="waiting"');
     expect((html.match(/class="folder-stream"/g) ?? []).length).toBe(1);
     expect(html).not.toContain("coder-v2");

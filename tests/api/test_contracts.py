@@ -63,3 +63,56 @@ def test_event_record_can_use_the_runtime_secret_registry() -> None:
             data={"summary": "runtime-secret"},
             secret_registry=registry,
         )
+
+
+def test_agent_run_events_project_only_low_sensitivity_summary_fields() -> None:
+    run_id = uuid4()
+    value = MigrationEvent.from_record(
+        event(run_id, 9, "agent_run.terminal"),
+        data={
+            "agent_run_id": str(uuid4()),
+            "phase": "EXECUTE",
+            "session_kind": "IMPLEMENTATION",
+            "slice_id": str(uuid4()),
+            "generation": 2,
+            "exit": "COMPLETED",
+            "receipt_category": "session.terminal",
+            "thread_id": str(uuid4()),
+            "checkpoint_uri": "cas://private/thread/checkpoint",
+            "prompt": "source code and credentials",
+            "provider_error": "private endpoint and response body",
+        },
+    )
+
+    assert value.data == {
+        "agent_run_id": value.data["agent_run_id"],
+        "phase": "EXECUTE",
+        "session_kind": "IMPLEMENTATION",
+        "slice_id": value.data["slice_id"],
+        "generation": 2,
+        "exit": "COMPLETED",
+        "receipt_category": "session.terminal",
+    }
+
+
+def test_agent_run_event_summary_rejects_unbounded_or_invalid_public_fields() -> None:
+    with pytest.raises(ValueError, match="AgentRun event summary"):
+        MigrationEvent.from_record(
+            event(uuid4(), 1, "agent_run.started"),
+            data={
+                "agent_run_id": str(uuid4()),
+                "phase": "prompt text must not be projected",
+                "session_kind": "IMPLEMENTATION",
+            },
+        )
+
+    with pytest.raises(ValueError, match="AgentRun event summary"):
+        MigrationEvent.from_record(
+            event(uuid4(), 1, "agent_run.started"),
+            data={
+                "agent_run_id": str(uuid4()),
+                "phase": "EXECUTE",
+                "session_kind": "IMPLEMENTATION",
+                "generation": 1,
+            },
+        )

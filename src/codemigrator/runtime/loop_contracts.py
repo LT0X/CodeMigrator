@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
+from uuid import UUID
+
+if TYPE_CHECKING:
+    from .agent_runs import AgentRunId
 
 from codemigrator.core import (
     ContextPack,
@@ -66,6 +71,11 @@ class SessionSpec:
     context: ContextEnvelope = field(default_factory=ContextEnvelope)
     template: str = "session"
     state: SessionState = SessionState.Created
+    agent_run_id: AgentRunId | None = None
+
+    def __post_init__(self) -> None:
+        if self.agent_run_id is not None and not isinstance(self.agent_run_id, UUID):
+            raise ValueError("AgentRun identity must be a UUID")
 
 
 __all__ = [

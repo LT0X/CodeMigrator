@@ -70,6 +70,7 @@ class ProviderRequest:
     binding: LockedModelBinding
     messages: tuple[PromptMessage, ...]
     tools: tuple[ToolDefinition, ...] = DEFAULT_TOOL_DEFINITIONS
+    tool_choice: str | None = None
     cancellation: CancellationSignal | None = None
 
 
@@ -138,6 +139,69 @@ class ProviderRegistry:
             return self._adapters[binding.provider_id]
         except KeyError as exc:
             raise ProviderError("provider binding is unavailable", retryable=False) from exc
+
+
+def provider_adapter_id_for_label(label: str) -> str:
+    """Map a local OpenCode config label onto an existing locked adapter ID."""
+
+    normalized = label.strip().casefold()
+    if normalized == "opencode":
+        return "openai-compatible"
+    if normalized in {"openai", "openai-compatible", "anthropic"}:
+        return normalized
+    raise ValueError("unsupported provider label")
+
+
+def decode_concatenated_json_objects(payload: str) -> tuple[dict[str, object], ...]:
+    """Decode adjacent config objects without including invalid input in errors."""
+
+    if not isinstance(payload, str) or not payload.strip():
+        raise ValueError("concatenated JSON objects are required")
+    if len(payload.encode("utf-8")) > 1_048_576:
+        raise ValueError("concatenated JSON objects exceed the size limit")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
+    decoder = json.JSONDecoder(object_pairs_hook=reject_duplicate_keys)
+    values: list[dict[str, object]] = []
+    position = 0
+    try:
+        while position < len(payload):
+            while position < len(payload) and payload[position].isspace():
+                position += 1
+            if position == len(payload):
+                break
+            decoded, position = decoder.raw_decode(payload, position)
+            if not isinstance(decoded, dict):
+                raise ValueError("JSON config document must be an object")
+            values.append(decoded)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid concatenated JSON objects") from exc
+    if not values:
+        raise ValueError("concatenated JSON objects are required")
+    return tuple(values)
+
+
+def select_unique_provider_config(payload: str, label: str) -> dict[str, object]:
+    """Select one provider record or fail closed on missing/ambiguous labels."""
+
+    normalized = label.strip().casefold()
+    if not normalized:
+        raise ValueError("provider label is required")
+    matches = tuple(
+        item
+        for item in decode_concatenated_json_objects(payload)
+        if str(item.get("Provider", "")).strip().casefold() == normalized
+    )
+    if len(matches) != 1:
+        raise ValueError("configuration must contain exactly one matching provider")
+    return matches[0]
 
 
 def retry_delay_for_attempt(attempt: int) -> int:
@@ -268,6 +332,10 @@ class OpenAICompatibleProvider:
             "tools": _openai_tools(request.tools),
             "max_tokens": request.binding.output_cap,
         }
+        if request.tool_choice is not None:
+            payload["tool_choice"] = (
+                "required" if request.tool_choice == "any" else request.tool_choice
+            )
         decoded = await _post_json(
             self._client,
             f"{self.endpoint}/chat/completions",
@@ -342,6 +410,7 @@ class AnthropicProvider:
                 "system": system_parts,
                 "messages": messages,
                 "tools": _anthropic_tools(request.tools),
+                **({"tool_choice": {"type": "any"}} if request.tool_choice == "any" else {}),
                 "max_tokens": request.binding.output_cap,
             },
             cancellation=request.cancellation,
@@ -549,5 +618,8 @@ __all__ = [
     "ToolDefinition",
     "DEFAULT_TOOL_DEFINITIONS",
     "UsageReceipt",
+    "decode_concatenated_json_objects",
+    "provider_adapter_id_for_label",
+    "select_unique_provider_config",
     "retry_delay_for_attempt",
 ]
