@@ -198,6 +198,19 @@ class CasCheckpointSaver(BaseCheckpointSaver[str]):
             pending_writes=pending,
         )
 
+    async def verify_checkpoint(self, thread_id: str, digest: str) -> bool:
+        """Validate the referenced checkpoint body and every pending-write CAS body."""
+
+        indexes = await self.store.list_checkpoint_indexes(thread_id, None)
+        for index in indexes:
+            if index.object.digest != digest:
+                continue
+            checkpoint = await self.aget_tuple(
+                _saved_config(thread_id, index.namespace, index.checkpoint_id)
+            )
+            return checkpoint is not None
+        return False
+
     async def alist(
         self,
         config: RunnableConfig | None,

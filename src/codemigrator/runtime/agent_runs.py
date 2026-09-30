@@ -38,7 +38,9 @@ class AgentRun:
     toolset_sha256: str
     template_sha256: str
     slice_ref: SliceGenerationRef | None = None
+    write_scope_sha256: str | None = None
     checkpoint_sha256: str | None = None
+    candidate_checkpoint_sha256: str | None = None
     result_sha256: str | None = None
     usage_sha256: str | None = None
     retry_of: AgentRunId | None = None
@@ -75,7 +77,9 @@ class AgentRun:
             "context_sha256",
             "toolset_sha256",
             "template_sha256",
+            "write_scope_sha256",
             "checkpoint_sha256",
+            "candidate_checkpoint_sha256",
             "result_sha256",
             "usage_sha256",
         ):
@@ -126,6 +130,7 @@ class AgentRun:
             "context_sha256",
             "toolset_sha256",
             "template_sha256",
+            "write_scope_sha256",
             "retry_of",
             "continuation_of",
             "restarted_from",

@@ -51,6 +51,23 @@ def test_crash_rebuild_keeps_generation_and_uses_latest_checkpoint(tmp_path: Pat
     assert manager.root(rebuilt).read_bytes("src/a.py") == b"checkpoint"
 
 
+def test_rebuild_from_candidate_records_committed_oid_and_keeps_generation(tmp_path: Path) -> None:
+    manager = WorkspaceManager(tmp_path / "managed")
+    run_id, slice_id = uuid.uuid4(), uuid.uuid4()
+    handle = manager.provision(run_id, slice_id, 2, "verified-1")
+    manager.start_iteration(handle)
+
+    rebuilt = manager.rebuild_from_candidate(
+        handle,
+        candidate_oid="a" * 40,
+        checkpoint_files={"src/a.py": b"latest candidate"},
+    )
+
+    assert rebuilt.generation == handle.generation == 2
+    assert rebuilt.candidate_oid == "a" * 40
+    assert manager.root(rebuilt).read_bytes("src/a.py") == b"latest candidate"
+
+
 def test_restart_recovery_restores_handle_and_operation_ledger(tmp_path: Path) -> None:
     managed = tmp_path / "managed"
     run_id, slice_id = uuid.uuid4(), uuid.uuid4()

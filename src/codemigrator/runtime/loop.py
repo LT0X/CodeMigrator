@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol, cast
 
-from codemigrator.core import SessionKind
+from codemigrator.core import Phase, SessionKind
 
 from .agent_runs import AgentRunReceipt
 from .binding import ContextOverflowError, ensure_context_fits, validate_session_admission
@@ -86,6 +86,7 @@ class CheckpointDecision:
     committed: bool = False
     rejection_reasons: tuple[str, ...] = ()
     owner_receipt: AgentRunReceipt | None = None
+    candidate_checkpoint_sha256: str | None = None
 
 
 class CheckpointPort(Protocol):
@@ -130,6 +131,7 @@ class SessionResult:
     provenance: SessionProvenance | None = None
     agent_run_id: AgentRunId | None = None
     structured_response: object | None = None
+    candidate_checkpoint_sha256: str | None = None
 
     @property
     def generated(self) -> bool:
@@ -359,6 +361,10 @@ class AgentLoop:
                         or (
                             decision.owner_receipt is not None
                             and decision.owner_receipt.agent_run_id == spec.agent_run_id
+                            and (
+                                not _requires_candidate_checkpoint(spec.identity)
+                                or _is_sha256(decision.candidate_checkpoint_sha256)
+                            )
                         )
                     )
                 ):
@@ -371,6 +377,7 @@ class AgentLoop:
                         round_index,
                         provenance,
                         outcome_published=True,
+                        candidate_checkpoint_sha256=decision.candidate_checkpoint_sha256,
                     )
                 if decision.accepted:
                     return self._result(
@@ -381,6 +388,7 @@ class AgentLoop:
                         usages,
                         round_index,
                         provenance,
+                        candidate_checkpoint_sha256=decision.candidate_checkpoint_sha256,
                     )
                 self_corrections += 1
                 if self_corrections > self.max_self_corrections:
@@ -548,6 +556,7 @@ class AgentLoop:
         provenance: SessionProvenance,
         *,
         outcome_published: bool = False,
+        candidate_checkpoint_sha256: str | None = None,
     ) -> SessionResult:
         return SessionResult(
             state=state,
@@ -559,6 +568,7 @@ class AgentLoop:
             rounds=rounds,
             provenance=provenance,
             agent_run_id=provenance.agent_run_id,
+            candidate_checkpoint_sha256=candidate_checkpoint_sha256,
         )
 
     @classmethod
@@ -636,3 +646,26 @@ __all__ = [
     "ToolObservation",
     "UsageSink",
 ]
+
+
+_WRITE_SESSION_KINDS = frozenset(
+    {
+        SessionKind.Contract,
+        SessionKind.Implementation,
+        SessionKind.TestTranslation,
+        SessionKind.TestGeneration,
+        SessionKind.RepairSession,
+    }
+)
+
+
+def _requires_candidate_checkpoint(identity: SessionIdentity) -> bool:
+    return identity.phase is Phase.Execute and identity.session_kind in _WRITE_SESSION_KINDS
+
+
+def _is_sha256(value: str | None) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )

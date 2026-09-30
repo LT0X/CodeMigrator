@@ -59,6 +59,12 @@ async def test_checkpoint_and_pending_writes_survive_saver_restart(tmp_path: Pat
     )
     reopened = saver(tmp_path, store, owner_id)
     latest = await reopened.aget_tuple(config(thread))
+    indexes = await store.list_checkpoint_indexes(thread)
+    first_digest = next(item.object.digest for item in indexes if item.checkpoint_id == one)
+    latest_digest = next(item.object.digest for item in indexes if item.checkpoint_id == two)
+    assert await reopened.verify_checkpoint(thread, first_digest)
+    assert await reopened.verify_checkpoint(thread, latest_digest)
+    assert not await reopened.verify_checkpoint(thread, "f" * 64)
     assert latest.checkpoint["id"] == two
     assert latest.parent_config["configurable"]["checkpoint_id"] == one
     previous = await reopened.aget_tuple(saved_one)
@@ -108,6 +114,8 @@ async def test_corrupt_checkpoint_is_rejected_before_deserialization(tmp_path: P
     instance.cas.path_for(digest).write_bytes(b"corrupt")
     with pytest.raises(CasIntegrityError):
         await instance.aget_tuple(saved)
+    with pytest.raises(CasIntegrityError):
+        await instance.verify_checkpoint(thread, digest)
 
 
 class CounterState(TypedDict):

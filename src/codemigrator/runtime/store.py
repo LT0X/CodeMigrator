@@ -21,12 +21,19 @@ from codemigrator.core import (
     SecretRegistry,
     SessionKind,
     SliceGenerationRef,
+    SliceId,
 )
 
 from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from .budget import BudgetUsage
 from .cas import CasObject, CheckpointIndex, PendingWriteIndex
-from .contracts import EventSpec, RunState, RuntimeEvent, RuntimeSnapshot
+from .contracts import (
+    CandidateCheckpointFact,
+    EventSpec,
+    RunState,
+    RuntimeEvent,
+    RuntimeSnapshot,
+)
 from .loop_contracts import SessionExit, SessionState
 from .memory import EvolutionSegment, EvolutionSegmentDraft
 from .schema import RUNTIME_SCHEMA_SQL
@@ -84,7 +91,12 @@ def _validate_new_agent_run(record: AgentRun) -> None:
         raise StoreCommitError("new AgentRun must be created without an exit")
     if any(
         getattr(record, name) is not None
-        for name in ("checkpoint_sha256", "result_sha256", "usage_sha256")
+        for name in (
+            "checkpoint_sha256",
+            "candidate_checkpoint_sha256",
+            "result_sha256",
+            "usage_sha256",
+        )
     ):
         raise StoreCommitError("new AgentRun cannot have terminal references")
 
@@ -1366,7 +1378,9 @@ def _decode_agent_run(value: Any) -> AgentRun:
             if payload.get("slice_ref") is not None
             else None
         ),
+        write_scope_sha256=payload.get("write_scope_sha256"),
         checkpoint_sha256=payload.get("checkpoint_sha256"),
+        candidate_checkpoint_sha256=payload.get("candidate_checkpoint_sha256"),
         result_sha256=payload.get("result_sha256"),
         usage_sha256=payload.get("usage_sha256"),
         retry_of=(AgentRunId(UUID(payload["retry_of"])) if payload.get("retry_of") else None),
@@ -1411,6 +1425,17 @@ def _decode_state(value: Any) -> RunState:
             else None
         ),
         frozen_plan_sha256=payload.get("frozen_plan_sha256"),
+        candidate_checkpoints=tuple(
+            CandidateCheckpointFact(
+                agent_run_id=AgentRunId(UUID(item["agent_run_id"])),
+                slice_id=SliceId(UUID(item["slice_id"])),
+                generation=int(item["generation"]),
+                expected_candidate_oid=str(item["expected_candidate_oid"]),
+                candidate_oid=str(item["candidate_oid"]),
+                receipt_sha256=str(item["receipt_sha256"]),
+            )
+            for item in payload.get("candidate_checkpoints", ())
+        ),
     )
 
 

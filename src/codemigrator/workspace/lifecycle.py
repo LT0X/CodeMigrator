@@ -10,7 +10,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
 
-from codemigrator.core import CandidateGeneration, RunId, SliceId, validate_candidate_generation
+from codemigrator.core import (
+    CandidateGeneration,
+    GitOid,
+    RunId,
+    SliceId,
+    validate_candidate_generation,
+)
 from codemigrator.core._base import CoreModel
 
 from .models import WorkspaceFileOperation, WorkspaceHandle, WorkspaceState
@@ -138,6 +144,8 @@ class WorkspaceManager:
         generation: int,
         base_verified_oid: str,
         checkpoint_files: Mapping[str, bytes] | None = None,
+        *,
+        candidate_oid: str | None = None,
     ) -> WorkspaceHandle:
         generation = validate_candidate_generation(generation)
         path = self.managed_root / str(run_id) / str(slice_id) / str(generation)
@@ -157,6 +165,7 @@ class WorkspaceManager:
             path=str(path),
             state=WorkspaceState.Provisioned,
             base_verified_oid=base_verified_oid,
+            candidate_oid=GitOid(candidate_oid) if candidate_oid is not None else None,
         )
         self._roots[handle.path] = root
         self._handles[handle.path] = handle
@@ -182,13 +191,18 @@ class WorkspaceManager:
         slice_id: uuid.UUID,
         generation: int,
         base_verified_oid: str,
+        *,
+        candidate_oid: str | None = None,
     ) -> WorkspaceHandle:
         """Reattach a surviving workspace and its durable ledger after a restart."""
 
         generation = validate_candidate_generation(generation)
         path = self.managed_root / str(run_id) / str(slice_id) / str(generation)
         if str(path) in self._handles:
-            return self._handles[str(path)]
+            existing = self._handles[str(path)]
+            if candidate_oid is not None and existing.candidate_oid != GitOid(candidate_oid):
+                raise WorkspaceStateError("workspace candidate OID does not match recovery request")
+            return existing
         if not path.is_dir():
             raise WorkspaceStateError("workspace does not exist for recovery")
         record = self.state_store.load(str(path))
@@ -200,6 +214,7 @@ class WorkspaceManager:
                 path=str(path),
                 state=WorkspaceState.Iterating,
                 base_verified_oid=base_verified_oid,
+                candidate_oid=GitOid(candidate_oid) if candidate_oid is not None else None,
             )
             operations: list[WorkspaceFileOperation] = []
         else:
@@ -210,6 +225,7 @@ class WorkspaceManager:
                 or handle.slice_id != SliceId(slice_id)
                 or handle.generation != generation
                 or handle.base_verified_oid != base_verified_oid
+                or (candidate_oid is not None and handle.candidate_oid != GitOid(candidate_oid))
             ):
                 raise WorkspaceStateError("workspace recovery identity does not match")
             handle = handle.model_copy(update={"state": WorkspaceState.Iterating})
@@ -289,7 +305,11 @@ class WorkspaceManager:
         self._persist(handle)
 
     def rebuild(
-        self, handle: WorkspaceHandle, *, checkpoint_files: Mapping[str, bytes] | None = None
+        self,
+        handle: WorkspaceHandle,
+        *,
+        checkpoint_files: Mapping[str, bytes] | None = None,
+        candidate_oid: str | None = None,
     ) -> WorkspaceHandle:
         self._require_known(handle)
         run_id, slice_id, generation, base_oid = (
@@ -299,7 +319,40 @@ class WorkspaceManager:
             handle.base_verified_oid,
         )
         self.close(handle)
-        return self.provision(run_id, slice_id, generation, base_oid, checkpoint_files)
+        return self.provision(
+            run_id,
+            slice_id,
+            generation,
+            base_oid,
+            checkpoint_files,
+            candidate_oid=candidate_oid,
+        )
+
+    def rebuild_from_candidate(
+        self,
+        handle: WorkspaceHandle,
+        *,
+        candidate_oid: str,
+        checkpoint_files: Mapping[str, bytes],
+    ) -> WorkspaceHandle:
+        if not candidate_oid:
+            raise WorkspaceStateError("candidate OID is required for a write-session rebuild")
+        current = self._handles.get(handle.path)
+        if current is None and Path(handle.path).is_dir():
+            current = self.recover(
+                handle.run_id,
+                handle.slice_id,
+                handle.generation,
+                handle.base_verified_oid,
+            )
+        if current is not None and current.candidate_oid == GitOid(candidate_oid):
+            return current
+        source = current or handle
+        return self.rebuild(
+            source,
+            checkpoint_files=checkpoint_files,
+            candidate_oid=candidate_oid,
+        )
 
     def close(self, handle: WorkspaceHandle) -> None:
         if handle.path not in self._handles:

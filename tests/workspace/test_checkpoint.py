@@ -57,6 +57,9 @@ def test_allowed_changes_checkpoint_once_and_repeat_is_idempotent(tmp_path: Path
 
     assert isinstance(first, CheckpointReceipt)
     assert second == first
+    assert service.is_committed_receipt(first)
+    forged = first.model_copy(update={"new_candidate_oid": "0" * 40})
+    assert not service.is_committed_receipt(forged)
     assert git.create_calls == 1
     assert first.manifest.scope_check_passed
 

@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal, TypeAlias
 from pydantic import ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from codemigrator.analysis import SourceAstQuery
-from codemigrator.core import Phase, SessionKind, StableErrorCode
+from codemigrator.core import GitOid, Phase, SessionKind, StableErrorCode
 from codemigrator.core._base import CoreModel
 from codemigrator.core.ids import RunId, Sha256, SliceId
 
@@ -273,6 +273,7 @@ class WorkspaceHandle(CoreModel):
     path: str
     state: WorkspaceState
     base_verified_oid: str
+    candidate_oid: GitOid | None = None
 
 
 __all__ = [

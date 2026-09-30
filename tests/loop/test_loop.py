@@ -212,11 +212,38 @@ async def test_agent_run_only_closes_with_matching_owner_receipt() -> None:
         provider=FakeProvider([_response('{"completed":true}')]),
         gateway=FakeGateway(),
         checkpoint=FakeCheckpoint(
-            [CheckpointDecision(accepted=True, committed=True, owner_receipt=matching)]
+            [
+                CheckpointDecision(
+                    accepted=True,
+                    committed=True,
+                    owner_receipt=matching,
+                    candidate_checkpoint_sha256="a" * 64,
+                )
+            ]
         ),
     ).run(spec)
     assert result.state is SessionState.Closed
     assert result.outcome_published is True
+    assert result.candidate_checkpoint_sha256 == "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_write_agent_run_needs_candidate_checkpoint_reference_even_with_owner_receipt():
+    agent_run_id = uuid4()
+    spec = replace(_spec(), agent_run_id=agent_run_id)
+    matching = AgentRunReceipt(uuid4(), agent_run_id, "session.terminal")
+    result = await AgentLoop(
+        provider=FakeProvider([_response('{"completed":true}')]),
+        gateway=FakeGateway(),
+        checkpoint=FakeCheckpoint(
+            [CheckpointDecision(accepted=True, committed=True, owner_receipt=matching)]
+        ),
+    ).run(spec)
+
+    assert result.exit is SessionExit.Completed
+    assert result.state is SessionState.CheckpointPending
+    assert result.outcome_published is False
+    assert result.candidate_checkpoint_sha256 is None
 
 
 @pytest.mark.asyncio

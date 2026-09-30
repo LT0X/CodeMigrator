@@ -13,9 +13,12 @@ from codemigrator.core import (
     FailureReason,
     RunId,
     RunStatus,
+    SliceId,
+    validate_candidate_generation,
 )
+from codemigrator.workspace import CheckpointReceipt
 
-from .agent_runs import AgentRun, AgentRunReceipt
+from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from .budget import BudgetUsage
 
 
@@ -59,13 +62,38 @@ class ExecuteRoundResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateCheckpointClaim:
+    agent_run_id: AgentRunId
+    receipt: CheckpointReceipt | None
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionRoundDecision:
     complete: bool
     dispatch_count: int
+    completed_write_agent_run_ids: tuple[AgentRunId, ...] = ()
+    candidate_claims: tuple[CandidateCheckpointClaim, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.dispatch_count) is not int or self.dispatch_count < 0:
             raise ValueError("execution dispatch count must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateCheckpointFact:
+    agent_run_id: AgentRunId
+    slice_id: SliceId
+    generation: int
+    expected_candidate_oid: str
+    candidate_oid: str
+    receipt_sha256: str
+
+    def __post_init__(self) -> None:
+        validate_candidate_generation(self.generation)
+        if not self.expected_candidate_oid or not self.candidate_oid:
+            raise ValueError("candidate checkpoint OIDs must be non-empty")
+        if not _is_sha256(self.receipt_sha256):
+            raise ValueError("candidate checkpoint receipt digest is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +239,7 @@ class RunState:
     reporting_halted: bool = False
     create_request: CreateRun | None = None
     frozen_plan_sha256: str | None = None
+    candidate_checkpoints: tuple[CandidateCheckpointFact, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +270,8 @@ __all__ = [
     "ActorPhaseReceipt",
     "BudgetEventMessage",
     "CancelCommand",
+    "CandidateCheckpointClaim",
+    "CandidateCheckpointFact",
     "CreateRunCommand",
     "EventSpec",
     "ExecuteRoundResult",

@@ -20,6 +20,7 @@ from codemigrator.core import (
     canonical_json_bytes,
 )
 from codemigrator.planning import FrozenPlan
+from codemigrator.workspace import CheckpointReceipt, checkpoint_receipt_digest
 
 from .advice import AdviceValidationContext, evaluate_advice
 from .budget import BudgetLimits, evaluate_budget
@@ -29,6 +30,8 @@ from .contracts import (
     ApiCommand,
     BudgetEventMessage,
     CancelCommand,
+    CandidateCheckpointClaim,
+    CandidateCheckpointFact,
     CreateRunCommand,
     EventSpec,
     ExecuteRoundResult,
@@ -83,6 +86,10 @@ class ExecutionSchedulerPort(Protocol):
         """Idempotently schedule ready Slice AgentRuns and return round status."""
 
 
+class CandidateCheckpointVerifierPort(Protocol):
+    def is_committed_receipt(self, receipt: CheckpointReceipt) -> bool: ...
+
+
 class _Stop:
     pass
 
@@ -106,6 +113,7 @@ class RunActor:
         integration_coordinator: IntegrationCoordinator | None = None,
         repair_advice_port: RepairAdvicePort | None = None,
         execution_scheduler: ExecutionSchedulerPort | None = None,
+        candidate_checkpoint_verifier: CandidateCheckpointVerifierPort | None = None,
     ) -> None:
         self.run_id = run_id
         self.store = store
@@ -118,6 +126,7 @@ class RunActor:
         self.integration_coordinator = integration_coordinator
         self.repair_advice_port = repair_advice_port
         self.execution_scheduler = execution_scheduler
+        self.candidate_checkpoint_verifier = candidate_checkpoint_verifier
         self._state: RunState | None = None
         self._queue: asyncio.Queue[RuntimeMessage | _Stop] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
@@ -360,14 +369,52 @@ class RunActor:
         )
         if not isinstance(decision, ExecutionRoundDecision):
             raise TypeError("Actor scheduler returned an invalid execution round")
+        completed_ids = set(decision.completed_write_agent_run_ids)
+        claimed_ids = {claim.agent_run_id for claim in decision.candidate_claims}
+        if (
+            len(claimed_ids) != len(decision.candidate_claims)
+            or len(completed_ids) != len(decision.completed_write_agent_run_ids)
+            or completed_ids != claimed_ids
+        ):
+            raise StoreCommitError("EXECUTE candidate checkpoint claim set is incomplete")
+        candidate_facts = list(state.candidate_checkpoints)
+        candidate_events: list[EventSpec] = []
+        for claim in decision.candidate_claims:
+            fact = await self._validate_candidate_claim(claim, candidate_facts)
+            current = next(
+                (
+                    item
+                    for item in candidate_facts
+                    if item.slice_id == fact.slice_id and item.generation == fact.generation
+                ),
+                None,
+            )
+            if current is not None and current.receipt_sha256 == fact.receipt_sha256:
+                continue
+            if current is None:
+                candidate_facts.append(fact)
+            else:
+                candidate_facts[candidate_facts.index(current)] = fact
+            candidate_events.append(
+                EventSpec(
+                    "slice.candidate.accepted",
+                    {
+                        "agent_run_id": str(fact.agent_run_id),
+                        "slice_id": str(fact.slice_id),
+                        "generation": fact.generation,
+                    },
+                )
+            )
         next_state = replace(
             state,
             status=RunStatus.Verifying if decision.complete else RunStatus.Executing,
+            candidate_checkpoints=tuple(candidate_facts),
             version=state.version + 1,
         )
         committed = await self._commit(
             next_state,
             (
+                *candidate_events,
                 EventSpec(
                     "run.execute.round",
                     {
@@ -387,6 +434,93 @@ class RunActor:
                 ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence),
                 decision.complete,
             )
+        )
+
+    async def _validate_candidate_claim(
+        self,
+        claim: CandidateCheckpointClaim,
+        accepted: list[CandidateCheckpointFact],
+    ) -> CandidateCheckpointFact:
+        receipt = claim.receipt
+        if receipt is None or self.candidate_checkpoint_verifier is None:
+            raise StoreCommitError("completed write AgentRun has no candidate checkpoint receipt")
+        record = await self.store.load_agent_run(claim.agent_run_id)
+        terminal_receipt = await self.store.load_agent_run_receipt(claim.agent_run_id)
+        slice_ref = record.slice_ref if record is not None else None
+        if (
+            record is None
+            or record.owner_kind != "run"
+            or record.owner_id != self.run_id
+            or record.phase is not Phase.Execute
+            or record.session_kind
+            not in {
+                SessionKind.Contract,
+                SessionKind.Implementation,
+                SessionKind.TestTranslation,
+                SessionKind.TestGeneration,
+                SessionKind.RepairSession,
+            }
+            or record.state is not SessionState.Closed
+            or record.exit is not SessionExit.Completed
+            or record.result_sha256 is None
+            or record.write_scope_sha256 is None
+            or terminal_receipt is None
+            or terminal_receipt.agent_run_id != record.agent_run_id
+            or terminal_receipt.category != "session.terminal"
+            or slice_ref is None
+            or record.candidate_checkpoint_sha256 != checkpoint_receipt_digest(receipt)
+            or slice_ref.baseline_candidate_oid is None
+            or receipt.run_id != self.run_id
+            or receipt.slice_id != slice_ref.slice_id
+            or receipt.generation != slice_ref.generation
+            or receipt.expected_candidate_oid != str(slice_ref.baseline_candidate_oid)
+            or receipt.manifest.slice_candidate.run_id != self.run_id
+            or receipt.manifest.slice_candidate.slice_id != slice_ref.slice_id
+            or receipt.manifest.slice_candidate.generation != slice_ref.generation
+            or str(receipt.manifest.slice_candidate.candidate_commit_oid)
+            != receipt.expected_candidate_oid
+            or not receipt.manifest.scope_check_passed
+            or receipt.new_candidate_oid == receipt.expected_candidate_oid
+        ):
+            raise StoreCommitError("candidate checkpoint receipt failed owner validation")
+        if not await asyncio.to_thread(
+            self.candidate_checkpoint_verifier.is_committed_receipt, receipt
+        ):
+            raise StoreCommitError("candidate checkpoint receipt is not committed by M-08")
+        candidate_digest = checkpoint_receipt_digest(receipt)
+        previous_receipt = next(
+            (item for item in accepted if item.receipt_sha256 == candidate_digest),
+            None,
+        )
+        if previous_receipt is not None:
+            if (
+                previous_receipt.agent_run_id != record.agent_run_id
+                or previous_receipt.candidate_oid != receipt.new_candidate_oid
+                or previous_receipt.slice_id != receipt.slice_id
+                or previous_receipt.generation != receipt.generation
+            ):
+                raise StoreCommitError("candidate checkpoint receipt was previously claimed")
+            return previous_receipt
+        current = next(
+            (
+                item
+                for item in accepted
+                if item.slice_id == slice_ref.slice_id and item.generation == slice_ref.generation
+            ),
+            None,
+        )
+        expected_current = (
+            current.candidate_oid if current is not None else str(slice_ref.baseline_candidate_oid)
+        )
+        if receipt.expected_candidate_oid != expected_current:
+            raise StoreCommitError("candidate checkpoint does not extend the accepted OID")
+        return CandidateCheckpointFact(
+            agent_run_id=record.agent_run_id,
+            slice_id=slice_ref.slice_id,
+            generation=int(slice_ref.generation),
+            expected_candidate_oid=receipt.expected_candidate_oid,
+            candidate_oid=receipt.new_candidate_oid,
+            receipt_sha256=candidate_digest,
         )
 
     async def _commit_verification(self, command: WorkflowCommandMessage, state: RunState) -> None:

@@ -65,7 +65,12 @@ def test_terminal_record_requires_matching_session_exit():
 
 
 def test_record_metadata_round_trip_and_lifecycle_spec_omit_private_refs():
-    record = replace(run_record(), checkpoint_sha256="e" * 64)
+    record = replace(
+        run_record(),
+        write_scope_sha256="f" * 64,
+        checkpoint_sha256="e" * 64,
+        candidate_checkpoint_sha256="1" * 64,
+    )
     assert _decode_agent_run(_dump_agent_run(record)) == record
     started = agent_run_lifecycle_spec(record)
     assert started.event_type == "agent_run.started"
@@ -80,6 +85,7 @@ def test_record_metadata_round_trip_and_lifecycle_spec_omit_private_refs():
     assert finished.data["exit"] == "COMPLETED"
     assert finished.data["receipt_category"] == "plan.accepted"
     assert "checkpoint_sha256" not in finished.data
+    assert "candidate_checkpoint_sha256" not in finished.data
     with pytest.raises(ValueError, match="category"):
         AgentRunReceipt(uuid4(), terminal.agent_run_id, "tool output: secret")
 
