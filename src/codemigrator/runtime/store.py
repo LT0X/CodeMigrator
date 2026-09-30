@@ -45,6 +45,16 @@ from .loop_contracts import SessionExit, SessionState
 from .memory import EvolutionSegment, EvolutionSegmentDraft
 from .schema import RUNTIME_SCHEMA_SQL
 
+_RUN_TERMINAL_STATUSES = frozenset(
+    {
+        RunStatus.Completed.value,
+        RunStatus.PartiallyCompleted.value,
+        RunStatus.Failed.value,
+        RunStatus.Cancelled.value,
+    }
+)
+_DRAFT_TERMINAL_EVENTS = frozenset({"session.closed", "session.attached_to_run"})
+
 
 class RuntimeStore(Protocol):
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
@@ -67,6 +77,15 @@ class RuntimeStore(Protocol):
         evolution: EvolutionSegmentDraft | None = None,
     ) -> RuntimeSnapshot:
         """Commit state and events in one transaction."""
+
+    async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
+        """Read committed Run events strictly after a sequence cursor."""
+
+    async def wait_for_run_events(self, run_id: RunId, after_sequence: int) -> None:
+        """Wait for a wake-up and recheck the durable Run event ledger."""
+
+    async def is_run_stream_terminal(self, run_id: RunId, after_sequence: int) -> bool:
+        """Report whether a terminal Run event at or before the cursor is committed."""
 
     async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
         """Create one session per owner logical task, or return its frozen identity."""
@@ -222,6 +241,7 @@ class InMemoryRuntimeStore:
         self.commit_count = 0
         self._fail_next = False
         self.secret_registry = secret_registry or SecretRegistry()
+        self._run_conditions: dict[RunId, asyncio.Condition] = {}
         self._agent_runs: dict[AgentRunId, AgentRun] = {}
         self._agent_run_keys: dict[tuple[str, UUID, str], AgentRunId] = {}
         self._agent_threads: dict[UUID, AgentRunId] = {}
@@ -290,17 +310,22 @@ class InMemoryRuntimeStore:
             self._draft_event_specs[key] = event_data
             ledger = self._draft_events.setdefault(draft_id, [])
             first_sequence = len(ledger) + 1
-            ledger.extend(
+            appended = tuple(
                 DraftSessionEvent(
                     draft_id, first_sequence + index, event_type, data, datetime.now(UTC)
                 )
                 for index, (event_type, data) in enumerate(event_data)
             )
-            if category in {"draft.attached_to_run", "draft.closed"}:
-                self._draft_terminals[draft_id] = len(ledger)
+            ledger.extend(appended)
+            for event in appended:
+                if event.event_type in _DRAFT_TERMINAL_EVENTS:
+                    terminal = self._draft_terminals.get(draft_id)
+                    if terminal is None or event.sequence < terminal:
+                        self._draft_terminals[draft_id] = event.sequence
             condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
             async with condition:
-                condition.notify_all()
+                if event_data:
+                    condition.notify_all()
             return receipt
 
     async def read_draft_session_events(
@@ -324,12 +349,59 @@ class InMemoryRuntimeStore:
             await condition.wait_for(
                 lambda: (
                     len(self._draft_events.get(draft_id, ())) > after_sequence
-                    or self._draft_terminals.get(draft_id, float("inf")) <= after_sequence
+                    or (
+                        self._draft_terminals.get(draft_id) is not None
+                        and self._draft_terminals[draft_id] <= after_sequence
+                    )
                 )
             )
 
     async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool:
-        return self._draft_terminals.get(draft_id, float("inf")) <= after_sequence
+        terminal_sequence = self._draft_terminals.get(draft_id)
+        return terminal_sequence is not None and terminal_sequence <= after_sequence
+
+    async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
+        snapshot = self._snapshots.get(run_id)
+        if snapshot is None:
+            return ()
+        return tuple(
+            RuntimeEvent(
+                sequence=event.sequence,
+                event_type=event.event_type,
+                data=dict(event.data),
+                timestamp_utc=event.timestamp_utc,
+            )
+            for event in snapshot.events
+            if event.sequence > after_sequence
+        )
+
+    async def wait_for_run_events(self, run_id: RunId, after_sequence: int) -> None:
+        condition = self._run_conditions.setdefault(run_id, asyncio.Condition())
+        async with condition:
+            await condition.wait_for(
+                lambda: (
+                    self._has_run_events_after(run_id, after_sequence)
+                    or self._run_terminal_reached(run_id, after_sequence)
+                )
+            )
+
+    async def is_run_stream_terminal(self, run_id: RunId, after_sequence: int) -> bool:
+        return self._run_terminal_reached(run_id, after_sequence)
+
+    def _has_run_events_after(self, run_id: RunId, after_sequence: int) -> bool:
+        snapshot = self._snapshots.get(run_id)
+        return snapshot is not None and any(
+            event.sequence > after_sequence for event in snapshot.events
+        )
+
+    def _run_terminal_reached(self, run_id: RunId, after_sequence: int) -> bool:
+        snapshot = self._snapshots.get(run_id)
+        return snapshot is not None and any(
+            event.sequence <= after_sequence
+            and event.event_type == "run.status_changed"
+            and _event_status(event.data) in _RUN_TERMINAL_STATUSES
+            for event in snapshot.events
+        )
 
     async def load_draft_owner_fact(
         self, draft_id: UUID, receipt_key: str
@@ -581,7 +653,12 @@ class InMemoryRuntimeStore:
             else:
                 snapshot = None
             if snapshot is not None:
-                self._snapshots[RunId(record.owner_id)] = snapshot
+                run_id = RunId(record.owner_id)
+                condition = self._run_conditions.setdefault(run_id, asyncio.Condition())
+                async with condition:
+                    self._snapshots[run_id] = snapshot
+                    if events:
+                        condition.notify_all()
             self._agent_runs[record.agent_run_id] = record
             self._agent_receipts[record.agent_run_id] = receipt
             for reference_key, object_ref in cas_references:
@@ -633,29 +710,33 @@ class InMemoryRuntimeStore:
         if self._fail_next:
             self._fail_next = False
             raise StoreCommitError("injected commit failure")
-        previous = self._snapshots.get(state.run_id)
-        first_sequence = len(previous.events) + 1 if previous is not None else 1
-        try:
-            materialized = tuple(
-                RuntimeEvent(
-                    sequence=first_sequence + index,
-                    event_type=event.event_type,
-                    data=_redact_event_data(event.data, self.secret_registry),
+        condition = self._run_conditions.setdefault(state.run_id, asyncio.Condition())
+        async with condition:
+            previous = self._snapshots.get(state.run_id)
+            first_sequence = len(previous.events) + 1 if previous is not None else 1
+            try:
+                materialized = tuple(
+                    RuntimeEvent(
+                        sequence=first_sequence + index,
+                        event_type=event.event_type,
+                        data=_redact_event_data(event.data, self.secret_registry),
+                    )
+                    for index, event in enumerate(events)
                 )
-                for index, event in enumerate(events)
+            except ValueError as exc:
+                raise StoreCommitError("observation rejected") from exc
+            evolution_entry = _next_in_memory_evolution(evolution, state.run_id, self._evolution)
+            snapshot = RuntimeSnapshot(
+                state=state,
+                events=(*previous.events, *materialized) if previous else materialized,
             )
-        except ValueError as exc:
-            raise StoreCommitError("observation rejected") from exc
-        evolution_entry = _next_in_memory_evolution(evolution, state.run_id, self._evolution)
-        snapshot = RuntimeSnapshot(
-            state=state,
-            events=(*previous.events, *materialized) if previous else materialized,
-        )
-        self._snapshots[state.run_id] = snapshot
-        if evolution_entry is not None:
-            self._evolution.setdefault(state.run_id, []).append(evolution_entry)
-        self.commit_count += 1
-        return snapshot
+            self._snapshots[state.run_id] = snapshot
+            if evolution_entry is not None:
+                self._evolution.setdefault(state.run_id, []).append(evolution_entry)
+            self.commit_count += 1
+            if materialized:
+                condition.notify_all()
+            return snapshot
 
     async def evolution_segments(self, *, run_id: object) -> tuple[EvolutionSegment, ...]:
         return tuple(self._evolution.get(run_id, ()))
@@ -734,7 +815,7 @@ class PostgreSQLRuntimeStore:
                             event_type,
                             json.dumps(data, sort_keys=True, separators=(",", ":")),
                         )
-                    if event_data or category in {"draft.attached_to_run", "draft.closed"}:
+                    if event_data:
                         await connection.execute(
                             "SELECT pg_notify('draft_session_events', $1)", str(draft_id)
                         )
@@ -788,16 +869,17 @@ class PostgreSQLRuntimeStore:
         async with self.pool.acquire() as connection:
             await connection.add_listener("draft_session_events", listener)
             try:
-                latest = await connection.fetchval(
-                    "SELECT COALESCE(MAX(sequence), 0) FROM draft_session_events WHERE draft_id=$1",
+                row = await connection.fetchrow(
+                    """SELECT COALESCE(MAX(sequence), 0) AS latest_sequence,
+                    COALESCE(MIN(sequence) FILTER (WHERE event_type = ANY($2::text[])), 0)
+                        AS terminal_sequence
+                    FROM draft_session_events WHERE draft_id=$1""",
                     draft_id,
+                    list(_DRAFT_TERMINAL_EVENTS),
                 )
-                terminal = await connection.fetchval(
-                    """SELECT EXISTS (SELECT 1 FROM draft_owner_facts WHERE draft_id=$1
-                    AND category IN ('draft.attached_to_run', 'draft.closed'))""",
-                    draft_id,
-                )
-                if latest > after_sequence or (terminal and latest <= after_sequence):
+                latest = int(_row_value(row, "latest_sequence"))
+                terminal = int(_row_value(row, "terminal_sequence"))
+                if latest > after_sequence or (terminal > 0 and terminal <= after_sequence):
                     return
                 await wake
             finally:
@@ -805,17 +887,15 @@ class PostgreSQLRuntimeStore:
 
     async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool:
         async with self.pool.acquire() as connection:
-            return bool(
-                await connection.fetchval(
-                    """SELECT EXISTS (
-                    SELECT 1 FROM draft_owner_facts
-                    WHERE draft_id=$1 AND category IN ('draft.attached_to_run', 'draft.closed')
-                ) AND (SELECT COALESCE(MAX(sequence), 0)
-                       FROM draft_session_events WHERE draft_id=$1) <= $2""",
-                    draft_id,
-                    after_sequence,
-                )
+            terminal = await connection.fetchval(
+                """SELECT COALESCE(MIN(sequence), 0)
+                FROM draft_session_events
+                WHERE draft_id=$1 AND sequence <= $2 AND event_type = ANY($3::text[])""",
+                draft_id,
+                after_sequence,
+                list(_DRAFT_TERMINAL_EVENTS),
             )
+            return int(terminal) > 0
 
     async def load_draft_owner_fact(
         self, draft_id: UUID, receipt_key: str
@@ -1340,6 +1420,65 @@ class PostgreSQLRuntimeStore:
         async with self.pool.acquire() as connection:
             await connection.execute(RUNTIME_SCHEMA_SQL)
 
+    async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT sequence, event_type, data, timestamp_utc FROM runtime_events
+                WHERE run_id=$1 AND sequence>$2 ORDER BY sequence""",
+                run_id,
+                after_sequence,
+            )
+        return tuple(
+            RuntimeEvent(
+                sequence=int(_row_value(row, "sequence")),
+                event_type=str(_row_value(row, "event_type")),
+                data=_decode_event_data(_row_value(row, "data")),
+                timestamp_utc=_row_value(row, "timestamp_utc"),
+            )
+            for row in rows
+        )
+
+    async def wait_for_run_events(self, run_id: RunId, after_sequence: int) -> None:
+        loop = asyncio.get_running_loop()
+        wake = loop.create_future()
+
+        def listener(_connection: Any, _pid: int, _channel: str, payload: str) -> None:
+            if payload == str(run_id) and not wake.done():
+                wake.set_result(None)
+
+        async with self.pool.acquire() as connection:
+            await connection.add_listener("runtime_events", listener)
+            try:
+                row = await connection.fetchrow(
+                    """SELECT COALESCE(MAX(sequence), 0) AS latest_sequence,
+                    COALESCE(MIN(sequence) FILTER (
+                        WHERE event_type='run.status_changed'
+                        AND COALESCE(data->>'run_status', data->>'status') = ANY($2::text[])
+                    ), 0) AS terminal_sequence
+                    FROM runtime_events WHERE run_id=$1""",
+                    run_id,
+                    list(_RUN_TERMINAL_STATUSES),
+                )
+                latest = int(_row_value(row, "latest_sequence"))
+                terminal = int(_row_value(row, "terminal_sequence"))
+                if latest > after_sequence or (terminal > 0 and terminal <= after_sequence):
+                    return
+                await wake
+            finally:
+                await connection.remove_listener("runtime_events", listener)
+
+    async def is_run_stream_terminal(self, run_id: RunId, after_sequence: int) -> bool:
+        async with self.pool.acquire() as connection:
+            terminal = await connection.fetchval(
+                """SELECT COALESCE(MIN(sequence), 0) FROM runtime_events
+                WHERE run_id=$1 AND sequence<=$2 AND event_type='run.status_changed'
+                AND COALESCE(data->>'run_status', data->>'status') = ANY($3::text[])""",
+                run_id,
+                after_sequence,
+                list(_RUN_TERMINAL_STATUSES),
+            )
+        return int(terminal) > 0
+
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         async with self.pool.acquire() as connection:
             row = await connection.fetchrow(
@@ -1350,7 +1489,7 @@ class PostgreSQLRuntimeStore:
                 return None
             event_rows = await connection.fetch(
                 """
-                SELECT sequence, event_type, data
+                SELECT sequence, event_type, data, timestamp_utc
                 FROM runtime_events
                 WHERE run_id = $1
                 ORDER BY sequence
@@ -1363,7 +1502,8 @@ class PostgreSQLRuntimeStore:
                 RuntimeEvent(
                     sequence=int(_row_value(event, "sequence")),
                     event_type=str(_row_value(event, "event_type")),
-                    data=dict(_row_value(event, "data")),
+                    data=_decode_event_data(_row_value(event, "data")),
+                    timestamp_utc=_row_value(event, "timestamp_utc"),
                 )
                 for event in event_rows
             ),
@@ -1679,14 +1819,31 @@ async def _insert_events(
             raise StoreCommitError("observation rejected") from exc
         await connection.execute(
             """
-            INSERT INTO runtime_events(run_id, sequence, event_type, data)
-            VALUES ($1, $2, $3, $4::jsonb)
+            INSERT INTO runtime_events(run_id, sequence, event_type, data, timestamp_utc)
+            VALUES ($1, $2, $3, $4::jsonb, clock_timestamp())
             """,
             run_id,
             index,
             event.event_type,
             json.dumps(data, sort_keys=True, separators=(",", ":")),
         )
+    if events:
+        await connection.execute("SELECT pg_notify('runtime_events', $1)", str(run_id))
+
+
+def _decode_event_data(value: Any) -> dict[str, object]:
+    try:
+        payload = json.loads(value) if isinstance(value, (str, bytes, bytearray)) else dict(value)
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored Run event data is invalid") from exc
+    if not isinstance(payload, dict):
+        raise StoreCommitError("stored Run event data is not an object")
+    return cast(dict[str, object], payload)
+
+
+def _event_status(data: Mapping[str, object]) -> object:
+    status = data.get("run_status", data.get("status"))
+    return getattr(status, "value", status)
 
 
 def _redact_event_data(value: dict[str, object], registry: SecretRegistry) -> dict[str, object]:

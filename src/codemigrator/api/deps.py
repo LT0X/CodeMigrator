@@ -46,6 +46,13 @@ class ApiRequest:
     expected_version: int | None = None
 
 
+class PersistedEvent(Protocol):
+    sequence: int
+    event_type: str
+    data: dict[str, object]
+    timestamp_utc: datetime
+
+
 @dataclass(frozen=True, slots=True)
 class EventRecord:
     run_id: UUID
@@ -60,6 +67,18 @@ class EventRecord:
         if self.timestamp_utc.tzinfo is None or self.timestamp_utc.utcoffset() is None:
             raise ValueError("event timestamp must be timezone-aware")
         object.__setattr__(self, "timestamp_utc", self.timestamp_utc.astimezone(UTC))
+
+    @classmethod
+    def from_persisted(cls, stream_id: UUID, event: PersistedEvent) -> EventRecord:
+        """Adapt one persisted Run or Draft event without projecting its payload."""
+
+        return cls(
+            run_id=stream_id,
+            sequence=event.sequence,
+            event_type=event.event_type,
+            data=dict(event.data),
+            timestamp_utc=event.timestamp_utc,
+        )
 
 
 class ApiBackend(Protocol):
@@ -90,7 +109,18 @@ class ApiBackend(Protocol):
         """Wait for a NOTIFY wake-up; the ledger remains the source of event data."""
 
     async def is_stream_terminal(self, run_id: UUID, after_sequence: int) -> bool:
-        """Report whether a terminal event at or before the cursor is committed."""
+        """Report whether a terminal Run event at or before the cursor is committed."""
+
+    async def read_session_events(
+        self, session_id: UUID, after_sequence: int
+    ) -> Sequence[EventRecord]:
+        """Read committed Draft session events strictly after a sequence cursor."""
+
+    async def wait_for_session_events(self, session_id: UUID, after_sequence: int) -> None:
+        """Wait for a Draft session ledger wake-up; the ledger remains authoritative."""
+
+    async def is_session_stream_terminal(self, session_id: UUID, after_sequence: int) -> bool:
+        """Report whether a terminal Draft session event at or before the cursor exists."""
 
 
 __all__ = ["ApiBackend", "ApiConfig", "ApiRequest", "EventRecord"]

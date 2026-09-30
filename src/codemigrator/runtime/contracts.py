@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TypeAlias
 from uuid import UUID
 
@@ -299,6 +299,12 @@ class RuntimeEvent:
     sequence: int
     event_type: str
     data: dict[str, object]
+    timestamp_utc: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if self.timestamp_utc.tzinfo is None or self.timestamp_utc.utcoffset() is None:
+            raise ValueError("runtime event timestamp must be timezone-aware")
+        object.__setattr__(self, "timestamp_utc", self.timestamp_utc.astimezone(UTC))
 
 
 @dataclass(frozen=True, slots=True)

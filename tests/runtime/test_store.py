@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC
+
 import pytest
 
-from codemigrator.core import SecretRegistry
+from codemigrator.core import RunId, SecretRegistry
 from codemigrator.runtime.agent_runs import AgentRunId
 from codemigrator.runtime.contracts import CandidateCheckpointFact, EventSpec, RunState
 from codemigrator.runtime.memory import EvolutionSegmentDraft
@@ -99,3 +102,79 @@ async def test_in_memory_store_rejects_sensitive_event_without_status_change():
             (EventSpec("unsafe.event", {"content": "source"}),),
         )
     assert await store.load(run_id) is None
+
+
+@pytest.mark.asyncio
+async def test_in_memory_run_event_read_wait_and_terminal_cursor_are_sequence_scoped():
+    from .conftest import uid
+
+    store = InMemoryRuntimeStore()
+    run_id = RunId(uid())
+    await store.create(
+        RunState(run_id=run_id),
+        (EventSpec("agent_run.terminal", {"status": "COMPLETED"}),),
+    )
+    assert await store.is_run_stream_terminal(run_id, 1) is False
+
+    assert await store.read_run_events(run_id, 1) == ()
+    waiter = asyncio.create_task(store.wait_for_run_events(run_id, 1))
+    await asyncio.sleep(0)
+    await store.commit(
+        RunState(run_id=run_id, version=1),
+        (EventSpec("run.status_changed", {"run_status": "FAILED"}),),
+    )
+    await asyncio.wait_for(waiter, timeout=1)
+
+    events = await store.read_run_events(run_id, 0)
+    assert [event.sequence for event in events] == [1, 2]
+    assert [event.event_type for event in events] == [
+        "agent_run.terminal",
+        "run.status_changed",
+    ]
+    assert all(event.timestamp_utc.tzinfo == UTC for event in events)
+    assert events == await store.read_run_events(run_id, 0)
+    assert await store.is_run_stream_terminal(run_id, 1) is False
+    assert await store.is_run_stream_terminal(run_id, 2) is True
+
+
+@pytest.mark.asyncio
+async def test_in_memory_run_wait_rechecks_commit_between_read_and_wait_setup():
+    from .conftest import uid
+
+    store = InMemoryRuntimeStore()
+    run_id = RunId(uid())
+    await store.create(RunState(run_id=run_id), ())
+    assert await store.read_run_events(run_id, 0) == ()
+    await store.commit(
+        RunState(run_id=run_id, version=1),
+        (EventSpec("slice.status_changed", {"status": "RUNNING"}),),
+    )
+    await asyncio.wait_for(store.wait_for_run_events(run_id, 0), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_draft_terminal_cursor_uses_only_committed_terminal_event_types():
+    from uuid import uuid4
+
+    from codemigrator.runtime.contracts import DraftSessionEventSpec
+
+    store = InMemoryRuntimeStore()
+    draft_id = uuid4()
+    await store.commit_draft_owner_fact(
+        draft_id,
+        "close-fact-without-close-event",
+        "draft.closed",
+        {},
+        events=(DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())}),),
+    )
+    assert await store.is_draft_session_terminal(draft_id, 1) is False
+
+    await store.commit_draft_owner_fact(
+        draft_id,
+        "attached",
+        "draft.attached_to_run",
+        {},
+        events=(DraftSessionEventSpec("session.attached_to_run", {"run_id": str(uuid4())}),),
+    )
+    assert await store.is_draft_session_terminal(draft_id, 1) is False
+    assert await store.is_draft_session_terminal(draft_id, 2) is True

@@ -11,8 +11,16 @@ CREATE TABLE IF NOT EXISTS runtime_events (
     sequence bigint NOT NULL,
     event_type text NOT NULL,
     data jsonb NOT NULL,
+    timestamp_utc timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (run_id, sequence)
 );
+
+ALTER TABLE runtime_events ADD COLUMN IF NOT EXISTS timestamp_utc timestamptz;
+UPDATE runtime_events
+SET timestamp_utc = TIMESTAMPTZ '1970-01-01 00:00:00+00'
+WHERE timestamp_utc IS NULL;
+ALTER TABLE runtime_events ALTER COLUMN timestamp_utc SET NOT NULL;
+ALTER TABLE runtime_events ALTER COLUMN timestamp_utc SET DEFAULT clock_timestamp();
 
 CREATE TABLE IF NOT EXISTS agent_runs (
     agent_run_id uuid PRIMARY KEY,

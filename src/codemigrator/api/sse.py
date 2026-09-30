@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -12,7 +12,7 @@ from sse_starlette import ServerSentEvent
 
 from codemigrator.core import RunStatus, SecretRegistry
 
-from .deps import ApiBackend
+from .deps import ApiBackend, EventRecord
 from .dto import MigrationEvent, SessionEvent
 
 EventEnvelope = type[MigrationEvent] | type[SessionEvent]
@@ -129,8 +129,27 @@ async def _produce_events(
     secret_registry: SecretRegistry | None,
 ) -> None:
     cursor = after_sequence
+
+    async def read_records(after: int) -> Sequence[EventRecord]:
+        if envelope_type is SessionEvent:
+            return await backend.read_session_events(run_id, after)
+        return await backend.read_events(run_id, after)
+
+    async def wait_for_records(after: int) -> None:
+        if envelope_type is SessionEvent:
+            await backend.wait_for_session_events(run_id, after)
+        else:
+            await backend.wait_for_events(run_id, after)
+
+    async def is_stream_terminal(after: int) -> bool:
+        if envelope_type is SessionEvent:
+            return await backend.is_session_stream_terminal(run_id, after)
+        return await backend.is_stream_terminal(run_id, after)
+
     while True:
-        records = await backend.read_events(run_id, cursor)
+        if await is_stream_terminal(cursor):
+            return
+        records = await read_records(cursor)
         delivered = False
         for record in sorted(records, key=lambda item: item.sequence):
             if record.sequence <= cursor:
@@ -153,16 +172,12 @@ async def _produce_events(
                 return
         if delivered:
             continue
-        if await backend.is_stream_terminal(run_id, cursor):
-            return
         try:
-            await asyncio.wait_for(
-                backend.wait_for_events(run_id, cursor), timeout=heartbeat_seconds
-            )
+            await asyncio.wait_for(wait_for_records(cursor), timeout=heartbeat_seconds)
         except TimeoutError:
-            if await backend.read_events(run_id, cursor):
+            if await read_records(cursor):
                 continue
-            if await backend.is_stream_terminal(run_id, cursor):
+            if await is_stream_terminal(cursor):
                 return
             _enqueue(queue, ServerSentEvent(comment="heartbeat"))
 
@@ -175,12 +190,9 @@ def _enqueue(queue: asyncio.Queue[ServerSentEvent], event: ServerSentEvent) -> N
 
 
 def _is_terminal(event: MigrationEvent | SessionEvent) -> bool:
-    expected_type = (
-        {"session.status_changed", "session.closed"}
-        if event.schema == "migration.session.event"
-        else {"run.status_changed"}
-    )
-    if event.type not in expected_type:
+    if event.schema == "migration.session.event":
+        return event.type in {"session.closed", "session.attached_to_run"}
+    if event.type != "run.status_changed":
         return False
     status = event.data.get("run_status", event.data.get("status"))
     terminal_statuses = {
@@ -189,8 +201,6 @@ def _is_terminal(event: MigrationEvent | SessionEvent) -> bool:
         RunStatus.Failed.value,
         RunStatus.Cancelled.value,
     }
-    if event.schema == "migration.session.event":
-        terminal_statuses.add("CLOSED")
     return getattr(status, "value", status) in terminal_statuses
 
 
