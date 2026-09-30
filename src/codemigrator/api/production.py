@@ -33,6 +33,10 @@ class _BackendSlot:
         backend, self._backend = self._backend, None
         return backend
 
+    def close_admission(self) -> None:
+        if self._backend is not None:
+            self._backend.close_admission()
+
     def _require_backend(self) -> ProductionApiBackend:
         if self._backend is None:
             raise ApiError(
@@ -192,6 +196,7 @@ def create_production_app(
                 lock_lost = True
                 app.state.runtime_ready = False
                 app.state.runtime_shutdown_requested = True
+                backend_slot.close_admission()
                 detached_backend = backend_slot.unbind()
                 try:
                     lock_loss_event.set()

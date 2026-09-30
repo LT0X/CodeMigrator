@@ -31,11 +31,24 @@ class CreateRunRejected(RuntimeError):
 
 
 class CreateRunPreflightPort(Protocol):
-    async def verify_descriptor_lock(self, request: CreateRun) -> None: ...
+    """Validate request gates using the API transaction when one is supplied.
 
-    async def verify_preindex(self, request: CreateRun) -> None: ...
+    API-owned calls pass their command transaction so database-backed gates use
+    its connection. Standalone CreateRunService calls pass ``None``; a gate may
+    use a separate read transaction in that standalone context.
+    """
 
-    async def verify_dossier_consistency(self, request: CreateRun) -> None: ...
+    async def verify_descriptor_lock(
+        self, request: CreateRun, transaction: RuntimeStoreTransaction | None
+    ) -> None: ...
+
+    async def verify_preindex(
+        self, request: CreateRun, transaction: RuntimeStoreTransaction | None
+    ) -> None: ...
+
+    async def verify_dossier_consistency(
+        self, request: CreateRun, transaction: RuntimeStoreTransaction | None
+    ) -> None: ...
 
 
 class RunCreationActor(Protocol):
@@ -103,9 +116,9 @@ class CreateRunService:
         self.graph_starter = graph_starter
 
     async def create(self, run_id: RunId, request: CreateRun) -> RunCreatedReceipt:
-        await self.preflight.verify_descriptor_lock(request)
-        await self.preflight.verify_preindex(request)
-        await self.preflight.verify_dossier_consistency(request)
+        await self.preflight.verify_descriptor_lock(request, None)
+        await self.preflight.verify_preindex(request, None)
+        await self.preflight.verify_dossier_consistency(request, None)
         receipt = await self.actor.create(request)
         if receipt is None or receipt.run_id != run_id:
             raise CreateRunRejected("missing RunCreated receipt")
@@ -133,29 +146,42 @@ class RunCreationOwner:
         self._actors = ActorRegistry(store)
         self._pending_committed_actors: dict[RunId, RunActor] = {}
         self._actor_selection_lock = asyncio.Lock()
+        self._admission_open = True
 
     @property
     def active_actor_count(self) -> int:
         return self._actors.active_actor_count
 
     async def close(self) -> None:
+        self.close_admission()
         async with self._actor_selection_lock:
             pending = tuple(self._pending_committed_actors.values())
             self._pending_committed_actors.clear()
             await self._actors.close()
         await asyncio.gather(*(actor.stop() for actor in pending), return_exceptions=True)
 
+    def close_admission(self) -> None:
+        self._admission_open = False
+        self._actors.close_admission()
+        for actor in tuple(self._pending_committed_actors.values()):
+            actor.close_admission()
+
     async def create_run(
         self, request: CreateRun, transaction: object
     ) -> RunCreatedReceipt:
+        if not self._admission_open:
+            raise StoreCommitError("Run creation owner is closed")
         if not isinstance(transaction, RuntimeStoreTransaction):
             raise StoreCommitError("CreateRun requires the shared runtime store transaction")
-        await self.preflight.verify_descriptor_lock(request)
-        await self.preflight.verify_preindex(request)
-        await self.preflight.verify_dossier_consistency(request)
+        await self.preflight.verify_descriptor_lock(request, transaction)
+        await self.preflight.verify_preindex(request, transaction)
+        await self.preflight.verify_dossier_consistency(request, transaction)
+        if not self._admission_open:
+            raise StoreCommitError("Run creation owner is closed")
 
         run_id = RunId(uuid4())
         actor = RunActor(run_id, self.store)
+        transaction.after_rollback(lambda: self._actors.stop_after_rollback(actor))
         await actor.start_new()
         try:
             receipt = await actor.create(request, transaction=transaction)
@@ -168,10 +194,11 @@ class RunCreationOwner:
         transaction.after_commit(
             lambda: self._pending_committed_actors.__setitem__(run_id, actor)
         )
-        transaction.after_rollback(lambda: self._actors.stop_after_rollback(actor))
         return receipt
 
     async def cancel_run(self, run_id: UUID, expected_version: int) -> RunState:
+        if not self._admission_open:
+            raise StoreCommitError("Run creation owner is closed")
         typed_run_id = RunId(run_id)
         actor = await self._get_actor(typed_run_id)
         if actor is None:
@@ -182,6 +209,8 @@ class RunCreationOwner:
         return await actor.cancel(expected_version)
 
     async def start_graph(self, run_id: UUID, receipt: RunCreatedReceipt) -> None:
+        if not self._admission_open:
+            raise StoreCommitError("Run creation owner is closed")
         typed_run_id = RunId(run_id)
         if receipt.run_id != typed_run_id:
             raise CreateRunRejected("RunCreated receipt owner mismatch")
@@ -195,7 +224,11 @@ class RunCreationOwner:
             await cast(RunGraphStarter, self.graph_starter).start(typed_run_id, receipt)
 
     async def _get_actor(self, run_id: RunId) -> RunActor | None:
+        if not self._admission_open:
+            raise StoreCommitError("Run creation owner is closed")
         async with self._actor_selection_lock:
+            if not self._admission_open:
+                raise StoreCommitError("Run creation owner is closed")
             pending = self._pending_committed_actors.pop(run_id, None)
             if pending is not None:
                 return await self._actors.register_committed(pending)

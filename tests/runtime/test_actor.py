@@ -39,7 +39,7 @@ from codemigrator.runtime.contracts import (
 from codemigrator.runtime.integration import IntegrationCoordinator, IntegrationItem
 from codemigrator.runtime.loop_contracts import SessionExit, SessionState
 from codemigrator.runtime.run_graph import PlanAgentCompletion
-from codemigrator.runtime.store import InMemoryRuntimeStore
+from codemigrator.runtime.store import InMemoryRuntimeStore, StoreCommitError
 
 from .conftest import create_run, uid
 
@@ -190,6 +190,86 @@ async def test_execute_agent_run_start_is_committed_while_scheduler_is_still_run
     scheduler.resume.set()
     await round_task
     await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_and_awaits_execution_scheduler_before_return(run_id):
+    class BlockingScheduler:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def advance_one_round(self, owner_run_id, logical_key, *, on_agent_run_started):
+            del owner_run_id, logical_key, on_agent_run_started
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled.set()
+
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(
+            run_id=run_id,
+            status=RunStatus.Executing,
+            version=1,
+            frozen_plan_sha256="c" * 64,
+        ),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    scheduler = BlockingScheduler()
+    actor = RunActor(run_id, store, execution_scheduler=scheduler)
+    await actor.start()
+    round_task = asyncio.create_task(actor.advance_execution_round(run_id, "execute:blocked"))
+    await asyncio.wait_for(scheduler.started.wait(), timeout=1)
+    commits_before_stop = store.commit_count
+
+    await actor.stop()
+
+    assert scheduler.cancelled.is_set()
+    with pytest.raises(StoreCommitError, match="stopped"):
+        await asyncio.wait_for(round_task, timeout=1)
+    assert store.commit_count == commits_before_stop
+    await asyncio.sleep(0)
+    assert store.commit_count == commits_before_stop
+
+
+@pytest.mark.asyncio
+async def test_close_admission_cancels_inflight_cancel_before_actor_close(run_id):
+    class PausingCommitStore(InMemoryRuntimeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_commit_started = asyncio.Event()
+            self.resume_cancel_commit = asyncio.Event()
+
+        async def commit(self, state, events, *, evolution=None):
+            if any(event.event_type == "run.cancelled" for event in events):
+                self.cancel_commit_started.set()
+                await self.resume_cancel_commit.wait()
+            return await super().commit(state, events, evolution=evolution)
+
+    store = PausingCommitStore()
+    actor = RunActor(run_id, store)
+    await actor.start()
+    assert await actor.create(create_run()) is not None
+    cancel_task = asyncio.create_task(actor.cancel(expected_version=1))
+    await asyncio.wait_for(store.cancel_commit_started.wait(), timeout=1)
+    commits_before_cancel = store.commit_count
+
+    try:
+        actor.close_admission()
+        with pytest.raises(StoreCommitError, match="stopping"):
+            await asyncio.wait_for(cancel_task, timeout=1)
+        await actor.stop()
+        snapshot = await store.snapshot(run_id)
+        assert snapshot.state.status is RunStatus.Planning
+        assert store.commit_count == commits_before_cancel
+    finally:
+        store.resume_cancel_commit.set()
+        if not cancel_task.done():
+            cancel_task.cancel()
+            await asyncio.gather(cancel_task, return_exceptions=True)
+        await actor.stop()
 
 
 @pytest.mark.asyncio

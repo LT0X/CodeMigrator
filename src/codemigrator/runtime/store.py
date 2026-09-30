@@ -1663,7 +1663,7 @@ class PostgreSQLRuntimeStore:
                             "owner_receipt_key": receipt_key,
                             "replayed": False,
                         }
-        except Exception:
+        except BaseException:
             if transaction_context is not None:
                 transaction_context.finish(committed=False)
             raise

@@ -13,13 +13,13 @@ class RecordingPreflight:
         self.calls: list[str] = []
         self.reject_at = reject_at
 
-    async def verify_descriptor_lock(self, request) -> None:
+    async def verify_descriptor_lock(self, request, transaction=None) -> None:
         await self._check("descriptor_lock")
 
-    async def verify_preindex(self, request) -> None:
+    async def verify_preindex(self, request, transaction=None) -> None:
         await self._check("preindex")
 
-    async def verify_dossier_consistency(self, request) -> None:
+    async def verify_dossier_consistency(self, request, transaction=None) -> None:
         await self._check("dossier_consistency")
 
     async def _check(self, name: str) -> None:

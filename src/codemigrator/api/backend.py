@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from threading import Lock
 from typing import Protocol, cast
 from uuid import UUID
 
@@ -91,30 +92,106 @@ class ProductionApiBackend:
         self._run_owner = run_owner
         self._shutdown = shutdown
         self._health_check = health_check
-        self._handoff_lock = asyncio.Lock()
+        self._admission_lock = Lock()
+        self._admission_open = True
+        self._active_command_tasks: set[asyncio.Task[object]] = set()
+        self._active_commands_drained = asyncio.Event()
+        self._active_commands_drained.set()
+        self._graph_start_tasks: dict[tuple[UUID, str], asyncio.Task[None]] = {}
+        self._close_lock = asyncio.Lock()
         self._closed = False
         if run_owner is not None and getattr(run_owner, "recovery_safe", None) is not True:
             raise ValueError("Run owner does not guarantee graph receipt recovery")
 
     async def close(self) -> None:
-        """Release host-owned graph managers after request handling stops."""
+        """Stop admission and drain commands/graphs before releasing owners."""
 
-        if self._closed:
+        async with self._close_lock:
+            if self._closed:
+                return
+            self.close_admission()
+            await self.drain_active_commands()
+            await self.cancel_graph_tasks()
+            self._closed = True
+            failures = False
+            close_owner = getattr(self._run_owner, "close", None)
+            for close_resource in (close_owner, self._shutdown):
+                if close_resource is None:
+                    continue
+                try:
+                    await close_resource()
+                except Exception:
+                    failures = True
+            if failures:
+                raise RuntimeError("API backend shutdown failed")
+
+    def close_admission(self) -> None:
+        """Synchronously reject new commands and cancel admitted writes."""
+
+        with self._admission_lock:
+            if not self._admission_open:
+                return
+            self._admission_open = False
+            active = tuple(self._active_command_tasks)
+        for task in active:
+            loop = task.get_loop()
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(task.cancel)
+        for task in tuple(self._graph_start_tasks.values()):
+            loop = task.get_loop()
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(task.cancel)
+        close_owner_admission = getattr(self._run_owner, "close_admission", None)
+        if callable(close_owner_admission):
+            close_owner_admission()
+
+    async def drain_active_commands(self) -> None:
+        await self._active_commands_drained.wait()
+
+    async def cancel_graph_tasks(self) -> None:
+        tasks = tuple(self._graph_start_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._graph_start_tasks.clear()
+
+    def _begin_command(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            raise _unavailable()
+        with self._admission_lock:
+            if not self._admission_open or self._closed:
+                raise _unavailable()
+            self._active_command_tasks.add(cast(asyncio.Task[object], task))
+            self._active_commands_drained.clear()
+
+    def _finish_command(self) -> None:
+        task = asyncio.current_task()
+        if task is None:
             return
-        self._closed = True
-        failures = False
-        close_owner = getattr(self._run_owner, "close", None)
-        for close_resource in (close_owner, self._shutdown):
-            if close_resource is None:
-                continue
-            try:
-                await close_resource()
-            except Exception:
-                failures = True
-        if failures:
-            raise RuntimeError("API backend shutdown failed")
+        with self._admission_lock:
+            self._active_command_tasks.discard(cast(asyncio.Task[object], task))
+            drained = not self._active_command_tasks
+        if drained:
+            self._active_commands_drained.set()
+
+    def _is_admission_open(self) -> bool:
+        with self._admission_lock:
+            return self._admission_open and not self._closed
 
     async def execute(self, request: ApiRequest) -> object:
+        self._begin_command()
+        try:
+            return await self._execute_admitted(request)
+        except asyncio.CancelledError:
+            if not self._is_admission_open():
+                raise _unavailable() from None
+            raise
+        finally:
+            self._finish_command()
+
+    async def _execute_admitted(self, request: ApiRequest) -> object:
         if request.operation == "health":
             if self._health_check is None:
                 raise _unavailable()
@@ -167,6 +244,31 @@ class ProductionApiBackend:
         raise _unavailable()
 
     async def execute_idempotent(
+        self,
+        request: ApiRequest,
+        *,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+    ) -> object:
+        self._begin_command()
+        try:
+            return await self._execute_idempotent_admitted(
+                request,
+                route=route,
+                key=key,
+                canonical_body=canonical_body,
+                status_code=status_code,
+            )
+        except asyncio.CancelledError:
+            if not self._is_admission_open():
+                raise _unavailable() from None
+            raise
+        finally:
+            self._finish_command()
+
+    async def _execute_idempotent_admitted(
         self,
         request: ApiRequest,
         *,
@@ -270,33 +372,48 @@ class ProductionApiBackend:
         ):
             raise RuntimeError("Run graph starter does not guarantee receipt recovery")
         for run_id, receipt_key in pending:
-            await self._start_pending_graph(run_id, receipt_key, fail_closed=True)
+            self._schedule_pending_graph_start(run_id, receipt_key)
 
     async def _try_start_pending_graph(self, run_id: UUID, receipt_key: str) -> None:
-        await self._start_pending_graph(run_id, receipt_key, fail_closed=False)
+        self._schedule_pending_graph_start(run_id, receipt_key)
 
-    async def _start_pending_graph(
-        self, run_id: UUID, receipt_key: str, *, fail_closed: bool
-    ) -> None:
-        owner = self._run_owner
-        if owner is None:
-            if fail_closed:
-                raise RuntimeError("Run graph-start recovery is not configured")
+    def _schedule_pending_graph_start(self, run_id: UUID, receipt_key: str) -> None:
+        if self._run_owner is None or not self._is_admission_open():
             return
-        # One API process owns the PostgreSQL advisory lock. This process-wide
-        # handoff lock also serializes concurrent idempotent HTTP replays.
-        async with self._handoff_lock:
+        task_key = (run_id, receipt_key)
+        existing = self._graph_start_tasks.get(task_key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._run_pending_graph_start(run_id, receipt_key),
+            name=f"codemigrator-graph-start-{run_id}-{receipt_key}",
+        )
+        self._graph_start_tasks[task_key] = task
+        task.add_done_callback(lambda completed: self._graph_start_finished(task_key, completed))
+
+    def _graph_start_finished(
+        self, task_key: tuple[UUID, str], task: asyncio.Task[None]
+    ) -> None:
+        if self._graph_start_tasks.get(task_key) is task:
+            del self._graph_start_tasks[task_key]
+        if not task.cancelled():
+            task.exception()
+
+    async def _run_pending_graph_start(self, run_id: UUID, receipt_key: str) -> None:
+        owner = self._run_owner
+        if owner is None or not self._is_admission_open():
+            return
+        try:
             if (run_id, receipt_key) not in await self._store.list_pending_graph_starts():
                 return
-            try:
-                receipt = await owner.load_run_created_receipt(run_id, receipt_key)
-                await owner.start_graph(run_id, receipt)
-                await self._store.mark_graph_start_started(run_id, receipt_key)
-            except Exception:
-                if fail_closed:
-                    raise RuntimeError("pending Run graph-start recovery failed") from None
-                # The committed handoff remains pending and will be retried at startup.
-                return
+            receipt = await owner.load_run_created_receipt(run_id, receipt_key)
+            await owner.start_graph(run_id, receipt)
+            await self._store.mark_graph_start_started(run_id, receipt_key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The durable handoff remains pending for receipt-idempotent recovery.
+            return
 
 
 def _unavailable() -> ApiError:

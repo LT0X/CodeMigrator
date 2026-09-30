@@ -1017,13 +1017,13 @@ async def test_create_run_rejection_keeps_draft_without_run_side_effects(
     tmp_path, artifacts
 ) -> None:
     class RejectingPreflight:
-        async def verify_descriptor_lock(self, request) -> None:
+        async def verify_descriptor_lock(self, request, transaction=None) -> None:
             raise CreateRunRejected("descriptor lock rejected")
 
-        async def verify_preindex(self, request) -> None:
+        async def verify_preindex(self, request, transaction=None) -> None:
             raise AssertionError("preindex must not run after rejection")
 
-        async def verify_dossier_consistency(self, request) -> None:
+        async def verify_dossier_consistency(self, request, transaction=None) -> None:
             raise AssertionError("dossier check must not run after rejection")
 
     class NoRunActor:
@@ -1071,13 +1071,13 @@ async def test_successful_attach_commits_once_then_releases_draft_threads(
     tmp_path, artifacts
 ) -> None:
     class PassingPreflight:
-        async def verify_descriptor_lock(self, request) -> None:
+        async def verify_descriptor_lock(self, request, transaction=None) -> None:
             return None
 
-        async def verify_preindex(self, request) -> None:
+        async def verify_preindex(self, request, transaction=None) -> None:
             return None
 
-        async def verify_dossier_consistency(self, request) -> None:
+        async def verify_dossier_consistency(self, request, transaction=None) -> None:
             return None
 
     class RecordingActor:
