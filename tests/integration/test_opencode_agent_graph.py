@@ -97,9 +97,7 @@ def _opencode_config() -> dict[str, object]:
     config_path = next((path for path in candidates if path.is_file()), None)
     if config_path is None:
         pytest.fail("local OpenCode provider config is unavailable")
-    return select_unique_provider_config(
-        config_path.read_text(encoding="utf-8"), "OpenCode"
-    )
+    return select_unique_provider_config(config_path.read_text(encoding="utf-8"), "OpenCode")
 
 
 @pytest.mark.asyncio
@@ -149,7 +147,7 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
         )
 
         class Runner:
-            async def run(self, owner_id, logical_task_key, task):
+            async def run(self, owner_id, logical_task_key, task, *, lifecycle):
                 agent_run_id = AgentRunId(new_uuid7())
                 context_identity = DraftContextIdentity(owner_id, revision_id, agent_run_id)
                 template_sha = agent_template_digest(
@@ -180,6 +178,7 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                     template_sha256=template_sha,
                 )
                 record = await store.create_or_get_agent_run(record)
+                await lifecycle.started(record)
                 bound = create_bound_agent(
                     agent_run=record,
                     binding=binding,
@@ -187,17 +186,15 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                     context_manager=context_manager,
                     template=template,
                     envelope=envelope,
-                        gateway=_NoToolGateway(
-                            GatewayContext(
-                                draft_id=owner_id,
-                                agent_run_id=agent_run_id,
-                                phase_policy_sha256=load_resource(
-                                    "core://phase-tool-policy/v2"
-                                ).sha256,
-                                phase=Phase.Plan,
-                                session_kind=SessionKind.ExploreCoordinator,
-                            )
-                        ),
+                    gateway=_NoToolGateway(
+                        GatewayContext(
+                            draft_id=owner_id,
+                            agent_run_id=agent_run_id,
+                            phase_policy_sha256=load_resource("core://phase-tool-policy/v2").sha256,
+                            phase=Phase.Plan,
+                            session_kind=SessionKind.ExploreCoordinator,
+                        )
+                    ),
                     usage_sink=usage_sink,
                     context_identity=context_identity,
                     checkpointer=agent_checkpointer,
@@ -226,6 +223,7 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                     new_uuid7(), terminal.agent_run_id, "draft.exploration.completed"
                 )
                 await store.commit_agent_run_receipt(terminal, receipt)
+                await lifecycle.terminal(terminal, receipt)
                 return DraftAgentCompletion(terminal, receipt, {"digest": result_sha})
 
         graph = MigrationSessionGraph(

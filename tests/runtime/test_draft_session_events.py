@@ -138,6 +138,48 @@ async def test_draft_agent_lifecycle_accepts_only_existing_public_fields() -> No
 
 
 @pytest.mark.asyncio
+async def test_draft_terminal_category_rejects_private_error_text() -> None:
+    store = InMemoryRuntimeStore()
+    draft_id = uuid4()
+    with pytest.raises(StoreCommitError, match="invalid"):
+        await store.commit_draft_owner_fact(
+            draft_id,
+            "terminal",
+            "draft.agent.terminal",
+            {},
+            events=(
+                DraftSessionEventSpec(
+                    "agent_run.terminal",
+                    {
+                        "agent_run_id": str(uuid4()),
+                        "phase": "PLAN",
+                        "session_kind": "EXPLORE_COORDINATOR",
+                        "exit": "FAILED",
+                        "receipt_category": "Private error body",
+                    },
+                ),
+            ),
+        )
+    assert await store.list_draft_owner_facts(draft_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_draft_event_reads_cannot_mutate_committed_payload() -> None:
+    store = InMemoryRuntimeStore()
+    draft_id = uuid4()
+    spec = DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())})
+    await store.commit_draft_owner_fact(
+        draft_id, "question", "draft.ask_user.question", {}, events=(spec,)
+    )
+    first = (await store.read_draft_session_events(draft_id, 0))[0]
+    first.data["question_id"] = "tampered"
+    assert (await store.read_draft_session_events(draft_id, 0))[0].data == spec.data
+    await store.commit_draft_owner_fact(
+        draft_id, "question", "draft.ask_user.question", {}, events=(spec,)
+    )
+
+
+@pytest.mark.asyncio
 async def test_draft_event_wait_wakes_after_commit() -> None:
     store = InMemoryRuntimeStore()
     draft_id = uuid4()

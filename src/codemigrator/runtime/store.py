@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
@@ -301,7 +302,13 @@ class InMemoryRuntimeStore:
         self, draft_id: UUID, after_sequence: int
     ) -> tuple[DraftSessionEvent, ...]:
         return tuple(
-            event
+            DraftSessionEvent(
+                event.draft_id,
+                event.sequence,
+                event.event_type,
+                dict(event.data),
+                event.timestamp_utc,
+            )
             for event in self._draft_events.get(draft_id, ())
             if event.sequence > after_sequence
         )
@@ -1738,7 +1745,8 @@ def _prepare_draft_events(
                 if event.event_type == "agent_run.terminal" and (
                     projected["exit"] not in {item.value for item in SessionExit}
                     or not isinstance(projected["receipt_category"], str)
-                    or not projected["receipt_category"]
+                    or re.fullmatch(r"[a-z][a-z0-9._-]{0,63}", projected["receipt_category"])
+                    is None
                 ):
                     raise ValueError("AgentRun terminal summary is invalid")
             for key in ("question_id", "run_id", "agent_run_id", "slice_id"):

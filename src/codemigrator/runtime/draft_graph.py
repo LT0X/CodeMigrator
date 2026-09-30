@@ -17,7 +17,12 @@ from codemigrator.core import CreateRun, RunId, canonical_json_bytes
 from codemigrator.core.paths import normalize_repo_relative_paths
 
 from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
-from .contracts import DraftOwnerReceipt, DraftSessionEventSpec, RunCreatedReceipt
+from .contracts import (
+    DraftOwnerReceipt,
+    DraftSessionEventSpec,
+    RunCreatedReceipt,
+    agent_run_lifecycle_spec,
+)
 from .create_run import CreateRunService
 from .draft import DraftConflictError, DraftFlow
 from .draft_models import AskUserAnswer, AskUserQuestion, DraftFreezeReceipt
@@ -55,6 +60,12 @@ class DraftOwnerPort(Protocol):
 
     async def commit_lifecycle_fact(
         self, receipt_key: str, category: str, fact: Mapping[str, object]
+    ) -> DraftOwnerReceipt: ...
+
+    async def commit_agent_started(self, record: AgentRun) -> DraftOwnerReceipt: ...
+
+    async def commit_agent_terminal(
+        self, record: AgentRun, receipt: AgentRunReceipt
     ) -> DraftOwnerReceipt: ...
 
 
@@ -161,6 +172,28 @@ class DraftFlowOwner:
             self.draft_id, receipt_key, category, fact, events=events
         )
 
+    async def commit_agent_started(self, record: AgentRun) -> DraftOwnerReceipt:
+        spec = agent_run_lifecycle_spec(record)
+        return await self.store.commit_draft_owner_fact(
+            self.draft_id,
+            f"draft.agent.started:{record.agent_run_id}",
+            "draft.agent.started",
+            {"agent_run_id": str(record.agent_run_id)},
+            events=(DraftSessionEventSpec(spec.event_type, spec.data),),
+        )
+
+    async def commit_agent_terminal(
+        self, record: AgentRun, receipt: AgentRunReceipt
+    ) -> DraftOwnerReceipt:
+        spec = agent_run_lifecycle_spec(record, receipt)
+        return await self.store.commit_draft_owner_fact(
+            self.draft_id,
+            f"draft.agent.terminal:{record.agent_run_id}",
+            "draft.agent.terminal",
+            {"agent_run_id": str(record.agent_run_id), "receipt_id": str(receipt.receipt_id)},
+            events=(DraftSessionEventSpec(spec.event_type, spec.data),),
+        )
+
 
 class DraftAgentRunStore(Protocol):
     async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun: ...
@@ -185,8 +218,40 @@ class DraftAgentCompletion:
 
 class DraftAgentRunnerPort(Protocol):
     async def run(
-        self, draft_id: UUID, logical_task_key: str, task: str
+        self,
+        draft_id: UUID,
+        logical_task_key: str,
+        task: str,
+        *,
+        lifecycle: DraftAgentLifecyclePort,
     ) -> DraftAgentCompletion: ...
+
+
+class DraftAgentLifecyclePort(Protocol):
+    async def started(self, record: AgentRun) -> None: ...
+
+    async def terminal(self, record: AgentRun, receipt: AgentRunReceipt) -> None: ...
+
+
+@dataclass(slots=True)
+class _DraftAgentLifecycle:
+    graph: MigrationSessionGraph
+    logical_task_key: str
+    expected_category: str
+    started_seen: bool = False
+    terminal_seen: bool = False
+
+    async def started(self, record: AgentRun) -> None:
+        await self.graph._commit_agent_started(record, self.logical_task_key)
+        self.started_seen = True
+
+    async def terminal(self, record: AgentRun, receipt: AgentRunReceipt) -> None:
+        if not self.started_seen:
+            raise ValueError("Draft AgentRun terminal requires a published start")
+        await self.graph._commit_agent_terminal(
+            record, receipt, self.logical_task_key, self.expected_category
+        )
+        self.terminal_seen = True
 
 
 class MigrationSessionGraph:
@@ -383,7 +448,12 @@ class MigrationSessionGraph:
             raise RuntimeError("Draft graph has no AgentRun runner")
         if not isinstance(task, str) or not task.strip():
             raise ValueError("Draft Agent task must be non-empty text")
-        completion = await self.agent_runner.run(self.owner.draft_id, logical_task_key, task)
+        lifecycle = _DraftAgentLifecycle(self, logical_task_key, expected_category)
+        completion = await self.agent_runner.run(
+            self.owner.draft_id, logical_task_key, task, lifecycle=lifecycle
+        )
+        if not lifecycle.started_seen or not lifecycle.terminal_seen:
+            raise ValueError("Draft AgentRun runner omitted a lifecycle callback")
         record = completion.record
         if (
             record.owner_kind != "draft"
@@ -401,6 +471,51 @@ class MigrationSessionGraph:
         if persisted_record != record or persisted_receipt != completion.receipt:
             raise ValueError("Draft AgentRun cannot advance without its durable receipt")
         return completion
+
+    async def _commit_agent_started(self, record: AgentRun, logical_task_key: str) -> None:
+        self._validate_agent_identity(record, logical_task_key)
+        if record.state is not SessionState.Created or record.exit is not None:
+            raise ValueError("Draft AgentRun start requires a created record")
+        persisted = await self.agent_runs.load_agent_run(record.agent_run_id)
+        already_published = await self.owner.has_receipt(
+            f"draft.agent.started:{record.agent_run_id}"
+        )
+        if persisted is None or not persisted.same_frozen_identity(record):
+            raise ValueError("Draft AgentRun start lacks its durable identity")
+        if not already_published and persisted != record:
+            raise ValueError("Draft AgentRun started after execution")
+        await self.owner.commit_agent_started(record)
+
+    async def _commit_agent_terminal(
+        self,
+        record: AgentRun,
+        receipt: AgentRunReceipt,
+        logical_task_key: str,
+        expected_category: str,
+    ) -> None:
+        self._validate_agent_identity(record, logical_task_key)
+        if (
+            not record.is_terminal
+            or record.exit is None
+            or receipt.agent_run_id != record.agent_run_id
+        ):
+            raise ValueError("Draft AgentRun terminal identity is invalid")
+        if record.exit is SessionExit.Completed and receipt.category != expected_category:
+            raise ValueError("Draft AgentRun completion category is invalid")
+        persisted = await self.agent_runs.load_agent_run(record.agent_run_id)
+        persisted_receipt = await self.agent_runs.load_agent_run_receipt(record.agent_run_id)
+        if persisted != record or persisted_receipt != receipt:
+            raise ValueError("Draft AgentRun terminal lacks its durable receipt")
+        await self.owner.commit_agent_terminal(record, receipt)
+
+    def _validate_agent_identity(self, record: AgentRun, logical_task_key: str) -> None:
+        if (
+            record.owner_kind != "draft"
+            or record.owner_id != self.owner.draft_id
+            or record.logical_task_key != logical_task_key
+            or record.thread_id == self.thread_id
+        ):
+            raise ValueError("Draft AgentRun lifecycle has a different owner task")
 
     async def _ensure_open(self) -> None:
         if await self.owner.has_receipt("draft.closed") or await self.owner.has_receipt(
