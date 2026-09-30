@@ -404,3 +404,32 @@ async def test_committed_plan_receipt_repairs_missing_graph_cursor_without_repla
     assert state["phase"] == "DONE"
     assert planner.calls == 1
     assert len(actor.round_keys) == 1
+
+
+@pytest.mark.asyncio
+async def test_graph_start_replay_after_handoff_mark_failure_does_not_repeat_domain_work(run_id):
+    actor = FakeActor(run_id, execute_rounds=1)
+    planner = FakePlanner(actor)
+    verifier = DeterministicService("verified")
+    reporter = DeterministicService("report")
+    checkpointer = RecordingCheckpointer()
+    graph = RunWorkflowGraph(
+        actor=actor,
+        planner=planner,
+        verifier=verifier,
+        reporter=reporter,
+        checkpointer=checkpointer,
+    )
+    receipt = RunCreatedReceipt(
+        run_id, f"run.created:{run_id}", event_sequence=1, state_version=1
+    )
+
+    first = await graph.start(receipt)
+    # The graph completed, but the caller failed before marking the durable handoff STARTED.
+    recovered = await graph.start(receipt)
+
+    assert first["phase"] == recovered["phase"] == "DONE"
+    assert planner.calls == 1
+    assert len(actor.round_keys) == 1
+    assert len(actor.verifications) == len(actor.reports) == 1
+    assert verifier.calls == reporter.calls == [str(run_id)]

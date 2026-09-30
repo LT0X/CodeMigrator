@@ -13,7 +13,7 @@ from codemigrator.core import ModelProfile, Phase, SessionKind, canonical_json_b
 from codemigrator.core.ids import new_uuid7
 from codemigrator.runtime.agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from codemigrator.runtime.binding import LockedModelBinding
-from codemigrator.runtime.cas import FileHostCAS
+from codemigrator.runtime.cas import CasLedger, FileHostCAS
 from codemigrator.runtime.checkpointer import CasCheckpointSaver
 from codemigrator.runtime.context import ContextEnvelope, ContextSegment
 from codemigrator.runtime.draft import DraftFlow
@@ -97,9 +97,7 @@ def _opencode_config() -> dict[str, object]:
     config_path = next((path for path in candidates if path.is_file()), None)
     if config_path is None:
         pytest.fail("local OpenCode provider config is unavailable")
-    return select_unique_provider_config(
-        config_path.read_text(encoding="utf-8"), "OpenCode"
-    )
+    return select_unique_provider_config(config_path.read_text(encoding="utf-8"), "OpenCode")
 
 
 @pytest.mark.asyncio
@@ -149,7 +147,7 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
         )
 
         class Runner:
-            async def run(self, owner_id, logical_task_key, task):
+            async def run(self, owner_id, logical_task_key, task, *, lifecycle):
                 agent_run_id = AgentRunId(new_uuid7())
                 context_identity = DraftContextIdentity(owner_id, revision_id, agent_run_id)
                 template_sha = agent_template_digest(
@@ -180,6 +178,7 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                     template_sha256=template_sha,
                 )
                 record = await store.create_or_get_agent_run(record)
+                await lifecycle.started(record)
                 bound = create_bound_agent(
                     agent_run=record,
                     binding=binding,
@@ -187,17 +186,15 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                     context_manager=context_manager,
                     template=template,
                     envelope=envelope,
-                        gateway=_NoToolGateway(
-                            GatewayContext(
-                                draft_id=owner_id,
-                                agent_run_id=agent_run_id,
-                                phase_policy_sha256=load_resource(
-                                    "core://phase-tool-policy/v2"
-                                ).sha256,
-                                phase=Phase.Plan,
-                                session_kind=SessionKind.ExploreCoordinator,
-                            )
-                        ),
+                    gateway=_NoToolGateway(
+                        GatewayContext(
+                            draft_id=owner_id,
+                            agent_run_id=agent_run_id,
+                            phase_policy_sha256=load_resource("core://phase-tool-policy/v2").sha256,
+                            phase=Phase.Plan,
+                            session_kind=SessionKind.ExploreCoordinator,
+                        )
+                    ),
                     usage_sink=usage_sink,
                     context_identity=context_identity,
                     checkpointer=agent_checkpointer,
@@ -205,28 +202,33 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                 result = await bound.ainvoke(task=task)
                 if result.exit is not SessionExit.Completed or not result.assistant_texts:
                     raise AssertionError("live OpenCode AgentRun did not complete")
-                result_sha = hashlib.sha256(
-                    canonical_json_bytes(
-                        {
-                            "answer_sha256": hashlib.sha256(
-                                result.assistant_texts[0].encode("utf-8")
-                            ).hexdigest()
-                        }
-                    )
-                ).hexdigest()
+                result_body = canonical_json_bytes(
+                    {
+                        "answer_sha256": hashlib.sha256(
+                            result.assistant_texts[0].encode("utf-8")
+                        ).hexdigest()
+                    }
+                )
+                result_reference = await CasLedger(cas, store).put(
+                    result_body,
+                    "draft",
+                    owner_id,
+                    f"agent-result:{record.agent_run_id}",
+                )
                 indexes = await store.list_checkpoint_indexes(record.thread_id)
                 terminal = replace(
                     record,
                     state=SessionState.Closed,
                     exit=SessionExit.Completed,
-                    result_sha256=result_sha,
+                    result_sha256=result_reference.digest,
                     checkpoint_sha256=indexes[0].object.digest if indexes else None,
                 )
                 receipt = AgentRunReceipt(
                     new_uuid7(), terminal.agent_run_id, "draft.exploration.completed"
                 )
                 await store.commit_agent_run_receipt(terminal, receipt)
-                return DraftAgentCompletion(terminal, receipt, {"digest": result_sha})
+                await lifecycle.terminal(terminal, receipt)
+                return DraftAgentCompletion(terminal, receipt, result_reference)
 
         graph = MigrationSessionGraph(
             owner=DraftFlowOwner(draft_id=draft_id, flow=DraftFlow(), store=store),

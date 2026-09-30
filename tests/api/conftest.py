@@ -15,6 +15,8 @@ class FakeBackend:
     def __init__(self) -> None:
         self.requests: list[ApiRequest] = []
         self.events: list[EventRecord] = []
+        self.session_events: list[EventRecord] = []
+        self.stream_calls: list[str] = []
         self.idempotency = IdempotencyStore()
         self.idempotency_lock = asyncio.Lock()
 
@@ -105,6 +107,7 @@ class FakeBackend:
             return result
 
     async def read_events(self, run_id: UUID, after_sequence: int) -> tuple[EventRecord, ...]:
+        self.stream_calls.append("run.read")
         return tuple(
             event
             for event in self.events
@@ -112,16 +115,43 @@ class FakeBackend:
         )
 
     async def wait_for_events(self, run_id: UUID, after_sequence: int) -> None:
+        self.stream_calls.append("run.wait")
         del run_id, after_sequence
         await asyncio.sleep(60)
 
     async def is_stream_terminal(self, run_id: UUID, after_sequence: int) -> bool:
-        terminal = {"COMPLETED", "PARTIALLY_COMPLETED", "FAILED", "CANCELLED", "CLOSED"}
+        self.stream_calls.append("run.terminal")
+        terminal = {"COMPLETED", "PARTIALLY_COMPLETED", "FAILED", "CANCELLED"}
         return any(
             item.run_id == run_id
             and item.sequence <= after_sequence
+            and item.event_type == "run.status_changed"
             and item.data.get("run_status", item.data.get("status")) in terminal
             for item in self.events
+        )
+
+    async def read_session_events(
+        self, session_id: UUID, after_sequence: int
+    ) -> tuple[EventRecord, ...]:
+        self.stream_calls.append("session.read")
+        return tuple(
+            event
+            for event in self.session_events
+            if event.run_id == session_id and event.sequence > after_sequence
+        )
+
+    async def wait_for_session_events(self, session_id: UUID, after_sequence: int) -> None:
+        self.stream_calls.append("session.wait")
+        del session_id, after_sequence
+        await asyncio.sleep(60)
+
+    async def is_session_stream_terminal(self, session_id: UUID, after_sequence: int) -> bool:
+        self.stream_calls.append("session.terminal")
+        return any(
+            item.run_id == session_id
+            and item.sequence <= after_sequence
+            and item.event_type in {"session.closed", "session.attached_to_run"}
+            for item in self.session_events
         )
 
 

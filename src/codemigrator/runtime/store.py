@@ -5,8 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any, Protocol, cast
 from uuid import UUID
 
@@ -32,14 +36,27 @@ from .cas import CasObject, CheckpointIndex, PendingWriteIndex
 from .contracts import (
     CandidateCheckpointFact,
     DraftOwnerReceipt,
+    DraftSessionEvent,
+    DraftSessionEventSpec,
     EventSpec,
     RunState,
     RuntimeEvent,
     RuntimeSnapshot,
+    RuntimeStoreTransaction,
 )
 from .loop_contracts import SessionExit, SessionState
 from .memory import EvolutionSegment, EvolutionSegmentDraft
 from .schema import RUNTIME_SCHEMA_SQL
+
+_RUN_TERMINAL_STATUSES = frozenset(
+    {
+        RunStatus.Completed.value,
+        RunStatus.PartiallyCompleted.value,
+        RunStatus.Failed.value,
+        RunStatus.Cancelled.value,
+    }
+)
+_DRAFT_TERMINAL_EVENTS = frozenset({"session.closed", "session.attached_to_run"})
 
 
 class RuntimeStore(Protocol):
@@ -52,8 +69,27 @@ class RuntimeStore(Protocol):
         events: Sequence[EventSpec],
         *,
         evolution: EvolutionSegmentDraft | None = None,
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> RuntimeSnapshot:
         """Insert a new Run atomically with its first events."""
+
+    async def execute_api_command(
+        self,
+        *,
+        principal_id: str,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+        command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
+        project_response: Callable[[object], object],
+        owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+    ) -> Mapping[str, object]:
+        """Commit an API receipt with its owner command in one transaction."""
+
+    async def list_pending_graph_starts(self) -> tuple[tuple[RunId, str], ...]: ...
+
+    async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None: ...
 
     async def commit(
         self,
@@ -63,6 +99,15 @@ class RuntimeStore(Protocol):
         evolution: EvolutionSegmentDraft | None = None,
     ) -> RuntimeSnapshot:
         """Commit state and events in one transaction."""
+
+    async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
+        """Read committed Run events strictly after a sequence cursor."""
+
+    async def wait_for_run_events(self, run_id: RunId, after_sequence: int) -> None:
+        """Wait for a wake-up and recheck the durable Run event ledger."""
+
+    async def is_run_stream_terminal(self, run_id: RunId, after_sequence: int) -> bool:
+        """Report whether a terminal Run event at or before the cursor is committed."""
 
     async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
         """Create one session per owner logical task, or return its frozen identity."""
@@ -81,6 +126,8 @@ class RuntimeStore(Protocol):
         receipt_key: str,
         category: str,
         fact: Mapping[str, object],
+        *,
+        events: Sequence[DraftSessionEventSpec] = (),
     ) -> DraftOwnerReceipt:
         """Persist an immutable Draft fact and its idempotency receipt."""
 
@@ -92,8 +139,21 @@ class RuntimeStore(Protocol):
         self, draft_id: UUID
     ) -> tuple[tuple[DraftOwnerReceipt, dict[str, object]], ...]: ...
 
+    async def read_draft_session_events(
+        self, draft_id: UUID, after_sequence: int
+    ) -> tuple[DraftSessionEvent, ...]: ...
+
+    async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None: ...
+
+    async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool: ...
+
     async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
         """Load the committed owner receipt, if any."""
+
+    async def get_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        """Load a durable owner reference to an opaque CAS object."""
 
     async def commit_agent_run_receipt(
         self,
@@ -203,15 +263,27 @@ class InMemoryRuntimeStore:
         self.commit_count = 0
         self._fail_next = False
         self.secret_registry = secret_registry or SecretRegistry()
+        self._run_conditions: dict[RunId, asyncio.Condition] = {}
         self._agent_runs: dict[AgentRunId, AgentRun] = {}
         self._agent_run_keys: dict[tuple[str, UUID, str], AgentRunId] = {}
         self._agent_threads: dict[UUID, AgentRunId] = {}
         self._agent_receipts: dict[AgentRunId, AgentRunReceipt] = {}
         self._agent_lock = asyncio.Lock()
         self._draft_facts: dict[tuple[UUID, str], tuple[DraftOwnerReceipt, dict[str, object]]] = {}
+        self._draft_events: dict[UUID, list[DraftSessionEvent]] = {}
+        self._draft_event_specs: dict[
+            tuple[UUID, str], tuple[tuple[str, dict[str, object]], ...]
+        ] = {}
+        self._draft_conditions: dict[UUID, asyncio.Condition] = {}
+        self._draft_terminals: dict[UUID, int] = {}
         self._cas_refs: dict[tuple[str, UUID, str], CasObject] = {}
         self._checkpoints: dict[tuple[str, str, str], CheckpointIndex] = {}
         self._pending_writes: dict[tuple[str, str, str, str, int], PendingWriteIndex] = {}
+        self._api_command_lock = asyncio.Lock()
+        self._api_commands: dict[
+            tuple[str, str, str], tuple[str, Mapping[str, object], datetime]
+        ] = {}
+        self._graph_start_handoffs: dict[RunId, str] = {}
 
     async def add_cas_reference(
         self, object_ref: CasObject, owner_kind: str, owner_id: UUID, reference_key: str
@@ -242,20 +314,121 @@ class InMemoryRuntimeStore:
         receipt_key: str,
         category: str,
         fact: Mapping[str, object],
+        *,
+        events: Sequence[DraftSessionEventSpec] = (),
     ) -> DraftOwnerReceipt:
         receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
+        event_data = _prepare_draft_events(events, self.secret_registry)
         async with self._agent_lock:
             key = (draft_id, receipt_key)
             previous = self._draft_facts.get(key)
             if previous is not None:
-                if previous[0] != receipt or previous[1] != payload:
+                if (
+                    previous[0] != receipt
+                    or previous[1] != payload
+                    or self._draft_event_specs[key] != event_data
+                ):
                     raise StoreCommitError("Draft owner fact replay mismatch")
                 return previous[0]
             if self._fail_next:
                 self._fail_next = False
                 raise StoreCommitError("injected commit failure")
             self._draft_facts[key] = (receipt, payload)
+            self._draft_event_specs[key] = event_data
+            ledger = self._draft_events.setdefault(draft_id, [])
+            first_sequence = len(ledger) + 1
+            appended = tuple(
+                DraftSessionEvent(
+                    draft_id, first_sequence + index, event_type, data, datetime.now(UTC)
+                )
+                for index, (event_type, data) in enumerate(event_data)
+            )
+            ledger.extend(appended)
+            for event in appended:
+                if event.event_type in _DRAFT_TERMINAL_EVENTS:
+                    terminal = self._draft_terminals.get(draft_id)
+                    if terminal is None or event.sequence < terminal:
+                        self._draft_terminals[draft_id] = event.sequence
+            condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
+            async with condition:
+                if event_data:
+                    condition.notify_all()
             return receipt
+
+    async def read_draft_session_events(
+        self, draft_id: UUID, after_sequence: int
+    ) -> tuple[DraftSessionEvent, ...]:
+        return tuple(
+            DraftSessionEvent(
+                event.draft_id,
+                event.sequence,
+                event.event_type,
+                dict(event.data),
+                event.timestamp_utc,
+            )
+            for event in self._draft_events.get(draft_id, ())
+            if event.sequence > after_sequence
+        )
+
+    async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None:
+        condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
+        async with condition:
+            await condition.wait_for(
+                lambda: (
+                    len(self._draft_events.get(draft_id, ())) > after_sequence
+                    or (
+                        self._draft_terminals.get(draft_id) is not None
+                        and self._draft_terminals[draft_id] <= after_sequence
+                    )
+                )
+            )
+
+    async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool:
+        terminal_sequence = self._draft_terminals.get(draft_id)
+        return terminal_sequence is not None and terminal_sequence <= after_sequence
+
+    async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
+        snapshot = self._snapshots.get(run_id)
+        if snapshot is None:
+            return ()
+        return tuple(
+            RuntimeEvent(
+                sequence=event.sequence,
+                event_type=event.event_type,
+                data=dict(event.data),
+                timestamp_utc=event.timestamp_utc,
+            )
+            for event in snapshot.events
+            if event.sequence > after_sequence
+        )
+
+    async def wait_for_run_events(self, run_id: RunId, after_sequence: int) -> None:
+        condition = self._run_conditions.setdefault(run_id, asyncio.Condition())
+        async with condition:
+            await condition.wait_for(
+                lambda: (
+                    self._has_run_events_after(run_id, after_sequence)
+                    or self._run_terminal_reached(run_id, after_sequence)
+                )
+            )
+
+    async def is_run_stream_terminal(self, run_id: RunId, after_sequence: int) -> bool:
+        return self._run_terminal_reached(run_id, after_sequence)
+
+    def _has_run_events_after(self, run_id: RunId, after_sequence: int) -> bool:
+        snapshot = self._snapshots.get(run_id)
+        return snapshot is not None and any(
+            event.sequence > after_sequence for event in snapshot.events
+        )
+
+    def _run_terminal_reached(self, run_id: RunId, after_sequence: int) -> bool:
+        snapshot = self._snapshots.get(run_id)
+        return snapshot is not None and any(
+            event.sequence <= after_sequence
+            and event.event_type == "run.status_changed"
+            and _event_status(event.data) in _RUN_TERMINAL_STATUSES
+            for event in snapshot.events
+        )
 
     async def load_draft_owner_fact(
         self, draft_id: UUID, receipt_key: str
@@ -507,7 +680,12 @@ class InMemoryRuntimeStore:
             else:
                 snapshot = None
             if snapshot is not None:
-                self._snapshots[RunId(record.owner_id)] = snapshot
+                run_id = RunId(record.owner_id)
+                condition = self._run_conditions.setdefault(run_id, asyncio.Condition())
+                async with condition:
+                    self._snapshots[run_id] = snapshot
+                    if events:
+                        condition.notify_all()
             self._agent_runs[record.agent_run_id] = record
             self._agent_receipts[record.agent_run_id] = receipt
             for reference_key, object_ref in cas_references:
@@ -524,10 +702,99 @@ class InMemoryRuntimeStore:
         events: Sequence[EventSpec],
         *,
         evolution: EvolutionSegmentDraft | None = None,
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> RuntimeSnapshot:
+        if transaction is not None:
+            if transaction.store is not self or not transaction.active:
+                raise StoreCommitError("runtime transaction does not belong to this store")
+            snapshot = await self._write(state, events, evolution=evolution)
+            transaction.after_rollback(lambda: self._snapshots.pop(state.run_id, None))
+            return snapshot
         if state.run_id in self._snapshots:
             raise StoreCommitError("run already exists")
         return await self._write(state, events, evolution=evolution)
+
+    async def execute_api_command(
+        self,
+        *,
+        principal_id: str,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+        command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
+        project_response: Callable[[object], object],
+        owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+    ) -> Mapping[str, object]:
+        scope = (principal_id, route, key)
+        body_digest = sha256(canonical_body).hexdigest()
+        now = datetime.now(UTC)
+        async with self._api_command_lock:
+            previous = self._api_commands.get(scope)
+            expired = previous is not None and previous[2] <= now
+            if previous is not None:
+                if not expired and previous[0] != body_digest:
+                    return {"conflict": True, "replayed": False}
+                if not expired:
+                    return {**previous[1], "replayed": True}
+            transaction = RuntimeStoreTransaction(self, None)
+            try:
+                value = await command(transaction)
+                response = project_response(value)
+                owner = owner_receipt(value)
+                self._record_in_memory_graph_handoff(owner)
+                outcome: dict[str, object] = {
+                    "response": response,
+                    "status_code": status_code,
+                    "owner_kind": owner[0] if owner else None,
+                    "owner_id": str(owner[1]) if owner else None,
+                    "owner_receipt_key": owner[2] if owner else None,
+                    "replayed": False,
+                }
+                if expired:
+                    del self._api_commands[scope]
+                self._api_commands[scope] = (
+                    body_digest,
+                    outcome,
+                    now + timedelta(hours=24),
+                )
+                if owner is not None:
+                    self._graph_start_handoffs[RunId(owner[1])] = owner[2]
+                transaction.after_rollback(lambda: self._api_commands.pop(scope, None))
+                if owner is not None:
+                    transaction.after_rollback(
+                        lambda: self._graph_start_handoffs.pop(RunId(owner[1]), None)
+                    )
+            except Exception:
+                transaction.finish(committed=False)
+                raise
+            transaction.finish(committed=True)
+            return outcome
+
+    def _record_in_memory_graph_handoff(
+        self, owner: tuple[str, UUID, str] | None
+    ) -> None:
+        if owner is None:
+            return
+        owner_kind, owner_id, receipt_key = owner
+        if owner_kind != "run":
+            raise StoreCommitError("unsupported API command owner receipt")
+        run_id = RunId(owner_id)
+        snapshot = self._snapshots.get(run_id)
+        if snapshot is None or not any(
+            event.event_type == "run.created"
+            and event.data.get("receipt_key") == receipt_key
+            for event in snapshot.events
+        ):
+            raise StoreCommitError("API command has no committed RunCreated receipt")
+
+    async def list_pending_graph_starts(self) -> tuple[tuple[RunId, str], ...]:
+        return tuple(self._graph_start_handoffs.items())
+
+    async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None:
+        if self._graph_start_handoffs.get(run_id) != receipt_key:
+            raise StoreCommitError("Run graph-start handoff is not pending")
+        del self._graph_start_handoffs[run_id]
 
     async def commit(
         self,
@@ -559,29 +826,33 @@ class InMemoryRuntimeStore:
         if self._fail_next:
             self._fail_next = False
             raise StoreCommitError("injected commit failure")
-        previous = self._snapshots.get(state.run_id)
-        first_sequence = len(previous.events) + 1 if previous is not None else 1
-        try:
-            materialized = tuple(
-                RuntimeEvent(
-                    sequence=first_sequence + index,
-                    event_type=event.event_type,
-                    data=_redact_event_data(event.data, self.secret_registry),
+        condition = self._run_conditions.setdefault(state.run_id, asyncio.Condition())
+        async with condition:
+            previous = self._snapshots.get(state.run_id)
+            first_sequence = len(previous.events) + 1 if previous is not None else 1
+            try:
+                materialized = tuple(
+                    RuntimeEvent(
+                        sequence=first_sequence + index,
+                        event_type=event.event_type,
+                        data=_redact_event_data(event.data, self.secret_registry),
+                    )
+                    for index, event in enumerate(events)
                 )
-                for index, event in enumerate(events)
+            except ValueError as exc:
+                raise StoreCommitError("observation rejected") from exc
+            evolution_entry = _next_in_memory_evolution(evolution, state.run_id, self._evolution)
+            snapshot = RuntimeSnapshot(
+                state=state,
+                events=(*previous.events, *materialized) if previous else materialized,
             )
-        except ValueError as exc:
-            raise StoreCommitError("observation rejected") from exc
-        evolution_entry = _next_in_memory_evolution(evolution, state.run_id, self._evolution)
-        snapshot = RuntimeSnapshot(
-            state=state,
-            events=(*previous.events, *materialized) if previous else materialized,
-        )
-        self._snapshots[state.run_id] = snapshot
-        if evolution_entry is not None:
-            self._evolution.setdefault(state.run_id, []).append(evolution_entry)
-        self.commit_count += 1
-        return snapshot
+            self._snapshots[state.run_id] = snapshot
+            if evolution_entry is not None:
+                self._evolution.setdefault(state.run_id, []).append(evolution_entry)
+            self.commit_count += 1
+            if materialized:
+                condition.notify_all()
+            return snapshot
 
     async def evolution_segments(self, *, run_id: object) -> tuple[EvolutionSegment, ...]:
         return tuple(self._evolution.get(run_id, ()))
@@ -592,11 +863,34 @@ class PostgreSQLRuntimeStore:
 
     The pool/connection object is deliberately accepted at the adapter boundary;
     runtime logic never imports or manages a database connection directly.
+    Production composition supplies the advisory-lock connection for every write;
+    standalone stores may omit it and use the pool for isolated tests and tools.
     """
 
-    def __init__(self, pool: Any, *, secret_registry: SecretRegistry | None = None) -> None:
+    def __init__(
+        self,
+        pool: Any,
+        *,
+        secret_registry: SecretRegistry | None = None,
+        write_connection: Any | None = None,
+    ) -> None:
         self.pool = pool
         self.secret_registry = secret_registry or SecretRegistry()
+        self._write_connection = write_connection
+        self._write_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def _acquire_write_connection(self) -> AsyncIterator[Any]:
+        """Serialize writes on the lock session so lock loss aborts active writes."""
+        if self._write_connection is None:
+            async with self.pool.acquire() as connection:
+                yield connection
+            return
+
+        async with self._write_lock:
+            if self._write_connection.is_closed():
+                raise StoreCommitError("application write connection is closed")
+            yield self._write_connection
 
     async def commit_draft_owner_fact(
         self,
@@ -604,15 +898,22 @@ class PostgreSQLRuntimeStore:
         receipt_key: str,
         category: str,
         fact: Mapping[str, object],
+        *,
+        events: Sequence[DraftSessionEventSpec] = (),
     ) -> DraftOwnerReceipt:
         receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
-        async with self.pool.acquire() as connection:
+        event_data = _prepare_draft_events(events, self.secret_registry)
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 await connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", str(draft_id)
+                )
+                inserted = await connection.fetchval(
                     """INSERT INTO draft_owner_facts(
                         draft_id, receipt_key, category, fact_sha256, fact
                     ) VALUES ($1,$2,$3,$4,$5::jsonb)
-                    ON CONFLICT (draft_id, receipt_key) DO NOTHING""",
+                    ON CONFLICT (draft_id, receipt_key) DO NOTHING
+                    RETURNING receipt_key""",
                     draft_id,
                     receipt_key,
                     category,
@@ -636,7 +937,104 @@ class PostgreSQLRuntimeStore:
                 )
                 if stored_receipt != receipt or stored != payload:
                     raise StoreCommitError("Draft owner fact replay mismatch")
+                if inserted is not None:
+                    first_sequence = await connection.fetchval(
+                        """SELECT COALESCE(MAX(sequence), 0) + 1
+                        FROM draft_session_events WHERE draft_id=$1""",
+                        draft_id,
+                    )
+                    for index, (event_type, data) in enumerate(event_data):
+                        await connection.execute(
+                            """INSERT INTO draft_session_events
+                            (draft_id, receipt_key, sequence, event_type, data)
+                            VALUES ($1,$2,$3,$4,$5::jsonb)""",
+                            draft_id,
+                            receipt_key,
+                            first_sequence + index,
+                            event_type,
+                            json.dumps(data, sort_keys=True, separators=(",", ":")),
+                        )
+                    if event_data:
+                        await connection.execute(
+                            "SELECT pg_notify('draft_session_events', $1)", str(draft_id)
+                        )
+                else:
+                    replay_rows = await connection.fetch(
+                        """SELECT event_type, data FROM draft_session_events
+                        WHERE draft_id=$1 AND receipt_key=$2 ORDER BY sequence""",
+                        draft_id,
+                        receipt_key,
+                    )
+                    replay_events = tuple(
+                        (
+                            str(_row_value(row, "event_type")),
+                            _decode_draft_fact(_row_value(row, "data")),
+                        )
+                        for row in replay_rows
+                    )
+                    if replay_events != event_data:
+                        raise StoreCommitError("Draft owner fact replay mismatch")
                 return stored_receipt
+
+    async def read_draft_session_events(
+        self, draft_id: UUID, after_sequence: int
+    ) -> tuple[DraftSessionEvent, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT sequence, event_type, data, timestamp_utc FROM draft_session_events
+                WHERE draft_id=$1 AND sequence>$2 ORDER BY sequence""",
+                draft_id,
+                after_sequence,
+            )
+        return tuple(
+            DraftSessionEvent(
+                draft_id,
+                int(_row_value(row, "sequence")),
+                str(_row_value(row, "event_type")),
+                _decode_draft_fact(_row_value(row, "data")),
+                _row_value(row, "timestamp_utc").astimezone(UTC),
+            )
+            for row in rows
+        )
+
+    async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None:
+        loop = asyncio.get_running_loop()
+        wake = loop.create_future()
+
+        def listener(_connection: Any, _pid: int, _channel: str, payload: str) -> None:
+            if payload == str(draft_id) and not wake.done():
+                wake.set_result(None)
+
+        async with self.pool.acquire() as connection:
+            await connection.add_listener("draft_session_events", listener)
+            try:
+                row = await connection.fetchrow(
+                    """SELECT COALESCE(MAX(sequence), 0) AS latest_sequence,
+                    COALESCE(MIN(sequence) FILTER (WHERE event_type = ANY($2::text[])), 0)
+                        AS terminal_sequence
+                    FROM draft_session_events WHERE draft_id=$1""",
+                    draft_id,
+                    list(_DRAFT_TERMINAL_EVENTS),
+                )
+                latest = int(_row_value(row, "latest_sequence"))
+                terminal = int(_row_value(row, "terminal_sequence"))
+                if latest > after_sequence or (terminal > 0 and terminal <= after_sequence):
+                    return
+                await wake
+            finally:
+                await connection.remove_listener("draft_session_events", listener)
+
+    async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool:
+        async with self.pool.acquire() as connection:
+            terminal = await connection.fetchval(
+                """SELECT COALESCE(MIN(sequence), 0)
+                FROM draft_session_events
+                WHERE draft_id=$1 AND sequence <= $2 AND event_type = ANY($3::text[])""",
+                draft_id,
+                after_sequence,
+                list(_DRAFT_TERMINAL_EVENTS),
+            )
+            return int(terminal) > 0
 
     async def load_draft_owner_fact(
         self, draft_id: UUID, receipt_key: str
@@ -687,7 +1085,7 @@ class PostgreSQLRuntimeStore:
 
     async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
         _validate_new_agent_run(record)
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 if record.owner_kind == "run":
                     owner_row = await connection.fetchrow(
@@ -777,7 +1175,7 @@ class PostgreSQLRuntimeStore:
         events: Sequence[EventSpec] = (),
         cas_references: Sequence[tuple[str, CasObject]] = (),
     ) -> AgentRunReceipt:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
                     "SELECT metadata FROM agent_runs WHERE agent_run_id = $1 FOR UPDATE",
@@ -897,7 +1295,7 @@ class PostgreSQLRuntimeStore:
     async def add_cas_reference(
         self, object_ref: CasObject, owner_kind: str, owner_id: UUID, reference_key: str
     ) -> None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 await _add_cas_reference_with_connection(
                     connection, object_ref, owner_kind, owner_id, reference_key
@@ -920,7 +1318,7 @@ class PostgreSQLRuntimeStore:
     async def release_cas_reference(
         self, owner_kind: str, owner_id: UUID, reference_key: str
     ) -> CasObject | None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 return await _release_cas_reference_with_connection(
                     connection, owner_kind, owner_id, reference_key
@@ -932,7 +1330,7 @@ class PostgreSQLRuntimeStore:
         return frozenset(str(_row_value(row, "digest")).strip() for row in rows)
 
     async def publish_checkpoint_index(self, index: CheckpointIndex) -> None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 await connection.execute(
                     """INSERT INTO graph_threads(thread_id, graph_family, owner_kind, owner_id)
@@ -995,7 +1393,7 @@ class PostgreSQLRuntimeStore:
             return await _list_checkpoint_indexes_with_connection(connection, thread_id, namespace)
 
     async def publish_pending_write_index(self, index: PendingWriteIndex) -> None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 await connection.execute(
                     """INSERT INTO graph_threads(thread_id, graph_family, owner_kind, owner_id)
@@ -1089,7 +1487,7 @@ class PostgreSQLRuntimeStore:
         )
 
     async def delete_checkpoint_thread(self, thread_id: str) -> tuple[CasObject, ...]:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 thread = await connection.fetchrow(
                     "SELECT owner_kind, owner_id FROM graph_threads WHERE thread_id=$1 FOR UPDATE",
@@ -1158,8 +1556,226 @@ class PostgreSQLRuntimeStore:
         )
 
     async def initialize(self) -> None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             await connection.execute(RUNTIME_SCHEMA_SQL)
+
+    async def execute_api_command(
+        self,
+        *,
+        principal_id: str,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+        command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
+        project_response: Callable[[object], object],
+        owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+    ) -> Mapping[str, object]:
+        """Run one owner command and persist its replay result on the same connection."""
+
+        if not principal_id.strip() or not route.startswith("/") or not key.strip():
+            raise ValueError("API idempotency scope is invalid")
+        if len(key) > 256:
+            raise ValueError("API idempotency key is too long")
+        body_digest = sha256(canonical_body).hexdigest()
+        scope_key = json.dumps(
+            [principal_id, route, key], ensure_ascii=True, separators=(",", ":")
+        )
+        transaction_context: RuntimeStoreTransaction | None = None
+        outcome: dict[str, object]
+        try:
+            async with self._acquire_write_connection() as connection:
+                async with connection.transaction():
+                    await connection.fetchval(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+                        scope_key,
+                    )
+                    existing = await connection.fetchrow(
+                        """SELECT body_sha256, status_code, response_body, owner_kind,
+                        owner_id, owner_receipt_key,
+                        expires_at > clock_timestamp() AS active
+                        FROM api_command_receipts
+                        WHERE principal_id=$1 AND route=$2 AND idempotency_key=$3""",
+                        principal_id,
+                        route,
+                        key,
+                    )
+                    expired = existing is not None and not bool(_row_value(existing, "active"))
+                    if expired:
+                        existing = None
+                    if existing is not None:
+                        if str(_row_value(existing, "body_sha256")).strip() != body_digest:
+                            outcome = {"conflict": True, "replayed": False}
+                        else:
+                            outcome = {
+                                "response": _decode_json_value(
+                                    _row_value(existing, "response_body")
+                                ),
+                                "status_code": int(_row_value(existing, "status_code")),
+                                "owner_kind": _row_value(existing, "owner_kind"),
+                                "owner_id": _row_value(existing, "owner_id"),
+                                "owner_receipt_key": _row_value(
+                                    existing, "owner_receipt_key"
+                                ),
+                                "replayed": True,
+                            }
+                    else:
+                        transaction_context = RuntimeStoreTransaction(self, connection)
+                        value = await command(transaction_context)
+                        response = project_response(value)
+                        response_json = json.dumps(
+                            response, sort_keys=True, separators=(",", ":")
+                        )
+                        owner = owner_receipt(value)
+                        owner_kind: str | None = None
+                        owner_id: UUID | None = None
+                        receipt_key: str | None = None
+                        if owner is not None:
+                            owner_kind, owner_id, receipt_key = owner
+                            if owner_kind != "run" or not receipt_key:
+                                raise StoreCommitError(
+                                    "API command owner receipt is unsupported"
+                                )
+                            committed_receipt = await connection.fetchval(
+                                """SELECT 1 FROM runtime_events WHERE run_id=$1
+                                AND sequence=1 AND event_type='run.created'
+                                AND data->>'receipt_key'=$2""",
+                                owner_id,
+                                receipt_key,
+                            )
+                            if committed_receipt is None:
+                                raise StoreCommitError(
+                                    "API command has no committed RunCreated receipt"
+                                )
+                            await connection.execute(
+                                """INSERT INTO run_graph_start_handoffs
+                                (run_id, receipt_key, status) VALUES ($1,$2,'PENDING')""",
+                                owner_id,
+                                receipt_key,
+                            )
+                        if expired:
+                            await connection.execute(
+                                """DELETE FROM api_command_receipts
+                                WHERE principal_id=$1 AND route=$2 AND idempotency_key=$3
+                                AND expires_at <= clock_timestamp()""",
+                                principal_id,
+                                route,
+                                key,
+                            )
+                        await connection.execute(
+                            """INSERT INTO api_command_receipts(
+                            principal_id, route, idempotency_key, body_sha256, status_code,
+                            response_body, owner_kind, owner_id, owner_receipt_key,
+                            expires_at
+                            ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,
+                                clock_timestamp() + INTERVAL '24 hours')""",
+                            principal_id,
+                            route,
+                            key,
+                            body_digest,
+                            status_code,
+                            response_json,
+                            owner_kind,
+                            owner_id,
+                            receipt_key,
+                        )
+                        outcome = {
+                            "response": response,
+                            "status_code": status_code,
+                            "owner_kind": owner_kind,
+                            "owner_id": owner_id,
+                            "owner_receipt_key": receipt_key,
+                            "replayed": False,
+                        }
+        except BaseException:
+            if transaction_context is not None:
+                transaction_context.finish(committed=False)
+            raise
+        if transaction_context is not None:
+            transaction_context.finish(committed=True)
+        return outcome
+
+    async def list_pending_graph_starts(self) -> tuple[tuple[RunId, str], ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT run_id, receipt_key FROM run_graph_start_handoffs
+                WHERE status='PENDING' ORDER BY created_at, run_id"""
+            )
+        return tuple(
+            (RunId(_row_value(row, "run_id")), str(_row_value(row, "receipt_key")))
+            for row in rows
+        )
+
+    async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None:
+        async with self._acquire_write_connection() as connection:
+            updated = await connection.execute(
+                """UPDATE run_graph_start_handoffs SET status='STARTED',
+                started_at=COALESCE(started_at, clock_timestamp())
+                WHERE run_id=$1 AND receipt_key=$2""",
+                run_id,
+                receipt_key,
+            )
+        if updated.split()[-1] != "1":
+            raise StoreCommitError("Run graph-start handoff does not exist")
+
+    async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT sequence, event_type, data, timestamp_utc FROM runtime_events
+                WHERE run_id=$1 AND sequence>$2 ORDER BY sequence""",
+                run_id,
+                after_sequence,
+            )
+        return tuple(
+            RuntimeEvent(
+                sequence=int(_row_value(row, "sequence")),
+                event_type=str(_row_value(row, "event_type")),
+                data=_decode_event_data(_row_value(row, "data")),
+                timestamp_utc=_row_value(row, "timestamp_utc"),
+            )
+            for row in rows
+        )
+
+    async def wait_for_run_events(self, run_id: RunId, after_sequence: int) -> None:
+        loop = asyncio.get_running_loop()
+        wake = loop.create_future()
+
+        def listener(_connection: Any, _pid: int, _channel: str, payload: str) -> None:
+            if payload == str(run_id) and not wake.done():
+                wake.set_result(None)
+
+        async with self.pool.acquire() as connection:
+            await connection.add_listener("runtime_events", listener)
+            try:
+                row = await connection.fetchrow(
+                    """SELECT COALESCE(MAX(sequence), 0) AS latest_sequence,
+                    COALESCE(MIN(sequence) FILTER (
+                        WHERE event_type='run.status_changed'
+                        AND COALESCE(data->>'run_status', data->>'status') = ANY($2::text[])
+                    ), 0) AS terminal_sequence
+                    FROM runtime_events WHERE run_id=$1""",
+                    run_id,
+                    list(_RUN_TERMINAL_STATUSES),
+                )
+                latest = int(_row_value(row, "latest_sequence"))
+                terminal = int(_row_value(row, "terminal_sequence"))
+                if latest > after_sequence or (terminal > 0 and terminal <= after_sequence):
+                    return
+                await wake
+            finally:
+                await connection.remove_listener("runtime_events", listener)
+
+    async def is_run_stream_terminal(self, run_id: RunId, after_sequence: int) -> bool:
+        async with self.pool.acquire() as connection:
+            terminal = await connection.fetchval(
+                """SELECT COALESCE(MIN(sequence), 0) FROM runtime_events
+                WHERE run_id=$1 AND sequence<=$2 AND event_type='run.status_changed'
+                AND COALESCE(data->>'run_status', data->>'status') = ANY($3::text[])""",
+                run_id,
+                after_sequence,
+                list(_RUN_TERMINAL_STATUSES),
+            )
+        return int(terminal) > 0
 
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         async with self.pool.acquire() as connection:
@@ -1171,7 +1787,7 @@ class PostgreSQLRuntimeStore:
                 return None
             event_rows = await connection.fetch(
                 """
-                SELECT sequence, event_type, data
+                SELECT sequence, event_type, data, timestamp_utc
                 FROM runtime_events
                 WHERE run_id = $1
                 ORDER BY sequence
@@ -1184,7 +1800,8 @@ class PostgreSQLRuntimeStore:
                 RuntimeEvent(
                     sequence=int(_row_value(event, "sequence")),
                     event_type=str(_row_value(event, "event_type")),
-                    data=dict(_row_value(event, "data")),
+                    data=_decode_event_data(_row_value(event, "data")),
+                    timestamp_utc=_row_value(event, "timestamp_utc"),
                 )
                 for event in event_rows
             ),
@@ -1196,30 +1813,69 @@ class PostgreSQLRuntimeStore:
         events: Sequence[EventSpec],
         *,
         evolution: EvolutionSegmentDraft | None = None,
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> RuntimeSnapshot:
-        async with self.pool.acquire() as connection:
+        if transaction is not None:
+            if transaction.store is not self or not transaction.active:
+                raise StoreCommitError("runtime transaction does not belong to this store")
+            return await self._create_with_connection(
+                transaction.connection, state, events, evolution=evolution
+            )
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
-                try:
-                    await connection.execute(
-                        "INSERT INTO runtime_runs(run_id, state) VALUES ($1, $2::jsonb)",
-                        state.run_id,
-                        _dump_json(state),
-                    )
-                except Exception as exc:
-                    raise StoreCommitError("unable to create runtime run") from exc
-                await _insert_events(
-                    connection,
-                    state.run_id,
-                    events,
-                    first_sequence=1,
-                    secret_registry=self.secret_registry,
-                )
-                if evolution is not None:
-                    await _append_evolution_with_connection(connection, evolution, state.run_id)
-        snapshot = await self.load(state.run_id)
-        if snapshot is None:
+                await self._create_with_connection(connection, state, events, evolution=evolution)
+            snapshot = await self.load(state.run_id)
+            if snapshot is None:
+                raise StoreCommitError("created runtime run disappeared")
+            return snapshot
+
+    async def _create_with_connection(
+        self,
+        connection: Any,
+        state: RunState,
+        events: Sequence[EventSpec],
+        *,
+        evolution: EvolutionSegmentDraft | None,
+    ) -> RuntimeSnapshot:
+        try:
+            await connection.execute(
+                "INSERT INTO runtime_runs(run_id, state) VALUES ($1, $2::jsonb)",
+                state.run_id,
+                _dump_json(state),
+            )
+        except Exception as exc:
+            raise StoreCommitError("unable to create runtime run") from exc
+        await _insert_events(
+            connection,
+            state.run_id,
+            events,
+            first_sequence=1,
+            secret_registry=self.secret_registry,
+        )
+        if evolution is not None:
+            await _append_evolution_with_connection(connection, evolution, state.run_id)
+        row = await connection.fetchrow(
+            "SELECT state FROM runtime_runs WHERE run_id=$1", state.run_id
+        )
+        event_rows = await connection.fetch(
+            """SELECT sequence, event_type, data, timestamp_utc FROM runtime_events
+            WHERE run_id=$1 ORDER BY sequence""",
+            state.run_id,
+        )
+        if row is None:
             raise StoreCommitError("created runtime run disappeared")
-        return snapshot
+        return RuntimeSnapshot(
+            state=_decode_state(_row_value(row, "state")),
+            events=tuple(
+                RuntimeEvent(
+                    sequence=int(_row_value(event, "sequence")),
+                    event_type=str(_row_value(event, "event_type")),
+                    data=_decode_event_data(_row_value(event, "data")),
+                    timestamp_utc=_row_value(event, "timestamp_utc"),
+                )
+                for event in event_rows
+            ),
+        )
 
     async def commit(
         self,
@@ -1228,7 +1884,7 @@ class PostgreSQLRuntimeStore:
         *,
         evolution: EvolutionSegmentDraft | None = None,
     ) -> RuntimeSnapshot:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 locked = await connection.fetchrow(
                     "SELECT run_id FROM runtime_runs WHERE run_id = $1 FOR UPDATE",
@@ -1284,7 +1940,7 @@ class PostgreSQLRuntimeStore:
             character not in "0123456789abcdef" for character in template_sha256
         ):
             raise ValueError("template digest must be SHA-256")
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 locked = await connection.fetchrow(
                     "SELECT run_id FROM runtime_runs WHERE run_id = $1 FOR UPDATE",
@@ -1500,14 +2156,38 @@ async def _insert_events(
             raise StoreCommitError("observation rejected") from exc
         await connection.execute(
             """
-            INSERT INTO runtime_events(run_id, sequence, event_type, data)
-            VALUES ($1, $2, $3, $4::jsonb)
+            INSERT INTO runtime_events(run_id, sequence, event_type, data, timestamp_utc)
+            VALUES ($1, $2, $3, $4::jsonb, clock_timestamp())
             """,
             run_id,
             index,
             event.event_type,
             json.dumps(data, sort_keys=True, separators=(",", ":")),
         )
+    if events:
+        await connection.execute("SELECT pg_notify('runtime_events', $1)", str(run_id))
+
+
+def _decode_event_data(value: Any) -> dict[str, object]:
+    try:
+        payload = json.loads(value) if isinstance(value, (str, bytes, bytearray)) else dict(value)
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored Run event data is invalid") from exc
+    if not isinstance(payload, dict):
+        raise StoreCommitError("stored Run event data is not an object")
+    return cast(dict[str, object], payload)
+
+
+def _decode_json_value(value: Any) -> object:
+    try:
+        return json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored API response is invalid JSON") from exc
+
+
+def _event_status(data: Mapping[str, object]) -> object:
+    status = data.get("run_status", data.get("status"))
+    return getattr(status, "value", status)
 
 
 def _redact_event_data(value: dict[str, object], registry: SecretRegistry) -> dict[str, object]:
@@ -1515,6 +2195,81 @@ def _redact_event_data(value: dict[str, object], registry: SecretRegistry) -> di
     if not result.accepted or not isinstance(result.value, dict):
         raise ValueError("observation rejected")
     return cast(dict[str, object], result.value)
+
+
+_DRAFT_EVENT_FIELDS: dict[str, frozenset[str]] = {
+    "session.question.asked": frozenset({"question_id"}),
+    "session.question.answered": frozenset({"question_id"}),
+    "session.attached_to_run": frozenset({"run_id"}),
+    "session.closed": frozenset({"status"}),
+    "agent_run.started": frozenset(
+        {"agent_run_id", "phase", "session_kind", "slice_id", "generation"}
+    ),
+    "agent_run.terminal": frozenset(
+        {
+            "agent_run_id",
+            "phase",
+            "session_kind",
+            "slice_id",
+            "generation",
+            "exit",
+            "receipt_category",
+        }
+    ),
+}
+
+
+def _prepare_draft_events(
+    events: Sequence[DraftSessionEventSpec], registry: SecretRegistry
+) -> tuple[tuple[str, dict[str, object]], ...]:
+    prepared = []
+    for event in events:
+        fields = _DRAFT_EVENT_FIELDS.get(event.event_type)
+        if fields is None:
+            raise StoreCommitError("Draft session event type is not durable")
+        if event.event_type in {"session.question.asked", "session.question.answered"}:
+            required = {"question_id"}
+        elif event.event_type == "session.attached_to_run":
+            required = {"run_id"}
+        elif event.event_type == "session.closed":
+            required = {"status"}
+        else:
+            required = {"agent_run_id", "phase", "session_kind"}
+            if event.event_type == "agent_run.terminal":
+                required |= {"exit", "receipt_category"}
+        if not required <= event.data.keys():
+            raise StoreCommitError("Draft session event fields are incomplete")
+        projected = {key: value for key, value in event.data.items() if key in fields}
+        if event.event_type == "session.closed" and projected != {"status": "CLOSED"}:
+            raise StoreCommitError("Draft close event status is invalid")
+        try:
+            if event.event_type.startswith("agent_run."):
+                if projected["phase"] not in {item.value for item in Phase} or projected[
+                    "session_kind"
+                ] not in {item.value for item in SessionKind}:
+                    raise ValueError("AgentRun public enum is invalid")
+                if event.event_type == "agent_run.terminal" and (
+                    projected["exit"] not in {item.value for item in SessionExit}
+                    or not isinstance(projected["receipt_category"], str)
+                    or re.fullmatch(r"[a-z][a-z0-9._-]{0,63}", projected["receipt_category"])
+                    is None
+                ):
+                    raise ValueError("AgentRun terminal summary is invalid")
+            for key in ("question_id", "run_id", "agent_run_id", "slice_id"):
+                if key in projected:
+                    UUID(str(projected[key]))
+            if ("slice_id" in projected) != ("generation" in projected):
+                raise ValueError("slice fields must be paired")
+            if "generation" in projected and (
+                type(projected["generation"]) is not int or projected["generation"] < 0
+            ):
+                raise ValueError("slice generation is invalid")
+            projected = _redact_event_data(projected, registry)
+            projected = _decode_draft_fact(canonical_json_bytes(projected))
+        except (TypeError, ValueError) as exc:
+            raise StoreCommitError("Draft session event data is invalid") from exc
+        prepared.append((event.event_type, projected))
+    return tuple(prepared)
 
 
 def _make_draft_receipt(

@@ -138,6 +138,10 @@ async def test_draft_graph_interrupts_and_resumes_after_durable_answer_receipt(
     )
 
     question_receipt = await graph.ask_user(question)
+    question_events = await store.read_draft_session_events(draft_id, 0)
+    assert [(event.event_type, event.data) for event in question_events] == [
+        ("session.question.asked", {"question_id": str(question.question_id)})
+    ]
     paused = await graph._graph.aget_state(graph.config)
     assert paused is not None
     assert paused.values["draft_id"] == str(draft_id)
@@ -169,6 +173,10 @@ async def test_draft_graph_interrupts_and_resumes_after_durable_answer_receipt(
         selected_option="keep",
     )
     answer_receipt = await resumed_graph.answer_user(answer)
+    answer_events = await store.read_draft_session_events(draft_id, 1)
+    assert [(event.sequence, event.event_type, event.data) for event in answer_events] == [
+        (2, "session.question.answered", {"question_id": str(question.question_id)})
+    ]
     completed = await resumed_graph._graph.aget_state(resumed_graph.config)
     assert completed is not None and completed.next == ()
     assert completed.values["answer_receipt_key"] == answer_receipt.receipt_key
@@ -231,7 +239,7 @@ async def test_draft_exploration_coordinator_and_trial_use_committed_agentruns(
             self.owner_id = owner_id
             self.keys: list[str] = []
 
-        async def run(self, draft_id, logical_task_key, task):
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
             assert draft_id == self.owner_id
             assert task
             self.keys.append(logical_task_key)
@@ -245,21 +253,32 @@ async def test_draft_exploration_coordinator_and_trial_use_committed_agentruns(
             )
             candidate = _agent_run(draft_id, logical_task_key)
             created = await self.store.create_or_get_agent_run(candidate)
+            await lifecycle.started(created)
+            assert (await self.store.read_draft_session_events(draft_id, 0))[
+                -1
+            ].event_type == "agent_run.started"
+            result_reference = await CasLedger(cas, self.store).put(
+                logical_task_key.encode("utf-8"),
+                "draft",
+                draft_id,
+                f"agent-result:{created.agent_run_id}",
+            )
             terminal = replace(
                 created,
                 state=SessionState.Closed,
                 exit=SessionExit.Completed,
-                result_sha256="e" * 64,
+                result_sha256=result_reference.digest,
             )
             receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, receipt_category)
             persisted = await self.store.commit_agent_run_receipt(terminal, receipt)
             assert persisted == receipt
-            return DraftAgentCompletion(terminal, receipt, {"task_key": logical_task_key})
+            await lifecycle.terminal(terminal, receipt)
+            return DraftAgentCompletion(terminal, receipt, result_reference)
 
     store = InMemoryRuntimeStore()
     draft_id = new_uuid7()
     flow, _ = _flow(artifacts)
-    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
     runner = Runner(store, draft_id)
     graph = MigrationSessionGraph(
         owner=DraftFlowOwner(draft_id=draft_id, flow=flow, store=store),
@@ -269,9 +288,22 @@ async def test_draft_exploration_coordinator_and_trial_use_committed_agentruns(
         agent_runner=runner,
     )
 
-    await graph.explore_domain("src/a", "inspect domain a")
+    first = await graph.explore_domain("src/a", "inspect domain a")
+    assert first.result.digest == first.record.result_sha256
+    assert await store.get_cas_reference(
+        "draft", draft_id, f"agent-result:{first.record.agent_run_id}"
+    ) == first.result
     await graph.explore_domain("src/b", "inspect domain b")
     await graph.coordinate_exploration("merge domain reports")
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert [event.event_type for event in events] == [
+        "agent_run.started",
+        "agent_run.terminal",
+        "agent_run.started",
+        "agent_run.terminal",
+        "agent_run.started",
+        "agent_run.terminal",
+    ]
     await graph.trial_translate("src/a.py", "compare translation approaches")
 
     assert runner.keys == [
@@ -281,6 +313,643 @@ async def test_draft_exploration_coordinator_and_trial_use_committed_agentruns(
         trial_translation_task_key("src/a.py"),
     ]
     assert len(await store.list_agent_runs_by_owner("draft", draft_id)) == 4
+
+
+@pytest.mark.asyncio
+async def test_draft_agent_lifecycle_recovery_replays_without_new_events(
+    tmp_path, artifacts
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class Runner:
+        created = None
+        terminal_record = None
+        receipt = None
+        result_reference = None
+        provider_calls = 0
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            if self.created is None:
+                self.created = await store.create_or_get_agent_run(
+                    _agent_run(draft_id, logical_task_key)
+                )
+            await lifecycle.started(self.created)
+            if self.terminal_record is None:
+                self.provider_calls += 1
+                self.result_reference = await CasLedger(cas, store).put(
+                    logical_task_key.encode("utf-8"),
+                    "draft",
+                    draft_id,
+                    f"agent-result:{self.created.agent_run_id}",
+                )
+                self.terminal_record = replace(
+                    self.created,
+                    state=SessionState.Closed,
+                    exit=SessionExit.Completed,
+                    result_sha256=self.result_reference.digest,
+                )
+                self.receipt = AgentRunReceipt(
+                    uuid4(), self.created.agent_run_id, "draft.coordinator.completed"
+                )
+                await store.commit_agent_run_receipt(self.terminal_record, self.receipt)
+            await lifecycle.terminal(self.terminal_record, self.receipt)
+            return DraftAgentCompletion(
+                self.terminal_record, self.receipt, self.result_reference
+            )
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    runner = Runner()
+    graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=flow, store=store),
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
+    )
+    first = await graph.coordinate_exploration("merge")
+    events = await store.read_draft_session_events(draft_id, 0)
+    recovered = await graph.coordinate_exploration("merge")
+    assert recovered.record == first.record
+    assert recovered.receipt == first.receipt
+    assert await store.read_draft_session_events(draft_id, 0) == events
+    assert [event.sequence for event in events] == [1, 2]
+    assert runner.provider_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fresh_draft_runner_recovers_terminal_receipt_after_crash(
+    tmp_path, artifacts
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class CrashedRunner:
+        calls = 0
+        result_reference = None
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls += 1
+            created = await store.create_or_get_agent_run(_agent_run(draft_id, logical_task_key))
+            await lifecycle.started(created)
+            self.result_reference = await CasLedger(cas, store).put(
+                logical_task_key.encode("utf-8"),
+                "draft",
+                draft_id,
+                f"agent-result:{created.agent_run_id}",
+            )
+            terminal = replace(
+                created,
+                state=SessionState.Closed,
+                exit=SessionExit.Completed,
+                result_sha256=self.result_reference.digest,
+            )
+            receipt = AgentRunReceipt(
+                uuid4(), terminal.agent_run_id, "draft.coordinator.completed"
+            )
+            await store.commit_agent_run_receipt(terminal, receipt)
+            raise RuntimeError("process died before Draft checkpoint")
+
+    class FreshRunner:
+        calls = 0
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls += 1
+            raise AssertionError("provider/tool execution must not recur")
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    first_runner = CrashedRunner()
+    first_graph = MigrationSessionGraph(
+        owner=owner, agent_runs=store, checkpointer=draft_saver,
+        agent_checkpointer=agent_saver, agent_runner=first_runner,
+    )
+    with pytest.raises(RuntimeError, match="process died"):
+        await first_graph.coordinate_exploration("merge")
+    before = await store.read_draft_session_events(draft_id, 0)
+    assert [event.event_type for event in before] == ["agent_run.started"]
+    persisted = (await store.list_agent_runs_by_owner("draft", draft_id))[0]
+    receipt = await store.load_agent_run_receipt(persisted.agent_run_id)
+
+    fresh_runner = FreshRunner()
+    fresh_graph = MigrationSessionGraph(
+        owner=owner, agent_runs=store, checkpointer=draft_saver,
+        agent_checkpointer=agent_saver, agent_runner=fresh_runner,
+        thread_id=first_graph.thread_id,
+    )
+    recovered = await fresh_graph.coordinate_exploration("merge")
+    assert recovered.record == persisted
+    assert recovered.receipt == receipt
+    assert recovered.result == first_runner.result_reference
+    assert recovered.result.digest == persisted.result_sha256
+    assert fresh_runner.calls == 0
+    assert first_runner.calls == 1
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert [event.sequence for event in events] == [1, 2]
+    assert [event.event_type for event in events] == [
+        "agent_run.started", "agent_run.terminal"
+    ]
+    terminal_fact = await owner.load_fact(f"draft.agent.terminal:{persisted.agent_run_id}")
+    assert terminal_fact is not None
+    assert terminal_fact[0].category == "draft.agent.terminal"
+    assert terminal_fact[1] == {
+        "agent_run_id": str(persisted.agent_run_id),
+        "receipt_id": str(receipt.receipt_id),
+    }
+    replayed = await fresh_graph.coordinate_exploration("merge")
+    assert replayed.receipt.receipt_id == receipt.receipt_id
+    assert replayed.result == recovered.result
+    assert await store.read_draft_session_events(draft_id, 0) == events
+
+
+@pytest.mark.asyncio
+async def test_terminal_draft_agent_without_start_owner_receipt_fails_closed(
+    tmp_path, artifacts
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class FreshRunner:
+        calls = 0
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls += 1
+            raise AssertionError("provider/tool execution must not recur")
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    created = await store.create_or_get_agent_run(_agent_run(draft_id, coordinator_task_key()))
+    terminal = replace(created, state=SessionState.Closed, exit=SessionExit.Completed)
+    await store.commit_agent_run_receipt(
+        terminal, AgentRunReceipt(uuid4(), created.agent_run_id, "draft.coordinator.completed")
+    )
+    runner = FreshRunner()
+    graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=flow, store=store),
+        agent_runs=store, checkpointer=draft_saver,
+        agent_checkpointer=agent_saver, agent_runner=runner,
+    )
+    with pytest.raises(ValueError, match="start receipt"):
+        await graph.coordinate_exploration("merge")
+    assert runner.calls == 0
+    assert await store.read_draft_session_events(draft_id, 0) == ()
+
+
+@pytest.mark.asyncio
+async def test_terminal_draft_agent_without_result_cas_reference_fails_closed(
+    tmp_path, artifacts
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.draft_graph import DraftAgentResultUnavailable
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class FreshRunner:
+        calls = 0
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls += 1
+            raise AssertionError("provider/tool execution must not recur")
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    created = await store.create_or_get_agent_run(_agent_run(draft_id, coordinator_task_key()))
+    await owner.commit_agent_started(created)
+    terminal = replace(
+        created,
+        state=SessionState.Closed,
+        exit=SessionExit.Completed,
+        result_sha256="e" * 64,
+    )
+    await store.commit_agent_run_receipt(
+        terminal,
+        AgentRunReceipt(uuid4(), created.agent_run_id, "draft.coordinator.completed"),
+    )
+    runner = FreshRunner()
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
+    )
+
+    with pytest.raises(DraftAgentResultUnavailable, match="durable CAS result reference"):
+        await graph.coordinate_exploration("merge")
+
+    assert runner.calls == 0
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert [event.event_type for event in events] == ["agent_run.started"]
+
+
+@pytest.mark.asyncio
+async def test_new_draft_completion_requires_matching_result_cas_reference(
+    tmp_path, artifacts
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.draft_graph import DraftAgentResultUnavailable
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class Runner:
+        calls = 0
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls += 1
+            created = await store.create_or_get_agent_run(_agent_run(draft_id, logical_task_key))
+            await lifecycle.started(created)
+            result_reference = await CasLedger(cas, store).put(
+                b"different-result",
+                "draft",
+                draft_id,
+                f"agent-result:{created.agent_run_id}",
+            )
+            terminal = replace(
+                created,
+                state=SessionState.Closed,
+                exit=SessionExit.Completed,
+                result_sha256="e" * 64,
+            )
+            receipt = AgentRunReceipt(
+                uuid4(), terminal.agent_run_id, "draft.coordinator.completed"
+            )
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            return DraftAgentCompletion(terminal, receipt, result_reference)
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    runner = Runner()
+    graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=flow, store=store),
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
+    )
+
+    with pytest.raises(DraftAgentResultUnavailable, match="matching durable CAS result"):
+        await graph.coordinate_exploration("merge")
+
+    assert runner.calls == 1
+    assert [
+        event.event_type for event in await store.read_draft_session_events(draft_id, 0)
+    ] == ["agent_run.started"]
+
+
+@pytest.mark.asyncio
+async def test_recovered_failed_draft_agent_publishes_terminal_without_rerun(
+    tmp_path, artifacts
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.draft_graph import DraftAgentExecutionFailed
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class FreshRunner:
+        calls = 0
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls += 1
+            raise AssertionError("provider/tool execution must not recur")
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    created = await store.create_or_get_agent_run(_agent_run(draft_id, coordinator_task_key()))
+    await owner.commit_agent_started(created)
+    failed = replace(created, state=SessionState.Failed, exit=SessionExit.Failed)
+    receipt = AgentRunReceipt(uuid4(), created.agent_run_id, "draft.coordinator.failed")
+    await store.commit_agent_run_receipt(failed, receipt)
+    runner = FreshRunner()
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
+    )
+
+    with pytest.raises(DraftAgentExecutionFailed, match="FAILED"):
+        await graph.coordinate_exploration("merge")
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert [event.event_type for event in events] == [
+        "agent_run.started",
+        "agent_run.terminal",
+    ]
+    assert [event.sequence for event in events] == [1, 2]
+
+    with pytest.raises(DraftAgentExecutionFailed, match="FAILED"):
+        await graph.coordinate_exploration("merge")
+    assert runner.calls == 0
+    assert await store.read_draft_session_events(draft_id, 0) == events
+
+
+@pytest.mark.parametrize(
+    ("exit_name", "state_name", "category"),
+    [
+        ("BudgetExhausted", "Failed", "draft.coordinator.failed"),
+        ("SegmentStopped", "Closed", "draft.coordinator.segment_stopped"),
+        ("Invalidated", "Invalidated", "draft.coordinator.invalidated"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recovered_noncompleted_draft_agent_publishes_terminal_without_rerun(
+    tmp_path, artifacts, exit_name, state_name, category
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.draft_graph import (
+        DraftAgentExecutionFailed,
+        DraftAgentExecutionTerminated,
+    )
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class FreshRunner:
+        calls = 0
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls += 1
+            raise AssertionError("provider/tool execution must not recur")
+
+    session_exit = getattr(SessionExit, exit_name)
+    session_state = getattr(SessionState, state_name)
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    created = await store.create_or_get_agent_run(
+        _agent_run(draft_id, coordinator_task_key())
+    )
+    await owner.commit_agent_started(created)
+    terminal = replace(created, state=session_state, exit=session_exit)
+    receipt = AgentRunReceipt(uuid4(), created.agent_run_id, category)
+    await store.commit_agent_run_receipt(terminal, receipt)
+    runner = FreshRunner()
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
+    )
+
+    with pytest.raises(DraftAgentExecutionTerminated) as first_error:
+        await graph.coordinate_exploration("merge")
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert [event.sequence for event in events] == [1, 2]
+    assert [event.event_type for event in events] == [
+        "agent_run.started",
+        "agent_run.terminal",
+    ]
+    assert events[1].data["exit"] == session_exit.value
+    assert events[1].data["receipt_category"] == category
+    terminal_fact = await owner.load_fact(f"draft.agent.terminal:{terminal.agent_run_id}")
+    assert terminal_fact is not None
+    assert terminal_fact[1] == {
+        "agent_run_id": str(terminal.agent_run_id),
+        "receipt_id": str(receipt.receipt_id),
+    }
+
+    with pytest.raises(DraftAgentExecutionTerminated) as replayed_error:
+        await graph.coordinate_exploration("merge")
+
+    assert first_error.value.exit is session_exit
+    assert replayed_error.value.exit is session_exit
+    if session_exit in {SessionExit.Failed, SessionExit.BudgetExhausted}:
+        assert isinstance(first_error.value, DraftAgentExecutionFailed)
+        assert isinstance(replayed_error.value, DraftAgentExecutionFailed)
+    else:
+        assert type(first_error.value) is DraftAgentExecutionTerminated
+        assert type(replayed_error.value) is DraftAgentExecutionTerminated
+    assert runner.calls == 0
+    assert await store.read_draft_session_events(draft_id, 0) == events
+
+
+@pytest.mark.parametrize(
+    ("exit_name", "state_name", "category"),
+    [
+        ("SegmentStopped", "Closed", "draft.coordinator.segment_stopped"),
+        ("Invalidated", "Invalidated", "draft.coordinator.invalidated"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_returned_noncompleted_draft_agent_uses_same_typed_outcome_on_replay(
+    tmp_path, artifacts, exit_name, state_name, category
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.draft_graph import DraftAgentExecutionTerminated
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class Runner:
+        calls = 0
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls += 1
+            created = await store.create_or_get_agent_run(
+                _agent_run(draft_id, logical_task_key)
+            )
+            await lifecycle.started(created)
+            terminal = replace(
+                created,
+                state=getattr(SessionState, state_name),
+                exit=getattr(SessionExit, exit_name),
+            )
+            receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, category)
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            return DraftAgentCompletion(terminal, receipt, None)
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    runner = Runner()
+    graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=flow, store=store),
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
+    )
+
+    with pytest.raises(DraftAgentExecutionTerminated) as first_error:
+        await graph.coordinate_exploration("merge")
+    events = await store.read_draft_session_events(draft_id, 0)
+    with pytest.raises(DraftAgentExecutionTerminated) as replayed_error:
+        await graph.coordinate_exploration("merge")
+
+    assert first_error.value.exit is getattr(SessionExit, exit_name)
+    assert replayed_error.value.exit is first_error.value.exit
+    assert runner.calls == 1
+    assert [event.event_type for event in events] == [
+        "agent_run.started",
+        "agent_run.terminal",
+    ]
+    assert await store.read_draft_session_events(draft_id, 0) == events
+
+
+@pytest.mark.asyncio
+async def test_failed_draft_terminal_category_mismatch_is_not_published(
+    tmp_path, artifacts
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class Runner:
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            created = await store.create_or_get_agent_run(_agent_run(draft_id, logical_task_key))
+            await lifecycle.started(created)
+            failed = replace(created, state=SessionState.Failed, exit=SessionExit.Failed)
+            receipt = AgentRunReceipt(
+                uuid4(), failed.agent_run_id, "draft.coordinator.completed"
+            )
+            await store.commit_agent_run_receipt(failed, receipt)
+            await lifecycle.terminal(failed, receipt)
+            raise AssertionError("invalid terminal receipt should not be accepted")
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=Runner(),
+    )
+
+    with pytest.raises(ValueError, match="failure category"):
+        await graph.coordinate_exploration("merge")
+
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert [event.event_type for event in events] == ["agent_run.started"]
+    assert await owner.load_fact(f"draft.agent.terminal:{events[0].data['agent_run_id']}") is None
+
+
+@pytest.mark.parametrize(
+    ("exit_name", "state_name", "category", "error_match"),
+    [
+        (
+            "SegmentStopped",
+            "Closed",
+            "draft.coordinator.invalidated",
+            "segment-stopped category",
+        ),
+        (
+            "Invalidated",
+            "Invalidated",
+            "draft.coordinator.segment_stopped",
+            "invalidated category",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_noncompleted_draft_terminal_category_mismatch_is_not_published(
+    tmp_path, artifacts, exit_name, state_name, category, error_match
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class Runner:
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            created = await store.create_or_get_agent_run(
+                _agent_run(draft_id, logical_task_key)
+            )
+            await lifecycle.started(created)
+            terminal = replace(
+                created,
+                state=getattr(SessionState, state_name),
+                exit=getattr(SessionExit, exit_name),
+            )
+            receipt = AgentRunReceipt(
+                uuid4(), terminal.agent_run_id, category
+            )
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            raise AssertionError("invalid terminal receipt should not be accepted")
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=Runner(),
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        await graph.coordinate_exploration("merge")
+
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert [event.event_type for event in events] == ["agent_run.started"]
+    assert await owner.load_fact(f"draft.agent.terminal:{events[0].data['agent_run_id']}") is None
+
+
+@pytest.mark.asyncio
+async def test_draft_agent_terminal_failure_is_published_before_error(tmp_path, artifacts) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class FailingRunner:
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            created = await store.create_or_get_agent_run(_agent_run(draft_id, logical_task_key))
+            await lifecycle.started(created)
+            assert [
+                event.event_type for event in await store.read_draft_session_events(draft_id, 0)
+            ] == ["agent_run.started"]
+            failed = replace(created, state=SessionState.Failed, exit=SessionExit.Failed)
+            receipt = AgentRunReceipt(uuid4(), created.agent_run_id, "draft.coordinator.failed")
+            await store.commit_agent_run_receipt(failed, receipt)
+            await lifecycle.terminal(failed, receipt)
+            raise RuntimeError("synthetic provider failure")
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=flow, store=store),
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=FailingRunner(),
+    )
+    with pytest.raises(RuntimeError, match="synthetic provider failure"):
+        await graph.coordinate_exploration("merge")
+    assert [event.event_type for event in await store.read_draft_session_events(draft_id, 0)] == [
+        "agent_run.started",
+        "agent_run.terminal",
+    ]
 
 
 @pytest.mark.asyncio
@@ -321,6 +990,13 @@ async def test_close_releases_draft_checkpoint_only_after_last_cas_reference(
     await store.add_cas_reference(checkpoint, "run", shared_owner, "held-by-run")
 
     closed_receipt = await graph.close()
+    assert (await store.read_draft_session_events(draft_id, 0))[-1].event_type == "session.closed"
+    assert (
+        await store.is_draft_session_terminal(
+            draft_id, (await store.read_draft_session_events(draft_id, 0))[-1].sequence
+        )
+        is True
+    )
 
     assert await store.list_checkpoint_indexes(graph.thread_id) == ()
     assert await store.list_checkpoint_indexes(agent_thread) == ()
@@ -341,13 +1017,13 @@ async def test_create_run_rejection_keeps_draft_without_run_side_effects(
     tmp_path, artifacts
 ) -> None:
     class RejectingPreflight:
-        async def verify_descriptor_lock(self, request) -> None:
+        async def verify_descriptor_lock(self, request, transaction=None) -> None:
             raise CreateRunRejected("descriptor lock rejected")
 
-        async def verify_preindex(self, request) -> None:
+        async def verify_preindex(self, request, transaction=None) -> None:
             raise AssertionError("preindex must not run after rejection")
 
-        async def verify_dossier_consistency(self, request) -> None:
+        async def verify_dossier_consistency(self, request, transaction=None) -> None:
             raise AssertionError("dossier check must not run after rejection")
 
     class NoRunActor:
@@ -395,13 +1071,13 @@ async def test_successful_attach_commits_once_then_releases_draft_threads(
     tmp_path, artifacts
 ) -> None:
     class PassingPreflight:
-        async def verify_descriptor_lock(self, request) -> None:
+        async def verify_descriptor_lock(self, request, transaction=None) -> None:
             return None
 
-        async def verify_preindex(self, request) -> None:
+        async def verify_preindex(self, request, transaction=None) -> None:
             return None
 
-        async def verify_dossier_consistency(self, request) -> None:
+        async def verify_dossier_consistency(self, request, transaction=None) -> None:
             return None
 
     class RecordingActor:
@@ -451,6 +1127,7 @@ async def test_successful_attach_commits_once_then_releases_draft_threads(
 
     request = _create_request(freeze.frozen_artifact_bundle)
     attached = await graph.attach_to_run(run_id, request)
+    assert (await store.read_draft_session_events(draft_id, 0))[-1].data == {"run_id": str(run_id)}
 
     assert attached == receipt
     assert actor.calls == starter.calls == 1

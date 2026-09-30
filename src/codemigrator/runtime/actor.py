@@ -19,6 +19,7 @@ from codemigrator.core import (
     RunId,
     RunStatus,
     SessionKind,
+    StableErrorCode,
     canonical_json_bytes,
 )
 from codemigrator.planning import FrozenPlan
@@ -48,6 +49,7 @@ from .contracts import (
     RuntimeEvent,
     RuntimeMessage,
     RuntimeSnapshot,
+    RuntimeStoreTransaction,
     SessionInputCommand,
     VerificationSummary,
     WorkflowCommandMessage,
@@ -100,6 +102,14 @@ class CandidateCheckpointVerifierPort(Protocol):
     def is_committed_receipt(self, receipt: CheckpointReceipt) -> bool: ...
 
 
+class RunCommandRejected(RuntimeError):
+    """A safe command rejection that the API can map to an existing public code."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.api_error_code = code
+
+
 class _Stop:
     pass
 
@@ -145,15 +155,25 @@ class RunActor:
         self._create_receipt: RunCreatedReceipt | None = None
         self._execution_round_responses: dict[str, list[asyncio.Future[object]]] = {}
         self._execution_round_tasks: dict[str, asyncio.Task[None]] = {}
+        self._stopping = False
+        self._current_message: RuntimeMessage | _Stop | None = None
 
     @property
     def state(self) -> RunState | None:
         return self._state
 
     async def start(self) -> None:
+        await self._start(load_existing=True)
+
+    async def start_new(self) -> None:
+        """Start a fresh actor without loading through a second store connection."""
+
+        await self._start(load_existing=False)
+
+    async def _start(self, *, load_existing: bool) -> None:
         if self._task is not None:
             return
-        snapshot = await self.store.load(self.run_id)
+        snapshot = await self.store.load(self.run_id) if load_existing else None
         self._state = snapshot.state if snapshot is not None else None
         self._create_receipt = _run_created_receipt(snapshot, self.run_id)
         self._task = asyncio.create_task(self._run(), name=f"codemigrator-run-{self.run_id}")
@@ -161,23 +181,80 @@ class RunActor:
     async def stop(self) -> None:
         if self._task is None:
             return
-        await self._queue.put(_Stop())
-        await self._task
+        self.close_admission()
+        execution_tasks = tuple(self._execution_round_tasks.values())
+        for task in execution_tasks:
+            task.cancel()
+        if execution_tasks:
+            await asyncio.gather(*execution_tasks, return_exceptions=True)
+        for logical_key in tuple(self._execution_round_responses):
+            self._finish_execution_round(
+                logical_key,
+                error=StoreCommitError("Run actor stopped during EXECUTE"),
+            )
+        actor_task = self._task
+        if not actor_task.done():
+            actor_task.cancel()
+        await asyncio.gather(actor_task, return_exceptions=True)
         self._task = None
+        self._reject_queued_messages()
+
+    def close_admission(self) -> None:
+        """Synchronously reject mailbox work and request cancellation of active work."""
+
+        if self._stopping:
+            return
+        self._stopping = True
+        if self._current_message is not None and not isinstance(self._current_message, _Stop):
+            self._reject_stopping_message(self._current_message)
+        for task in tuple(self._execution_round_tasks.values()):
+            task.get_loop().call_soon_threadsafe(task.cancel)
+        actor_task = self._task
+        if actor_task is not None and not actor_task.done():
+            actor_task.get_loop().call_soon_threadsafe(actor_task.cancel)
+        self._reject_queued_messages()
+
+    def _reject_queued_messages(self) -> None:
+        while True:
+            try:
+                message = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if not isinstance(message, _Stop):
+                self._reject_stopping_message(message)
+            self._queue.task_done()
 
     async def submit(self, message: RuntimeMessage) -> None:
-        if self._task is None:
+        if self._task is None or self._stopping:
             raise RuntimeError("actor is not started")
         await self._queue.put(message)
 
     async def join(self) -> None:
         await self._queue.join()
 
-    async def create(self, create_run: CreateRun) -> RunCreatedReceipt | None:
+    async def create(
+        self,
+        create_run: CreateRun,
+        *,
+        transaction: RuntimeStoreTransaction | None = None,
+    ) -> RunCreatedReceipt | None:
         self._create_receipt = None
-        await self.submit(ApiCommand(CreateRunCommand(run_id=self.run_id, create_run=create_run)))
+        await self.submit(
+            ApiCommand(
+                CreateRunCommand(
+                    run_id=self.run_id,
+                    create_run=create_run,
+                    transaction=transaction,
+                )
+            )
+        )
         await self.join()
         return self._create_receipt
+
+    async def cancel(self, expected_version: int) -> RunState:
+        response: asyncio.Future[RunState] = asyncio.get_running_loop().create_future()
+        await self.submit(ApiCommand(CancelCommand(expected_version, response)))
+        return await response
 
     async def has_receipt(self, run_id: RunId, receipt_key: str) -> bool:
         if run_id != self.run_id:
@@ -267,18 +344,44 @@ class RunActor:
     async def _run(self) -> None:
         while True:
             message = await self._queue.get()
+            self._current_message = message
             try:
                 if isinstance(message, _Stop):
                     return
+                if self._stopping:
+                    self._reject_stopping_message(message)
+                    continue
                 await self._handle(message)
             except Exception as exc:  # Keep the mailbox alive; the failed commit is observable.
                 self.last_error = exc
                 if isinstance(message, WorkflowCommandMessage) and not message.response.done():
                     message.response.set_exception(exc)
+                elif (
+                    isinstance(message, ApiCommand)
+                    and isinstance(message.command, CancelCommand)
+                    and message.command.response is not None
+                    and not message.command.response.done()
+                ):
+                    message.command.response.set_exception(exc)
                 elif isinstance(message, ExecutionRoundFinishedMessage):
                     self._finish_execution_round(message.logical_key, error=exc)
             finally:
+                self._current_message = None
                 self._queue.task_done()
+
+    def _reject_stopping_message(self, message: RuntimeMessage) -> None:
+        error = StoreCommitError("Run actor is stopping")
+        if isinstance(message, WorkflowCommandMessage) and not message.response.done():
+            message.response.set_exception(error)
+        elif (
+            isinstance(message, ApiCommand)
+            and isinstance(message.command, CancelCommand)
+            and message.command.response is not None
+            and not message.command.response.done()
+        ):
+            message.command.response.set_exception(error)
+        elif isinstance(message, ExecutionRoundFinishedMessage):
+            self._finish_execution_round(message.logical_key, error=error)
 
     async def _handle(self, message: RuntimeMessage) -> None:
         if isinstance(message, ApiCommand):
@@ -447,9 +550,12 @@ class RunActor:
             )
             if not isinstance(decision, ExecutionRoundDecision):
                 raise TypeError("Actor scheduler returned an invalid execution round")
+            if self._stopping:
+                return
             await self.submit(ExecutionRoundFinishedMessage(logical_key, decision=decision))
         except Exception as exc:
-            await self.submit(ExecutionRoundFinishedMessage(logical_key, error=exc))
+            if not self._stopping:
+                await self.submit(ExecutionRoundFinishedMessage(logical_key, error=exc))
 
     async def _handle_execution_round_finished(
         self, message: ExecutionRoundFinishedMessage
@@ -757,6 +863,9 @@ class RunActor:
             version=1,
             create_request=command.create_run,
         )
+        transaction = command.transaction
+        if transaction is not None and not isinstance(transaction, RuntimeStoreTransaction):
+            raise StoreCommitError("RunActor received an unsupported store transaction")
         snapshot = await self.store.create(
             state,
             (
@@ -769,15 +878,36 @@ class RunActor:
                     },
                 ),
             ),
+            transaction=transaction,
         )
         self._state = snapshot.state
         self._create_receipt = _run_created_receipt(snapshot, self.run_id)
+        if transaction is not None:
+            transaction.after_rollback(self._rollback_uncommitted_create)
+
+    def _rollback_uncommitted_create(self) -> None:
+        if self._state is not None and self._state.run_id == self.run_id:
+            self._state = None
+            self._create_receipt = None
 
     async def _handle_cancel(self, command: CancelCommand) -> None:
         state = self._state
-        if state is None or state.status in _TERMINAL_STATUSES:
+        response = command.response
+        if state is None:
+            if response is not None and not response.done():
+                response.set_exception(RunCommandRejected("NOT_FOUND"))
             return
         if command.expected_version != state.version:
+            if response is not None and not response.done():
+                response.set_exception(
+                    RunCommandRejected(StableErrorCode.STALE_VERSION.value)
+                )
+            return
+        if state.status in _TERMINAL_STATUSES:
+            if response is not None and not response.done():
+                response.set_exception(
+                    RunCommandRejected(StableErrorCode.PHASE_STATUS_MISMATCH.value)
+                )
             return
         next_state = replace(
             state,
@@ -787,7 +917,8 @@ class RunActor:
             active_dispatches=(),
             version=state.version + 1,
         )
-        if await self._commit(next_state, (EventSpec("run.cancelled"),)):
+        committed = await self._commit(next_state, (EventSpec("run.cancelled"),))
+        if committed:
             if self.integration_coordinator is not None:
                 self.integration_coordinator.cancel_run(str(self.run_id))
             if self.cancellation_port is not None:
@@ -795,6 +926,10 @@ class RunActor:
                     await self.cancellation_port.cancel(self.run_id)
                 except Exception as exc:
                     self.last_error = exc
+            if response is not None and not response.done():
+                response.set_result(next_state)
+        elif response is not None and not response.done():
+            response.set_exception(StoreCommitError("Run cancellation was not committed"))
 
     async def _handle_session_input(self, command: SessionInputCommand) -> None:
         state = self._state
@@ -1193,25 +1328,76 @@ class ActorRegistry:
         self.store = store
         self._actors: dict[RunId, RunActor] = {}
         self._lock = asyncio.Lock()
+        self._retiring_tasks: set[asyncio.Task[None]] = set()
+        self._admission_open = True
+
+    @property
+    def active_actor_count(self) -> int:
+        return len(self._actors)
+
+    async def register_committed(self, actor: RunActor) -> RunActor:
+        """Keep the actor whose CreateRun facts committed in the shared transaction."""
+
+        async with self._lock:
+            if not self._admission_open:
+                actor.close_admission()
+                self.stop_after_rollback(actor)
+                raise StoreCommitError("Run actor registry is closed")
+            existing = self._actors.get(actor.run_id)
+            if existing is None:
+                self._actors[actor.run_id] = actor
+                return actor
+            if existing is actor:
+                return actor
+        await actor.stop()
+        assert existing is not None
+        return existing
+
+    def stop_after_rollback(self, actor: RunActor) -> None:
+        actor.close_admission()
+        task = asyncio.get_running_loop().create_task(actor.stop())
+        self._retiring_tasks.add(task)
+        task.add_done_callback(self._retirement_finished)
+
+    def _retirement_finished(self, task: asyncio.Task[None]) -> None:
+        self._retiring_tasks.discard(task)
+        _consume_task_exception(task)
 
     async def get_or_create(self, run_id: RunId) -> RunActor | None:
+        if not self._admission_open:
+            raise StoreCommitError("Run actor registry is closed")
         async with self._lock:
+            if not self._admission_open:
+                raise StoreCommitError("Run actor registry is closed")
             actor = self._actors.get(run_id)
             if actor is not None:
                 return actor
             snapshot = await self.store.load(run_id)
-            if snapshot is not None and snapshot.state.status in _TERMINAL_STATUSES:
+            if not self._admission_open:
+                raise StoreCommitError("Run actor registry is closed")
+            if snapshot is None or snapshot.state.status in _TERMINAL_STATUSES:
                 return None
             actor = RunActor(run_id, self.store)
             await actor.start()
             self._actors[run_id] = actor
             return actor
 
+    def close_admission(self) -> None:
+        self._admission_open = False
+        for actor in tuple(self._actors.values()):
+            actor.close_admission()
+
     async def close(self) -> None:
-        actors = tuple(self._actors.values())
-        self._actors.clear()
-        for actor in actors:
-            await actor.stop()
+        self.close_admission()
+        async with self._lock:
+            actors = tuple(self._actors.values())
+            self._actors.clear()
+            retiring_tasks = tuple(self._retiring_tasks)
+        results = await asyncio.gather(
+            *(actor.stop() for actor in actors), *retiring_tasks, return_exceptions=True
+        )
+        if any(isinstance(result, BaseException) for result in results):
+            raise RuntimeError("Run actor shutdown failed")
 
     async def rebuild(self, run_id: RunId) -> RunActor | None:
         """Replace one actor from durable facts after an explicit recovery trigger."""
@@ -1233,3 +1419,8 @@ __all__ = [
     "RepairAdvicePort",
     "RunActor",
 ]
+
+
+def _consume_task_exception(task: asyncio.Task[None]) -> None:
+    if not task.cancelled():
+        task.exception()

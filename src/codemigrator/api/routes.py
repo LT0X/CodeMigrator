@@ -13,6 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 from sse_starlette import EventSourceResponse, ServerSentEvent
+from starlette.types import Lifespan
 
 from codemigrator.core import (
     CreateRun,
@@ -107,6 +108,7 @@ def create_app(
     config: ApiConfig,
     connections: SseConnectionManager | None = None,
     secret_registry: SecretRegistry | None = None,
+    lifespan: Lifespan[FastAPI] | None = None,
 ) -> FastAPI:
     """Build an API app from runtime-owned ports and deployment configuration."""
 
@@ -118,7 +120,7 @@ def create_app(
     # even when callers provide a shared registry, so accidental backend echoing
     # cannot turn a valid bearer token into public response data.
     redaction_registry.register(config.token)
-    app = FastAPI(title="CodeMigrator API", version="1")
+    app = FastAPI(title="CodeMigrator API", version="1", lifespan=lifespan)
     app.state.backend = backend
     app.state.config = config
     app.state.secret_registry = redaction_registry

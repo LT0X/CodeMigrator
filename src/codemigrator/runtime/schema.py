@@ -11,8 +11,43 @@ CREATE TABLE IF NOT EXISTS runtime_events (
     sequence bigint NOT NULL,
     event_type text NOT NULL,
     data jsonb NOT NULL,
+    timestamp_utc timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (run_id, sequence)
 );
+
+CREATE TABLE IF NOT EXISTS api_command_receipts (
+    principal_id text NOT NULL CHECK (length(btrim(principal_id)) > 0),
+    route text NOT NULL CHECK (length(btrim(route)) > 0),
+    idempotency_key text NOT NULL CHECK (length(btrim(idempotency_key)) BETWEEN 1 AND 256),
+    body_sha256 char(64) NOT NULL CHECK (body_sha256 ~ '^[0-9a-f]{64}$'),
+    status_code integer NOT NULL CHECK (status_code BETWEEN 200 AND 599),
+    response_body jsonb NOT NULL,
+    owner_kind text,
+    owner_id uuid,
+    owner_receipt_key text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    expires_at timestamptz NOT NULL,
+    PRIMARY KEY (principal_id, route, idempotency_key),
+    CHECK (
+        (owner_kind IS NULL AND owner_id IS NULL AND owner_receipt_key IS NULL)
+        OR (owner_kind = 'run' AND owner_id IS NOT NULL AND owner_receipt_key IS NOT NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS run_graph_start_handoffs (
+    run_id uuid PRIMARY KEY REFERENCES runtime_runs(run_id),
+    receipt_key text NOT NULL CHECK (length(btrim(receipt_key)) BETWEEN 1 AND 256),
+    status text NOT NULL CHECK (status IN ('PENDING', 'STARTED')),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    started_at timestamptz
+);
+
+ALTER TABLE runtime_events ADD COLUMN IF NOT EXISTS timestamp_utc timestamptz;
+UPDATE runtime_events
+SET timestamp_utc = TIMESTAMPTZ '1970-01-01 00:00:00+00'
+WHERE timestamp_utc IS NULL;
+ALTER TABLE runtime_events ALTER COLUMN timestamp_utc SET NOT NULL;
+ALTER TABLE runtime_events ALTER COLUMN timestamp_utc SET DEFAULT clock_timestamp();
 
 CREATE TABLE IF NOT EXISTS agent_runs (
     agent_run_id uuid PRIMARY KEY,
@@ -51,6 +86,18 @@ CREATE TABLE IF NOT EXISTS draft_owner_facts (
     created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (draft_id, receipt_key)
 );
+
+CREATE TABLE IF NOT EXISTS draft_session_events (
+    draft_id uuid NOT NULL,
+    receipt_key text NOT NULL,
+    sequence bigint NOT NULL CHECK (sequence > 0),
+    event_type text NOT NULL,
+    data jsonb NOT NULL,
+    timestamp_utc timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (draft_id, sequence)
+);
+
+ALTER TABLE draft_session_events ADD COLUMN IF NOT EXISTS receipt_key text;
 
 CREATE TABLE IF NOT EXISTS cas_objects (
     digest char(64) PRIMARY KEY CHECK (digest ~ '^[0-9a-f]{64}$'),

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TypeAlias
+from datetime import UTC, datetime
+from typing import Any, TypeAlias
 from uuid import UUID
 
 from codemigrator.core import (
@@ -23,10 +25,48 @@ from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from .budget import BudgetUsage
 
 
+class RuntimeTransactionError(RuntimeError):
+    """Raised when a shared runtime owner transaction is no longer usable."""
+
+
+class RuntimeStoreTransaction:
+    """Explicit connection scope shared by one command and its RunActor write."""
+
+    def __init__(self, store: object, connection: Any) -> None:
+        self.store = store
+        self.connection = connection
+        self._active = True
+        self._after_commit: list[Callable[[], object]] = []
+        self._after_rollback: list[Callable[[], object]] = []
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def after_commit(self, callback: Callable[[], object]) -> None:
+        if not self._active:
+            raise RuntimeTransactionError("runtime transaction is no longer active")
+        self._after_commit.append(callback)
+
+    def after_rollback(self, callback: Callable[[], object]) -> None:
+        if not self._active:
+            raise RuntimeTransactionError("runtime transaction is no longer active")
+        self._after_rollback.append(callback)
+
+    def finish(self, *, committed: bool) -> None:
+        if not self._active:
+            return
+        self._active = False
+        callbacks = self._after_commit if committed else self._after_rollback
+        for callback in callbacks:
+            callback()
+
+
 @dataclass(frozen=True, slots=True)
 class CreateRunCommand:
     run_id: RunId
     create_run: CreateRun
+    transaction: RuntimeStoreTransaction | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +201,7 @@ class ExecutionRoundFinishedMessage:
 @dataclass(frozen=True, slots=True)
 class CancelCommand:
     expected_version: int
+    response: asyncio.Future[RunState] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +264,21 @@ class EventSpec:
     data: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class DraftSessionEventSpec:
+    event_type: str
+    data: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class DraftSessionEvent:
+    draft_id: UUID
+    sequence: int
+    event_type: str
+    data: dict[str, object]
+    timestamp_utc: datetime
+
+
 def agent_run_lifecycle_spec(
     record: AgentRun,
     receipt: AgentRunReceipt | None = None,
@@ -283,6 +339,12 @@ class RuntimeEvent:
     sequence: int
     event_type: str
     data: dict[str, object]
+    timestamp_utc: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if self.timestamp_utc.tzinfo is None or self.timestamp_utc.utcoffset() is None:
+            raise ValueError("runtime event timestamp must be timezone-aware")
+        object.__setattr__(self, "timestamp_utc", self.timestamp_utc.astimezone(UTC))
 
 
 @dataclass(frozen=True, slots=True)
