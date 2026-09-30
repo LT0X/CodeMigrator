@@ -663,6 +663,152 @@ async def test_recovered_failed_draft_agent_publishes_terminal_without_rerun(
     assert await store.read_draft_session_events(draft_id, 0) == events
 
 
+@pytest.mark.parametrize(
+    ("exit_name", "state_name", "category"),
+    [
+        ("BudgetExhausted", "Failed", "draft.coordinator.failed"),
+        ("SegmentStopped", "Closed", "draft.coordinator.segment_stopped"),
+        ("Invalidated", "Invalidated", "draft.coordinator.invalidated"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recovered_noncompleted_draft_agent_publishes_terminal_without_rerun(
+    tmp_path, artifacts, exit_name, state_name, category
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.draft_graph import (
+        DraftAgentExecutionFailed,
+        DraftAgentExecutionTerminated,
+    )
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class FreshRunner:
+        calls = 0
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls += 1
+            raise AssertionError("provider/tool execution must not recur")
+
+    session_exit = getattr(SessionExit, exit_name)
+    session_state = getattr(SessionState, state_name)
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    created = await store.create_or_get_agent_run(
+        _agent_run(draft_id, coordinator_task_key())
+    )
+    await owner.commit_agent_started(created)
+    terminal = replace(created, state=session_state, exit=session_exit)
+    receipt = AgentRunReceipt(uuid4(), created.agent_run_id, category)
+    await store.commit_agent_run_receipt(terminal, receipt)
+    runner = FreshRunner()
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
+    )
+
+    with pytest.raises(DraftAgentExecutionTerminated) as first_error:
+        await graph.coordinate_exploration("merge")
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert [event.sequence for event in events] == [1, 2]
+    assert [event.event_type for event in events] == [
+        "agent_run.started",
+        "agent_run.terminal",
+    ]
+    assert events[1].data["exit"] == session_exit.value
+    assert events[1].data["receipt_category"] == category
+    terminal_fact = await owner.load_fact(f"draft.agent.terminal:{terminal.agent_run_id}")
+    assert terminal_fact is not None
+    assert terminal_fact[1] == {
+        "agent_run_id": str(terminal.agent_run_id),
+        "receipt_id": str(receipt.receipt_id),
+    }
+
+    with pytest.raises(DraftAgentExecutionTerminated) as replayed_error:
+        await graph.coordinate_exploration("merge")
+
+    assert first_error.value.exit is session_exit
+    assert replayed_error.value.exit is session_exit
+    if session_exit in {SessionExit.Failed, SessionExit.BudgetExhausted}:
+        assert isinstance(first_error.value, DraftAgentExecutionFailed)
+        assert isinstance(replayed_error.value, DraftAgentExecutionFailed)
+    else:
+        assert type(first_error.value) is DraftAgentExecutionTerminated
+        assert type(replayed_error.value) is DraftAgentExecutionTerminated
+    assert runner.calls == 0
+    assert await store.read_draft_session_events(draft_id, 0) == events
+
+
+@pytest.mark.parametrize(
+    ("exit_name", "state_name", "category"),
+    [
+        ("SegmentStopped", "Closed", "draft.coordinator.segment_stopped"),
+        ("Invalidated", "Invalidated", "draft.coordinator.invalidated"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_returned_noncompleted_draft_agent_uses_same_typed_outcome_on_replay(
+    tmp_path, artifacts, exit_name, state_name, category
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.draft_graph import DraftAgentExecutionTerminated
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class Runner:
+        calls = 0
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls += 1
+            created = await store.create_or_get_agent_run(
+                _agent_run(draft_id, logical_task_key)
+            )
+            await lifecycle.started(created)
+            terminal = replace(
+                created,
+                state=getattr(SessionState, state_name),
+                exit=getattr(SessionExit, exit_name),
+            )
+            receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, category)
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            return DraftAgentCompletion(terminal, receipt, None)
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    runner = Runner()
+    graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=flow, store=store),
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
+    )
+
+    with pytest.raises(DraftAgentExecutionTerminated) as first_error:
+        await graph.coordinate_exploration("merge")
+    events = await store.read_draft_session_events(draft_id, 0)
+    with pytest.raises(DraftAgentExecutionTerminated) as replayed_error:
+        await graph.coordinate_exploration("merge")
+
+    assert first_error.value.exit is getattr(SessionExit, exit_name)
+    assert replayed_error.value.exit is first_error.value.exit
+    assert runner.calls == 1
+    assert [event.event_type for event in events] == [
+        "agent_run.started",
+        "agent_run.terminal",
+    ]
+    assert await store.read_draft_session_events(draft_id, 0) == events
+
+
 @pytest.mark.asyncio
 async def test_failed_draft_terminal_category_mismatch_is_not_published(
     tmp_path, artifacts
@@ -697,6 +843,70 @@ async def test_failed_draft_terminal_category_mismatch_is_not_published(
     )
 
     with pytest.raises(ValueError, match="failure category"):
+        await graph.coordinate_exploration("merge")
+
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert [event.event_type for event in events] == ["agent_run.started"]
+    assert await owner.load_fact(f"draft.agent.terminal:{events[0].data['agent_run_id']}") is None
+
+
+@pytest.mark.parametrize(
+    ("exit_name", "state_name", "category", "error_match"),
+    [
+        (
+            "SegmentStopped",
+            "Closed",
+            "draft.coordinator.invalidated",
+            "segment-stopped category",
+        ),
+        (
+            "Invalidated",
+            "Invalidated",
+            "draft.coordinator.segment_stopped",
+            "invalidated category",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_noncompleted_draft_terminal_category_mismatch_is_not_published(
+    tmp_path, artifacts, exit_name, state_name, category, error_match
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class Runner:
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            created = await store.create_or_get_agent_run(
+                _agent_run(draft_id, logical_task_key)
+            )
+            await lifecycle.started(created)
+            terminal = replace(
+                created,
+                state=getattr(SessionState, state_name),
+                exit=getattr(SessionExit, exit_name),
+            )
+            receipt = AgentRunReceipt(
+                uuid4(), terminal.agent_run_id, category
+            )
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            raise AssertionError("invalid terminal receipt should not be accepted")
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=Runner(),
+    )
+
+    with pytest.raises(ValueError, match=error_match):
         await graph.coordinate_exploration("merge")
 
     events = await store.read_draft_session_events(draft_id, 0)

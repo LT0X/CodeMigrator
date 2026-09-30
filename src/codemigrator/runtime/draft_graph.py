@@ -39,12 +39,16 @@ class DraftAgentResultUnavailable(RuntimeError):
     """A terminal Draft AgentRun has no matching durable result reference."""
 
 
-class DraftAgentExecutionFailed(RuntimeError):
-    """A recovered Draft AgentRun terminated without successful completion."""
+class DraftAgentExecutionTerminated(RuntimeError):
+    """A Draft AgentRun reached a valid non-completed terminal exit."""
 
     def __init__(self, exit: SessionExit) -> None:
         self.exit = exit
         super().__init__(f"Draft AgentRun terminated with {exit.value}")
+
+
+class DraftAgentExecutionFailed(DraftAgentExecutionTerminated):
+    """A Draft AgentRun failed or exhausted its execution budget."""
 
 
 class _DraftGraphState(TypedDict, total=False):
@@ -230,11 +234,11 @@ class DraftAgentRunStore(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class DraftAgentCompletion:
-    """An opaque CAS result reference with durable AgentRun and owner receipts."""
+    """A durable terminal receipt and optional successful result reference."""
 
     record: AgentRun
     receipt: AgentRunReceipt
-    result: CasObject
+    result: CasObject | None
 
 
 class DraftAgentRunnerPort(Protocol):
@@ -481,21 +485,28 @@ class MigrationSessionGraph:
         if not lifecycle.started_seen or not lifecycle.terminal_seen:
             raise ValueError("Draft AgentRun runner omitted a lifecycle callback")
         record = completion.record
+        self._validate_agent_identity(record, logical_task_key)
         if (
-            record.owner_kind != "draft"
-            or record.owner_id != self.owner.draft_id
-            or record.logical_task_key != logical_task_key
-            or record.thread_id == self.thread_id
-            or record.state is not SessionState.Closed
-            or record.exit is not SessionExit.Completed
+            not record.is_terminal
+            or record.exit is None
             or completion.receipt.agent_run_id != record.agent_run_id
-            or completion.receipt.category != expected_category
         ):
-            raise ValueError("Draft AgentRun completion does not match its owner task")
+            raise ValueError("Draft AgentRun completion identity is invalid")
+        expected_state, expected_receipt_category, outcome = _agent_terminal_contract(
+            record, expected_category
+        )
+        if record.state is not expected_state:
+            raise ValueError(f"Draft AgentRun {outcome} state is invalid")
+        if completion.receipt.category != expected_receipt_category:
+            raise ValueError(f"Draft AgentRun {outcome} category is invalid")
         persisted_record = await self.agent_runs.load_agent_run(record.agent_run_id)
         persisted_receipt = await self.agent_runs.load_agent_run_receipt(record.agent_run_id)
         if persisted_record != record or persisted_receipt != completion.receipt:
             raise ValueError("Draft AgentRun cannot advance without its durable receipt")
+        if record.exit in {SessionExit.Failed, SessionExit.BudgetExhausted}:
+            raise DraftAgentExecutionFailed(record.exit)
+        if record.exit is not SessionExit.Completed:
+            raise DraftAgentExecutionTerminated(record.exit)
         result_reference = await self.agent_runs.get_cas_reference(
             "draft", self.owner.draft_id, _agent_result_reference_key(record.agent_run_id)
         )
@@ -541,31 +552,30 @@ class MigrationSessionGraph:
             raise DraftAgentRecoveryError(
                 "Draft AgentRun terminal receipt is missing or mismatched"
             )
-        if record.exit is SessionExit.Completed:
-            if record.state is not SessionState.Closed or receipt.category != expected_category:
-                raise DraftAgentRecoveryError(
-                    "Draft AgentRun completion category does not match its owner task"
-                )
-            result_reference = await self._load_result_reference(record)
-        elif record.exit in {SessionExit.Failed, SessionExit.BudgetExhausted}:
-            if record.state is not SessionState.Failed:
-                raise DraftAgentRecoveryError("Draft AgentRun failure state is inconsistent")
-            expected_failure_category = f"{expected_category.rsplit('.', maxsplit=1)[0]}.failed"
-            if receipt.category != expected_failure_category:
-                raise DraftAgentRecoveryError(
-                    "Draft AgentRun failure category does not match its owner task"
-                )
-            result_reference = None
-        else:
-            raise DraftAgentRecoveryError(
-                "Draft AgentRun terminal exit cannot be recovered as a completion"
+        try:
+            expected_state, expected_receipt_category, outcome = _agent_terminal_contract(
+                record, expected_category
             )
+        except ValueError as exc:
+            raise DraftAgentRecoveryError(str(exc)) from exc
+        if record.state is not expected_state:
+            raise DraftAgentRecoveryError(f"Draft AgentRun {outcome} state is inconsistent")
+        if receipt.category != expected_receipt_category:
+            raise DraftAgentRecoveryError(
+                f"Draft AgentRun {outcome} category does not match its owner task"
+            )
+        if record.exit is SessionExit.Completed:
+            result_reference = await self._load_result_reference(record)
+        else:
+            result_reference = None
 
         lifecycle = _DraftAgentLifecycle(self, logical_task_key, expected_category)
         await lifecycle.started(record)
         await lifecycle.terminal(record, receipt)
-        if record.exit is not SessionExit.Completed:
+        if record.exit in {SessionExit.Failed, SessionExit.BudgetExhausted}:
             raise DraftAgentExecutionFailed(record.exit or SessionExit.Failed)
+        if record.exit is not SessionExit.Completed:
+            raise DraftAgentExecutionTerminated(record.exit or SessionExit.Failed)
         if result_reference is None:
             raise DraftAgentResultUnavailable(
                 "Draft AgentRun terminal receipt has no matching durable CAS result reference"
@@ -603,14 +613,13 @@ class MigrationSessionGraph:
             or receipt.agent_run_id != record.agent_run_id
         ):
             raise ValueError("Draft AgentRun terminal identity is invalid")
-        if record.exit is SessionExit.Completed and receipt.category != expected_category:
-            raise ValueError("Draft AgentRun completion category is invalid")
-        if record.exit in {SessionExit.Failed, SessionExit.BudgetExhausted}:
-            expected_failure_category = f"{expected_category.rsplit('.', maxsplit=1)[0]}.failed"
-            if record.state is not SessionState.Failed:
-                raise ValueError("Draft AgentRun failure state is invalid")
-            if receipt.category != expected_failure_category:
-                raise ValueError("Draft AgentRun failure category is invalid")
+        expected_state, expected_receipt_category, outcome = _agent_terminal_contract(
+            record, expected_category
+        )
+        if record.state is not expected_state:
+            raise ValueError(f"Draft AgentRun {outcome} state is invalid")
+        if receipt.category != expected_receipt_category:
+            raise ValueError(f"Draft AgentRun {outcome} category is invalid")
         if not await self._has_matching_agent_start_fact(record):
             raise DraftAgentRecoveryError(
                 "Draft AgentRun terminal requires its durable start receipt"
@@ -700,6 +709,23 @@ def _agent_result_reference_key(agent_run_id: AgentRunId) -> str:
     return f"agent-result:{agent_run_id}"
 
 
+def _agent_terminal_contract(
+    record: AgentRun, expected_completion_category: str
+) -> tuple[SessionState, str, str]:
+    task_base, separator, suffix = expected_completion_category.rpartition(".")
+    if not separator or not task_base or suffix != "completed":
+        raise ValueError("Draft AgentRun expected category must end in .completed")
+    if record.exit is SessionExit.Completed:
+        return SessionState.Closed, expected_completion_category, "completion"
+    if record.exit in {SessionExit.Failed, SessionExit.BudgetExhausted}:
+        return SessionState.Failed, f"{task_base}.failed", "failure"
+    if record.exit is SessionExit.SegmentStopped:
+        return SessionState.Closed, f"{task_base}.segment_stopped", "segment-stopped"
+    if record.exit is SessionExit.Invalidated:
+        return SessionState.Invalidated, f"{task_base}.invalidated", "invalidated"
+    raise ValueError("Draft AgentRun terminal exit is unsupported")
+
+
 def _key_digest(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("Draft logical task identity must be non-empty")
@@ -722,6 +748,7 @@ def _has_interrupt(snapshot: object) -> bool:
 
 __all__ = [
     "DraftAgentCompletion",
+    "DraftAgentExecutionTerminated",
     "DraftAgentExecutionFailed",
     "DraftAgentRecoveryError",
     "DraftAgentResultUnavailable",
