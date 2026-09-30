@@ -17,6 +17,7 @@ from codemigrator.core import CreateRun, RunId, canonical_json_bytes
 from codemigrator.core.paths import normalize_repo_relative_paths
 
 from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
+from .cas import CasObject
 from .contracts import (
     DraftOwnerReceipt,
     DraftSessionEventSpec,
@@ -28,6 +29,22 @@ from .draft import DraftConflictError, DraftFlow
 from .draft_models import AskUserAnswer, AskUserQuestion, DraftFreezeReceipt
 from .loop_contracts import SessionExit, SessionState
 from .store import RuntimeStore, StoreCommitError
+
+
+class DraftAgentRecoveryError(ValueError):
+    """Persisted Draft AgentRun facts do not satisfy the recovery contract."""
+
+
+class DraftAgentResultUnavailable(RuntimeError):
+    """A terminal Draft AgentRun has no matching durable result reference."""
+
+
+class DraftAgentExecutionFailed(RuntimeError):
+    """A recovered Draft AgentRun terminated without successful completion."""
+
+    def __init__(self, exit: SessionExit) -> None:
+        self.exit = exit
+        super().__init__(f"Draft AgentRun terminated with {exit.value}")
 
 
 class _DraftGraphState(TypedDict, total=False):
@@ -202,6 +219,10 @@ class DraftAgentRunStore(Protocol):
 
     async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None: ...
 
+    async def get_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None: ...
+
     async def list_agent_runs_by_owner(
         self, owner_kind: str, owner_id: UUID
     ) -> tuple[AgentRun, ...]: ...
@@ -209,11 +230,11 @@ class DraftAgentRunStore(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class DraftAgentCompletion:
-    """A model result whose AgentRun and completion receipt are already durable."""
+    """An opaque CAS result reference with durable AgentRun and owner receipts."""
 
     record: AgentRun
     receipt: AgentRunReceipt
-    result: object
+    result: CasObject
 
 
 class DraftAgentRunnerPort(Protocol):
@@ -448,6 +469,11 @@ class MigrationSessionGraph:
             raise RuntimeError("Draft graph has no AgentRun runner")
         if not isinstance(task, str) or not task.strip():
             raise ValueError("Draft Agent task must be non-empty text")
+        existing = await self._find_agent_run(logical_task_key)
+        if existing is not None and existing.is_terminal:
+            return await self._recover_terminal_agent(
+                existing, logical_task_key, expected_category
+            )
         lifecycle = _DraftAgentLifecycle(self, logical_task_key, expected_category)
         completion = await self.agent_runner.run(
             self.owner.draft_id, logical_task_key, task, lifecycle=lifecycle
@@ -470,21 +496,98 @@ class MigrationSessionGraph:
         persisted_receipt = await self.agent_runs.load_agent_run_receipt(record.agent_run_id)
         if persisted_record != record or persisted_receipt != completion.receipt:
             raise ValueError("Draft AgentRun cannot advance without its durable receipt")
+        result_reference = await self.agent_runs.get_cas_reference(
+            "draft", self.owner.draft_id, _agent_result_reference_key(record.agent_run_id)
+        )
+        if (
+            not isinstance(completion.result, CasObject)
+            or record.result_sha256 is None
+            or completion.result.digest != record.result_sha256
+            or result_reference != completion.result
+        ):
+            raise DraftAgentResultUnavailable(
+                "Draft AgentRun completion lacks its matching durable CAS result reference"
+            )
         return completion
+
+    async def _find_agent_run(self, logical_task_key: str) -> AgentRun | None:
+        matches = tuple(
+            record
+            for record in await self.agent_runs.list_agent_runs_by_owner(
+                "draft", self.owner.draft_id
+            )
+            if record.logical_task_key == logical_task_key
+        )
+        if len(matches) > 1:
+            raise DraftAgentRecoveryError("Draft AgentRun logical task has conflicting records")
+        return matches[0] if matches else None
+
+    async def _recover_terminal_agent(
+        self,
+        record: AgentRun,
+        logical_task_key: str,
+        expected_category: str,
+    ) -> DraftAgentCompletion:
+        self._validate_agent_identity(record, logical_task_key)
+        persisted_record = await self.agent_runs.load_agent_run(record.agent_run_id)
+        if persisted_record != record:
+            raise DraftAgentRecoveryError("Draft AgentRun terminal record changed during recovery")
+        if not await self._has_matching_agent_start_fact(record):
+            raise DraftAgentRecoveryError(
+                "Draft AgentRun terminal recovery requires its durable start receipt"
+            )
+        receipt = await self.agent_runs.load_agent_run_receipt(record.agent_run_id)
+        if receipt is None or receipt.agent_run_id != record.agent_run_id:
+            raise DraftAgentRecoveryError(
+                "Draft AgentRun terminal receipt is missing or mismatched"
+            )
+        if record.exit is SessionExit.Completed:
+            if record.state is not SessionState.Closed or receipt.category != expected_category:
+                raise DraftAgentRecoveryError(
+                    "Draft AgentRun completion category does not match its owner task"
+                )
+            result_reference = await self._load_result_reference(record)
+        elif record.exit in {SessionExit.Failed, SessionExit.BudgetExhausted}:
+            if record.state is not SessionState.Failed:
+                raise DraftAgentRecoveryError("Draft AgentRun failure state is inconsistent")
+            expected_failure_category = f"{expected_category.rsplit('.', maxsplit=1)[0]}.failed"
+            if receipt.category != expected_failure_category:
+                raise DraftAgentRecoveryError(
+                    "Draft AgentRun failure category does not match its owner task"
+                )
+            result_reference = None
+        else:
+            raise DraftAgentRecoveryError(
+                "Draft AgentRun terminal exit cannot be recovered as a completion"
+            )
+
+        lifecycle = _DraftAgentLifecycle(self, logical_task_key, expected_category)
+        await lifecycle.started(record)
+        await lifecycle.terminal(record, receipt)
+        if record.exit is not SessionExit.Completed:
+            raise DraftAgentExecutionFailed(record.exit or SessionExit.Failed)
+        if result_reference is None:
+            raise DraftAgentResultUnavailable(
+                "Draft AgentRun terminal receipt has no matching durable CAS result reference"
+            )
+        return DraftAgentCompletion(record, receipt, result_reference)
 
     async def _commit_agent_started(self, record: AgentRun, logical_task_key: str) -> None:
         self._validate_agent_identity(record, logical_task_key)
-        if record.state is not SessionState.Created or record.exit is not None:
-            raise ValueError("Draft AgentRun start requires a created record")
         persisted = await self.agent_runs.load_agent_run(record.agent_run_id)
-        already_published = await self.owner.has_receipt(
-            f"draft.agent.started:{record.agent_run_id}"
-        )
-        if persisted is None or not persisted.same_frozen_identity(record):
+        if persisted != record:
             raise ValueError("Draft AgentRun start lacks its durable identity")
-        if not already_published and persisted != record:
-            raise ValueError("Draft AgentRun started after execution")
-        await self.owner.commit_agent_started(record)
+        already_published = await self._has_matching_agent_start_fact(record)
+        if record.state is SessionState.Created and record.exit is None:
+            await self.owner.commit_agent_started(record)
+            return
+        if record.is_terminal and already_published:
+            return
+        if record.is_terminal:
+            raise DraftAgentRecoveryError(
+                "Draft AgentRun terminal start replay requires its durable start receipt"
+            )
+        raise ValueError("Draft AgentRun start requires a created record")
 
     async def _commit_agent_terminal(
         self,
@@ -502,11 +605,54 @@ class MigrationSessionGraph:
             raise ValueError("Draft AgentRun terminal identity is invalid")
         if record.exit is SessionExit.Completed and receipt.category != expected_category:
             raise ValueError("Draft AgentRun completion category is invalid")
+        if record.exit in {SessionExit.Failed, SessionExit.BudgetExhausted}:
+            expected_failure_category = f"{expected_category.rsplit('.', maxsplit=1)[0]}.failed"
+            if record.state is not SessionState.Failed:
+                raise ValueError("Draft AgentRun failure state is invalid")
+            if receipt.category != expected_failure_category:
+                raise ValueError("Draft AgentRun failure category is invalid")
+        if not await self._has_matching_agent_start_fact(record):
+            raise DraftAgentRecoveryError(
+                "Draft AgentRun terminal requires its durable start receipt"
+            )
         persisted = await self.agent_runs.load_agent_run(record.agent_run_id)
         persisted_receipt = await self.agent_runs.load_agent_run_receipt(record.agent_run_id)
         if persisted != record or persisted_receipt != receipt:
             raise ValueError("Draft AgentRun terminal lacks its durable receipt")
+        if record.exit is SessionExit.Completed:
+            await self._load_result_reference(record)
         await self.owner.commit_agent_terminal(record, receipt)
+
+    async def _load_result_reference(self, record: AgentRun) -> CasObject:
+        result_reference = await self.agent_runs.get_cas_reference(
+            "draft", self.owner.draft_id, _agent_result_reference_key(record.agent_run_id)
+        )
+        if (
+            record.result_sha256 is None
+            or result_reference is None
+            or result_reference.digest != record.result_sha256
+        ):
+            raise DraftAgentResultUnavailable(
+                "Draft AgentRun terminal receipt has no matching durable CAS result reference"
+            )
+        return result_reference
+
+    async def _has_matching_agent_start_fact(self, record: AgentRun) -> bool:
+        key = f"draft.agent.started:{record.agent_run_id}"
+        persisted = await self.owner.load_fact(key)
+        if persisted is None:
+            return False
+        receipt, fact = persisted
+        if (
+            receipt.draft_id != self.owner.draft_id
+            or receipt.receipt_key != key
+            or receipt.category != "draft.agent.started"
+            or fact != {"agent_run_id": str(record.agent_run_id)}
+        ):
+            raise DraftAgentRecoveryError(
+                "Draft AgentRun start owner fact conflicts with its identity"
+            )
+        return True
 
     def _validate_agent_identity(self, record: AgentRun, logical_task_key: str) -> None:
         if (
@@ -550,6 +696,10 @@ def _answer_receipt_key(question_id: object) -> str:
     return f"draft.answer:{question_id}"
 
 
+def _agent_result_reference_key(agent_run_id: AgentRunId) -> str:
+    return f"agent-result:{agent_run_id}"
+
+
 def _key_digest(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("Draft logical task identity must be non-empty")
@@ -572,6 +722,9 @@ def _has_interrupt(snapshot: object) -> bool:
 
 __all__ = [
     "DraftAgentCompletion",
+    "DraftAgentExecutionFailed",
+    "DraftAgentRecoveryError",
+    "DraftAgentResultUnavailable",
     "DraftAgentRunnerPort",
     "DraftFlowOwner",
     "DraftOwnerPort",

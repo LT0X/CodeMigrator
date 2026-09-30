@@ -109,6 +109,11 @@ class RuntimeStore(Protocol):
     async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
         """Load the committed owner receipt, if any."""
 
+    async def get_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        """Load a durable owner reference to an opaque CAS object."""
+
     async def commit_agent_run_receipt(
         self,
         record: AgentRun,

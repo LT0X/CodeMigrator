@@ -13,7 +13,7 @@ from codemigrator.core import ModelProfile, Phase, SessionKind, canonical_json_b
 from codemigrator.core.ids import new_uuid7
 from codemigrator.runtime.agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from codemigrator.runtime.binding import LockedModelBinding
-from codemigrator.runtime.cas import FileHostCAS
+from codemigrator.runtime.cas import CasLedger, FileHostCAS
 from codemigrator.runtime.checkpointer import CasCheckpointSaver
 from codemigrator.runtime.context import ContextEnvelope, ContextSegment
 from codemigrator.runtime.draft import DraftFlow
@@ -202,21 +202,25 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                 result = await bound.ainvoke(task=task)
                 if result.exit is not SessionExit.Completed or not result.assistant_texts:
                     raise AssertionError("live OpenCode AgentRun did not complete")
-                result_sha = hashlib.sha256(
-                    canonical_json_bytes(
-                        {
-                            "answer_sha256": hashlib.sha256(
-                                result.assistant_texts[0].encode("utf-8")
-                            ).hexdigest()
-                        }
-                    )
-                ).hexdigest()
+                result_body = canonical_json_bytes(
+                    {
+                        "answer_sha256": hashlib.sha256(
+                            result.assistant_texts[0].encode("utf-8")
+                        ).hexdigest()
+                    }
+                )
+                result_reference = await CasLedger(cas, store).put(
+                    result_body,
+                    "draft",
+                    owner_id,
+                    f"agent-result:{record.agent_run_id}",
+                )
                 indexes = await store.list_checkpoint_indexes(record.thread_id)
                 terminal = replace(
                     record,
                     state=SessionState.Closed,
                     exit=SessionExit.Completed,
-                    result_sha256=result_sha,
+                    result_sha256=result_reference.digest,
                     checkpoint_sha256=indexes[0].object.digest if indexes else None,
                 )
                 receipt = AgentRunReceipt(
@@ -224,7 +228,7 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                 )
                 await store.commit_agent_run_receipt(terminal, receipt)
                 await lifecycle.terminal(terminal, receipt)
-                return DraftAgentCompletion(terminal, receipt, {"digest": result_sha})
+                return DraftAgentCompletion(terminal, receipt, result_reference)
 
         graph = MigrationSessionGraph(
             owner=DraftFlowOwner(draft_id=draft_id, flow=DraftFlow(), store=store),
