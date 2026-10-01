@@ -32,9 +32,9 @@ PLAN factory 以 `plan:{RunId}` 作为 logical task key，并核对 loader 的�
 
 ## Provider 响应失败边界
 
-OpenAI-compatible 与 Anthropic HTTP client 默认使用 10 秒 connect/write/pool timeout 和 120 秒 read timeout，宿主仍可注入覆盖值。适配器只暴露固定格式的内部 `ProviderError.failure_code`（如 HTTP 状态类别、传输类别、无效响应类别），不把响应正文或异常文本复制进诊断码；这些内部类别不扩展 M-00 公共错误契约。usage receipt 先记录，再检查模型完成原因与结构化工具参数；`finish_reason=length`、非 JSON 参数或非对象参数都 fail closed，且不会 dispatch ToolGateway。
+OpenAI-compatible 与 Anthropic HTTP client 默认使用 10 秒 connect/write/pool timeout 和 120 秒 read timeout，宿主仍可注入覆盖值。`ProviderError.failure_code` 仅接受内部固定类别；`http_status_NNN` 限定为 100–599，范围外的状态收敛为 `http_status_out_of_range`。这些内部类别不扩展 M-00 公共错误契约。usage receipt 先记录，再检查模型完成原因与结构化工具参数；`length`、Anthropic `max_tokens`、`model_context_window_exceeded`、非 JSON 参数和非对象参数都 fail closed，且不会 dispatch ToolGateway。Provider adapter 将 JSON 中非字符串的 arguments 重新序列化后交给 bridge，使格式校验失败仍可先记录实际 usage。
 
-生产 PLAN 的 OpenCode 兼容性必须经 `POST /api/v1/migrations`、Run graph、AgentRun 与 Actor acceptance 完整验证。当前实测出现无 tool call 的普通文本与被 `finish_reason=length` 截断的 tool-call JSON；这只能证明本次请求没有完成结构化协议，不能据此断言 provider 不支持工具调用。测试诊断只记录固定 failure code、异常类型/栈位置以及工具名、完成原因和长度等形状元数据，不记录 provider body、prompt、凭据或源码。8192 输出 cap 与 150 秒等待配置仍需后续真实 API 单请求复验。
+生产 PLAN 的 OpenCode 兼容性必须经 `POST /api/v1/migrations`、Run graph、AgentRun 与 Actor acceptance 完整验证。当前实测出现无 tool call 的普通文本与被长度上限截断的 tool-call JSON；这只能证明本次请求没有完成结构化协议，不能据此断言 provider 不支持工具调用。测试诊断只记录固定 failure code、异常类型/栈位置以及布尔形状标记和有界数字，不回显 provider 返回的 tool 名或 finish reason，也不记录 provider body、prompt、凭据或源码。8192 输出 cap 与 150 秒等待配置仍需后续真实 API 单请求复验。
 
 ## 观测装配
 

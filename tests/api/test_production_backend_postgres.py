@@ -8,6 +8,7 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -30,6 +31,50 @@ from codemigrator.runtime.create_run import (
 from codemigrator.runtime.store import PostgreSQLRuntimeStore
 
 from .conftest import build_plan_agent_inputs, create_run_payload
+
+
+def _safe_provider_shape_for_diagnostics(request, response, *, content_is_plan_proposal: bool):
+    requested_names = frozenset(tool.name for tool in request.tools)
+    response_names = tuple(call.name for call in response.tool_calls)
+    finish_reason = response.finish_reason
+    truncated_reasons = {"length", "max_tokens", "model_context_window_exceeded"}
+    return {
+        "tool_choice_required": request.tool_choice == "any",
+        "request_tool_count": min(len(requested_names), 64),
+        "response_tool_count": min(len(response_names), 64),
+        "response_tools_match_request": all(
+            isinstance(name, str) and len(name) <= 64 and name in requested_names
+            for name in response_names
+        ),
+        "response_truncated": isinstance(finish_reason, str)
+        and len(finish_reason) <= 64
+        and finish_reason in truncated_reasons,
+        "response_content_length": min(len(response.content), 1_000_000)
+        if isinstance(response.content, str)
+        else 0,
+        "content_is_plan_proposal": bool(content_is_plan_proposal),
+    }
+
+
+def test_provider_shape_diagnostics_do_not_echo_untrusted_response_fields() -> None:
+    request = SimpleNamespace(
+        tool_choice="private request choice",
+        tools=(SimpleNamespace(name="ReadFile"),),
+    )
+    response = SimpleNamespace(
+        finish_reason="private finish reason marker",
+        tool_calls=(SimpleNamespace(name="private tool name marker"),),
+        content="private response body marker",
+    )
+
+    shape = _safe_provider_shape_for_diagnostics(
+        request, response, content_is_plan_proposal=False
+    )
+
+    assert shape["response_tools_match_request"] is False
+    assert shape["response_truncated"] is False
+    assert shape["response_content_length"] == len(response.content)
+    assert "private" not in repr(shape)
 
 
 async def noop_server_stop() -> None:
@@ -1407,6 +1452,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
     )
     from codemigrator.runtime.provider import (
         OpenAICompatibleProvider,
+        ProviderError,
         ProviderRegistry,
         ProviderResponse,
         ProviderToolCall,
@@ -1455,9 +1501,8 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                 if id(current) in seen:
                     continue
                 seen.add(id(current))
-                code = getattr(current, "failure_code", None)
-                if isinstance(code, str):
-                    return code
+                if isinstance(current, ProviderError):
+                    return current.failure_code
                 for cause in (current.__cause__, current.__context__):
                     if cause is not None:
                         pending.append(cause)
@@ -1552,16 +1597,11 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                 else:
                     content_is_plan_proposal = True
                 provider_shapes.append(
-                    {
-                        "tool_choice": request.tool_choice,
-                        "request_tools": tuple(tool.name for tool in request.tools),
-                        "finish_reason": response.finish_reason,
-                        "response_tool_names": tuple(
-                            call.name for call in response.tool_calls
-                        ),
-                        "response_content_length": len(response.content),
-                        "content_is_plan_proposal": content_is_plan_proposal,
-                    }
+                    _safe_provider_shape_for_diagnostics(
+                        request,
+                        response,
+                        content_is_plan_proposal=content_is_plan_proposal,
+                    )
                 )
                 return response
 

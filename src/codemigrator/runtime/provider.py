@@ -22,6 +22,56 @@ _DEFAULT_PROVIDER_TIMEOUT = httpx.Timeout(
     pool=10.0,
 )
 
+_PROVIDER_FAILURE_CODES = frozenset(
+    {
+        "provider_error",
+        "invalid_response",
+        "cancelled",
+        "invalid_json",
+        "invalid_envelope",
+        "invalid_usage",
+        "invalid_content",
+        "provider_binding_mismatch",
+        "invalid_choices",
+        "invalid_choice",
+        "invalid_message",
+        "missing_finish_reason",
+        "invalid_content_blocks",
+        "invalid_tool_calls",
+        "invalid_tool_call",
+        "model_identity_mismatch",
+        "missing_response_id",
+        "missing_tool_call_id",
+        "connect_timeout",
+        "read_timeout",
+        "write_timeout",
+        "pool_timeout",
+        "proxy_error",
+        "remote_protocol_error",
+        "connect_error",
+        "transport_error",
+        "provider_response_truncated",
+        "invalid_tool_arguments_json",
+        "invalid_tool_arguments_shape",
+        "http_status_out_of_range",
+    }
+)
+
+
+def _is_provider_failure_code(value: str) -> bool:
+    if value in _PROVIDER_FAILURE_CODES:
+        return True
+    prefix = "http_status_"
+    if not value.startswith(prefix):
+        return False
+    status = value[len(prefix) :]
+    return (
+        len(status) == 3
+        and status.isascii()
+        and status.isdigit()
+        and 100 <= int(status) <= 599
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class TokenUsage:
@@ -130,14 +180,10 @@ class ProviderError(RuntimeError):
         self.retryable = retryable
         self.retry_delay_secs = retry_delay_secs
         self.cancelled = cancelled
-        if (
-            not isinstance(failure_code, str)
-            or not failure_code
-            or not failure_code.isascii()
-            or failure_code != failure_code.lower()
-            or not failure_code.replace("_", "").isalnum()
+        if not isinstance(failure_code, str) or not _is_provider_failure_code(
+            failure_code
         ):
-            raise ValueError("provider failure code must be a safe lowercase identifier")
+            raise ValueError("provider failure code must be a fixed safe category")
         self.failure_code = failure_code
 
 
@@ -260,6 +306,12 @@ def _transport_failure_code(error: httpx.HTTPError) -> str:
     return "transport_error"
 
 
+def _http_status_failure_code(status_code: int) -> str:
+    if 100 <= status_code <= 599:
+        return f"http_status_{status_code:03d}"
+    return "http_status_out_of_range"
+
+
 async def _post_json(
     client: httpx.AsyncClient,
     url: str,
@@ -298,11 +350,13 @@ async def _post_json(
             await asyncio.gather(cancellation_task, return_exceptions=True)
     if response.status_code >= 500 or response.status_code == 429:
         raise _provider_error(
-            retryable=True, failure_code=f"http_status_{response.status_code}"
+            retryable=True,
+            failure_code=_http_status_failure_code(response.status_code),
         )
     if response.status_code >= 400:
         raise _provider_error(
-            retryable=False, failure_code=f"http_status_{response.status_code}"
+            retryable=False,
+            failure_code=_http_status_failure_code(response.status_code),
         )
     try:
         decoded = response.json()
@@ -522,10 +576,13 @@ def _tool_calls(value: object) -> tuple[ProviderToolCall, ...]:
             arguments = item.get("input")
         if not isinstance(name, str) or not name:
             raise _provider_error(retryable=False, failure_code="invalid_tool_call")
-        if isinstance(arguments, Mapping):
-            arguments = json.dumps(arguments, separators=(",", ":"))
         if not isinstance(arguments, str):
-            raise _provider_error(retryable=False, failure_code="invalid_tool_call")
+            try:
+                arguments = json.dumps(arguments, separators=(",", ":"))
+            except (TypeError, ValueError):
+                raise _provider_error(
+                    retryable=False, failure_code="invalid_tool_call"
+                ) from None
         call_id = item.get("id")
         if not isinstance(call_id, str) or not call_id:
             call_id = f"call-{index + 1}"

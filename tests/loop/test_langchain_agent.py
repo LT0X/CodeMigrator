@@ -485,7 +485,12 @@ async def test_create_agent_redacts_truncated_structured_tool_arguments() -> Non
 
 
 @pytest.mark.asyncio
-async def test_create_agent_rejects_provider_response_truncated_at_output_limit() -> None:
+@pytest.mark.parametrize(
+    "finish_reason", ["length", "max_tokens", "model_context_window_exceeded"]
+)
+async def test_create_agent_rejects_provider_response_truncated_at_output_limit(
+    finish_reason: str,
+) -> None:
     binding = _binding()
     run = _run(binding)
     provider = FakeProvider(
@@ -508,11 +513,12 @@ async def test_create_agent_rejects_provider_response_truncated_at_output_limit(
                         ),
                     ),
                 ),
-                finish_reason="length",
+                finish_reason=finish_reason,
             )
         ]
     )
     gateway = FakeGateway()
+    sink = UsageSink()
     bound = create_bound_agent(
         agent_run=run,
         binding=binding,
@@ -525,12 +531,51 @@ async def test_create_agent_rejects_provider_response_truncated_at_output_limit(
         gateway=gateway,
         context_identity=_context_identity(run, binding),
         response_format=PlanProposal,
+        usage_sink=sink,
     )
 
     with pytest.raises(ProviderError) as caught:
         await bound.ainvoke(task="Return a structured plan")
 
     assert caught.value.failure_code == "provider_response_truncated"
+    assert len(sink.receipts) == 1
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_agent_records_usage_before_rejecting_non_object_tool_arguments() -> None:
+    binding = _binding()
+    run = _run(binding)
+    provider = FakeProvider(
+        [
+            _response(
+                "",
+                tools=(ProviderToolCall("PlanProposal", "[]", "plan-1"),),
+            )
+        ]
+    )
+    gateway = FakeGateway()
+    sink = UsageSink()
+    bound = create_bound_agent(
+        agent_run=run,
+        binding=binding,
+        registry=ProviderRegistry({"openai-compatible": provider}),
+        context_manager=ContextManager(
+            token_counter=ExactCounter(), net_input_cap=FormulaNetInputCap()
+        ),
+        template="plan role",
+        envelope=ContextEnvelope(stable=(ContextSegment("stable", "frozen facts"),)),
+        gateway=gateway,
+        usage_sink=sink,
+        context_identity=_context_identity(run, binding),
+        response_format=PlanProposal,
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        await bound.ainvoke(task="Return a structured plan")
+
+    assert caught.value.failure_code == "invalid_tool_arguments_shape"
+    assert len(sink.receipts) == 1
     assert gateway.calls == []
 
 

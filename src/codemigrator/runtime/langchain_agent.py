@@ -439,7 +439,11 @@ class ProviderChatModel(BaseChatModel):
         )
         self._usages.append(response.usage)
         await self._usage_sink.record(self._agent_run_id, response.usage, receipt)
-        if response.finish_reason == "length":
+        if response.finish_reason in {
+            "length",
+            "max_tokens",
+            "model_context_window_exceeded",
+        }:
             raise ProviderError(
                 "provider request failed",
                 retryable=False,
