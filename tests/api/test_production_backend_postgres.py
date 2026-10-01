@@ -20,7 +20,14 @@ from codemigrator.api.backend import DraftCommandResult, ProductionApiBackend
 from codemigrator.api.deps import ApiRequest
 from codemigrator.api.sse import sse_events
 from codemigrator.asgi import create_production_app
-from codemigrator.core import CreateRun, FailureReason, RunId, StableErrorCode, canonical_json_bytes
+from codemigrator.core import (
+    CreateRun,
+    FailureReason,
+    MigrationSessionStatus,
+    RunId,
+    StableErrorCode,
+    canonical_json_bytes,
+)
 from codemigrator.runtime.actor import RunActor
 from codemigrator.runtime.contracts import (
     DraftSessionEventSpec,
@@ -89,9 +96,20 @@ def test_draft_command_result_requires_a_receipt_for_the_same_session() -> None:
     with pytest.raises(ValueError, match="identify its session owner"):
         DraftCommandResult(
             session_id=uuid4(),
-            status="DRAFT",
+            status=MigrationSessionStatus.Drafting,
             revision=0,
             owner_receipt=SimpleNamespace(draft_id=uuid4(), receipt_key="draft.receipt"),
+        )
+
+
+def test_draft_command_result_rejects_status_outside_m00_contract() -> None:
+    session_id = uuid4()
+    with pytest.raises(ValueError, match="valid MigrationSessionStatus"):
+        DraftCommandResult(
+            session_id=session_id,
+            status="DRAFT",  # type: ignore[arg-type]
+            revision=0,
+            owner_receipt=SimpleNamespace(draft_id=session_id, receipt_key="draft.receipt"),
         )
 
 
@@ -352,7 +370,7 @@ class RecordingDraftSessionCommands:
         )
         return DraftCommandResult(
             session_id=draft_id,
-            status="DRAFT",
+            status=MigrationSessionStatus.Drafting,
             revision=revision,
             owner_receipt=receipt,
         )
@@ -385,7 +403,7 @@ class InvalidDraftResultCommands(RecordingDraftSessionCommands):
         await super().create_session(payload, transaction)
         return SimpleNamespace(
             session_id=self.draft_id,
-            status="DRAFT",
+            status=MigrationSessionStatus.Drafting,
             revision=0,
         )
 
@@ -982,7 +1000,7 @@ async def test_draft_api_commands_delegate_through_the_api_transaction_without_r
         assert set(response.json()) == {"session_id", "status", "revision"}
         assert response.json() == {
             "session_id": session_id,
-            "status": "DRAFT",
+            "status": MigrationSessionStatus.Drafting.value,
             "revision": revision,
         }
     assert [operation for operation, _transaction in draft_owner.calls] == [
@@ -1199,7 +1217,7 @@ async def test_production_asgi_injects_draft_owner_for_all_four_atomic_commands(
             assert set(response.json()) == {"session_id", "status", "revision"}
             assert response.json() == {
                 "session_id": session_id,
-                "status": "DRAFT",
+                "status": MigrationSessionStatus.Drafting.value,
                 "revision": revision,
             }
         async with inspection_store.pool.acquire() as connection:

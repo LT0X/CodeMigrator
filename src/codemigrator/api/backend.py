@@ -9,7 +9,13 @@ from threading import Lock
 from typing import Protocol, cast
 from uuid import UUID
 
-from codemigrator.core import CreateRun, FailureReason, RunStatus, StableErrorCode
+from codemigrator.core import (
+    CreateRun,
+    FailureReason,
+    MigrationSessionStatus,
+    RunStatus,
+    StableErrorCode,
+)
 
 from .deps import ApiRequest, EventRecord, PersistedEvent
 from .dto import (
@@ -102,15 +108,18 @@ class DraftCommandResult:
     """Committed SessionView fields plus the identity of the Draft owner receipt."""
 
     session_id: UUID
-    status: str
+    status: MigrationSessionStatus
     revision: int
     owner_receipt: DraftOwnerReceiptIdentity
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, UUID):
             raise ValueError("Draft command session id must be a UUID")
-        if not isinstance(self.status, str) or not self.status.strip():
-            raise ValueError("Draft command status must be non-empty")
+        try:
+            status = MigrationSessionStatus(self.status)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Draft command status must be a valid MigrationSessionStatus") from exc
+        object.__setattr__(self, "status", status)
         if type(self.revision) is not int or self.revision < 0:
             raise ValueError("Draft command revision must be a non-negative integer")
         if self.owner_receipt.draft_id != self.session_id:
@@ -480,7 +489,7 @@ class ProductionApiBackend:
                     raise ValueError("Draft owner returned a result for another session")
                 return {
                     "session_id": str(result.session_id),
-                    "status": result.status,
+                    "status": result.status.value,
                     "revision": result.revision,
                 }
 
