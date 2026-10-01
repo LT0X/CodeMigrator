@@ -1417,6 +1417,89 @@ def test_production_run_owner_rejects_assembly_for_another_store(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_production_root_rejects_checkpointer_bound_to_unfenced_postgres_store(
+    tmp_path: Path,
+):
+    dsn = os.environ.get("CODEMIGRATOR_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("CODEMIGRATOR_TEST_PG_DSN is not configured")
+    async with isolated_store() as (_store, schema):
+        from codemigrator.runtime.cas import FileHostCAS
+        from codemigrator.runtime.checkpointer import CasCheckpointSaver
+        from codemigrator.runtime.graph_composition import (
+            AgentGraphInfrastructure,
+            RuntimeGraphAssembly,
+        )
+        from codemigrator.runtime.memory import ContextManager
+        from codemigrator.runtime.provider import ProviderRegistry
+
+        def components_factory(store, pool, lock_connection):
+            assert isinstance(store, PostgreSQLRuntimeStore)
+            assert store.pool is pool
+            assert store._write_connection is lock_connection
+            unfenced_store = PostgreSQLRuntimeStore(pool)
+            app_owner_id = uuid4()
+            cas = FileHostCAS(tmp_path / "cas")
+            infrastructure = AgentGraphInfrastructure(
+                provider_registry=ProviderRegistry({}),
+                context_manager=ContextManager(),
+                tool_gateway=object(),
+                runtime_store=store,
+                host_cas=cas,
+                cas_references=store,
+                usage_sink=object(),
+                run_checkpointer=CasCheckpointSaver(
+                    cas,
+                    unfenced_store,
+                    graph_family="run",
+                    owner_kind="run",
+                    owner_id=app_owner_id,
+                ),
+                draft_graph_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="draft",
+                    owner_kind="draft",
+                    owner_id=app_owner_id,
+                ),
+                agent_run_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="agent",
+                    owner_kind="run",
+                    owner_id=app_owner_id,
+                ),
+            )
+            assembly = RuntimeGraphAssembly(
+                infrastructure,
+                plan_stage_factory=lambda _infra, _actor: object(),
+                verifier_factory=lambda _infra, _actor: object(),
+                reporter_factory=lambda _infra, _actor: object(),
+                draft_agent_runner_factory=lambda _infra, _owner: object(),
+                create_run_service_factory=lambda _infra, _owner: object(),
+            )
+            from codemigrator.asgi import ProductionRunComponents
+
+            return ProductionRunComponents(
+                preflight=PassingPreflight(),
+                graph_assembly=assembly,
+                actor_factory=RunActor,
+                durable_checkpointer=True,
+            )
+
+        app = create_production_app(
+            dsn,
+            config=ApiConfig(token="synthetic-token"),
+            run_components_factory=components_factory,
+            stop_server=noop_server_stop,
+            pool_server_settings={"search_path": schema},
+        )
+        with pytest.raises(RuntimeError, match="production API startup failed"):
+            async with app.router.lifespan_context(app):
+                pytest.fail("production application accepted an unfenced checkpointer")
+
+
+@pytest.mark.asyncio
 async def test_lock_connection_loss_revokes_api_and_stops_server_immediately():
     dsn = os.environ.get("CODEMIGRATOR_TEST_PG_DSN")
     if not dsn:

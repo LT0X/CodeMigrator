@@ -6,6 +6,8 @@ from uuid import uuid4
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
+from codemigrator.runtime.cas import FileHostCAS
+from codemigrator.runtime.checkpointer import CasCheckpointSaver
 from codemigrator.runtime.graph_composition import (
     AgentGraphInfrastructure,
     RuntimeGraphAssembly,
@@ -29,6 +31,60 @@ def infrastructure(tmp_path, *, provider_registry=None):
         run_checkpointer=InMemorySaver(),
         draft_graph_checkpointer=InMemorySaver(),
         agent_run_checkpointer=InMemorySaver(),
+    )
+
+
+def durable_infrastructure(
+    tmp_path,
+    *,
+    cas_references=None,
+    run_store=None,
+    draft_store=None,
+    agent_store=None,
+    run_cas=None,
+):
+    store = InMemoryRuntimeStore()
+    cas = FileHostCAS(tmp_path / "durable-cas")
+    owner_id = uuid4()
+
+    def saver(graph_family, owner_kind, saver_store, saver_cas):
+        return CasCheckpointSaver(
+            saver_cas,
+            saver_store,
+            graph_family=graph_family,
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+        )
+
+    return AgentGraphInfrastructure(
+        provider_registry=ProviderRegistry({}),
+        context_manager=object(),
+        tool_gateway=object(),
+        runtime_store=store,
+        host_cas=cas,
+        cas_references=store if cas_references is None else cas_references,
+        usage_sink=object(),
+        run_checkpointer=saver(
+            "run", "run", store if run_store is None else run_store,
+            cas if run_cas is None else run_cas,
+        ),
+        draft_graph_checkpointer=saver(
+            "draft", "draft", store if draft_store is None else draft_store, cas
+        ),
+        agent_run_checkpointer=saver(
+            "agent", "run", store if agent_store is None else agent_store, cas
+        ),
+    )
+
+
+def assembly_for(infra):
+    return RuntimeGraphAssembly(
+        infra,
+        plan_stage_factory=lambda _infra, _actor: object(),
+        verifier_factory=lambda _infra, _actor: object(),
+        reporter_factory=lambda _infra, _actor: object(),
+        draft_agent_runner_factory=lambda _infra, _owner: object(),
+        create_run_service_factory=lambda _infra, _owner: object(),
     )
 
 
@@ -102,15 +158,7 @@ def test_assembly_compiles_both_graphs_with_the_injected_runtime_dependencies(tm
 
 
 def test_run_graph_starter_is_bound_to_assembly_and_requires_durable_attestation(tmp_path):
-    infra = infrastructure(tmp_path)
-    assembly = RuntimeGraphAssembly(
-        infra,
-        plan_stage_factory=lambda _infra, _actor: object(),
-        verifier_factory=lambda _infra, _actor: object(),
-        reporter_factory=lambda _infra, _actor: object(),
-        draft_agent_runner_factory=lambda _infra, _owner: object(),
-        create_run_service_factory=lambda _infra, _owner: object(),
-    )
+    assembly = assembly_for(durable_infrastructure(tmp_path))
 
     with pytest.raises(ValueError, match="durable checkpointer"):
         assembly.build_run_graph_starter(durable_checkpointer=False)  # type: ignore[arg-type]
@@ -119,3 +167,25 @@ def test_run_graph_starter_is_bound_to_assembly_and_requires_durable_attestation
 
     assert starter.receipt_idempotent is True
     assert starter._graph_factory.__self__ is assembly
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["cas_references", "run_store", "draft_store", "agent_store", "run_cas"],
+)
+def test_durable_run_graph_starter_rejects_persistence_outside_assembly_boundary(
+    tmp_path, mismatch
+):
+    other_store = InMemoryRuntimeStore()
+    other_cas = FileHostCAS(tmp_path / "other-cas")
+    overrides = {
+        "cas_references": other_store,
+        "run_store": other_store,
+        "draft_store": other_store,
+        "agent_store": other_store,
+        "run_cas": other_cas,
+    }
+    assembly = assembly_for(durable_infrastructure(tmp_path, **{mismatch: overrides[mismatch]}))
+
+    with pytest.raises(RuntimeGraphConfigurationError, match="application (RuntimeStore|host CAS)"):
+        assembly.build_run_graph_starter(durable_checkpointer=True)

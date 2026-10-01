@@ -11,6 +11,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from .actor import RunActor
 from .cas import CasReferenceStore, FileHostCAS
+from .checkpointer import CasCheckpointSaver
 from .create_run import CreateRunService, RunWorkflowGraphStarter
 from .draft_graph import (
     DraftAgentRunnerPort,
@@ -75,6 +76,31 @@ class AgentGraphInfrastructure:
             raise RuntimeGraphConfigurationError(
                 "Run, Draft, and AgentRun require isolated checkpointer instances"
             )
+
+    def validate_durable_persistence_bindings(self) -> None:
+        """Keep production CAS and checkpoint writes on the application store."""
+
+        if cast(object, self.cas_references) is not self.runtime_store:
+            raise RuntimeGraphConfigurationError(
+                "CAS reference store must use the application RuntimeStore"
+            )
+        for name, saver in (
+            ("run_checkpointer", self.run_checkpointer),
+            ("draft_graph_checkpointer", self.draft_graph_checkpointer),
+            ("agent_run_checkpointer", self.agent_run_checkpointer),
+        ):
+            if not isinstance(saver, CasCheckpointSaver):
+                raise RuntimeGraphConfigurationError(
+                    f"production {name} must use CasCheckpointSaver"
+                )
+            if cast(object, saver.store) is not self.runtime_store:
+                raise RuntimeGraphConfigurationError(
+                    f"production {name} must use the application RuntimeStore"
+                )
+            if saver.cas is not self.host_cas:
+                raise RuntimeGraphConfigurationError(
+                    f"production {name} must use the application host CAS"
+                )
 
 
 PlanStageFactory = Callable[[AgentGraphInfrastructure, RunGraphActorPort], PlanStagePort]
@@ -142,6 +168,9 @@ class RuntimeGraphAssembly:
         an in-memory saver is valid for tests but cannot satisfy this production gate.
         """
 
+        if durable_checkpointer is not True:
+            raise ValueError("Run graph recovery requires a durable checkpointer")
+        self.infrastructure.validate_durable_persistence_bindings()
         graph_factory = cast(
             Callable[[RunActor], RunWorkflowGraph], self.build_run_graph
         )
