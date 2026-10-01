@@ -99,6 +99,65 @@ async def test_one_actor_serializes_mailbox_and_commits_state_with_events(run_id
 
 
 @pytest.mark.asyncio
+async def test_actor_registry_uses_injected_factory_when_restoring_active_run(run_id):
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(run_id=run_id, status=RunStatus.Planning, version=1),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    scheduler = RecordingScheduler()
+    calls = []
+
+    def actor_factory(received_run_id, received_store):
+        calls.append((received_run_id, received_store))
+        return RunActor(received_run_id, received_store, execution_scheduler=scheduler)
+
+    registry = ActorRegistry(store, actor_factory=actor_factory)
+    actor = await registry.get_or_create(run_id)
+
+    assert actor is not None
+    assert actor.execution_scheduler is scheduler
+    assert calls == [(run_id, store)]
+    assert await registry.get_or_create(run_id) is actor
+    assert len(calls) == 1
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_actor_registry_rejects_factory_actor_with_wrong_owner(run_id):
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(run_id=run_id, status=RunStatus.Planning, version=1),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    mismatched = RunActor(uuid4(), store)
+    registry = ActorRegistry(store, actor_factory=lambda _run_id, _store: mismatched)
+
+    with pytest.raises(StoreCommitError, match="RunActor factory"):
+        await registry.get_or_create(run_id)
+
+    assert registry.active_actor_count == 0
+    assert mismatched._task is None
+
+
+@pytest.mark.asyncio
+async def test_actor_registry_rejects_factory_actor_with_wrong_store(run_id):
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(run_id=run_id, status=RunStatus.Planning, version=1),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    mismatched = RunActor(run_id, InMemoryRuntimeStore())
+    registry = ActorRegistry(store, actor_factory=lambda _run_id, _store: mismatched)
+
+    with pytest.raises(StoreCommitError, match="RunActor factory"):
+        await registry.get_or_create(run_id)
+
+    assert registry.active_actor_count == 0
+    assert mismatched._task is None
+
+
+@pytest.mark.asyncio
 async def test_run_created_receipt_is_recovered_from_committed_event(run_id):
     store = InMemoryRuntimeStore()
     actor = RunActor(run_id, store)

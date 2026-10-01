@@ -1250,6 +1250,173 @@ async def test_production_asgi_startup_recovers_before_ready_and_closes_owned_re
 
 
 @pytest.mark.asyncio
+async def test_production_asgi_composes_run_graph_from_locked_store_and_actor_factory(
+    tmp_path: Path,
+):
+    dsn = os.environ.get("CODEMIGRATOR_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("CODEMIGRATOR_TEST_PG_DSN is not configured")
+    async with isolated_store() as (_store, schema):
+        from codemigrator.runtime.cas import FileHostCAS
+        from codemigrator.runtime.checkpointer import CasCheckpointSaver
+        from codemigrator.runtime.graph_composition import (
+            AgentGraphInfrastructure,
+            RuntimeGraphAssembly,
+        )
+        from codemigrator.runtime.memory import ContextManager
+        from codemigrator.runtime.provider import ProviderRegistry
+
+        entered_plan = asyncio.Event()
+        hold_plan = asyncio.Event()
+        scheduler = object()
+        factory_calls = []
+        created_actors = []
+        stage_actors = []
+
+        class WaitingPlanStage:
+            def __init__(self, received_actor):
+                self.actor = received_actor
+
+            async def run(self, run_id):
+                assert self.actor.run_id == run_id
+                assert self.actor.execution_scheduler is scheduler
+                stage_actors.append(self.actor)
+                entered_plan.set()
+                await hold_plan.wait()
+
+        def components_factory(store, pool, lock_connection):
+            assert isinstance(store, PostgreSQLRuntimeStore)
+            assert store.pool is pool
+            assert store._write_connection is lock_connection
+            app_owner_id = uuid4()
+            cas = FileHostCAS(tmp_path / "cas")
+            infrastructure = AgentGraphInfrastructure(
+                provider_registry=ProviderRegistry({}),
+                context_manager=ContextManager(),
+                tool_gateway=object(),
+                runtime_store=store,
+                host_cas=cas,
+                cas_references=store,
+                usage_sink=object(),
+                run_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="run",
+                    owner_kind="run",
+                    owner_id=app_owner_id,
+                ),
+                draft_graph_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="draft",
+                    owner_kind="draft",
+                    owner_id=app_owner_id,
+                ),
+                agent_run_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="agent",
+                    owner_kind="run",
+                    owner_id=app_owner_id,
+                ),
+            )
+
+            def actor_factory(run_id, actor_store):
+                factory_calls.append((run_id, actor_store))
+                actor = RunActor(run_id, actor_store, execution_scheduler=scheduler)
+                created_actors.append(actor)
+                return actor
+
+            assembly = RuntimeGraphAssembly(
+                infrastructure,
+                plan_stage_factory=lambda _infra, received_actor: WaitingPlanStage(
+                    received_actor
+                ),
+                verifier_factory=lambda _infra, _actor: object(),
+                reporter_factory=lambda _infra, _actor: object(),
+                draft_agent_runner_factory=lambda _infra, _owner: object(),
+                create_run_service_factory=lambda _infra, _owner: object(),
+            )
+            from codemigrator.asgi import ProductionRunComponents
+
+            return ProductionRunComponents(
+                preflight=PassingPreflight(),
+                graph_assembly=assembly,
+                actor_factory=actor_factory,
+                durable_checkpointer=True,
+            )
+
+        app = create_production_app(
+            dsn,
+            config=ApiConfig(token="synthetic-token"),
+            run_components_factory=components_factory,
+            stop_server=noop_server_stop,
+            pool_server_settings={"search_path": schema},
+        )
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+            ) as client:
+                response = await client.post(
+                    "/api/v1/migrations",
+                    json=create_run_payload(),
+                    headers={
+                        "Authorization": "Bearer synthetic-token",
+                        "Idempotency-Key": "runtime-components-factory",
+                    },
+                )
+            assert response.status_code == 201
+            await asyncio.wait_for(entered_plan.wait(), timeout=2)
+            assert len(factory_calls) == 1
+            assert factory_calls[0][1] is stage_actors[0].store
+            assert stage_actors == created_actors
+
+
+def test_production_run_owner_rejects_assembly_for_another_store(tmp_path: Path):
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from codemigrator.asgi import ProductionRunComponents, create_production_run_owner
+    from codemigrator.runtime.graph_composition import (
+        AgentGraphInfrastructure,
+        RuntimeGraphAssembly,
+        RuntimeGraphConfigurationError,
+    )
+    from codemigrator.runtime.provider import ProviderRegistry
+    from codemigrator.runtime.store import InMemoryRuntimeStore
+
+    application_store = InMemoryRuntimeStore()
+    assembly_store = InMemoryRuntimeStore()
+    assembly = RuntimeGraphAssembly(
+        AgentGraphInfrastructure(
+            provider_registry=ProviderRegistry({}),
+            context_manager=object(),
+            tool_gateway=object(),
+            runtime_store=assembly_store,
+            host_cas=object(),
+            cas_references=assembly_store,
+            usage_sink=object(),
+            run_checkpointer=InMemorySaver(),
+            draft_graph_checkpointer=InMemorySaver(),
+            agent_run_checkpointer=InMemorySaver(),
+        ),
+        plan_stage_factory=lambda _infra, _actor: object(),
+        verifier_factory=lambda _infra, _actor: object(),
+        reporter_factory=lambda _infra, _actor: object(),
+        draft_agent_runner_factory=lambda _infra, _owner: object(),
+        create_run_service_factory=lambda _infra, _owner: object(),
+    )
+    components = ProductionRunComponents(
+        preflight=PassingPreflight(),
+        graph_assembly=assembly,
+        actor_factory=RunActor,
+        durable_checkpointer=True,
+    )
+
+    with pytest.raises(RuntimeGraphConfigurationError, match="application RuntimeStore"):
+        create_production_run_owner(application_store, components)
+
+
+@pytest.mark.asyncio
 async def test_lock_connection_loss_revokes_api_and_stops_server_immediately():
     dsn = os.environ.get("CODEMIGRATOR_TEST_PG_DSN")
     if not dsn:

@@ -99,3 +99,23 @@ def test_assembly_compiles_both_graphs_with_the_injected_runtime_dependencies(tm
         "draft_runner",
         "create_run",
     }
+
+
+def test_run_graph_starter_is_bound_to_assembly_and_requires_durable_attestation(tmp_path):
+    infra = infrastructure(tmp_path)
+    assembly = RuntimeGraphAssembly(
+        infra,
+        plan_stage_factory=lambda _infra, _actor: object(),
+        verifier_factory=lambda _infra, _actor: object(),
+        reporter_factory=lambda _infra, _actor: object(),
+        draft_agent_runner_factory=lambda _infra, _owner: object(),
+        create_run_service_factory=lambda _infra, _owner: object(),
+    )
+
+    with pytest.raises(ValueError, match="durable checkpointer"):
+        assembly.build_run_graph_starter(durable_checkpointer=False)  # type: ignore[arg-type]
+
+    starter = assembly.build_run_graph_starter(durable_checkpointer=True)
+
+    assert starter.receipt_idempotent is True
+    assert starter._graph_factory.__self__ is assembly

@@ -1321,11 +1321,20 @@ def _has_agent_run_event(
     )
 
 
+RunActorFactory = Callable[[RunId, RuntimeStore], RunActor]
+
+
 class ActorRegistry:
     """Keep exactly one in-memory actor for each non-terminal Run."""
 
-    def __init__(self, store: RuntimeStore) -> None:
+    def __init__(
+        self,
+        store: RuntimeStore,
+        *,
+        actor_factory: RunActorFactory | None = None,
+    ) -> None:
         self.store = store
+        self._actor_factory = actor_factory or RunActor
         self._actors: dict[RunId, RunActor] = {}
         self._lock = asyncio.Lock()
         self._retiring_tasks: set[asyncio.Task[None]] = set()
@@ -1335,9 +1344,27 @@ class ActorRegistry:
     def active_actor_count(self) -> int:
         return len(self._actors)
 
+    def create_actor(self, run_id: RunId) -> RunActor:
+        """Create an unstarted actor through the configured runtime factory."""
+
+        actor = self._actor_factory(run_id, self.store)
+        self._validate_factory_actor(actor, run_id)
+        return actor
+
+    def _validate_factory_actor(self, actor: RunActor, run_id: RunId) -> None:
+        if (
+            not isinstance(actor, RunActor)
+            or actor.run_id != run_id
+            or actor.store is not self.store
+        ):
+            raise StoreCommitError(
+                "RunActor factory returned a different Run owner or RuntimeStore"
+            )
+
     async def register_committed(self, actor: RunActor) -> RunActor:
         """Keep the actor whose CreateRun facts committed in the shared transaction."""
 
+        self._validate_factory_actor(actor, actor.run_id)
         async with self._lock:
             if not self._admission_open:
                 actor.close_admission()
@@ -1377,7 +1404,7 @@ class ActorRegistry:
                 raise StoreCommitError("Run actor registry is closed")
             if snapshot is None or snapshot.state.status in _TERMINAL_STATUSES:
                 return None
-            actor = RunActor(run_id, self.store)
+            actor = self.create_actor(run_id)
             await actor.start()
             self._actors[run_id] = actor
             return actor
@@ -1418,6 +1445,7 @@ __all__ = [
     "ExecutionSchedulerPort",
     "RepairAdvicePort",
     "RunActor",
+    "RunActorFactory",
 ]
 
 

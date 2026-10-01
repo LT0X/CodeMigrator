@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from codemigrator.core import CreateRun, FailureReason, RunId, StableErrorCode
 
-from .actor import ActorRegistry, RunActor, RunCommandRejected
+from .actor import ActorRegistry, RunActor, RunActorFactory, RunCommandRejected
 from .contracts import RunCreatedReceipt, RunState, RuntimeStoreTransaction
 from .run_graph import RunWorkflowGraph
 from .store import RuntimeStore, StoreCommitError
@@ -137,13 +137,14 @@ class RunCreationOwner:
         store: RuntimeStore,
         preflight: CreateRunPreflightPort,
         graph_starter: RunGraphStarter | ActorBoundRunGraphStarter,
+        actor_factory: RunActorFactory | None = None,
     ) -> None:
         if getattr(graph_starter, "receipt_idempotent", None) is not True:
             raise ValueError("Run graph starter must guarantee receipt-idempotent recovery")
         self.store = store
         self.preflight = preflight
         self.graph_starter = graph_starter
-        self._actors = ActorRegistry(store)
+        self._actors = ActorRegistry(store, actor_factory=actor_factory)
         self._pending_committed_actors: dict[RunId, RunActor] = {}
         self._actor_selection_lock = asyncio.Lock()
         self._admission_open = True
@@ -180,7 +181,7 @@ class RunCreationOwner:
             raise StoreCommitError("Run creation owner is closed")
 
         run_id = RunId(uuid4())
-        actor = RunActor(run_id, self.store)
+        actor = self._actors.create_actor(run_id)
         transaction.after_rollback(lambda: self._actors.stop_after_rollback(actor))
         await actor.start_new()
         try:

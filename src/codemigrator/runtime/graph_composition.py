@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, cast
 from uuid import UUID
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from .actor import RunActor
 from .cas import CasReferenceStore, FileHostCAS
-from .create_run import CreateRunService
+from .create_run import CreateRunService, RunWorkflowGraphStarter
 from .draft_graph import (
     DraftAgentRunnerPort,
     DraftOwnerPort,
@@ -130,6 +131,23 @@ class RuntimeGraphAssembly:
             verifier=verifier,
             reporter=reporter,
             checkpointer=self.infrastructure.run_checkpointer,
+        )
+
+    def build_run_graph_starter(
+        self, *, durable_checkpointer: Literal[True]
+    ) -> RunWorkflowGraphStarter:
+        """Create an idempotent starter bound to this assembly's Run graph factory.
+
+        The host attests that the injected saver persists across process restarts;
+        an in-memory saver is valid for tests but cannot satisfy this production gate.
+        """
+
+        graph_factory = cast(
+            Callable[[RunActor], RunWorkflowGraph], self.build_run_graph
+        )
+        return RunWorkflowGraphStarter(
+            graph_factory,
+            durable_checkpointer=durable_checkpointer,
         )
 
     def build_draft_graph(self, owner: DraftOwnerPort) -> MigrationSessionGraph:
