@@ -195,6 +195,129 @@ async def test_draft_event_wait_wakes_after_commit() -> None:
     await asyncio.wait_for(waiter, 1)
 
 
+@pytest.mark.asyncio
+async def test_api_command_commits_and_replays_draft_owner_receipt_atomically() -> None:
+    store = InMemoryRuntimeStore()
+    draft_id = uuid4()
+    question_id = str(uuid4())
+    event = DraftSessionEventSpec("session.question.asked", {"question_id": question_id})
+    body = b'{"kind":"DRAFT"}'
+
+    async def command(transaction):
+        return await store.commit_draft_owner_fact(
+            draft_id,
+            "draft.created",
+            "draft.created",
+            {"revision": 0},
+            events=(event,),
+            transaction=transaction,
+        )
+
+    def project(receipt):
+        return {"session_id": str(receipt.draft_id), "revision": 0}
+
+    def owner(receipt):
+        return ("draft", receipt.draft_id, receipt.receipt_key)
+
+    first = await store.execute_api_command(
+        principal_id="local",
+        route="/api/v1/sessions",
+        key="create-draft-1",
+        canonical_body=body,
+        status_code=201,
+        command=command,
+        project_response=project,
+        owner_receipt=owner,
+    )
+    replay = await store.execute_api_command(
+        principal_id="local",
+        route="/api/v1/sessions",
+        key="create-draft-1",
+        canonical_body=body,
+        status_code=201,
+        command=lambda _transaction: pytest.fail("replayed owner command ran twice"),
+        project_response=project,
+        owner_receipt=owner,
+    )
+    conflict = await store.execute_api_command(
+        principal_id="local",
+        route="/api/v1/sessions",
+        key="create-draft-1",
+        canonical_body=b'{"kind":"DIFFERENT"}',
+        status_code=201,
+        command=lambda _transaction: pytest.fail("conflicting owner command ran"),
+        project_response=project,
+        owner_receipt=owner,
+    )
+
+    assert first["replayed"] is False
+    assert replay["replayed"] is True
+    assert replay["response"] == {"session_id": str(draft_id), "revision": 0}
+    assert conflict == {"conflict": True, "replayed": False}
+    assert await store.load_draft_owner_fact(draft_id, "draft.created") is not None
+    assert [item.sequence for item in await store.read_draft_session_events(draft_id, 0)] == [1]
+
+
+@pytest.mark.asyncio
+async def test_api_command_projection_failure_rolls_back_draft_fact_and_event() -> None:
+    store = InMemoryRuntimeStore()
+    draft_id = uuid4()
+    event = DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())})
+    body = b'{"kind":"DRAFT"}'
+
+    async def command(transaction):
+        return await store.commit_draft_owner_fact(
+            draft_id,
+            "draft.created",
+            "draft.created",
+            {"revision": 0},
+            events=(event,),
+            transaction=transaction,
+        )
+
+    with pytest.raises(RuntimeError, match="projection failed"):
+        await store.execute_api_command(
+            principal_id="local",
+            route="/api/v1/sessions",
+            key="create-draft-rollback",
+            canonical_body=body,
+            status_code=201,
+            command=command,
+            project_response=lambda _receipt: (_ for _ in ()).throw(
+                RuntimeError("projection failed")
+            ),
+            owner_receipt=lambda receipt: (
+                "draft",
+                receipt.draft_id,
+                receipt.receipt_key,
+            ),
+        )
+
+    assert await store.load_draft_owner_fact(draft_id, "draft.created") is None
+    assert await store.list_draft_owner_facts(draft_id) == ()
+    assert await store.read_draft_session_events(draft_id, 0) == ()
+
+    committed = await store.execute_api_command(
+        principal_id="local",
+        route="/api/v1/sessions",
+        key="create-draft-rollback",
+        canonical_body=body,
+        status_code=201,
+        command=command,
+        project_response=lambda receipt: {
+            "session_id": str(receipt.draft_id),
+            "revision": 0,
+        },
+        owner_receipt=lambda receipt: (
+            "draft",
+            receipt.draft_id,
+            receipt.receipt_key,
+        ),
+    )
+    assert committed["replayed"] is False
+    assert len(await store.read_draft_session_events(draft_id, 0)) == 1
+
+
 def test_session_event_projection_discards_internal_details_and_redacts_secret() -> None:
     registry = SecretRegistry()
     registry.register("sensitive-token")

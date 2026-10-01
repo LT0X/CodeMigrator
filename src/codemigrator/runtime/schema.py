@@ -34,6 +34,21 @@ CREATE TABLE IF NOT EXISTS api_command_receipts (
     )
 );
 
+ALTER TABLE api_command_receipts
+    DROP CONSTRAINT IF EXISTS api_command_receipts_check;
+ALTER TABLE api_command_receipts
+    DROP CONSTRAINT IF EXISTS api_command_receipts_owner_reference_check;
+ALTER TABLE api_command_receipts
+    ADD CONSTRAINT api_command_receipts_owner_reference_check CHECK (
+        (owner_kind IS NULL AND owner_id IS NULL AND owner_receipt_key IS NULL)
+        OR (
+            owner_kind IS NOT NULL
+            AND owner_kind IN ('run', 'draft')
+            AND owner_id IS NOT NULL
+            AND owner_receipt_key IS NOT NULL
+        )
+    );
+
 CREATE TABLE IF NOT EXISTS run_graph_start_handoffs (
     run_id uuid PRIMARY KEY REFERENCES runtime_runs(run_id),
     receipt_key text NOT NULL CHECK (length(btrim(receipt_key)) BETWEEN 1 AND 256),
