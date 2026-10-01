@@ -21,6 +21,7 @@ from codemigrator.runtime.draft_graph import (
     DraftAgentCompletion,
     DraftFlowOwner,
     MigrationSessionGraph,
+    artifact_proposal_task_key,
     coordinator_task_key,
     exploration_task_key,
     trial_translation_task_key,
@@ -28,6 +29,7 @@ from codemigrator.runtime.draft_graph import (
 from codemigrator.runtime.draft_models import (
     AskUserAnswer,
     AskUserQuestion,
+    DraftArtifacts,
     ExplorationReport,
     QuestionOption,
 )
@@ -207,6 +209,97 @@ def _split_reassignment_bytes() -> bytes:
 
 
 @pytest.mark.asyncio
+async def test_artifact_proposal_agent_result_materializes_revision_and_public_event(
+    tmp_path, artifacts
+) -> None:
+    import json
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    revised_blueprint = artifacts.target_project_blueprint.model_copy(
+        update={"version": 2}
+    )
+    proposed = DraftArtifacts.model_validate(
+        {
+            "spec": artifacts.spec,
+            "understanding_dossier": artifacts.understanding_dossier,
+            "target_project_blueprint": revised_blueprint,
+            "migration_rulebook": artifacts.migration_rulebook,
+        }
+    )
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    logical_task_key = artifact_proposal_task_key(2, "message-1")
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    await owner.persist_current_revision()
+    event_cursor = len(await store.read_draft_session_events(draft_id, 0))
+
+    class Runner:
+        async def run(self, owner_id, task_key, task, *, lifecycle):  # type: ignore[no-untyped-def]
+            assert owner_id == draft_id
+            assert task_key == logical_task_key
+            assert task == "Revise the draft for the user's message."
+            created = await store.create_or_get_agent_run(_agent_run(owner_id, task_key))
+            await lifecycle.started(created)
+            result_reference = await CasLedger(cas, store).put(
+                proposed.model_dump_json(by_alias=True).encode("utf-8"),
+                "draft",
+                owner_id,
+                f"agent-result:{created.agent_run_id}",
+            )
+            terminal = replace(
+                created,
+                state=SessionState.Closed,
+                exit=SessionExit.Completed,
+                result_sha256=result_reference.digest,
+            )
+            receipt = AgentRunReceipt(
+                uuid4(), terminal.agent_run_id, "draft.artifacts.completed"
+            )
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            return DraftAgentCompletion(terminal, receipt, result_reference)
+
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=Runner(),
+    )
+
+    completion = await graph.propose_artifacts(
+        "Revise the draft for the user's message.", message_key="message-1"
+    )
+
+    assert completion.materialized == proposed
+    assert flow.ledger.current_revision is not None
+    assert flow.ledger.current_revision.revision_number == 2
+    events = await store.read_draft_session_events(draft_id, event_cursor)
+    assert [event.event_type for event in events] == [
+        "agent_run.started",
+        "agent_run.terminal",
+        "session.draft_revision.created",
+    ]
+    revision_event = events[-1]
+    assert revision_event.data["revision"] == 2
+    assert set(revision_event.data["artifacts"]) == {
+        "spec",
+        "understanding_dossier",
+        "target_project_blueprint",
+        "migration_rulebook",
+    }
+    persisted = await store.load_draft_owner_fact(
+        draft_id, f"draft.agent.result:{completion.record.agent_run_id}"
+    )
+    assert persisted is not None and persisted[1]["result_type"] == "DraftArtifacts"
+    assert "canonical_bytes" not in json.dumps(revision_event.data)
+
+
+@pytest.mark.asyncio
 async def test_draft_graph_interrupts_and_resumes_after_durable_answer_receipt(
     tmp_path, artifacts
 ) -> None:
@@ -224,9 +317,31 @@ async def test_draft_graph_interrupts_and_resumes_after_durable_answer_receipt(
 
     question_receipt = await graph.ask_user(question)
     question_events = await store.read_draft_session_events(draft_id, 0)
-    assert [(event.event_type, event.data) for event in question_events] == [
-        ("session.question.asked", {"question_id": str(question.question_id)})
+    assert [event.event_type for event in question_events] == [
+        "session.draft_revision.created",
+        "session.question.asked",
     ]
+    revision_event, question_event = question_events
+    assert revision_event.data["revision"] == 1
+    assert set(revision_event.data["artifacts"]) == {
+        "spec",
+        "understanding_dossier",
+        "target_project_blueprint",
+        "migration_rulebook",
+    }
+    assert [item["name"] for item in revision_event.data["artifact_snapshots"]] == [
+        "spec",
+        "understanding_dossier",
+        "target_project_blueprint",
+        "migration_rulebook",
+    ]
+    assert question_event.data == {
+        "question_id": str(question.question_id),
+        "revision": 1,
+        "prompt": question.prompt,
+        "options": [option.model_dump(mode="json") for option in question.options],
+        "allow_free_text": question.allow_free_text,
+    }
     paused = await graph._graph.aget_state(graph.config)
     assert paused is not None
     assert paused.values["draft_id"] == str(draft_id)
@@ -258,9 +373,9 @@ async def test_draft_graph_interrupts_and_resumes_after_durable_answer_receipt(
         selected_option="keep",
     )
     answer_receipt = await resumed_graph.answer_user(answer)
-    answer_events = await store.read_draft_session_events(draft_id, 1)
+    answer_events = await store.read_draft_session_events(draft_id, 2)
     assert [(event.sequence, event.event_type, event.data) for event in answer_events] == [
-        (2, "session.question.answered", {"question_id": str(question.question_id)})
+        (3, "session.question.answered", {"question_id": str(question.question_id)})
     ]
     completed = await resumed_graph._graph.aget_state(resumed_graph.config)
     assert completed is not None and completed.next == ()
@@ -1650,3 +1765,173 @@ async def test_successful_attach_commits_once_then_releases_draft_threads(
         await graph.attach_to_run(new_uuid7(), request)
     with pytest.raises(DraftConflictError, match="attached Draft"):
         await graph.close()
+
+
+def test_draft_turn_is_a_closed_question_or_artifacts_choice(artifacts) -> None:
+    from pydantic import ValidationError
+
+    import codemigrator.runtime.draft_models as draft_models
+
+    assert hasattr(draft_models, "DraftQuestionTurn")
+    assert hasattr(draft_models, "DraftArtifactsTurn")
+    assert hasattr(draft_models, "DraftTurn")
+    DraftQuestionTurn = draft_models.DraftQuestionTurn
+    DraftTurn = draft_models.DraftTurn
+
+    flow, _ = _flow(artifacts)
+    revision = flow.ledger.current_revision
+    assert revision is not None
+    question = AskUserQuestion(
+        revision_id=revision.revision_id,
+        prompt="Which migration policy should be used?",
+        options=(
+            QuestionOption(
+                key="preserve",
+                label="Preserve",
+                impact="Retains current behavior.",
+                recommended=True,
+            ),
+            QuestionOption(
+                key="simplify",
+                label="Simplify",
+                impact="May change current behavior.",
+                recommended=False,
+            ),
+        ),
+    )
+
+    question_turn = DraftTurn.model_validate(
+        {"kind": "question", "question": question.model_dump(mode="json")}
+    )
+    artifact_turn = DraftTurn.model_validate(
+        {"kind": "artifacts", "artifacts": artifacts.model_dump(mode="json", by_alias=True)}
+    )
+
+    assert isinstance(question_turn.root, DraftQuestionTurn)
+    assert question_turn.root.question == question
+    assert artifact_turn.root.kind == "artifacts"
+    with pytest.raises(ValidationError):
+        DraftTurn.model_validate(
+            {
+                "kind": "question",
+                "question": question.model_dump(mode="json"),
+                "artifacts": artifacts.model_dump(mode="json", by_alias=True),
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_propose_turn_persists_ask_user_result_and_recovers_outer_interrupt(
+    tmp_path, artifacts
+) -> None:
+    from dataclasses import replace
+
+    import codemigrator.runtime.draft_graph as draft_graph
+    import codemigrator.runtime.draft_models as draft_models
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    assert hasattr(draft_graph, "draft_turn_task_key")
+    assert hasattr(draft_models, "DraftTurn")
+    draft_turn_task_key = draft_graph.draft_turn_task_key
+    DraftTurn = draft_models.DraftTurn
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    revision = flow.ledger.current_revision
+    assert revision is not None
+    question = AskUserQuestion(
+        revision_id=revision.revision_id,
+        prompt="Which migration policy should be used?",
+        options=(
+            QuestionOption(
+                key="preserve",
+                label="Preserve",
+                impact="Retains current behavior.",
+                recommended=True,
+            ),
+            QuestionOption(
+                key="simplify",
+                label="Simplify",
+                impact="May change current behavior.",
+                recommended=False,
+            ),
+        ),
+    )
+    turn = DraftTurn.model_validate(
+        {"kind": "question", "question": question.model_dump(mode="json")}
+    )
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+
+    class Runner:
+        async def run(self, owner_id, task_key, task, *, lifecycle):  # type: ignore[no-untyped-def]
+            assert task_key == draft_turn_task_key(1, "message-1")
+            assert task == "Clarify the unresolved migration choice."
+            record = await store.create_or_get_agent_run(_agent_run(owner_id, task_key))
+            await lifecycle.started(record)
+            result = await CasLedger(cas, store).put(
+                turn.model_dump_json(by_alias=True).encode("utf-8"),
+                "draft",
+                owner_id,
+                f"agent-result:{record.agent_run_id}",
+            )
+            terminal = replace(
+                record,
+                state=SessionState.Closed,
+                exit=SessionExit.Completed,
+                result_sha256=result.digest,
+            )
+            receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, "draft.turn.completed")
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            return DraftAgentCompletion(terminal, receipt, result)
+
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=Runner(),
+    )
+    await owner.persist_current_revision()
+
+    completion = await graph.propose_turn(
+        "Clarify the unresolved migration choice.", message_key="message-1", revision_number=1
+    )
+
+    assert completion.result is not None
+    question_fact = await store.load_draft_owner_fact(
+        draft_id, f"draft.question:{question.question_id}"
+    )
+    assert question_fact is not None
+    assert question_fact[1] == question.model_dump(mode="json")
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert [event.event_type for event in events] == [
+        "session.draft_revision.created",
+        "agent_run.started",
+        "agent_run.terminal",
+        "session.question.asked",
+    ]
+    assert events[-1].data["question_id"] == str(question.question_id)
+    paused = await graph._graph.aget_state(graph.config)
+    assert paused is not None and paused.tasks and paused.tasks[0].interrupts
+
+    restarted_graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=DraftFlow(), store=store),
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        thread_id=graph.thread_id,
+        agent_runner=Runner(),
+    )
+    await restarted_graph.restore()
+    answer = AskUserAnswer(
+        question_id=question.question_id,
+        revision_id=question.revision_id,
+        selected_option="preserve",
+    )
+    answer_receipt = await restarted_graph.answer_user(answer)
+    assert answer_receipt.receipt_key == f"draft.answer:{question.question_id}"
+    state = await restarted_graph._graph.aget_state(restarted_graph.config)
+    assert state is not None and state.next == ()

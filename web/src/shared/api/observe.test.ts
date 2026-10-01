@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { observeRun } from "./observe";
+import { observeRun, observeSession } from "./observe";
 import type { ApiClient } from "./client";
 
 const client = (streamEvents: ApiClient["streamEvents"]): ApiClient => ({
@@ -9,6 +9,8 @@ const client = (streamEvents: ApiClient["streamEvents"]): ApiClient => ({
   getReport: async () => ({ run_id: "run", status: "COMPLETED" }),
   getEvidence: async () => ({}),
   getHealth: async () => ({ app: "healthy", postgres: "healthy", sandbox: "ready", optional_profiles: {} }),
+  listProjects: async () => [],
+  createDraftSession: async () => ({ session_id: "s", status: "OPEN", revision: 0 }),
   sendSessionMessage: async () => ({ session_id: "s", status: "OPEN", revision: 1 }),
   answerSession: async () => ({ session_id: "s", status: "OPEN", revision: 1 }),
   confirmSession: async () => ({ session_id: "s", status: "OPEN", revision: 1 }),
@@ -66,5 +68,27 @@ describe("live observation", () => {
 
     expect(received).toEqual([5]);
     expect(phases).toEqual(["start", "end"]);
+  });
+
+  it("reconnects from the last contiguous session sequence after a replay gap", async () => {
+    const cursors: number[] = [];
+    let attempts = 0;
+    const source = client(async function* () { yield* events(); });
+    source.streamSessionEvents = async function* (_sessionId, afterSequence) {
+      cursors.push(afterSequence);
+      attempts += 1;
+      if (attempts === 1) {
+        yield { schema: "migration.session.event", version: 1, type: "session.message.received", sequence: 2, data: {}, timestamp_utc: "", sse_id: "2" };
+        return;
+      }
+      yield { schema: "migration.session.event", version: 1, type: "session.message.received", sequence: 1, data: {}, timestamp_utc: "", sse_id: "1" };
+      yield { schema: "migration.session.event", version: 1, type: "session.message.received", sequence: 2, data: {}, timestamp_utc: "", sse_id: "2" };
+    };
+    const received: number[] = [];
+
+    for await (const event of observeSession(source, "session")) received.push(event.sequence);
+
+    expect(cursors).toEqual([0, 0]);
+    expect(received).toEqual([1, 2]);
   });
 });

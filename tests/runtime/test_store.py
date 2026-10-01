@@ -254,6 +254,8 @@ async def test_draft_terminal_cursor_uses_only_committed_terminal_event_types():
 
     from codemigrator.runtime.contracts import DraftSessionEventSpec
 
+    from .conftest import draft_question_event
+
     store = InMemoryRuntimeStore()
     draft_id = uuid4()
     await store.commit_draft_owner_fact(
@@ -261,7 +263,7 @@ async def test_draft_terminal_cursor_uses_only_committed_terminal_event_types():
         "close-fact-without-close-event",
         "draft.closed",
         {},
-        events=(DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())}),),
+        events=(draft_question_event(),),
     )
     assert await store.is_draft_session_terminal(draft_id, 1) is False
 

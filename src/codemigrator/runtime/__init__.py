@@ -55,6 +55,7 @@ from .contracts import (
     ExecuteRoundResult,
     ExecutionReceiptMessage,
     ExecutionRoundDecision,
+    IntegrationReceipt,
     RecoveryCommandMessage,
     ReportSummary,
     RunCreatedReceipt,
@@ -106,6 +107,7 @@ from .integration import (
     IntegrationStart,
     RepairRetryBudget,
 )
+from .integration_driver import IntegrationRecoveryError, RunIntegrationDriver
 from .langchain_agent import (
     BoundAgentRun,
     GovernedContextMiddleware,
@@ -362,6 +364,7 @@ __all__ = [
     "BudgetUsage",
     "CandidateCheckpointClaim",
     "CandidateCheckpointFact",
+    "IntegrationReceipt",
     "CandidateCheckpointVerifier",
     "CandidateCheckpointVerifierPort",
     "CandidateSnapshotPort",
@@ -409,8 +412,10 @@ __all__ = [
     "InMemoryAdvisoryLock",
     "InMemoryRuntimeStore",
     "IntegrationCoordinator",
+    "IntegrationRecoveryError",
     "IntegrationItem",
     "IntegrationStart",
+    "RunIntegrationDriver",
     "LockedModelBinding",
     "ModelAction",
     "NormalizationError",

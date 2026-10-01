@@ -10,6 +10,7 @@ import pytest
 from codemigrator.runtime.contracts import DraftSessionEventSpec
 from codemigrator.runtime.store import StoreCommitError
 
+from .conftest import draft_question_event
 from .test_agent_runs_postgres import isolated_store
 
 
@@ -17,7 +18,7 @@ from .test_agent_runs_postgres import isolated_store
 async def test_postgres_concurrent_replay_has_one_fact_and_one_event() -> None:
     async with isolated_store() as store:
         draft_id = uuid4()
-        event = DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())})
+        event = draft_question_event()
 
         async def commit():
             return await store.commit_draft_owner_fact(
@@ -40,7 +41,7 @@ async def test_postgres_concurrent_replay_has_one_fact_and_one_event() -> None:
                 "draft.ask_user.question",
                 {"private": "body"},
                 events=(
-                    DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())}),
+                    draft_question_event(),
                 ),
             )
         with pytest.raises(StoreCommitError, match="replay mismatch"):

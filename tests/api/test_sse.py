@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from codemigrator.api.deps import EventRecord
-from codemigrator.api.dto import SessionEvent
+from codemigrator.api.dto import MigrationEvent, SessionEvent
 from codemigrator.api.sse import (
     ConnectionLimitError,
     SseConnectionManager,
@@ -316,6 +316,41 @@ def test_persisted_run_and_draft_events_adapt_without_changing_fields() -> None:
         {"question_id": "q-1"},
     )
     assert adapted_run.timestamp_utc == adapted_draft.timestamp_utc == timestamp
+
+
+def test_migration_events_project_only_safe_integration_fields() -> None:
+    timestamp = datetime(2026, 10, 2, 10, 11, 12, tzinfo=UTC)
+    slice_id = str(uuid4())
+    completed = MigrationEvent(
+        type="integration.completed",
+        data={
+            "receipt_key": "integration.completed:private-key",
+            "slice_id": slice_id,
+            "generation": 1,
+            "verified_commit_oid": "a" * 40,
+            "provider_response": "private integration details",
+        },
+        sequence=1,
+        timestamp_utc=timestamp,
+    )
+    advanced = MigrationEvent(
+        type="verified.advanced",
+        data={
+            "slice_id": slice_id,
+            "generation": 1,
+            "commit_oid": "a" * 40,
+            "source_diff": "private source data",
+        },
+        sequence=2,
+        timestamp_utc=timestamp,
+    )
+
+    assert completed.data == {
+        "slice_id": slice_id,
+        "generation": 1,
+        "verified_commit_oid": "a" * 40,
+    }
+    assert advanced.data == {"slice_id": slice_id, "generation": 1, "commit_oid": "a" * 40}
 
 
 @pytest.mark.asyncio

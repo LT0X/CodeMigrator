@@ -15,6 +15,8 @@ from codemigrator.core import RunId
 from codemigrator.runtime.contracts import DraftSessionEventSpec, EventSpec, RunState
 from codemigrator.runtime.store import PostgreSQLRuntimeStore
 
+from .conftest import draft_question_event
+
 
 @asynccontextmanager
 async def isolated_store(*, legacy_run_id: UUID | None = None):
@@ -110,7 +112,7 @@ async def test_postgres_draft_event_order_and_timestamp_survive_new_store_instan
             "question:asked",
             "draft.ask_user.question",
             {},
-            events=(DraftSessionEventSpec("session.question.asked", {"question_id": question_id}),),
+            events=(draft_question_event(question_id),),
         )
         await store.commit_draft_owner_fact(
             draft_id,
@@ -227,7 +229,7 @@ async def test_postgres_draft_terminal_cursor_uses_persisted_terminal_event_sequ
             "draft.closed",
             {},
             events=(
-                DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())}),
+                draft_question_event(),
             ),
         )
         assert await store.is_draft_session_terminal(draft_id, 1) is False

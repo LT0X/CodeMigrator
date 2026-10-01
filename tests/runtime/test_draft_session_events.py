@@ -14,12 +14,14 @@ from codemigrator.core import SecretRegistry
 from codemigrator.runtime.contracts import DraftSessionEventSpec
 from codemigrator.runtime.store import InMemoryRuntimeStore, StoreCommitError
 
+from .conftest import draft_question_event
+
 
 @pytest.mark.asyncio
 async def test_draft_fact_and_event_replay_is_ordered_idempotent_and_terminal() -> None:
     store = InMemoryRuntimeStore()
     draft_id = uuid4()
-    question = DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())})
+    question = draft_question_event()
     receipt = await store.commit_draft_owner_fact(
         draft_id, "question:1", "draft.ask_user.question", {"prompt": "private"}, events=(question,)
     )
@@ -45,7 +47,7 @@ async def test_draft_fact_and_event_replay_is_ordered_idempotent_and_terminal() 
             "draft.ask_user.question",
             {"prompt": "private"},
             events=(
-                DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())}),
+                draft_question_event(),
             ),
         )
     with pytest.raises(StoreCommitError, match="replay mismatch"):
@@ -85,6 +87,29 @@ async def test_draft_event_validation_failure_rolls_back_fact() -> None:
         )
     assert await store.list_draft_owner_facts(draft_id) == ()
     assert await store.read_draft_session_events(draft_id, 0) == ()
+
+
+@pytest.mark.asyncio
+async def test_confirmation_request_event_is_a_redacted_revision_projection() -> None:
+    store = InMemoryRuntimeStore()
+    draft_id = uuid4()
+    await store.commit_draft_owner_fact(
+        draft_id,
+        "confirm:3",
+        "draft.confirm.requested",
+        {"revision": 3, "prompt": "private confirmation detail"},
+        events=(
+            DraftSessionEventSpec(
+                "session.draft_revision.confirmation_requested",
+                {"revision": 3, "prompt": "private confirmation detail"},
+            ),
+        ),
+    )
+
+    events = await store.read_draft_session_events(draft_id, 0)
+    assert len(events) == 1
+    assert events[0].event_type == "session.draft_revision.confirmation_requested"
+    assert events[0].data == {"revision": 3}
 
 
 @pytest.mark.asyncio
@@ -167,7 +192,7 @@ async def test_draft_terminal_category_rejects_private_error_text() -> None:
 async def test_draft_event_reads_cannot_mutate_committed_payload() -> None:
     store = InMemoryRuntimeStore()
     draft_id = uuid4()
-    spec = DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())})
+    spec = draft_question_event()
     await store.commit_draft_owner_fact(
         draft_id, "question", "draft.ask_user.question", {}, events=(spec,)
     )
@@ -200,7 +225,7 @@ async def test_api_command_commits_and_replays_draft_owner_receipt_atomically() 
     store = InMemoryRuntimeStore()
     draft_id = uuid4()
     question_id = str(uuid4())
-    event = DraftSessionEventSpec("session.question.asked", {"question_id": question_id})
+    event = draft_question_event(question_id)
     body = b'{"kind":"DRAFT"}'
 
     async def command(transaction):
@@ -262,7 +287,7 @@ async def test_api_command_commits_and_replays_draft_owner_receipt_atomically() 
 async def test_api_command_projection_failure_rolls_back_draft_fact_and_event() -> None:
     store = InMemoryRuntimeStore()
     draft_id = uuid4()
-    event = DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())})
+    event = draft_question_event()
     body = b'{"kind":"DRAFT"}'
 
     async def command(transaction):

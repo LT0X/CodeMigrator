@@ -15,6 +15,8 @@ from codemigrator.core import (
     AdviceKind,
     CreateRun,
     FailureReason,
+    GitOid,
+    IntegrationIntent,
     Phase,
     RunId,
     RunStatus,
@@ -318,6 +320,34 @@ class RunActor:
             await self._workflow_command("execute_round", run_id, logical_key, None),
         )
 
+    async def persist_integration_intent(self, intent: IntegrationIntent) -> IntegrationIntent:
+        """Commit M-11's immutable intent before the Git verified-ref CAS."""
+
+        return cast(
+            IntegrationIntent,
+            await self._workflow_command(
+                "integration_intent",
+                RunId(intent.run_id),
+                f"integration.intent:{intent.idempotency_key}",
+                intent,
+            ),
+        )
+
+    async def complete_integration(
+        self, intent: IntegrationIntent, verified_commit_oid: GitOid
+    ) -> ActorPhaseReceipt:
+        """Adopt the M-11 verified head after its external expected-OID CAS succeeds."""
+
+        return cast(
+            ActorPhaseReceipt,
+            await self._workflow_command(
+                "integration_completed",
+                RunId(intent.run_id),
+                f"integration.completed:{intent.idempotency_key}",
+                (intent, verified_commit_oid),
+            ),
+        )
+
     async def commit_verification(
         self, run_id: RunId, result: VerificationSummary, logical_key: str
     ) -> ActorPhaseReceipt:
@@ -428,6 +458,8 @@ class RunActor:
         if event is not None:
             if command.kind == "agent_run_terminal":
                 await self._validate_agent_run_terminal_replay(command)
+            elif command.kind == "integration_completed":
+                await self._validate_integration_replay(command, event.sequence)
             receipt = ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
             if command.kind == "execute_round":
                 command.response.set_result(
@@ -447,12 +479,141 @@ class RunActor:
             await self._record_agent_run_started(command, state)
         elif command.kind == "agent_run_terminal":
             await self._record_agent_run_terminal(command, state, snapshot)
+        elif command.kind == "integration_intent":
+            await self._persist_integration_intent(command, state)
+        elif command.kind == "integration_completed":
+            await self._record_integration_completed(command, state)
         elif command.kind == "verification":
             await self._commit_verification(command, state)
         elif command.kind == "report":
             await self._commit_report(command, state)
         else:
             raise ValueError("unsupported Run workflow command")
+
+    async def _persist_integration_intent(
+        self, command: WorkflowCommandMessage, state: RunState
+    ) -> None:
+        intent = command.payload
+        if (
+            not isinstance(intent, IntegrationIntent)
+            or intent.run_id != self.run_id
+            or state.status is not RunStatus.Executing
+            or state.frozen_plan_sha256 is None
+        ):
+            raise StoreCommitError("integration intent failed Run owner validation")
+        if not any(
+            fact.slice_id == intent.slice_id and fact.generation == int(intent.generation)
+            for fact in state.candidate_checkpoints
+        ):
+            raise StoreCommitError("integration intent requires an accepted M-08 candidate")
+        key = str(intent.idempotency_key)
+        if command.logical_key != f"integration.intent:{key}":
+            raise StoreCommitError("integration intent command identity mismatch")
+        existing = await self.store.load_integration_intent(self.run_id, key)
+        if existing is None:
+            latest = await self.store.load_latest_integration_receipt(self.run_id)
+            if latest is not None and latest.verified_commit_oid != intent.expected_verified_oid:
+                raise StoreCommitError(
+                    "integration intent expected head differs from latest receipt"
+                )
+        try:
+            committed = await self.store.persist_integration_intent(intent)
+        except StoreCommitError:
+            raise
+        if committed != intent:
+            raise StoreCommitError("integration intent owner receipt does not match request")
+        command.response.set_result(committed)
+
+    async def _record_integration_completed(
+        self, command: WorkflowCommandMessage, state: RunState
+    ) -> None:
+        if not isinstance(command.payload, tuple) or len(command.payload) != 2:
+            raise ValueError("integration completion payload is invalid")
+        intent, verified_commit_oid = command.payload
+        if not isinstance(intent, IntegrationIntent) or not isinstance(verified_commit_oid, str):
+            raise ValueError("integration completion facts have invalid types")
+        if (
+            intent.run_id != self.run_id
+            or state.status is not RunStatus.Executing
+            or state.frozen_plan_sha256 is None
+            or command.logical_key != f"integration.completed:{intent.idempotency_key}"
+        ):
+            raise StoreCommitError("integration completion failed Run owner validation")
+        if verified_commit_oid != intent.prospective_commit_oid:
+            raise StoreCommitError("verified head does not match the intent")
+        if not any(
+            fact.slice_id == intent.slice_id and fact.generation == int(intent.generation)
+            for fact in state.candidate_checkpoints
+        ):
+            raise StoreCommitError("integration completion requires an accepted M-08 candidate")
+        stored_intent = await self.store.load_integration_intent(
+            self.run_id, str(intent.idempotency_key)
+        )
+        if stored_intent != intent:
+            raise StoreCommitError("integration intent is not durably committed")
+        latest = await self.store.load_latest_integration_receipt(self.run_id)
+        if latest is not None and latest.verified_commit_oid != intent.expected_verified_oid:
+            raise StoreCommitError("integration intent expected head differs from latest receipt")
+        next_state = replace(state, version=state.version + 1)
+        events = (
+            EventSpec(
+                "integration.completed",
+                {
+                    "receipt_key": command.logical_key,
+                    "slice_id": str(intent.slice_id),
+                    "generation": int(intent.generation),
+                    "verified_commit_oid": str(verified_commit_oid),
+                },
+            ),
+            EventSpec(
+                "verified.advanced",
+                {
+                    "slice_id": str(intent.slice_id),
+                    "generation": int(intent.generation),
+                    "commit_oid": str(verified_commit_oid),
+                },
+            ),
+        )
+        receipt = await self.store.commit_integration_receipt(
+            next_state, intent, GitOid(verified_commit_oid), events
+        )
+        committed = await self.store.load(self.run_id)
+        event = _event_for_receipt(committed, command.logical_key)
+        if (
+            receipt.run_id != self.run_id
+            or receipt.idempotency_key != str(intent.idempotency_key)
+            or receipt.verified_commit_oid != verified_commit_oid
+            or committed is None
+            or event is None
+            or receipt.event_sequence != event.sequence
+        ):
+            raise StoreCommitError("integration receipt could not be reloaded")
+        self._state = committed.state
+        command.response.set_result(
+            ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
+        )
+
+    async def _validate_integration_replay(
+        self, command: WorkflowCommandMessage, event_sequence: int
+    ) -> None:
+        if not isinstance(command.payload, tuple) or len(command.payload) != 2:
+            raise ValueError("integration completion payload is invalid")
+        intent, verified_commit_oid = command.payload
+        if not isinstance(intent, IntegrationIntent) or not isinstance(verified_commit_oid, str):
+            raise ValueError("integration completion facts have invalid types")
+        stored_intent = await self.store.load_integration_intent(
+            self.run_id, str(intent.idempotency_key)
+        )
+        receipt = await self.store.load_integration_receipt(
+            self.run_id, str(intent.idempotency_key)
+        )
+        if (
+            stored_intent != intent
+            or receipt is None
+            or receipt.verified_commit_oid != verified_commit_oid
+            or receipt.event_sequence != event_sequence
+        ):
+            raise StoreCommitError("integration receipt replay mismatch")
 
     async def _record_agent_run_started(
         self, command: WorkflowCommandMessage, state: RunState

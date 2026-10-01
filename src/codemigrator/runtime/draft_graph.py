@@ -29,11 +29,16 @@ from .contracts import (
 )
 from .create_run import CreateRunService
 from .draft import DraftConflictError, DraftFlow, DraftLedger, select_trial_paths
+from .draft_events import question_asked_event, revision_confirmed_event, revision_created_event
 from .draft_models import (
     AskUserAnswer,
     AskUserQuestion,
+    DraftArtifacts,
+    DraftArtifactsTurn,
     DraftFreezeReceipt,
+    DraftQuestionTurn,
     DraftStage,
+    DraftTurn,
     ExplorationMerge,
     ExplorationReport,
     ExploreReassignment,
@@ -112,14 +117,27 @@ class _DraftAgentContext:
 
 
 DraftAgentResult: TypeAlias = (
-    ExplorationReport | ExploreReassignment | ExplorationMerge | TrialTranslation
+    ExplorationReport
+    | ExploreReassignment
+    | ExplorationMerge
+    | DraftArtifacts
+    | DraftTurn
+    | TrialTranslation
 )
 
 
 class DraftOwnerPort(Protocol):
-    draft_id: UUID
-    freeze_receipt: DraftFreezeReceipt | None
-    current_revision_id: str | None
+    @property
+    def draft_id(self) -> UUID: ...
+
+    @property
+    def freeze_receipt(self) -> DraftFreezeReceipt | None: ...
+
+    @property
+    def current_revision_id(self) -> str | None: ...
+
+    @property
+    def current_revision_number(self) -> int | None: ...
 
     async def load_fact(
         self, receipt_key: str
@@ -186,6 +204,11 @@ class DraftFlowOwner:
         revision = self.flow.ledger.current_revision
         return str(revision.revision_id) if revision is not None else None
 
+    @property
+    def current_revision_number(self) -> int | None:
+        revision = self.flow.ledger.current_revision
+        return revision.revision_number if revision is not None else None
+
     def validate_trial_group(self, paths: Sequence[str]) -> tuple[str, ...]:
         selected = select_trial_paths(paths)
         revision_id = self.current_revision_id
@@ -232,6 +255,11 @@ class DraftFlowOwner:
                 receipt_key,
                 "draft.task_revision",
                 body,
+                events=(
+                    DraftSessionEventSpec(
+                        "session.draft_revision.created", revision_created_event(revision)
+                    ),
+                ),
             )
         except DraftOwnerFrozenError as exc:
             await self.restore_ledger()
@@ -256,6 +284,14 @@ class DraftFlowOwner:
                 "draft.freeze",
                 "draft.freeze",
                 freeze_receipt.model_dump(mode="json", by_alias=True),
+                events=(
+                    DraftSessionEventSpec(
+                        "session.draft_revision.confirmed",
+                        revision_confirmed_event(
+                            freeze_receipt.revision_id, freeze_receipt.revision_number
+                        ),
+                    ),
+                ),
                 expected_existing_facts=tuple(receipt for receipt, _ in facts),
             )
         except DraftLedgerChangedError as exc:
@@ -283,6 +319,8 @@ class DraftFlowOwner:
             self._trial_revision_id = None
         for receipt, fact in sorted(materialized, key=_agent_result_restore_key):
             result, logical_task_key, agent_run_id = _agent_result_from_fact(receipt, fact)
+            if receipt.receipt_key != f"draft.agent.result:{agent_run_id}":
+                raise StoreCommitError("Draft agent result receipt key is inconsistent")
             trial_group_paths: tuple[str, ...] | None = None
             trial_revision_id: str | None = None
             if isinstance(result, TrialTranslation):
@@ -307,14 +345,39 @@ class DraftFlowOwner:
                 trial_revision_id=trial_revision_id,
                 restoring=True,
             )
+            if isinstance(result, DraftTurn) and isinstance(result.root, DraftQuestionTurn):
+                question = result.root.question
+                question_key = _question_receipt_key(question.question_id)
+                question_fact = await self.store.load_draft_owner_fact(self.draft_id, question_key)
+                if question_fact is None:
+                    if self.flow.ledger.current_revision is None:
+                        raise StoreCommitError(
+                            "stored AskUser AgentRun result has no current Draft revision"
+                        )
+                    self.flow._stage = (
+                        DraftStage.Draft
+                        if self.flow.merged_exploration is not None
+                        else DraftStage.Align
+                    )
+                    await self.commit_question(question)
+                elif question_fact[0].category != "draft.ask_user.question" or question_fact[
+                    1
+                ] != question.model_dump(mode="json"):
+                    raise StoreCommitError(
+                        "stored AskUser AgentRun result conflicts with the question fact"
+                    )
+                self._materialized_agent_results.add(receipt.receipt_key)
+                continue
             self._apply_agent_result(
                 receipt.receipt_key,
                 result,
                 trial_group_paths=trial_group_paths,
                 restoring=True,
             )
-            if receipt.receipt_key != f"draft.agent.result:{agent_run_id}":
-                raise StoreCommitError("Draft agent result receipt key is inconsistent")
+            if isinstance(result, (DraftArtifacts, DraftTurn)) and (
+                not isinstance(result, DraftTurn) or isinstance(result.root, DraftArtifactsTurn)
+            ):
+                await self.persist_current_revision()
 
         if self.flow.ledger.freeze_receipt is not None:
             if self._trial_agent_results:
@@ -364,7 +427,7 @@ class DraftFlowOwner:
             "agent_receipt_id": str(receipt.receipt_id),
             "result_sha256": result_reference.digest,
             "result_type": type(result).__name__,
-            "result": result.model_dump(mode="json"),
+            "result": result.model_dump(mode="json", by_alias=True),
             "trial_group_paths": (
                 list(trial_group_paths)
                 if isinstance(result, TrialTranslation) and trial_group_paths is not None
@@ -387,7 +450,12 @@ class DraftFlowOwner:
             trial_group_paths=trial_group_paths,
             trial_revision_id=trial_revision_id,
         )
-        if isinstance(result, TrialTranslation):
+        is_artifact_turn = isinstance(result, DraftTurn) and isinstance(
+            result.root, DraftArtifactsTurn
+        )
+        if isinstance(result, (DraftArtifacts, TrialTranslation)) or (
+            is_artifact_turn and self.flow.ledger.current_revision is not None
+        ):
             await self.persist_current_revision()
         owner_receipt = (
             previous[0]
@@ -399,13 +467,18 @@ class DraftFlowOwner:
                 fact,
             )
         )
-        if receipt_key not in self._materialized_agent_results:
+        if isinstance(result, DraftTurn) and isinstance(result.root, DraftQuestionTurn):
+            await self.commit_question(result.root.question)
+            self._materialized_agent_results.add(receipt_key)
+        elif receipt_key not in self._materialized_agent_results:
             self._apply_agent_result(
                 receipt_key,
                 result,
                 trial_group_paths=trial_group_paths,
             )
             self._materialized_agent_results.add(receipt_key)
+        if isinstance(result, DraftArtifacts) or is_artifact_turn:
+            await self.persist_current_revision()
         return owner_receipt
 
     def _validate_agent_result(
@@ -465,13 +538,65 @@ class DraftFlowOwner:
             selected_paths = _normalize_trial_group(trial_group_paths)
             if result.file_path not in selected_paths:
                 raise DraftAgentResultInvalid("trial result is outside its selected file group")
-            if (
-                self._trial_group_paths is not None
-                and self._trial_group_paths != selected_paths
-            ):
+            if self._trial_group_paths is not None and self._trial_group_paths != selected_paths:
                 raise DraftConflictError("Draft trial replay changed the selected file group")
             if set(self._trial_agent_results).difference(selected_paths):
                 raise DraftConflictError("Draft trial has results outside its selected file group")
+            return
+        if isinstance(result, DraftArtifacts):
+            target_revision = _artifact_proposal_revision(logical_task_key)
+            current = self.flow.ledger.current_revision
+            expected_revision = 1 if current is None else current.revision_number + 1
+            accepted_revisions = {
+                expected_revision,
+                current.revision_number if current is not None else None,
+            }
+            if target_revision not in accepted_revisions:
+                raise DraftAgentResultInvalid(
+                    "artifact proposal does not match its expected Draft revision"
+                )
+            if not restoring and self.flow.stage not in {
+                DraftStage.Align,
+                DraftStage.Draft,
+                DraftStage.Calibrate,
+            }:
+                raise DraftConflictError("artifact proposals are outside the Draft authoring stage")
+            return
+        if isinstance(result, DraftTurn):
+            target_revision = _draft_turn_revision(logical_task_key)
+            if target_revision is None:
+                raise DraftAgentResultInvalid("Draft turn result does not match its logical task")
+            if isinstance(result.root, DraftQuestionTurn):
+                current = self.flow.ledger.current_revision
+                if (
+                    current is None
+                    or target_revision != current.revision_number
+                    or result.root.question.revision_id != current.revision_id
+                ):
+                    raise DraftAgentResultInvalid(
+                        "AskUser result does not target the current Draft revision"
+                    )
+                if not restoring and self.flow.stage not in {
+                    DraftStage.Align,
+                    DraftStage.Draft,
+                }:
+                    raise DraftConflictError(
+                        "AskUser results are outside the Draft authoring stage"
+                    )
+                return
+            current = self.flow.ledger.current_revision
+            expected_revision = 1 if current is None else current.revision_number + 1
+            if target_revision not in {
+                expected_revision,
+                current.revision_number if current else None,
+            }:
+                raise DraftAgentResultInvalid("Draft turn does not match its expected revision")
+            if not restoring and self.flow.stage not in {
+                DraftStage.Align,
+                DraftStage.Draft,
+                DraftStage.Calibrate,
+            }:
+                raise DraftConflictError("Draft turns are outside the Draft authoring stage")
             return
         raise DraftAgentResultInvalid("Draft AgentRun result type is unsupported")
 
@@ -523,6 +648,21 @@ class DraftFlowOwner:
             self._trial_agent_results[result.file_path] = result
             if set(self._trial_agent_results) == set(selected_paths):
                 self._apply_trial_results()
+        elif isinstance(result, DraftArtifacts):
+            if self.flow.stage is DraftStage.Align:
+                self.flow.seed_artifacts(result)
+            else:
+                self.flow.revise_artifacts(result)
+        elif isinstance(result, DraftTurn):
+            if isinstance(result.root, DraftQuestionTurn):
+                raise DraftAgentResultInvalid(
+                    "AskUser result must be committed before graph interruption"
+                )
+            artifacts = result.root.artifacts
+            if self.flow.stage is DraftStage.Align:
+                self.flow.seed_artifacts(artifacts)
+            else:
+                self.flow.revise_artifacts(artifacts)
         self._materialized_agent_results.add(receipt_key)
 
     def _apply_trial_results(self) -> None:
@@ -605,7 +745,11 @@ class DraftFlowOwner:
                 body,
                 events=(
                     DraftSessionEventSpec(
-                        "session.question.asked", {"question_id": str(question.question_id)}
+                        "session.question.asked",
+                        question_asked_event(
+                            question,
+                            self.flow.ledger.current_revision.revision_number,
+                        ),
                     ),
                 ),
             )
@@ -890,6 +1034,59 @@ class MigrationSessionGraph:
         return await self._run_agent_graph(
             coordinator_task_key(round_number), task, "draft.coordinator.completed"
         )
+
+    async def propose_artifacts(
+        self,
+        task: str,
+        *,
+        message_key: str,
+        revision_number: int | None = None,
+    ) -> DraftAgentCompletion:
+        """Run one typed artifact proposal and materialize its owner revision."""
+
+        current_revision = self.owner.current_revision_number
+        expected_revision = 1 if current_revision is None else current_revision + 1
+        target_revision = expected_revision if revision_number is None else revision_number
+        if target_revision not in {
+            expected_revision,
+            current_revision,
+        }:
+            raise DraftConflictError("artifact proposal revision is stale")
+        return await self._run_agent_graph(
+            artifact_proposal_task_key(target_revision, message_key),
+            task,
+            "draft.artifacts.completed",
+        )
+
+    async def propose_turn(
+        self,
+        task: str,
+        *,
+        message_key: str,
+        revision_number: int | None = None,
+    ) -> DraftAgentCompletion:
+        """Run one typed Draft turn, then interrupt only after its owner receipt commits."""
+
+        current_revision = self.owner.current_revision_number
+        expected_revision = 1 if current_revision is None else current_revision + 1
+        target_revision = expected_revision if revision_number is None else revision_number
+        if target_revision not in {expected_revision, current_revision}:
+            raise DraftConflictError("Draft turn revision is stale")
+        completion = await self._run_agent_graph(
+            draft_turn_task_key(target_revision, message_key),
+            task,
+            "draft.turn.completed",
+        )
+        result = completion.materialized
+        if not isinstance(result, DraftTurn):
+            raise DraftAgentResultInvalid(
+                "Draft turn AgentRun did not materialize a typed DraftTurn"
+            )
+        if isinstance(result.root, DraftQuestionTurn):
+            # The result materializer commits the question fact/event first; this call
+            # then advances the outer graph to its durable AskUser interrupt.
+            await self.ask_user(result.root.question)
+        return completion
 
     async def trial_translate(
         self, risk_hotspots: Sequence[str], tasks_by_file: Mapping[str, str]
@@ -1434,6 +1631,50 @@ def trial_translation_task_key(file_path: str, revision_id: str | UUID) -> str:
     return f"draft.trial:{revision_id}:{_key_digest(_normalize_path(file_path))}"
 
 
+def artifact_proposal_task_key(revision_number: int, message_key: str) -> str:
+    if type(revision_number) is not int or revision_number < 1:
+        raise ValueError("artifact proposal revision number must be positive")
+    return f"draft.artifacts:{revision_number}:{_key_digest(message_key)}"
+
+
+def draft_turn_task_key(revision_number: int, message_key: str) -> str:
+    if type(revision_number) is not int or revision_number < 1:
+        raise ValueError("Draft turn revision number must be positive")
+    return f"draft.turn:{revision_number}:{_key_digest(message_key)}"
+
+
+def _artifact_proposal_revision(logical_task_key: str) -> int | None:
+    prefix = "draft.artifacts:"
+    if not logical_task_key.startswith(prefix):
+        return None
+    parts = logical_task_key.removeprefix(prefix).split(":")
+    if (
+        len(parts) != 2
+        or not parts[0].isdecimal()
+        or parts[0].startswith("0")
+        or len(parts[1]) != 64
+        or any(character not in "0123456789abcdef" for character in parts[1])
+    ):
+        return None
+    return int(parts[0])
+
+
+def _draft_turn_revision(logical_task_key: str) -> int | None:
+    prefix = "draft.turn:"
+    if not logical_task_key.startswith(prefix):
+        return None
+    parts = logical_task_key.removeprefix(prefix).split(":")
+    if (
+        len(parts) != 2
+        or not parts[0].isdecimal()
+        or parts[0].startswith("0")
+        or len(parts[1]) != 64
+        or any(character not in "0123456789abcdef" for character in parts[1])
+    ):
+        return None
+    return int(parts[0])
+
+
 def _coordinator_task_round(logical_task_key: str) -> int | None:
     prefix = "draft.explore.coordinator:round:"
     if not logical_task_key.startswith(prefix):
@@ -1479,6 +1720,10 @@ def _parse_draft_agent_result(logical_task_key: str, body: bytes) -> DraftAgentR
         models = (ExploreReassignment, ExplorationMerge)
     elif logical_task_key.startswith("draft.trial:"):
         models = (TrialTranslation,)
+    elif _draft_turn_revision(logical_task_key) is not None:
+        models = (DraftTurn,)
+    elif _artifact_proposal_revision(logical_task_key) is not None:
+        models = (DraftArtifacts,)
     else:
         raise DraftAgentResultInvalid("Draft AgentRun has an unsupported logical task")
 
@@ -1517,6 +1762,8 @@ def _agent_result_from_fact(
             ExplorationReport,
             ExploreReassignment,
             ExplorationMerge,
+            DraftArtifacts,
+            DraftTurn,
             TrialTranslation,
         )
     }
@@ -1545,6 +1792,8 @@ def _agent_result_restore_key(
         "ExplorationReport": 0,
         "ExploreReassignment": 1,
         "ExplorationMerge": 2,
+        "DraftArtifacts": 3,
+        "DraftTurn": 3,
         "TrialTranslation": 4,
     }
     if not isinstance(result_body, Mapping):
@@ -1561,6 +1810,16 @@ def _agent_result_restore_key(
         logical_task_key = fact.get("logical_task_key")
         if isinstance(logical_task_key, str):
             round_number = _coordinator_task_round(logical_task_key) or 0
+    elif result_type == "DraftArtifacts":
+        logical_task_key = fact.get("logical_task_key")
+        if isinstance(logical_task_key, str):
+            round_number = _artifact_proposal_revision(logical_task_key) or 0
+    elif result_type == "DraftTurn":
+        logical_task_key = fact.get("logical_task_key")
+        kind = result_body.get("kind")
+        if isinstance(logical_task_key, str):
+            round_number = _draft_turn_revision(logical_task_key) or 0
+        sort_value = "0-artifacts" if kind == "artifacts" else "1-question"
     return (
         priorities.get(result_type, len(priorities))
         if isinstance(result_type, str)
@@ -1620,6 +1879,8 @@ __all__ = [
     "DraftOwnerPort",
     "MigrationSessionGraph",
     "coordinator_task_key",
+    "artifact_proposal_task_key",
+    "draft_turn_task_key",
     "exploration_task_key",
     "trial_translation_task_key",
 ]

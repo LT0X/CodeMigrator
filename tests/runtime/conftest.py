@@ -15,6 +15,7 @@ from codemigrator.core import (
     RunId,
     Sha256,
 )
+from codemigrator.runtime.contracts import DraftSessionEventSpec
 
 
 def uid() -> uuid.UUID:
@@ -41,9 +42,37 @@ def create_run() -> CreateRun:
     )
 
 
+def draft_question_event(question_id: str | None = None) -> DraftSessionEventSpec:
+    """Build the complete public AskUser event accepted by the Draft allowlist."""
+
+    return DraftSessionEventSpec(
+        "session.question.asked",
+        {
+            "question_id": question_id or str(uid()),
+            "revision": 1,
+            "prompt": "Choose how this migration should handle compatibility.",
+            "options": [
+                {
+                    "key": "preserve",
+                    "label": "Preserve behavior",
+                    "impact": "Keeps current user-visible behavior.",
+                    "recommended": True,
+                },
+                {
+                    "key": "simplify",
+                    "label": "Simplify behavior",
+                    "impact": "May change existing edge cases.",
+                    "recommended": False,
+                },
+            ],
+            "allow_free_text": True,
+        },
+    )
+
+
 @pytest.fixture
 def run_id() -> RunId:
     return RunId(uid())
 
 
-__all__ = ["artifact", "create_run", "uid"]
+__all__ = ["artifact", "create_run", "draft_question_event", "uid"]

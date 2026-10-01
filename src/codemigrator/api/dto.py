@@ -13,12 +13,14 @@ from codemigrator.core import (
     CheckAction,
     DeliveryChannelStatus,
     Phase,
+    RegisteredProject,
     RunStatus,
     SecretRegistry,
     SessionKind,
     SliceAttemptStatus,
     SliceKind,
 )
+from codemigrator.core.draft_event_projection import project_draft_public_event
 
 
 class ApiModel(BaseModel):
@@ -149,16 +151,23 @@ class SkillListView(ApiModel):
     items: list[SkillView] = Field(default_factory=list)
 
 
-class SessionCreateRequest(ApiModel):
-    kind: str
-    payload: dict[str, object] = Field(default_factory=dict)
+class SessionCreatePayload(ApiModel):
+    """Closed Draft initialization input; clients can select registered IDs only."""
 
-    @field_validator("kind")
+    source: RegisteredProject
+    goal: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("goal")
     @classmethod
-    def kind_is_non_empty(cls, value: str) -> str:
+    def goal_is_non_empty(cls, value: str) -> str:
         if not value.strip():
-            raise ValueError("session kind must not be empty")
+            raise ValueError("Draft goal must not be empty")
         return value
+
+
+class SessionCreateRequest(ApiModel):
+    kind: Literal["DRAFT"]
+    payload: SessionCreatePayload
 
 
 class SessionMessageRequest(ApiModel):
@@ -173,9 +182,20 @@ class SessionMessageRequest(ApiModel):
         return value
 
 
+class SessionAnswerValue(ApiModel):
+    selected_option: str | None = Field(default=None, min_length=1, max_length=64)
+    free_text: str | None = Field(default=None, min_length=1, max_length=4096)
+
+    @model_validator(mode="after")
+    def exactly_one_answer_form(self) -> SessionAnswerValue:
+        if (self.selected_option is None) == (self.free_text is None):
+            raise ValueError("an AskUser answer must select one option or provide free text")
+        return self
+
+
 class SessionAnswerRequest(ApiModel):
     question_id: UUID
-    answer: object
+    answer: SessionAnswerValue
     revision: int
 
 
@@ -362,15 +382,21 @@ _PUBLIC_EVENT_FIELDS: dict[str, tuple[str, ...]] = {
         "exit",
         "receipt_category",
     ),
+    "integration.completed": ("slice_id", "generation", "verified_commit_oid"),
+    "verified.advanced": ("slice_id", "generation", "commit_oid"),
 }
 _AGENT_RUN_EXITS = frozenset(
     {"COMPLETED", "FAILED", "BUDGET_EXHAUSTED", "SEGMENT_STOPPED", "INVALIDATED"}
 )
 _RECEIPT_CATEGORY = re.compile(r"[a-z][a-z0-9._-]{0,63}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_GIT_OID = re.compile(r"[0-9a-f]{40}")
 
 
 def _project_public_event_data(event_type: str, value: dict[str, object]) -> dict[str, object]:
+    draft_projection = project_draft_public_event(event_type, value)
+    if draft_projection is not None:
+        return draft_projection
     fields = _PUBLIC_EVENT_FIELDS.get(event_type)
     if fields is None:
         return value
@@ -393,6 +419,21 @@ def _project_public_event_data(event_type: str, value: dict[str, object]) -> dic
                 != projected.get("agent_run_id")
                 or not isinstance(plan_sha256, str)
                 or _SHA256.fullmatch(plan_sha256) is None
+            ):
+                raise ValueError
+            return projected
+        if event_type in {"integration.completed", "verified.advanced"}:
+            slice_id = projected.get("slice_id")
+            generation = projected.get("generation")
+            commit_oid = projected.get(
+                "verified_commit_oid" if event_type == "integration.completed" else "commit_oid"
+            )
+            if (
+                str(UUID(str(slice_id))) != slice_id
+                or type(generation) is not int
+                or generation < 0
+                or not isinstance(commit_oid, str)
+                or _GIT_OID.fullmatch(commit_oid) is None
             ):
                 raise ValueError
             return projected
@@ -443,8 +484,10 @@ __all__ = [
     "ReportView",
     "RequiredCheckView",
     "SessionAnswerRequest",
+    "SessionAnswerValue",
     "SessionConfirmRequest",
     "SessionCreateRequest",
+    "SessionCreatePayload",
     "SessionEvent",
     "SessionMessageRequest",
     "SessionView",

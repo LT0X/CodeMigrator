@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ReportView } from "../features/run-report/ReportView";
 import { RunListView } from "../features/run-list/RunListView";
 import { SessionInputView } from "../features/session-input/SessionInputView";
+import { SessionStartView } from "../features/session-input/SessionStartView";
 import { createApiClient } from "../shared/api/client";
 import { LiveRunView } from "../features/run-workspace/LiveRunView";
 import { LiveReportView } from "../features/run-report/ReportView";
@@ -41,6 +42,8 @@ export function App() {
   if (path === "/system") return <LiveSystemHealthView client={client} />;
   const runMatch = path.match(/^\/runs\/([^/]+)$/);
   if (runMatch) return <LiveRunView client={client} runId={runMatch[1]} />;
-  if (path.startsWith("/sessions/")) return <SessionInputView sessionId={path.split("/").at(-1) ?? "new"} client={client} />;
+  const sessionMatch = path.match(/^\/sessions\/([^/]+)\/?$/);
+  if (sessionMatch?.[1] === "new") return <SessionStartView client={client} />;
+  if (sessionMatch) return <SessionInputView sessionId={sessionMatch[1]} client={client} />;
   return <RouteNotFound />;
 }

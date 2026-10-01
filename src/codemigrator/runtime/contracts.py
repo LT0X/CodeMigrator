@@ -14,6 +14,8 @@ from codemigrator.core import (
     Advice,
     CreateRun,
     FailureReason,
+    GitOid,
+    IntegrationIntent,
     RunId,
     RunStatus,
     SliceId,
@@ -158,6 +160,32 @@ class CandidateCheckpointFact:
             raise ValueError("candidate checkpoint OIDs must be non-empty")
         if not _is_sha256(self.receipt_sha256):
             raise ValueError("candidate checkpoint receipt digest is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrationReceipt:
+    """Durable Run-owner acknowledgement that a verified ref reached an intent head."""
+
+    intent: IntegrationIntent
+    verified_commit_oid: GitOid
+    receipt_sha256: str
+    event_sequence: int
+
+    def __post_init__(self) -> None:
+        if self.verified_commit_oid != self.intent.prospective_commit_oid:
+            raise ValueError("integration receipt head must match its intent")
+        if not _is_sha256(self.receipt_sha256):
+            raise ValueError("integration receipt digest must be SHA-256")
+        if type(self.event_sequence) is not int or self.event_sequence < 1:
+            raise ValueError("integration receipt event sequence must be positive")
+
+    @property
+    def run_id(self) -> RunId:
+        return RunId(self.intent.run_id)
+
+    @property
+    def idempotency_key(self) -> str:
+        return str(self.intent.idempotency_key)
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +396,7 @@ def _is_sha256(value: str) -> bool:
 
 
 __all__ = [
+    "IntegrationReceipt",
     "DraftOwnerReceipt",
     "AdviceMessage",
     "ApiCommand",

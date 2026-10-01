@@ -20,6 +20,8 @@ from codemigrator.core import (
     ActiveDispatch,
     CreateRun,
     FailureReason,
+    GitOid,
+    IntegrationIntent,
     Phase,
     RunId,
     RunStatus,
@@ -29,6 +31,7 @@ from codemigrator.core import (
     SliceId,
     canonical_json_bytes,
 )
+from codemigrator.core.draft_event_projection import project_draft_public_event
 
 from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from .budget import BudgetUsage
@@ -39,6 +42,7 @@ from .contracts import (
     DraftSessionEvent,
     DraftSessionEventSpec,
     EventSpec,
+    IntegrationReceipt,
     RunState,
     RunStatePage,
     RuntimeEvent,
@@ -59,7 +63,13 @@ _RUN_TERMINAL_STATUSES = frozenset(
 )
 _DRAFT_TERMINAL_EVENTS = frozenset({"session.closed", "session.attached_to_run"})
 _DRAFT_MUTABLE_LEDGER_CATEGORIES = frozenset(
-    {"draft.task_revision", "draft.ask_user.question", "draft.ask_user.answer"}
+    {
+        "draft.turn.requested",
+        "draft.confirm.requested",
+        "draft.task_revision",
+        "draft.ask_user.question",
+        "draft.ask_user.answer",
+    }
 )
 
 
@@ -193,6 +203,38 @@ class RuntimeStore(Protocol):
     ) -> AgentRunReceipt:
         """Commit terminal metadata and owner facts/events in one transaction."""
 
+    async def persist_integration_intent(self, intent: IntegrationIntent) -> IntegrationIntent:
+        """Persist one immutable M-11 intent before any verified-ref update."""
+        ...
+
+    async def load_integration_intent(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationIntent | None: ...
+
+    async def load_integration_receipt(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationReceipt | None: ...
+
+    async def load_latest_integration_receipt(self, run_id: RunId) -> IntegrationReceipt | None: ...
+
+    async def list_pending_integration_intents(
+        self, run_id: RunId
+    ) -> tuple[IntegrationIntent, ...]: ...
+
+    async def list_integration_receipts(
+        self, run_id: RunId
+    ) -> tuple[IntegrationReceipt, ...]: ...
+
+    async def commit_integration_receipt(
+        self,
+        state: RunState,
+        intent: IntegrationIntent,
+        verified_commit_oid: GitOid,
+        events: Sequence[EventSpec],
+    ) -> IntegrationReceipt:
+        """Atomically adopt an advanced verified head with its Run events/state."""
+        ...
+
 
 class StoreCommitError(RuntimeError):
     """Raised when the persistence transaction cannot be committed."""
@@ -219,6 +261,87 @@ def _validate_new_agent_run(record: AgentRun) -> None:
         )
     ):
         raise StoreCommitError("new AgentRun cannot have terminal references")
+
+
+def _make_integration_receipt(
+    intent: IntegrationIntent, verified_commit_oid: GitOid, event_sequence: int
+) -> IntegrationReceipt:
+    payload = {
+        "idempotency_key": str(intent.idempotency_key),
+        "verified_commit_oid": str(verified_commit_oid),
+    }
+    return IntegrationReceipt(
+        intent=intent,
+        verified_commit_oid=verified_commit_oid,
+        receipt_sha256=sha256(canonical_json_bytes(payload)).hexdigest(),
+        event_sequence=event_sequence,
+    )
+
+
+def _integration_intent_digest(intent: IntegrationIntent) -> str:
+    payload = intent.model_dump(mode="json", by_alias=True)
+    return sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def _stored_integration_intent(value: Any, digest: Any) -> IntegrationIntent:
+    intent = _decode_integration_intent(value)
+    if str(digest).strip() != _integration_intent_digest(intent):
+        raise StoreCommitError("stored integration intent digest mismatch")
+    return intent
+
+
+def _stored_integration_receipt(
+    intent: IntegrationIntent,
+    verified_commit_oid: Any,
+    digest: Any,
+    event_sequence: Any,
+) -> IntegrationReceipt:
+    receipt = _make_integration_receipt(
+        intent,
+        GitOid(str(verified_commit_oid)),
+        int(event_sequence),
+    )
+    if str(digest).strip() != receipt.receipt_sha256:
+        raise StoreCommitError("stored integration receipt digest mismatch")
+    return receipt
+
+
+def _validate_integration_intent(intent: IntegrationIntent) -> None:
+    hashes = (
+        str(intent.guard_sha256),
+        str(intent.verification_fingerprint),
+        str(intent.idempotency_key),
+    )
+    oids = (str(intent.expected_verified_oid), str(intent.prospective_commit_oid))
+    if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in hashes):
+        raise StoreCommitError("IntegrationIntent digests are invalid")
+    if any(re.fullmatch(r"[0-9a-f]{40}", value) is None for value in oids):
+        raise StoreCommitError("IntegrationIntent Git OIDs are invalid")
+    if oids[0] == oids[1] or oids[1] == "0" * 40:
+        raise StoreCommitError("IntegrationIntent must advance to a non-zero commit")
+
+
+def _validate_integration_events(
+    intent: IntegrationIntent,
+    verified_commit_oid: GitOid,
+    events: Sequence[EventSpec],
+) -> None:
+    if len(events) != 2:
+        raise StoreCommitError("integration receipt requires its ordered Run events")
+    completed, advanced = events
+    receipt_key = f"integration.completed:{intent.idempotency_key}"
+    if (
+        completed.event_type != "integration.completed"
+        or completed.data.get("receipt_key") != receipt_key
+        or completed.data.get("slice_id") != str(intent.slice_id)
+        or completed.data.get("generation") != int(intent.generation)
+        or completed.data.get("verified_commit_oid") != str(verified_commit_oid)
+        or advanced.event_type != "verified.advanced"
+        or advanced.data.get("slice_id") != str(intent.slice_id)
+        or advanced.data.get("generation") != int(intent.generation)
+        or advanced.data.get("commit_oid") != str(verified_commit_oid)
+    ):
+        raise StoreCommitError("integration receipt Run events do not match its intent")
 
 
 def _validate_agent_receipt(
@@ -311,6 +434,8 @@ class InMemoryRuntimeStore:
         ] = {}
         self._draft_conditions: dict[UUID, asyncio.Condition] = {}
         self._draft_terminals: dict[UUID, int] = {}
+        self._integration_intents: dict[tuple[RunId, str], IntegrationIntent] = {}
+        self._integration_receipts: dict[tuple[RunId, str], IntegrationReceipt] = {}
         self._cas_refs: dict[tuple[str, UUID, str], CasObject] = {}
         self._checkpoints: dict[tuple[str, str, str], CheckpointIndex] = {}
         self._pending_writes: dict[tuple[str, str, str, str, int], PendingWriteIndex] = {}
@@ -847,6 +972,159 @@ class InMemoryRuntimeStore:
             for reference_key, object_ref in cas_references:
                 self._cas_refs[(record.owner_kind, record.owner_id, reference_key)] = object_ref
             self.commit_count += 1
+            return receipt
+
+    async def persist_integration_intent(self, intent: IntegrationIntent) -> IntegrationIntent:
+        _validate_integration_intent(intent)
+        run_id = RunId(intent.run_id)
+        key = (run_id, str(intent.idempotency_key))
+        async with self._agent_lock:
+            if run_id not in self._snapshots:
+                raise StoreCommitError("integration intent owner Run does not exist")
+            existing = self._integration_intents.get(key)
+            if existing is not None:
+                if existing != intent:
+                    raise StoreCommitError("integration intent replay mismatch")
+                return existing
+            if any(
+                pending_run == run_id
+                and pending_key != key[1]
+                and pending_key not in {
+                    receipt_key
+                    for receipt_run, receipt_key in self._integration_receipts
+                    if receipt_run == run_id
+                }
+                for pending_run, pending_key in self._integration_intents
+            ):
+                raise StoreCommitError("another integration intent is awaiting verified receipt")
+            latest = await self.load_latest_integration_receipt(run_id)
+            if latest is not None and latest.verified_commit_oid != intent.expected_verified_oid:
+                raise StoreCommitError(
+                    "integration intent expected head differs from latest receipt"
+                )
+            self._integration_intents[key] = intent
+            return intent
+
+    async def load_integration_intent(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationIntent | None:
+        return self._integration_intents.get((RunId(run_id), idempotency_key))
+
+    async def load_integration_receipt(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationReceipt | None:
+        return self._integration_receipts.get((RunId(run_id), idempotency_key))
+
+    async def load_latest_integration_receipt(self, run_id: RunId) -> IntegrationReceipt | None:
+        receipts = [
+            receipt
+            for (receipt_run, _), receipt in self._integration_receipts.items()
+            if receipt_run == run_id
+        ]
+        return max(receipts, key=lambda receipt: receipt.event_sequence, default=None)
+
+    async def list_pending_integration_intents(
+        self, run_id: RunId
+    ) -> tuple[IntegrationIntent, ...]:
+        return tuple(
+            intent
+            for (intent_run, key), intent in self._integration_intents.items()
+            if intent_run == run_id and (intent_run, key) not in self._integration_receipts
+        )
+
+    async def list_integration_receipts(
+        self, run_id: RunId
+    ) -> tuple[IntegrationReceipt, ...]:
+        return tuple(
+            sorted(
+                (
+                    receipt
+                    for (receipt_run, _), receipt in self._integration_receipts.items()
+                    if receipt_run == run_id
+                ),
+                key=lambda receipt: receipt.event_sequence,
+            )
+        )
+
+    async def commit_integration_receipt(
+        self,
+        state: RunState,
+        intent: IntegrationIntent,
+        verified_commit_oid: GitOid,
+        events: Sequence[EventSpec],
+    ) -> IntegrationReceipt:
+        run_id = RunId(intent.run_id)
+        idempotency_key = str(intent.idempotency_key)
+        key = (run_id, idempotency_key)
+        async with self._agent_lock:
+            existing = self._integration_receipts.get(key)
+            if existing is not None:
+                if (
+                    self._integration_intents.get(key) != intent
+                    or existing.verified_commit_oid != verified_commit_oid
+                ):
+                    raise StoreCommitError("integration receipt replay mismatch")
+                stored_events = self._snapshots[run_id].events
+                matching = next(
+                    (
+                        event
+                        for event in stored_events
+                        if event.sequence == existing.event_sequence
+                        and event.event_type == "integration.completed"
+                    ),
+                    None,
+                )
+                if matching is None or matching.data.get("receipt_key") != (
+                    f"integration.completed:{idempotency_key}"
+                ):
+                    raise StoreCommitError("integration receipt event replay mismatch")
+                return existing
+            _validate_integration_intent(intent)
+            if self._integration_intents.get(key) != intent:
+                raise StoreCommitError("integration intent is not durably committed")
+            if verified_commit_oid != intent.prospective_commit_oid:
+                raise StoreCommitError("verified head does not match the intent")
+            previous_receipt = await self.load_latest_integration_receipt(run_id)
+            if (
+                previous_receipt is not None
+                and previous_receipt.verified_commit_oid != intent.expected_verified_oid
+            ):
+                raise StoreCommitError(
+                    "integration intent expected head differs from latest receipt"
+                )
+            previous = self._snapshots.get(run_id)
+            if previous is None:
+                raise StoreCommitError("integration receipt owner Run does not exist")
+            if state.run_id != run_id or state.version != previous.state.version + 1:
+                raise StoreCommitError("Run owner state version is stale")
+            _validate_integration_events(intent, verified_commit_oid, events)
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            first_sequence = len(previous.events) + 1
+            try:
+                materialized = tuple(
+                    RuntimeEvent(
+                        sequence=first_sequence + index,
+                        event_type=event.event_type,
+                        data=_redact_event_data(event.data, self.secret_registry),
+                    )
+                    for index, event in enumerate(events)
+                )
+            except ValueError as exc:
+                raise StoreCommitError("observation rejected") from exc
+            receipt = _make_integration_receipt(
+                intent, verified_commit_oid, first_sequence
+            )
+            condition = self._run_conditions.setdefault(run_id, asyncio.Condition())
+            async with condition:
+                self._snapshots[run_id] = RuntimeSnapshot(
+                    state=state,
+                    events=(*previous.events, *materialized),
+                )
+                self._integration_receipts[key] = receipt
+                self.commit_count += 1
+                condition.notify_all()
             return receipt
 
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
@@ -1539,6 +1817,276 @@ class PostgreSQLRuntimeStore:
                     receipt.receipt_id,
                     receipt.agent_run_id,
                     receipt.category,
+                )
+                return receipt
+
+    async def persist_integration_intent(self, intent: IntegrationIntent) -> IntegrationIntent:
+        _validate_integration_intent(intent)
+        run_id = RunId(intent.run_id)
+        idempotency_key = str(intent.idempotency_key)
+        payload = intent.model_dump(mode="json", by_alias=True)
+        encoded = canonical_json_bytes(payload).decode("utf-8")
+        digest = _integration_intent_digest(intent)
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                owner = await connection.fetchrow(
+                    "SELECT run_id FROM runtime_runs WHERE run_id=$1 FOR UPDATE", run_id
+                )
+                if owner is None:
+                    raise StoreCommitError("integration intent owner Run does not exist")
+                existing = await connection.fetchrow(
+                    """SELECT intent, intent_sha256 FROM run_integration_intents
+                    WHERE run_id=$1 AND idempotency_key=$2 FOR UPDATE""",
+                    run_id,
+                    idempotency_key,
+                )
+                if existing is not None:
+                    stored = _stored_integration_intent(
+                        _row_value(existing, "intent"),
+                        _row_value(existing, "intent_sha256"),
+                    )
+                    if stored != intent or _integration_intent_digest(stored) != digest:
+                        raise StoreCommitError("integration intent replay mismatch")
+                    return stored
+                pending = await connection.fetchrow(
+                    """SELECT i.idempotency_key FROM run_integration_intents i
+                    LEFT JOIN run_integration_receipts r
+                      ON r.run_id=i.run_id AND r.idempotency_key=i.idempotency_key
+                    WHERE i.run_id=$1 AND r.idempotency_key IS NULL LIMIT 1""",
+                    run_id,
+                )
+                if pending is not None:
+                    raise StoreCommitError(
+                        "another integration intent is awaiting verified receipt"
+                    )
+                latest = await connection.fetchrow(
+                    """SELECT verified_commit_oid FROM run_integration_receipts
+                    WHERE run_id=$1 ORDER BY event_sequence DESC LIMIT 1""",
+                    run_id,
+                )
+                if (
+                    latest is not None
+                    and str(_row_value(latest, "verified_commit_oid"))
+                    != str(intent.expected_verified_oid)
+                ):
+                    raise StoreCommitError(
+                        "integration intent expected head differs from latest receipt"
+                    )
+                await connection.execute(
+                    """INSERT INTO run_integration_intents(
+                        run_id,idempotency_key,intent_sha256,intent
+                    ) VALUES($1,$2,$3,$4::jsonb)""",
+                    run_id,
+                    idempotency_key,
+                    digest,
+                    encoded,
+                )
+        return intent
+
+    async def load_integration_intent(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationIntent | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT intent,intent_sha256 FROM run_integration_intents
+                WHERE run_id=$1 AND idempotency_key=$2""",
+                run_id,
+                idempotency_key,
+            )
+        return (
+            _stored_integration_intent(
+                _row_value(row, "intent"), _row_value(row, "intent_sha256")
+            )
+            if row is not None
+            else None
+        )
+
+    async def load_integration_receipt(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationReceipt | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT i.intent,i.intent_sha256,r.verified_commit_oid,
+                          r.receipt_sha256,r.event_sequence
+                FROM run_integration_receipts r
+                JOIN run_integration_intents i USING(run_id,idempotency_key)
+                WHERE r.run_id=$1 AND r.idempotency_key=$2""",
+                run_id,
+                idempotency_key,
+            )
+        if row is None:
+            return None
+        intent = _stored_integration_intent(
+            _row_value(row, "intent"), _row_value(row, "intent_sha256")
+        )
+        return _stored_integration_receipt(
+            intent,
+            _row_value(row, "verified_commit_oid"),
+            _row_value(row, "receipt_sha256"),
+            _row_value(row, "event_sequence"),
+        )
+
+    async def load_latest_integration_receipt(self, run_id: RunId) -> IntegrationReceipt | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT i.intent,i.intent_sha256,r.verified_commit_oid,
+                          r.receipt_sha256,r.event_sequence
+                FROM run_integration_receipts r
+                JOIN run_integration_intents i USING(run_id,idempotency_key)
+                WHERE r.run_id=$1 ORDER BY r.event_sequence DESC LIMIT 1""",
+                run_id,
+            )
+        if row is None:
+            return None
+        intent = _stored_integration_intent(
+            _row_value(row, "intent"), _row_value(row, "intent_sha256")
+        )
+        return _stored_integration_receipt(
+            intent,
+            _row_value(row, "verified_commit_oid"),
+            _row_value(row, "receipt_sha256"),
+            _row_value(row, "event_sequence"),
+        )
+
+    async def list_pending_integration_intents(
+        self, run_id: RunId
+    ) -> tuple[IntegrationIntent, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT i.intent,i.intent_sha256 FROM run_integration_intents i
+                LEFT JOIN run_integration_receipts r USING(run_id,idempotency_key)
+                WHERE i.run_id=$1 AND r.idempotency_key IS NULL ORDER BY i.created_at""",
+                run_id,
+            )
+        return tuple(
+            _stored_integration_intent(
+                _row_value(row, "intent"), _row_value(row, "intent_sha256")
+            )
+            for row in rows
+        )
+
+    async def list_integration_receipts(
+        self, run_id: RunId
+    ) -> tuple[IntegrationReceipt, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT i.intent,i.intent_sha256,r.verified_commit_oid,
+                          r.receipt_sha256,r.event_sequence
+                FROM run_integration_receipts r
+                JOIN run_integration_intents i USING(run_id,idempotency_key)
+                WHERE r.run_id=$1 ORDER BY r.event_sequence""",
+                run_id,
+            )
+        return tuple(
+            _stored_integration_receipt(
+                _stored_integration_intent(
+                    _row_value(row, "intent"), _row_value(row, "intent_sha256")
+                ),
+                _row_value(row, "verified_commit_oid"),
+                _row_value(row, "receipt_sha256"),
+                _row_value(row, "event_sequence"),
+            )
+            for row in rows
+        )
+
+    async def commit_integration_receipt(
+        self,
+        state: RunState,
+        intent: IntegrationIntent,
+        verified_commit_oid: GitOid,
+        events: Sequence[EventSpec],
+    ) -> IntegrationReceipt:
+        run_id = RunId(intent.run_id)
+        idempotency_key = str(intent.idempotency_key)
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                owner = await connection.fetchrow(
+                    "SELECT state FROM runtime_runs WHERE run_id=$1 FOR UPDATE", run_id
+                )
+                if owner is None:
+                    raise StoreCommitError("integration receipt owner Run does not exist")
+                intent_row = await connection.fetchrow(
+                    """SELECT intent,intent_sha256 FROM run_integration_intents
+                    WHERE run_id=$1 AND idempotency_key=$2 FOR UPDATE""",
+                    run_id,
+                    idempotency_key,
+                )
+                stored_intent = (
+                    _stored_integration_intent(
+                        _row_value(intent_row, "intent"),
+                        _row_value(intent_row, "intent_sha256"),
+                    )
+                    if intent_row is not None
+                    else None
+                )
+                if stored_intent != intent:
+                    raise StoreCommitError("integration intent is not durably committed")
+                existing = await connection.fetchrow(
+                    """SELECT verified_commit_oid,receipt_sha256,event_sequence
+                    FROM run_integration_receipts
+                    WHERE run_id=$1 AND idempotency_key=$2""",
+                    run_id,
+                    idempotency_key,
+                )
+                if existing is not None:
+                    receipt = _stored_integration_receipt(
+                        stored_intent,
+                        _row_value(existing, "verified_commit_oid"),
+                        _row_value(existing, "receipt_sha256"),
+                        _row_value(existing, "event_sequence"),
+                    )
+                    if receipt.verified_commit_oid != verified_commit_oid:
+                        raise StoreCommitError("integration receipt replay mismatch")
+                    return receipt
+                if verified_commit_oid != intent.prospective_commit_oid:
+                    raise StoreCommitError("verified head does not match the intent")
+                previous_state = _decode_state(_row_value(owner, "state"))
+                if state.run_id != run_id or state.version != previous_state.version + 1:
+                    raise StoreCommitError("Run owner state version is stale")
+                latest = await connection.fetchrow(
+                    """SELECT verified_commit_oid FROM run_integration_receipts
+                    WHERE run_id=$1 ORDER BY event_sequence DESC LIMIT 1""",
+                    run_id,
+                )
+                if (
+                    latest is not None
+                    and str(_row_value(latest, "verified_commit_oid"))
+                    != str(intent.expected_verified_oid)
+                ):
+                    raise StoreCommitError(
+                        "integration intent expected head differs from latest receipt"
+                    )
+                _validate_integration_events(intent, verified_commit_oid, events)
+                sequence_row = await connection.fetchrow(
+                    """SELECT COALESCE(MAX(sequence),0) AS last_sequence
+                    FROM runtime_events WHERE run_id=$1""",
+                    run_id,
+                )
+                event_sequence = int(_row_value(sequence_row, "last_sequence")) + 1
+                receipt = _make_integration_receipt(
+                    intent, verified_commit_oid, event_sequence
+                )
+                await connection.execute(
+                    "UPDATE runtime_runs SET state=$2::jsonb WHERE run_id=$1",
+                    run_id,
+                    _dump_json(state),
+                )
+                await _insert_events(
+                    connection,
+                    run_id,
+                    events,
+                    first_sequence=event_sequence,
+                    secret_registry=self.secret_registry,
+                )
+                await connection.execute(
+                    """INSERT INTO run_integration_receipts(
+                        run_id,idempotency_key,verified_commit_oid,receipt_sha256,event_sequence
+                    ) VALUES($1,$2,$3,$4,$5)""",
+                    run_id,
+                    idempotency_key,
+                    str(verified_commit_oid),
+                    receipt.receipt_sha256,
+                    event_sequence,
                 )
                 return receipt
 
@@ -2546,6 +3094,28 @@ def _prepare_draft_events(
 ) -> tuple[tuple[str, dict[str, object]], ...]:
     prepared = []
     for event in events:
+        if event.event_type in {
+            "session.question.asked",
+            "session.draft_revision.created",
+            "session.draft_revision.confirmation_requested",
+            "session.draft_revision.confirmed",
+        }:
+            try:
+                projected = project_draft_public_event(event.event_type, event.data)
+                if projected is None:
+                    raise ValueError("Draft event projection is unavailable")
+            except ValueError as exc:
+                raise StoreCommitError("Draft session event summary is invalid") from exc
+            try:
+                prepared.append(
+                    (
+                        event.event_type,
+                        _redact_draft_public_event(event.event_type, projected, registry),
+                    )
+                )
+            except ValueError as exc:
+                raise StoreCommitError("observation rejected") from exc
+            continue
         fields = _DRAFT_EVENT_FIELDS.get(event.event_type)
         if fields is None:
             raise StoreCommitError("Draft session event type is not durable")
@@ -2592,6 +3162,23 @@ def _prepare_draft_events(
             raise StoreCommitError("Draft session event data is invalid") from exc
         prepared.append((event.event_type, projected))
     return tuple(prepared)
+
+
+def _redact_draft_public_event(
+    event_type: str, value: dict[str, object], registry: SecretRegistry
+) -> dict[str, object]:
+    """Scan allowlisted user-facing text without treating AskUser as a model prompt."""
+
+    if event_type != "session.question.asked":
+        return _redact_event_data(value, registry)
+    prompt = value.get("prompt")
+    if not isinstance(prompt, str):
+        raise ValueError("Draft question event summary is invalid")
+    scan_value = {key: nested for key, nested in value.items() if key != "prompt"}
+    scan_value["ask_user_text"] = prompt
+    redacted = _redact_event_data(scan_value, registry)
+    redacted["prompt"] = redacted.pop("ask_user_text")
+    return redacted
 
 
 def _make_draft_receipt(
@@ -2744,6 +3331,16 @@ def _decode_state(value: Any) -> RunState:
             for item in payload.get("candidate_checkpoints", ())
         ),
     )
+
+
+def _decode_integration_intent(value: Any) -> IntegrationIntent:
+    payload = _decode_json_value(value)
+    if not isinstance(payload, Mapping):
+        raise StoreCommitError("stored IntegrationIntent is invalid")
+    try:
+        return IntegrationIntent.model_validate(payload)
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored IntegrationIntent is invalid") from exc
 
 
 __all__ = [

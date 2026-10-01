@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from codemigrator.core import ModelProfile, Phase, SessionKind, canonical_json_bytes, load_resource
 from codemigrator.core.ids import new_uuid7
@@ -22,6 +23,7 @@ from codemigrator.runtime.draft_graph import (
     DraftFlowOwner,
     MigrationSessionGraph,
 )
+from codemigrator.runtime.draft_models import ExplorationReport
 from codemigrator.runtime.langchain_agent import (
     agent_context_digest,
     agent_template_digest,
@@ -117,7 +119,7 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
             ).encode("utf-8")
         ).hexdigest(),
         context_window=int(config["Context Window"]),
-        output_cap=min(32, int(config["模型输出上限"])),
+        output_cap=min(512, int(config["模型输出上限"])),
     )
     provider = OpenAICompatibleProvider(
         endpoint=str(config["Base URL"]), api_key=str(config["API Key"])
@@ -133,7 +135,11 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
     )
     template = (
         "You are a read-only CodeMigrator exploration assistant. "
-        "Return exactly OK and do not call tools."
+        "Return only one JSON object matching this shape: "
+        '{"domain_path":".","anchors":[{"file_path":"src/example.py",'
+        '"start":{"line":1,"column":0},"end":{"line":1,"column":1}}],'
+        '"coverage":["src/example.py"],"confidence_reason":"brief reason"}. '
+        "Do not wrap it in Markdown fences and do not call tools."
     )
     usage_sink = _UsageSink()
 
@@ -202,13 +208,18 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                 result = await bound.ainvoke(task=task)
                 if result.exit is not SessionExit.Completed or not result.assistant_texts:
                     raise AssertionError("live OpenCode AgentRun did not complete")
-                result_body = canonical_json_bytes(
-                    {
-                        "answer_sha256": hashlib.sha256(
-                            result.assistant_texts[0].encode("utf-8")
-                        ).hexdigest()
-                    }
-                )
+                report_text = result.assistant_texts[0].strip()
+                if report_text.startswith("```"):
+                    lines = report_text.splitlines()
+                    if len(lines) >= 3 and lines[-1].strip() == "```":
+                        report_text = "\n".join(lines[1:-1])
+                try:
+                    report = ExplorationReport.model_validate_json(report_text)
+                except ValidationError:
+                    raise AssertionError(
+                        "live OpenCode response was not a valid typed Draft report"
+                    ) from None
+                result_body = canonical_json_bytes(report.model_dump(mode="json", by_alias=True))
                 result_reference = await CasLedger(cas, store).put(
                     result_body,
                     "draft",
@@ -228,7 +239,12 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                 )
                 await store.commit_agent_run_receipt(terminal, receipt)
                 await lifecycle.terminal(terminal, receipt)
-                return DraftAgentCompletion(terminal, receipt, result_reference)
+                return DraftAgentCompletion(
+                    terminal,
+                    receipt,
+                    result_reference,
+                    materialized=report,
+                )
 
         graph = MigrationSessionGraph(
             owner=DraftFlowOwner(draft_id=draft_id, flow=DraftFlow(), store=store),
@@ -238,7 +254,9 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
             agent_runner=Runner(),
         )
         try:
-            completion = await graph.explore_domain(".", "Respond with the word OK.")
+            completion = await graph.explore_domain(
+                ".", "Return a minimal typed report for the synthetic source example."
+            )
             assert usage_sink.receipts
             assert await store.load_agent_run(completion.record.agent_run_id) == completion.record
             assert (

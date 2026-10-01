@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, StrictInt, field_validator, model_validator
+from pydantic import Field, RootModel, StrictInt, field_validator, model_validator
 
 from codemigrator.analysis import SourceRange
 from codemigrator.core import (
@@ -239,6 +239,30 @@ class AskUserAnswer(_FrozenDraftModel):
         return self
 
 
+class DraftQuestionTurn(_FrozenDraftModel):
+    """One AgentRun turn that pauses the Draft for a structured user answer."""
+
+    kind: Literal["question"]
+    question: AskUserQuestion
+
+
+class DraftArtifactsTurn(_FrozenDraftModel):
+    """One AgentRun turn that proposes the four typed Draft artifacts."""
+
+    kind: Literal["artifacts"]
+    artifacts: DraftArtifacts
+
+
+class DraftTurn(
+    RootModel[
+        Annotated[DraftQuestionTurn | DraftArtifactsTurn, Field(discriminator="kind")]
+    ]
+):
+    """Closed structured result: ask one question or propose a Draft revision."""
+
+    model_config = {"frozen": True}
+
+
 class DraftExecRequest(_FrozenDraftModel):
     """Closed input accepted by the draft Exec orchestration boundary."""
 
@@ -289,9 +313,12 @@ __all__ = [
     "CoverageResult",
     "DomainSkeleton",
     "DraftArtifacts",
+    "DraftArtifactsTurn",
     "DraftExecRequest",
     "DraftFreezeReceipt",
     "DraftStage",
+    "DraftQuestionTurn",
+    "DraftTurn",
     "DossierConsistencyResult",
     "ExploreReassignment",
     "ExplorationMerge",
