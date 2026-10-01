@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from codemigrator.api.backend import (
     ApiCommandStorePort,
     ApiProductionCapabilities,
+    DraftSessionCommandPort,
     RunCreationOwnerPort,
 )
 from codemigrator.api.deps import ApiConfig
@@ -63,6 +64,9 @@ ProductionRunComponentsFactory = Callable[
     [RuntimeStore, asyncpg.Pool, asyncpg.Connection],
     ProductionRunComponents,
 ]
+DraftSessionCommandOwnerFactory = Callable[
+    [RuntimeStore, ApiApplicationResources], DraftSessionCommandPort | None
+]
 
 
 def create_production_run_owner(
@@ -91,6 +95,7 @@ def create_production_app(
     preflight: CreateRunPreflightPort | None = None,
     graph_starter: RunGraphStarter | None = None,
     run_components_factory: ProductionRunComponentsFactory | None = None,
+    draft_command_owner_factory: DraftSessionCommandOwnerFactory | None = None,
     stop_server: Callable[[], Awaitable[None]],
     shutdown: Callable[[], Awaitable[None]] | None = None,
     pool_server_settings: Mapping[str, str] | None = None,
@@ -118,29 +123,38 @@ def create_production_app(
         resources: ApiApplicationResources,
     ) -> RunCreationOwnerPort | ApiProductionCapabilities | None:
         runtime_store = cast(RuntimeStore, store)
+        draft_owner = (
+            draft_command_owner_factory(runtime_store, resources)
+            if draft_command_owner_factory is not None
+            else None
+        )
         if run_components_factory is not None:
             components = run_components_factory(
                 runtime_store,
                 resources.pool,
                 resources.write_connection,
             )
-            run_owner = create_production_run_owner(runtime_store, components)
+            components_run_owner = create_production_run_owner(runtime_store, components)
             return ApiProductionCapabilities(
-                run_owner=cast(RunCreationOwnerPort, run_owner),
+                run_owner=cast(RunCreationOwnerPort, components_run_owner),
                 run_read_projection=RuntimeRunReadModel(
                     runtime_store, components.graph_assembly.infrastructure.host_cas
                 ),
+                draft_owner=draft_owner,
             )
-        if preflight is None or graph_starter is None:
+        run_owner: RunCreationOwnerPort | None = None
+        if preflight is not None and graph_starter is not None:
+            run_owner = cast(
+                RunCreationOwnerPort,
+                RunCreationOwner(
+                    store=runtime_store,
+                    preflight=preflight,
+                    graph_starter=graph_starter,
+                ),
+            )
+        if run_owner is None and draft_owner is None:
             return None
-        return cast(
-            RunCreationOwnerPort,
-            RunCreationOwner(
-                store=runtime_store,
-                preflight=preflight,
-                graph_starter=graph_starter,
-            ),
-        )
+        return ApiProductionCapabilities(run_owner=run_owner, draft_owner=draft_owner)
 
     return _create_api_app(
         dsn,
@@ -156,6 +170,7 @@ def create_production_app(
 __all__ = [
     "ProductionRunComponents",
     "ProductionRunComponentsFactory",
+    "DraftSessionCommandOwnerFactory",
     "create_production_app",
     "create_production_run_owner",
 ]

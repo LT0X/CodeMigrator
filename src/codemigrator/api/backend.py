@@ -9,9 +9,21 @@ from threading import Lock
 from typing import Protocol, cast
 from uuid import UUID
 
-from codemigrator.core import CreateRun, FailureReason, RunStatus, StableErrorCode
+from codemigrator.core import (
+    CreateRun,
+    FailureReason,
+    MigrationSessionStatus,
+    RunStatus,
+    StableErrorCode,
+)
 
 from .deps import ApiRequest, EventRecord, PersistedEvent
+from .dto import (
+    SessionAnswerRequest,
+    SessionConfirmRequest,
+    SessionCreateRequest,
+    SessionMessageRequest,
+)
 from .problems import ApiError
 
 
@@ -86,10 +98,69 @@ class RunReadProjectionPort(Protocol):
     async def get_workspace(self, run_id: UUID) -> object: ...
 
 
+class DraftOwnerReceiptIdentity(Protocol):
+    draft_id: UUID
+    receipt_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class DraftCommandResult:
+    """Committed SessionView fields plus the identity of the Draft owner receipt."""
+
+    session_id: UUID
+    status: MigrationSessionStatus
+    revision: int
+    owner_receipt: DraftOwnerReceiptIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, UUID):
+            raise ValueError("Draft command session id must be a UUID")
+        try:
+            status = MigrationSessionStatus(self.status)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Draft command status must be a valid MigrationSessionStatus") from exc
+        object.__setattr__(self, "status", status)
+        if type(self.revision) is not int or self.revision < 0:
+            raise ValueError("Draft command revision must be a non-negative integer")
+        if self.owner_receipt.draft_id != self.session_id:
+            raise ValueError("Draft command receipt must identify its session owner")
+        if (
+            not isinstance(self.owner_receipt.receipt_key, str)
+            or not self.owner_receipt.receipt_key
+            or len(self.owner_receipt.receipt_key) > 256
+        ):
+            raise ValueError("Draft command receipt key must be non-empty and bounded")
+
+
+class DraftSessionCommandPort(Protocol):
+    """Draft facts owner; methods run inside the supplied API command transaction.
+
+    Implementations may commit Draft facts and their already defined events here,
+    but must not execute a Draft graph, Agent, provider, or tool in this transaction.
+    """
+
+    async def create_session(
+        self, payload: SessionCreateRequest, transaction: object
+    ) -> DraftCommandResult: ...
+
+    async def send_message(
+        self, session_id: UUID, payload: SessionMessageRequest, transaction: object
+    ) -> DraftCommandResult: ...
+
+    async def answer_question(
+        self, session_id: UUID, payload: SessionAnswerRequest, transaction: object
+    ) -> DraftCommandResult: ...
+
+    async def confirm_session(
+        self, session_id: UUID, payload: SessionConfirmRequest, transaction: object
+    ) -> DraftCommandResult: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ApiProductionCapabilities:
     run_owner: RunCreationOwnerPort | None = None
     run_read_projection: RunReadProjectionPort | None = None
+    draft_owner: DraftSessionCommandPort | None = None
 
 
 class ProductionApiBackend:
@@ -101,12 +172,14 @@ class ProductionApiBackend:
         *,
         run_owner: RunCreationOwnerPort | None = None,
         run_read_projection: RunReadProjectionPort | None = None,
+        draft_owner: DraftSessionCommandPort | None = None,
         shutdown: Callable[[], Awaitable[None]] | None = None,
         health_check: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
     ) -> None:
         self._store = store
         self._run_owner = run_owner
         self._run_read_projection = run_read_projection
+        self._draft_owner = draft_owner
         self._shutdown = shutdown
         self._health_check = health_check
         self._admission_lock = Lock()
@@ -131,10 +204,20 @@ class ProductionApiBackend:
             await self.cancel_graph_tasks()
             self._closed = True
             failures = False
-            close_owner = getattr(self._run_owner, "close", None)
-            for close_resource in (close_owner, self._shutdown):
-                if close_resource is None:
-                    continue
+            owners: list[object] = []
+            seen_owners: set[int] = set()
+            for owner in (self._run_owner, self._draft_owner):
+                if owner is not None and id(owner) not in seen_owners:
+                    seen_owners.add(id(owner))
+                    owners.append(owner)
+            close_resources: list[Callable[[], Awaitable[None]]] = []
+            for owner_resource in owners:
+                close_resource = getattr(owner_resource, "close", None)
+                if callable(close_resource):
+                    close_resources.append(close_resource)
+            if self._shutdown is not None:
+                close_resources.append(self._shutdown)
+            for close_resource in close_resources:
                 try:
                     await close_resource()
                 except Exception:
@@ -158,9 +241,14 @@ class ProductionApiBackend:
             loop = task.get_loop()
             if not loop.is_closed():
                 loop.call_soon_threadsafe(task.cancel)
-        close_owner_admission = getattr(self._run_owner, "close_admission", None)
-        if callable(close_owner_admission):
-            close_owner_admission()
+        seen: set[int] = set()
+        for owner in (self._run_owner, self._draft_owner):
+            if owner is None or id(owner) in seen:
+                continue
+            seen.add(id(owner))
+            close_owner_admission = getattr(owner, "close_admission", None)
+            if callable(close_owner_admission):
+                close_owner_admission()
 
     async def drain_active_commands(self) -> None:
         await self._active_commands_drained.wait()
@@ -322,27 +410,100 @@ class ProductionApiBackend:
         canonical_body: bytes,
         status_code: int,
     ) -> object:
-        owner = self._run_owner
         payload = request.payload
-        if request.operation != "create_run" or not isinstance(payload, CreateRun) or owner is None:
-            raise _unavailable()
+
+        command: Callable[[object], Awaitable[object]]
+        project_response: Callable[[object], object]
+        owner_receipt: Callable[[object], tuple[str, UUID, str]]
+        if request.operation == "create_run":
+            run_owner = self._run_owner
+            if not isinstance(payload, CreateRun) or run_owner is None:
+                raise _unavailable()
+
+            async def create_run_command(transaction: object) -> RunCreatedProjection:
+                return await run_owner.create_run(payload, transaction)
+
+            def project_run_response(value: object) -> dict[str, object]:
+                receipt = cast(RunCreatedProjection, value)
+                return {
+                    "run_id": str(receipt.run_id),
+                    "status": RunStatus.Planning.value,
+                    "version": receipt.state_version,
+                }
+
+            def run_owner_receipt(value: object) -> tuple[str, UUID, str]:
+                receipt = cast(RunCreatedProjection, value)
+                return "run", UUID(str(receipt.run_id)), receipt.receipt_key
+
+            command = create_run_command
+            project_response = project_run_response
+            owner_receipt = run_owner_receipt
+        else:
+            draft_owner = self._draft_owner
+            if draft_owner is None:
+                raise _unavailable()
+
+            if request.operation == "create_session" and isinstance(
+                payload, SessionCreateRequest
+            ):
+
+                async def create_draft_command(transaction: object) -> DraftCommandResult:
+                    return await draft_owner.create_session(payload, transaction)
+
+                command = create_draft_command
+            else:
+                session_id = request.resource_id
+                if session_id is None:
+                    raise _unavailable()
+
+                if request.operation == "session_message" and isinstance(
+                    payload, SessionMessageRequest
+                ):
+
+                    async def send_draft_message(transaction: object) -> DraftCommandResult:
+                        return await draft_owner.send_message(session_id, payload, transaction)
+
+                    command = send_draft_message
+                elif request.operation == "session_answer" and isinstance(
+                    payload, SessionAnswerRequest
+                ):
+
+                    async def answer_draft_question(transaction: object) -> DraftCommandResult:
+                        return await draft_owner.answer_question(session_id, payload, transaction)
+
+                    command = answer_draft_question
+                elif request.operation == "session_confirm" and isinstance(
+                    payload, SessionConfirmRequest
+                ):
+
+                    async def confirm_draft_session(transaction: object) -> DraftCommandResult:
+                        return await draft_owner.confirm_session(session_id, payload, transaction)
+
+                    command = confirm_draft_session
+                else:
+                    raise _unavailable()
+
+            def project_draft_response(value: object) -> dict[str, object]:
+                result = _require_draft_command_result(value)
+                if request.resource_id is not None and result.session_id != request.resource_id:
+                    raise ValueError("Draft owner returned a result for another session")
+                return {
+                    "session_id": str(result.session_id),
+                    "status": result.status.value,
+                    "revision": result.revision,
+                }
+
+            def draft_owner_receipt(value: object) -> tuple[str, UUID, str]:
+                result = _require_draft_command_result(value)
+                if request.resource_id is not None and result.session_id != request.resource_id:
+                    raise ValueError("Draft owner returned a result for another session")
+                return "draft", result.owner_receipt.draft_id, result.owner_receipt.receipt_key
+
+            project_response = project_draft_response
+            owner_receipt = draft_owner_receipt
+
         if not key.strip() or len(key) > 256:
             raise ApiError(422, "Idempotency-Key is invalid", "INVALID_REQUEST")
-
-        async def command(transaction: object) -> RunCreatedProjection:
-            return await owner.create_run(payload, transaction)
-
-        def project_response(value: object) -> dict[str, object]:
-            receipt = cast(RunCreatedProjection, value)
-            return {
-                "run_id": str(receipt.run_id),
-                "status": RunStatus.Planning.value,
-                "version": receipt.state_version,
-            }
-
-        def owner_receipt(value: object) -> tuple[str, UUID, str]:
-            receipt = cast(RunCreatedProjection, value)
-            return "run", UUID(str(receipt.run_id)), receipt.receipt_key
 
         try:
             outcome = await self._store.execute_api_command(
@@ -468,6 +629,12 @@ def _unavailable() -> ApiError:
         "DEPENDENCY_UNAVAILABLE",
         retryable=True,
     )
+
+
+def _require_draft_command_result(value: object) -> DraftCommandResult:
+    if not isinstance(value, DraftCommandResult):
+        raise TypeError("Draft owner returned an invalid command result")
+    return value
 
 
 def _create_run_gate_code(error: Exception) -> str | None:
