@@ -28,6 +28,7 @@ from langchain_core.messages import (
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import StructuredTool
 from langchain_core.tracers.context import tracing_v2_callback_var
+from langchain_core.utils.function_calling import convert_to_openai_function
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langsmith import tracing_context
 from pydantic import BaseModel, PrivateAttr, ValidationError
@@ -39,6 +40,7 @@ from codemigrator.core import (
     canonical_json_bytes,
     load_resource,
 )
+from codemigrator.core.models.plan import PlanProposal
 from codemigrator.workspace import GatewayContext
 from codemigrator.workspace.models import (
     EditFileCall,
@@ -63,6 +65,7 @@ from .memory import (
     EvictionAuditSink,
     EvictionEngine,
 )
+from .plan_agent_output import PlanProposalAgentOutput, parse_plan_proposal_agent_output
 from .provider import (
     AsyncProvider,
     ProviderCallIdentity,
@@ -125,7 +128,7 @@ def agent_toolset_digest(
     owner_kind: str,
     response_format: type[BaseModel] | None = None,
 ) -> str:
-    """Digest the closed policy projection and the exact schemas given to LangChain."""
+    """Digest the closed tools and canonical response contract for one AgentRun."""
 
     if owner_kind not in {"run", "draft"}:
         raise ValueError("AgentRun owner kind must be run or draft")
@@ -152,7 +155,7 @@ def agent_toolset_digest(
     digest = hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
     if response_format is None:
         return digest
-    output_tool = _structured_output_tool_definition(response_format)
+    output_tool = _raw_structured_output_tool_definition(response_format)
     return hashlib.sha256(
         canonical_json_bytes(
             {
@@ -192,12 +195,57 @@ def agent_tool_definitions(
 
 
 def _structured_output_tool_definition(schema: type[BaseModel]) -> ToolDefinition:
-    json_schema = schema.model_json_schema()
+    wire_schema: type[BaseModel] = (
+        PlanProposalAgentOutput if schema is PlanProposal else schema
+    )
+    raw_wire_schema = wire_schema.model_json_schema()
+    if _has_dynamic_object_schemas(raw_wire_schema):
+        raise ValueError("strict structured output requires explicit object fields")
+    function_schema = convert_to_openai_function(wire_schema, strict=True)
+    parameters = function_schema.get("parameters")
+    if not isinstance(parameters, dict):
+        raise ValueError("structured output schema must be a JSON object")
+    _remove_schema_defaults(parameters)
     return ToolDefinition(
         name=schema.__name__,
         description=schema.__doc__ or "",
-        parameters=json_schema,
+        parameters=parameters,
+        strict=True,
     )
+
+
+def _raw_structured_output_tool_definition(schema: type[BaseModel]) -> ToolDefinition:
+    """Return the canonical Pydantic schema used by the persisted AgentRun digest."""
+
+    return ToolDefinition(
+        name=schema.__name__,
+        description=schema.__doc__ or "",
+        parameters=schema.model_json_schema(),
+    )
+
+
+def _remove_schema_defaults(schema: object) -> None:
+    """Drop JSON Schema defaults from the strict provider-facing projection."""
+
+    if isinstance(schema, dict):
+        schema.pop("default", None)
+        for value in schema.values():
+            _remove_schema_defaults(value)
+    elif isinstance(schema, list):
+        for value in schema:
+            _remove_schema_defaults(value)
+
+
+def _has_dynamic_object_schemas(schema: object) -> bool:
+    if isinstance(schema, dict):
+        if schema.get("additionalProperties") is True or isinstance(
+            schema.get("additionalProperties"), dict
+        ):
+            return True
+        return any(_has_dynamic_object_schemas(value) for value in schema.values())
+    if isinstance(schema, list):
+        return any(_has_dynamic_object_schemas(value) for value in schema)
+    return False
 
 
 def agent_context_digest(
@@ -363,17 +411,13 @@ class ProviderChatModel(BaseChatModel):
                 parameters = schema
             else:
                 raise ValueError("structured output tool has no closed JSON schema")
-            expected_schema = _structured_output_tool_definition(
+            expected_schema = _raw_structured_output_tool_definition(
                 cast(type[BaseModel], self._structured_output)
             ).parameters
             if parameters.get("properties") != expected_schema.get("properties"):
                 raise ValueError("structured output schema differs from the frozen AgentRun schema")
             definitions.append(
-                ToolDefinition(
-                    name=output_name,
-                    description=str(output_tool.description or ""),
-                    parameters=parameters,
-                )
+                _structured_output_tool_definition(cast(type[BaseModel], self._structured_output))
             )
         self._request_tools = tuple(definitions)
         tool_choice = kwargs.get("tool_choice")
@@ -465,6 +509,11 @@ class ProviderChatModel(BaseChatModel):
                     retryable=False,
                     failure_code="invalid_tool_arguments_shape",
                 )
+            if (
+                self._structured_output is PlanProposal
+                and call.name == self._structured_output.__name__
+            ):
+                arguments = parse_plan_proposal_agent_output(arguments) or arguments
             tool_calls.append(
                 {
                     "name": call.name,
@@ -476,10 +525,18 @@ class ProviderChatModel(BaseChatModel):
         content = response.content
         if not tool_calls and self._structured_output is not None and content:
             try:
-                structured_value = self._structured_output.model_validate_json(content)
-            except ValidationError:
-                pass
-            else:
+                content_value = json.loads(content)
+            except (TypeError, ValueError):
+                content_value = None
+            if self._structured_output is PlanProposal:
+                content_value = parse_plan_proposal_agent_output(content_value) or content_value
+            structured_value = None
+            if isinstance(content_value, dict):
+                try:
+                    structured_value = self._structured_output.model_validate(content_value)
+                except ValidationError:
+                    pass
+            if structured_value is not None:
                 tool_calls.append(
                     {
                         "name": self._structured_output.__name__,

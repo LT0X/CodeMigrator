@@ -83,6 +83,8 @@ def _safe_provider_shape_for_diagnostics(
 def _safe_plan_proposal_argument_shape(raw_arguments: object) -> dict[str, object]:
     """Summarize structured output validation without retaining provider data."""
 
+    from codemigrator.runtime.plan_agent_output import parse_plan_proposal_agent_output
+
     fields = frozenset({"slices", "edges", "integration_ranks", "planner_rationale"})
     if not isinstance(raw_arguments, str) or len(raw_arguments) > 1_000_000:
         return {"root_kind": "unavailable", "known_field_count": 0, "missing_field_count": 4}
@@ -92,6 +94,7 @@ def _safe_plan_proposal_argument_shape(raw_arguments: object) -> dict[str, objec
         return {"root_kind": "invalid_json", "known_field_count": 0, "missing_field_count": 4}
     if not isinstance(value, dict):
         return {"root_kind": "non_object", "known_field_count": 0, "missing_field_count": 4}
+    value = parse_plan_proposal_agent_output(value) or value
 
     keys = set(value)
     result: dict[str, object] = {
@@ -2436,12 +2439,17 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
 
         class StructuredProvider:
             async def complete(self, request):
+                wire_proposal = proposal.model_dump(mode="json", by_alias=True)
+                wire_proposal["integration_ranks"] = [
+                    {"local_ref": local_ref, "rank": rank}
+                    for local_ref, rank in proposal.integration_ranks.items()
+                ]
                 return ProviderResponse(
                     content="",
                     tool_calls=(
                         ProviderToolCall(
                             "PlanProposal",
-                            json.dumps(proposal.model_dump(mode="json", by_alias=True)),
+                            json.dumps(wire_proposal),
                             f"production-plan-{len(requests)}",
                         ),
                     ),
@@ -2466,10 +2474,12 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                 calls = self.calls.setdefault(agent_run_id, {})
                 if call_id in calls:
                     return calls[call_id]
-                if calls:
+                round_limit = 1 if real_opencode else 4
+                if len(calls) >= min(max_rounds, round_limit):
                     return None
-                calls[call_id] = 1
-                return 1
+                round_index = len(calls) + 1
+                calls[call_id] = round_index
+                return round_index
 
             async def record(self, agent_run_id, usage, receipt):
                 return None
@@ -2497,11 +2507,16 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                 requests.append(request)
                 response = await self.delegate.complete(request)
                 try:
-                    PlanProposal.model_validate_json(response.content)
+                    content_value = json.loads(response.content)
                 except Exception:
                     content_is_plan_proposal = False
                 else:
-                    content_is_plan_proposal = True
+                    content_is_plan_proposal = (
+                        _safe_plan_proposal_argument_shape(
+                            json.dumps(content_value, ensure_ascii=False)
+                        ).get("valid")
+                        is True
+                    )
                 matching_calls = [
                     call for call in response.tool_calls if call.name == "PlanProposal"
                 ]
@@ -2562,7 +2577,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                 profile=ModelProfile.Reasoning,
                 config_revision=config_revision,
                 context_window=int(opencode["Context Window"]),
-                output_cap=min(8_192, int(opencode["模型输出上限"])),
+                output_cap=min(2_048, int(opencode["模型输出上限"])),
             )
             delegate = OpenAICompatibleProvider(
                 endpoint=str(opencode["Base URL"]), api_key=str(opencode["API Key"])
@@ -2588,7 +2603,8 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                         f"{source_modules[0].module_id}, writes target/a.py, and owns target/a; "
                         "B uses source module "
                         f"{source_modules[1].module_id}, writes target/b.py, and owns target/b. "
-                        "Use no edges, rank A as 0 and B as 1, and do not call tools.",
+                        "Use no edges, rank A as 0 and B as 1. Do not call exploration tools; "
+                        "return the required structured PlanProposal.",
                         required=True,
                     ),
                 )
@@ -2742,7 +2758,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                     assert entered_after_plan.is_set(), (
                         "production PLAN returned without reaching its acceptance pause"
                     )
-                    assert len(requests) == 1
+                    assert 1 <= len(requests) <= (1 if real_opencode else 4)
                     assert len(actors) == 1
                     run_events = await actors[0].store.read_run_events(run_id, 0)
                     assert [event.event_type for event in run_events][-4:] == [

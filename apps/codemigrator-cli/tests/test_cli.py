@@ -159,6 +159,23 @@ def test_no_follow_returns_only_creation_projection() -> None:
     }
 
 
+def test_run_create_without_api_configuration_never_returns_a_mock_run(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_file = tmp_path / "create-run.json"
+    request_file.write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("CODEMIGRATOR_API_URL", raising=False)
+    monkeypatch.delenv("CODEMIGRATOR_API_TOKEN", raising=False)
+
+    code, output = run_command(
+        ["run", "create", str(request_file), "--idempotency-key", "create-1", "--output", "json"]
+    )
+
+    assert code == int(ExitCode.UNKNOWN)
+    assert json.loads(output) == {"status": "UNKNOWN"}
+    assert "mock-run-001" not in output
+
+
 def test_run_watch_no_follow_projects_current_events() -> None:
     code, output = run_command(["run", "watch", "run-1", "--no-follow", "--output", "json"])
     assert code == 0
@@ -353,3 +370,40 @@ def test_http_run_control_sends_quoted_if_match(monkeypatch: pytest.MonkeyPatch)
     )
     assert payload["status"] == "CANCELLED"
     assert requests[0].get_header("If-match") == '"8"'
+
+
+def test_http_run_control_posts_create_request_with_idempotency_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[object] = []
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"run_id":"run-1","status":"CREATED","version":1}'
+
+    def open_url(request: object, *, timeout: int) -> Response:
+        del timeout
+        requests.append(request)
+        return Response()
+
+    monkeypatch.setattr("codemigrator_cli.client.urlopen", open_url)
+    request_payload = {"source": {"project_id": "project-1", "snapshot_id": "snapshot-1"}}
+    result = HttpRunControl("https://api.example.test/api/v1", token="secret").create(
+        request_payload,
+        idempotency_key="create-1",
+    )
+
+    request = requests[0]
+    assert result["run_id"] == "run-1"
+    assert request.full_url == "https://api.example.test/api/v1/migrations"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == "Bearer secret"
+    assert request.get_header("Idempotency-key") == "create-1"
+    assert request.get_header("Content-type") == "application/json"
+    assert json.loads(request.data) == request_payload

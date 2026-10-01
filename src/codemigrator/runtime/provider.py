@@ -100,6 +100,7 @@ class ToolDefinition:
     name: str
     description: str
     parameters: Mapping[str, object]
+    strict: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parameters", MappingProxyType(dict(self.parameters)))
@@ -620,6 +621,7 @@ def _openai_tools(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": dict(tool.parameters),
+                **({"strict": True} if tool.strict else {}),
             },
         }
         for tool in tools

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from typing import Protocol
 from urllib.error import HTTPError
 from urllib.parse import quote, urljoin
@@ -60,6 +60,27 @@ class HttpRunControl:
             "DELETE",
             f"migrations/{quote(run_id, safe='')}",
             headers={"If-Match": f'"{expected_version}"'},
+            stale_version_on_conflict=True,
+        )
+
+    def create(
+        self, payload: Mapping[str, object], idempotency_key: str
+    ) -> dict[str, object]:
+        if not isinstance(payload, Mapping):
+            raise ValueError("CreateRun request must be an object")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValueError("idempotency_key must not be empty")
+        body = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return self._request(
+            "POST",
+            "migrations",
+            headers={
+                "Content-Type": "application/json",
+                "Idempotency-Key": idempotency_key,
+            },
+            body=body,
         )
 
     def _request(
@@ -68,15 +89,22 @@ class HttpRunControl:
         path: str,
         *,
         headers: dict[str, str] | None = None,
+        body: bytes | None = None,
+        stale_version_on_conflict: bool = False,
     ) -> dict[str, object]:
         request_headers = {"Accept": "application/json", "Authorization": f"Bearer {self.token}"}
         request_headers.update(headers or {})
-        request = Request(urljoin(self.base_url, path), method=method, headers=request_headers)
+        request = Request(
+            urljoin(self.base_url, path),
+            data=body,
+            method=method,
+            headers=request_headers,
+        )
         try:
             with urlopen(request, timeout=30) as response:  # noqa: S310 - deployment URL is explicit
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            if exc.code in {409, 412}:
+            if stale_version_on_conflict and exc.code in {409, 412}:
                 raise StaleVersionError("server rejected If-Match version") from exc
             raise RuntimeError(f"API request failed: {exc.code}") from exc
         if not isinstance(payload, dict):
