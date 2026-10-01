@@ -440,8 +440,15 @@ async def test_graph_restart_uses_fresh_actor_and_pg_cas_checkpoint(tmp_path: Pa
         def __init__(self, effects) -> None:  # type: ignore[no-untyped-def]
             self.effects = effects
 
-        async def advance_one_round(self, run_id, logical_key, *, on_agent_run_started):  # type: ignore[no-untyped-def]
-            del run_id, logical_key, on_agent_run_started
+        async def advance_one_round(
+            self,
+            run_id,
+            logical_key,
+            *,
+            on_agent_run_started,
+            on_agent_run_terminal,
+        ):  # type: ignore[no-untyped-def]
+            del run_id, logical_key, on_agent_run_started, on_agent_run_terminal
             self.effects["EXECUTE"] += 1
             return ExecutionRoundDecision(complete=True, dispatch_count=0)
 
