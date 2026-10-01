@@ -2,6 +2,7 @@ import type {
   EvidenceProjection,
   HealthProjection,
   MigrationProjection,
+  RegisteredProjectProjection,
   ReportProjection,
   SessionProjection,
   WorkspaceProjection,
@@ -26,6 +27,8 @@ export interface SessionEvent {
 
 export interface ApiClient {
   listMigrations(): Promise<MigrationProjection[]>;
+  listProjects(): Promise<RegisteredProjectProjection[]>;
+  createDraftSession(input: CreateDraftSessionInput): Promise<SessionProjection>;
   getMigration(runId: string): Promise<MigrationProjection>;
   getWorkspace(runId: string): Promise<WorkspaceProjection>;
   getReport(runId: string): Promise<ReportProjection>;
@@ -37,6 +40,14 @@ export interface ApiClient {
   confirmCorrection(sessionId: string, correctionId: string, previewHash: string): Promise<SessionProjection>;
   streamEvents(runId: string, afterSequence: number, signal?: AbortSignal): AsyncIterable<RunEvent>;
   streamSessionEvents(sessionId: string, afterSequence: number, signal?: AbortSignal): AsyncIterable<SessionEvent>;
+}
+
+export interface CreateDraftSessionInput {
+  readonly source: {
+    readonly project_id: string;
+    readonly snapshot_id: string;
+  };
+  readonly goal: string;
 }
 
 const requireResponse = async (response: Response): Promise<Response> => {
@@ -138,6 +149,8 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   });
   return {
     listMigrations: async () => (await readJson<{ items?: MigrationProjection[] }>(request("/migrations"))).items ?? [],
+    listProjects: async () => (await readJson<{ items?: RegisteredProjectProjection[] }>(request("/projects"))).items ?? [],
+    createDraftSession: async (input) => readJson<SessionProjection>(writeRequest("/sessions", { kind: "DRAFT", payload: input })),
     getMigration: async (runId) => readJson<MigrationProjection>(request(`/migrations/${encode(runId)}`)),
     getWorkspace: async (runId) => readJson<WorkspaceProjection>(request(`/migrations/${encode(runId)}/workspace`)),
     getReport: async (runId) => readJson<ReportProjection>(request(`/migrations/${encode(runId)}/report`)),

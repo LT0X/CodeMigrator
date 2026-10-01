@@ -62,25 +62,37 @@ export async function* observeSession(client: ApiClient, sessionId: string, sign
   let retries = 0;
 
   while (!signal?.aborted && retries < 3) {
+    let needsReconnect = false;
+    let failed = false;
+    let failure: unknown;
     try {
       for await (const event of client.streamSessionEvents(sessionId, cursor, signal)) {
         if (event.sequence <= cursor) continue;
+        if (event.sequence !== cursor + 1) {
+          needsReconnect = true;
+          break;
+        }
         cursor = event.sequence;
         retries = 0;
         yield event;
         if (event.type === "session.closed" || event.type === "session.attached_to_run") return;
       }
-      return;
     } catch (error) {
       if (signal?.aborted) return;
-      retries += 1;
-      if (retries >= 3) throw error;
-      try {
-        await delay(250 * retries, signal);
-      } catch {
-        if (signal?.aborted) return;
-        throw error;
-      }
+      failed = true;
+      failure = error;
+    }
+    if (!needsReconnect && !failed) return;
+    retries += 1;
+    if (retries >= 3) {
+      if (failed) throw failure;
+      throw new Error("session event replay could not fill a sequence gap");
+    }
+    try {
+      await delay(250 * retries, signal);
+    } catch (error) {
+      if (signal?.aborted) return;
+      throw error;
     }
   }
 }

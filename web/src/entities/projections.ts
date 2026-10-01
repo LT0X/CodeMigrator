@@ -54,3 +54,9 @@ export interface SessionProjection {
   readonly status: string;
   readonly revision: number;
 }
+
+export interface RegisteredProjectProjection {
+  readonly project_id: string;
+  readonly snapshot_id: string | null;
+  readonly status: string;
+}

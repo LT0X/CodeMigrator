@@ -18,6 +18,7 @@ from codemigrator.core import (
 )
 
 from .deps import ApiRequest, EventRecord, PersistedEvent
+from .draft_host import RegisteredSnapshot, RegisteredSnapshotResolver
 from .dto import (
     SessionAnswerRequest,
     SessionConfirmRequest,
@@ -104,9 +105,14 @@ class RunReadProjectionPort(Protocol):
 
 
 class DraftOwnerReceiptIdentity(Protocol):
-    draft_id: UUID
-    receipt_key: str
-    category: str
+    @property
+    def draft_id(self) -> UUID: ...
+
+    @property
+    def receipt_key(self) -> str: ...
+
+    @property
+    def category(self) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +158,11 @@ class DraftSessionCommandPort(Protocol):
     """
 
     async def create_session(
-        self, payload: SessionCreateRequest, transaction: object
+        self,
+        principal_id: str,
+        payload: SessionCreateRequest,
+        snapshot: RegisteredSnapshot,
+        transaction: object,
     ) -> DraftCommandResult: ...
 
     async def send_message(
@@ -182,6 +192,7 @@ class ApiProductionCapabilities:
     run_read_projection: RunReadProjectionPort | None = None
     draft_owner: DraftSessionCommandPort | None = None
     draft_graph_starter: DraftGraphStarterPort | None = None
+    registered_snapshot_resolver: RegisteredSnapshotResolver | None = None
 
 
 class ProductionApiBackend:
@@ -195,6 +206,7 @@ class ProductionApiBackend:
         run_read_projection: RunReadProjectionPort | None = None,
         draft_owner: DraftSessionCommandPort | None = None,
         draft_graph_starter: DraftGraphStarterPort | None = None,
+        registered_snapshot_resolver: RegisteredSnapshotResolver | None = None,
         shutdown: Callable[[], Awaitable[None]] | None = None,
         health_check: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
     ) -> None:
@@ -203,6 +215,7 @@ class ProductionApiBackend:
         self._run_read_projection = run_read_projection
         self._draft_owner = draft_owner
         self._draft_graph_starter = draft_graph_starter
+        self._registered_snapshot_resolver = registered_snapshot_resolver
         self._shutdown = shutdown
         self._health_check = health_check
         self._admission_lock = Lock()
@@ -476,12 +489,24 @@ class ProductionApiBackend:
             if draft_owner is None:
                 raise _unavailable()
 
-            if request.operation == "create_session" and isinstance(
-                payload, SessionCreateRequest
-            ):
+            if request.operation == "create_session" and isinstance(payload, SessionCreateRequest):
 
                 async def create_draft_command(transaction: object) -> DraftCommandResult:
-                    return await draft_owner.create_session(payload, transaction)
+                    resolver = self._registered_snapshot_resolver
+                    if resolver is None:
+                        raise _unavailable()
+                    snapshot = await resolver.resolve_snapshot(
+                        request.principal_id, payload.payload.source
+                    )
+                    if snapshot is None:
+                        raise ApiError(404, "registered snapshot not found", "NOT_FOUND")
+                    if snapshot.project != payload.payload.source:
+                        raise RuntimeError(
+                            "snapshot resolver returned a different registered source"
+                        )
+                    return await draft_owner.create_session(
+                        request.principal_id, payload, snapshot, transaction
+                    )
 
                 command = create_draft_command
             else:
@@ -666,9 +691,7 @@ class ProductionApiBackend:
             lambda completed: self._draft_graph_start_finished(task_key, completed)
         )
 
-    def _graph_start_finished(
-        self, task_key: tuple[UUID, str], task: asyncio.Task[None]
-    ) -> None:
+    def _graph_start_finished(self, task_key: tuple[UUID, str], task: asyncio.Task[None]) -> None:
         if self._graph_start_tasks.get(task_key) is task:
             del self._graph_start_tasks[task_key]
         if not task.cancelled():

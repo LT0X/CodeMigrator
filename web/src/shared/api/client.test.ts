@@ -2,6 +2,46 @@ import { describe, expect, it } from "vitest";
 import { createApiClient, parseSse } from "./client";
 
 describe("API boundary", () => {
+  it("lists only registered projects and their selectable snapshots", async () => {
+    const calls: string[] = [];
+    const fetchImpl = async (input: RequestInfo | URL): Promise<Response> => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ items: [{ project_id: "project-1", snapshot_id: "snapshot-1", status: "READY" }] }), { status: 200 });
+    };
+
+    const projects = await createApiClient({ baseUrl: "/api/v1", fetchImpl }).listProjects();
+
+    expect(calls).toEqual(["/api/v1/projects"]);
+    expect(projects).toEqual([{ project_id: "project-1", snapshot_id: "snapshot-1", status: "READY" }]);
+  });
+
+  it("creates a Draft session from a registered project snapshot and goal", async () => {
+    let requestUrl = "";
+    let requestInit: RequestInit | undefined;
+    const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      requestUrl = String(input);
+      requestInit = init;
+      return new Response(JSON.stringify({ session_id: "session-1", status: "OPEN", revision: 0 }), { status: 201 });
+    };
+
+    const session = await createApiClient({ baseUrl: "/api/v1", fetchImpl }).createDraftSession({
+      source: { project_id: "project-1", snapshot_id: "snapshot-1" },
+      goal: "把服务迁移到 Python",
+    });
+
+    expect(requestUrl).toBe("/api/v1/sessions");
+    expect(requestInit?.method).toBe("POST");
+    expect(JSON.parse(String(requestInit?.body))).toEqual({
+      kind: "DRAFT",
+      payload: {
+        source: { project_id: "project-1", snapshot_id: "snapshot-1" },
+        goal: "把服务迁移到 Python",
+      },
+    });
+    expect(new Headers(requestInit?.headers).get("Idempotency-Key")).toBeTruthy();
+    expect(session).toEqual({ session_id: "session-1", status: "OPEN", revision: 0 });
+  });
+
   it("builds encoded read-only projection paths", async () => {
     const calls: string[] = [];
     const initValues: RequestInit[] = [];

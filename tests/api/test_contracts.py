@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
 
-from codemigrator.api.dto import MigrationEvent, SpecView
+from codemigrator.api.dto import MigrationEvent, SessionEvent, SpecView
 from codemigrator.api.events import RunEventType
 from codemigrator.core import SecretRegistry
 
@@ -160,3 +161,60 @@ def test_run_lifecycle_event_projection_rejects_invalid_safe_fields(
 ) -> None:
     with pytest.raises(ValueError, match="run event summary"):
         MigrationEvent.from_record(event(uuid4(), 1, event_type), data=data)
+
+
+def test_draft_revision_event_projects_only_four_artifacts_and_snapshot_metadata() -> None:
+    names = (
+        "spec",
+        "understanding_dossier",
+        "target_project_blueprint",
+        "migration_rulebook",
+    )
+    value = SessionEvent(
+        type="session.draft_revision.created",
+        data={
+            "revision": 2,
+            "artifacts": {name: {"version": 1} for name in names},
+            "artifact_snapshots": [
+                {
+                    "name": name,
+                    "version": 2,
+                    "sha256": "a" * 64,
+                    "size": 10,
+                    "media_type": "application/json",
+                    "cas_reference": "private-reference",
+                }
+                for name in names
+            ],
+            "prompt": "private model prompt",
+            "source": "private source body",
+            "graph_state": {"secret": "hidden"},
+        },
+        sequence=1,
+        timestamp_utc=datetime.now(UTC),
+    )
+
+    assert set(value.data) == {"revision", "artifacts", "artifact_snapshots"}
+    assert all(
+        set(snapshot) == {"name", "version", "sha256", "size", "media_type"}
+        for snapshot in value.data["artifact_snapshots"]
+    )
+
+
+def test_draft_question_event_requires_a_recommended_choice() -> None:
+    with pytest.raises(ValueError, match="Draft question event summary"):
+        SessionEvent(
+            type="session.question.asked",
+            data={
+                "question_id": str(uuid4()),
+                "revision": 1,
+                "prompt": "Choose a migration boundary.",
+                "options": [
+                    {"key": "a", "label": "A", "impact": "A", "recommended": False},
+                    {"key": "b", "label": "B", "impact": "B", "recommended": False},
+                ],
+                "allow_free_text": True,
+            },
+            sequence=1,
+            timestamp_utc=datetime.now(UTC),
+        )

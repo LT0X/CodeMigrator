@@ -15,6 +15,28 @@ CREATE TABLE IF NOT EXISTS runtime_events (
     PRIMARY KEY (run_id, sequence)
 );
 
+CREATE TABLE IF NOT EXISTS run_integration_intents (
+    run_id uuid NOT NULL REFERENCES runtime_runs(run_id),
+    idempotency_key char(64) NOT NULL CHECK (idempotency_key ~ '^[0-9a-f]{64}$'),
+    intent_sha256 char(64) NOT NULL CHECK (intent_sha256 ~ '^[0-9a-f]{64}$'),
+    intent jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (run_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS run_integration_receipts (
+    run_id uuid NOT NULL,
+    idempotency_key char(64) NOT NULL,
+    verified_commit_oid text NOT NULL CHECK (length(btrim(verified_commit_oid)) > 0),
+    receipt_sha256 char(64) NOT NULL CHECK (receipt_sha256 ~ '^[0-9a-f]{64}$'),
+    event_sequence bigint NOT NULL CHECK (event_sequence > 0),
+    created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (run_id, idempotency_key),
+    UNIQUE (run_id, event_sequence),
+    FOREIGN KEY (run_id, idempotency_key)
+        REFERENCES run_integration_intents(run_id, idempotency_key)
+);
+
 CREATE TABLE IF NOT EXISTS api_command_receipts (
     principal_id text NOT NULL CHECK (length(btrim(principal_id)) > 0),
     route text NOT NULL CHECK (length(btrim(route)) > 0),
@@ -28,9 +50,10 @@ CREATE TABLE IF NOT EXISTS api_command_receipts (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     expires_at timestamptz NOT NULL,
     PRIMARY KEY (principal_id, route, idempotency_key),
-    CHECK (
+    CONSTRAINT api_command_receipts_owner_receipt_check CHECK (
         (owner_kind IS NULL AND owner_id IS NULL AND owner_receipt_key IS NULL)
         OR (owner_kind = 'run' AND owner_id IS NOT NULL AND owner_receipt_key IS NOT NULL)
+        OR (owner_kind = 'draft' AND owner_id IS NOT NULL AND owner_receipt_key IS NOT NULL)
     )
 );
 

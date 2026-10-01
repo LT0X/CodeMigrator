@@ -279,11 +279,13 @@ def create_production_app(
                 run_read_projection = owner_result.run_read_projection
                 draft_owner = owner_result.draft_owner
                 draft_graph_starter = owner_result.draft_graph_starter
+                registered_snapshot_resolver = owner_result.registered_snapshot_resolver
             else:
                 owner = owner_result
                 run_read_projection = None
                 draft_owner = None
                 draft_graph_starter = None
+                registered_snapshot_resolver = None
 
             async def check_health() -> Mapping[str, object]:
                 if not app.state.runtime_ready or pool is None or pool.is_closing():
@@ -314,6 +316,7 @@ def create_production_app(
                 run_read_projection=run_read_projection,
                 draft_owner=draft_owner,
                 draft_graph_starter=draft_graph_starter,
+                registered_snapshot_resolver=registered_snapshot_resolver,
                 shutdown=shutdown,
                 health_check=check_health,
             )

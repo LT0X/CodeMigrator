@@ -16,15 +16,18 @@ import asyncpg
 import httpx
 import pytest
 
+from codemigrator.analysis import InMemorySnapshotSource
 from codemigrator.api import ApiConfig, create_app
 from codemigrator.api.backend import DraftCommandResult, ProductionApiBackend
 from codemigrator.api.deps import ApiRequest
+from codemigrator.api.draft_host import RegisteredSnapshot
 from codemigrator.api.sse import sse_events
 from codemigrator.asgi import create_production_app
 from codemigrator.core import (
     CreateRun,
     FailureReason,
     MigrationSessionStatus,
+    RegisteredProject,
     RunId,
     StableErrorCode,
     canonical_json_bytes,
@@ -32,7 +35,6 @@ from codemigrator.core import (
 from codemigrator.core.models.plan import PlanProposal
 from codemigrator.runtime.actor import RunActor
 from codemigrator.runtime.contracts import (
-    DraftSessionEventSpec,
     RunCreatedReceipt,
     RuntimeStoreTransaction,
 )
@@ -46,6 +48,7 @@ from codemigrator.runtime.store import (
     PostgreSQLRuntimeStore,
     RuntimeStore,
 )
+from tests.runtime.conftest import draft_question_event
 
 from .conftest import build_frozen_plan, build_plan_agent_inputs, create_run_payload
 
@@ -78,6 +81,40 @@ def _safe_provider_shape_for_diagnostics(
         "content_is_plan_proposal": bool(content_is_plan_proposal),
         "tool_arguments_are_plan_proposal": bool(tool_arguments_are_plan_proposal),
     }
+
+
+def _draft_session_payload(
+    goal: str = "Translate the registered source snapshot.",
+) -> dict[str, object]:
+    return {
+        "kind": "DRAFT",
+        "payload": {
+            "source": {
+                "project_id": "00000000-0000-4000-8000-000000000001",
+                "snapshot_id": "00000000-0000-4000-8000-000000000002",
+            },
+            "goal": goal,
+        },
+    }
+
+
+def _draft_snapshot() -> RegisteredSnapshot:
+    return RegisteredSnapshot(
+        project=RegisteredProject(
+            project_id=UUID("00000000-0000-4000-8000-000000000001"),
+            snapshot_id=UUID("00000000-0000-4000-8000-000000000002"),
+        ),
+        source=InMemorySnapshotSource("a" * 40, {"src/main.py": b"print('ok')"}),
+        module_files={".": ("src/main.py",)},
+    )
+
+
+class _DraftSnapshotResolver:
+    def __init__(self) -> None:
+        self.snapshot = _draft_snapshot()
+
+    async def resolve_snapshot(self, _principal_id: str, project: RegisteredProject):
+        return self.snapshot if project == self.snapshot.project else None
 
 
 def _safe_plan_proposal_argument_shape(raw_arguments: object) -> dict[str, object]:
@@ -601,8 +638,10 @@ class RecordingDraftSessionCommands:
             owner_receipt=receipt,
         )
 
-    async def create_session(self, payload, transaction):  # type: ignore[no-untyped-def]
-        del payload
+    async def create_session(
+        self, principal_id, payload, snapshot, transaction
+    ):  # type: ignore[no-untyped-def]
+        del principal_id, payload, snapshot
         return await self._commit("create_session", self.draft_id, 0, transaction)
 
     async def send_message(self, session_id, payload, transaction):  # type: ignore[no-untyped-def]
@@ -629,14 +668,18 @@ class RecordingDraftGraphStarter:
 
 
 class FailingDraftSessionCommands(RecordingDraftSessionCommands):
-    async def create_session(self, payload, transaction):  # type: ignore[no-untyped-def]
-        await super().create_session(payload, transaction)
+    async def create_session(
+        self, principal_id, payload, snapshot, transaction
+    ):  # type: ignore[no-untyped-def]
+        await super().create_session(principal_id, payload, snapshot, transaction)
         raise RuntimeError("synthetic Draft command failure")
 
 
 class InvalidDraftResultCommands(RecordingDraftSessionCommands):
-    async def create_session(self, payload, transaction):  # type: ignore[no-untyped-def]
-        await super().create_session(payload, transaction)
+    async def create_session(
+        self, principal_id, payload, snapshot, transaction
+    ):  # type: ignore[no-untyped-def]
+        await super().create_session(principal_id, payload, snapshot, transaction)
         return SimpleNamespace(
             session_id=self.draft_id,
             status=MigrationSessionStatus.Drafting,
@@ -650,8 +693,10 @@ class BlockingDraftSessionCommands(RecordingDraftSessionCommands):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def create_session(self, payload, transaction):  # type: ignore[no-untyped-def]
-        result = await super().create_session(payload, transaction)
+    async def create_session(
+        self, principal_id, payload, snapshot, transaction
+    ):  # type: ignore[no-untyped-def]
+        result = await super().create_session(principal_id, payload, snapshot, transaction)
         self.entered.set()
         await self.release.wait()
         return result
@@ -1165,7 +1210,11 @@ async def test_preflight_gates_share_the_api_transaction_connection_at_pool_size
 async def test_draft_api_commands_delegate_through_the_api_transaction_without_run_handoff():
     store = InMemoryRuntimeStore()
     draft_owner = RecordingDraftSessionCommands(store)
-    backend = ProductionApiBackend(store, draft_owner=draft_owner)
+    backend = ProductionApiBackend(
+        store,
+        draft_owner=draft_owner,
+        registered_snapshot_resolver=_DraftSnapshotResolver(),
+    )
     app = create_app(backend, config=ApiConfig(token="synthetic-token"))
 
     async with httpx.AsyncClient(
@@ -1175,17 +1224,17 @@ async def test_draft_api_commands_delegate_through_the_api_transaction_without_r
         headers = {**auth, "Idempotency-Key": "draft-api-create"}
         created = await client.post(
             "/api/v1/sessions",
-            json={"kind": "DRAFT", "payload": {}},
+            json=_draft_session_payload(),
             headers=headers,
         )
         replay = await client.post(
             "/api/v1/sessions",
-            json={"kind": "DRAFT", "payload": {}},
+            json=_draft_session_payload(),
             headers=headers,
         )
         conflict = await client.post(
             "/api/v1/sessions",
-            json={"kind": "OTHER", "payload": {}},
+            json=_draft_session_payload("Use another migration goal."),
             headers=headers,
         )
         session_id = str(draft_owner.draft_id)
@@ -1196,7 +1245,11 @@ async def test_draft_api_commands_delegate_through_the_api_transaction_without_r
         )
         answer = await client.post(
             f"/api/v1/sessions/{session_id}/answers",
-            json={"question_id": str(uuid4()), "answer": "yes", "revision": 1},
+            json={
+                "question_id": str(uuid4()),
+                "answer": {"free_text": "yes"},
+                "revision": 1,
+            },
             headers={**auth, "Idempotency-Key": "draft-api-answer"},
         )
         confirmed = await client.post(
@@ -1243,7 +1296,7 @@ async def test_draft_api_write_commands_fail_closed_without_a_draft_owner():
         responses = (
             await client.post(
                 "/api/v1/sessions",
-                json={"kind": "DRAFT", "payload": {}},
+                json=_draft_session_payload(),
                 headers={**headers, "Idempotency-Key": "missing-draft-create"},
             ),
             await client.post(
@@ -1253,7 +1306,11 @@ async def test_draft_api_write_commands_fail_closed_without_a_draft_owner():
             ),
             await client.post(
                 f"/api/v1/sessions/{session_id}/answers",
-                json={"question_id": str(uuid4()), "answer": "yes", "revision": 0},
+                json={
+                    "question_id": str(uuid4()),
+                    "answer": {"free_text": "yes"},
+                    "revision": 0,
+                },
                 headers={**headers, "Idempotency-Key": "missing-draft-answer"},
             ),
             await client.post(
@@ -1276,14 +1333,18 @@ async def test_draft_api_write_commands_fail_closed_without_a_draft_owner():
 async def test_failed_draft_owner_command_rolls_back_fact_and_api_receipt():
     store = InMemoryRuntimeStore()
     draft_owner = FailingDraftSessionCommands(store)
-    backend = ProductionApiBackend(store, draft_owner=draft_owner)
+    backend = ProductionApiBackend(
+        store,
+        draft_owner=draft_owner,
+        registered_snapshot_resolver=_DraftSnapshotResolver(),
+    )
     app = create_app(backend, config=ApiConfig(token="synthetic-token"))
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
         response = await client.post(
             "/api/v1/sessions",
-            json={"kind": "DRAFT", "payload": {}},
+            json=_draft_session_payload(),
             headers={
                 "Authorization": "Bearer synthetic-token",
                 "Idempotency-Key": "failed-draft-command",
@@ -1302,14 +1363,18 @@ async def test_failed_draft_owner_command_rolls_back_fact_and_api_receipt():
 async def test_draft_command_result_without_owner_receipt_is_rejected_and_rolled_back():
     store = InMemoryRuntimeStore()
     draft_owner = InvalidDraftResultCommands(store)
-    backend = ProductionApiBackend(store, draft_owner=draft_owner)
+    backend = ProductionApiBackend(
+        store,
+        draft_owner=draft_owner,
+        registered_snapshot_resolver=_DraftSnapshotResolver(),
+    )
     app = create_app(backend, config=ApiConfig(token="synthetic-token"))
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
         response = await client.post(
             "/api/v1/sessions",
-            json={"kind": "DRAFT", "payload": {}},
+            json=_draft_session_payload(),
             headers={
                 "Authorization": "Bearer synthetic-token",
                 "Idempotency-Key": "invalid-draft-result",
@@ -1327,7 +1392,11 @@ async def test_draft_command_result_without_owner_receipt_is_rejected_and_rolled
 async def test_draft_command_cancellation_rolls_back_owner_fact_and_api_receipt():
     store = InMemoryRuntimeStore()
     draft_owner = BlockingDraftSessionCommands(store)
-    backend = ProductionApiBackend(store, draft_owner=draft_owner)
+    backend = ProductionApiBackend(
+        store,
+        draft_owner=draft_owner,
+        registered_snapshot_resolver=_DraftSnapshotResolver(),
+    )
     app = create_app(backend, config=ApiConfig(token="synthetic-token"))
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
@@ -1335,7 +1404,7 @@ async def test_draft_command_cancellation_rolls_back_owner_fact_and_api_receipt(
         request = asyncio.create_task(
             client.post(
                 "/api/v1/sessions",
-                json={"kind": "DRAFT", "payload": {}},
+                json=_draft_session_payload(),
                 headers={
                     "Authorization": "Bearer synthetic-token",
                     "Idempotency-Key": "cancelled-draft-command",
@@ -1376,11 +1445,16 @@ async def test_production_asgi_injects_draft_owner_for_all_four_atomic_commands(
             graph_starters.append(starter)
             return starter
 
+        def snapshot_resolver_factory(store, resources):  # type: ignore[no-untyped-def]
+            del store, resources
+            return _DraftSnapshotResolver()
+
         app = create_production_app(
             dsn,
             config=ApiConfig(token="synthetic-token"),
             draft_command_owner_factory=draft_owner_factory,
             draft_graph_starter_factory=draft_graph_starter_factory,
+            registered_snapshot_resolver_factory=snapshot_resolver_factory,
             stop_server=noop_server_stop,
             pool_server_settings={"search_path": schema},
         )
@@ -1392,17 +1466,17 @@ async def test_production_asgi_injects_draft_owner_for_all_four_atomic_commands(
                 create_headers = {**auth, "Idempotency-Key": "root-draft-create"}
                 created = await client.post(
                     "/api/v1/sessions",
-                    json={"kind": "DRAFT", "payload": {}},
+                    json=_draft_session_payload(),
                     headers=create_headers,
                 )
                 replay = await client.post(
                     "/api/v1/sessions",
-                    json={"kind": "DRAFT", "payload": {}},
+                    json=_draft_session_payload(),
                     headers=create_headers,
                 )
                 conflict = await client.post(
                     "/api/v1/sessions",
-                    json={"kind": "OTHER", "payload": {}},
+                    json=_draft_session_payload("Use another migration goal."),
                     headers=create_headers,
                 )
                 session_id = created.json()["session_id"]
@@ -1413,7 +1487,11 @@ async def test_production_asgi_injects_draft_owner_for_all_four_atomic_commands(
                 )
                 answer = await client.post(
                     f"/api/v1/sessions/{session_id}/answers",
-                    json={"question_id": str(uuid4()), "answer": "yes", "revision": 1},
+                    json={
+                        "question_id": str(uuid4()),
+                        "answer": {"free_text": "yes"},
+                        "revision": 1,
+                    },
                     headers={**auth, "Idempotency-Key": "root-draft-answer"},
                 )
                 confirmed = await client.post(
@@ -1489,7 +1567,7 @@ async def test_production_asgi_hides_draft_owner_without_graph_starter():
             ) as client:
                 response = await client.post(
                     "/api/v1/sessions",
-                    json={"kind": "DRAFT", "payload": {}},
+                    json=_draft_session_payload(),
                     headers={
                         "Authorization": "Bearer synthetic-token",
                         "Idempotency-Key": "draft-needs-graph-starter",
@@ -1509,7 +1587,7 @@ async def test_production_asgi_hides_draft_owner_without_graph_starter():
 async def test_draft_owner_api_receipt_commits_and_replays_without_run_handoff():
     async with isolated_store() as (store, _schema):
         draft_id = uuid4()
-        event = DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())})
+        event = draft_question_event()
 
         async def command(transaction: RuntimeStoreTransaction):
             return await store.commit_draft_owner_fact(
@@ -1605,7 +1683,7 @@ async def test_draft_owner_api_receipt_commits_and_replays_without_run_handoff()
 async def test_draft_owner_api_receipt_rolls_back_fact_and_event_after_projection_error():
     async with isolated_store() as (store, _schema):
         draft_id = uuid4()
-        event = DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())})
+        event = draft_question_event()
 
         async def command(transaction: RuntimeStoreTransaction):
             return await store.commit_draft_owner_fact(
@@ -2049,7 +2127,7 @@ async def test_backend_fails_closed_for_unsupported_projection_and_replays_real_
             unsupported = await client.get("/api/v1/migrations", headers=headers)
             draft = await client.post(
                 "/api/v1/sessions",
-                json={"kind": "DISCOVERY", "payload": {"synthetic": "input"}},
+                json=_draft_session_payload(),
                 headers={
                     "Authorization": "Bearer synthetic-token",
                     "Idempotency-Key": "draft-not-supported",

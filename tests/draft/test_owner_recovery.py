@@ -96,6 +96,9 @@ async def test_draft_owner_persists_and_restores_revision_qa_and_freeze(artifact
     freeze_receipt = await owner.persist_freeze_receipt()
     fact_count = len(await store.list_draft_owner_facts(draft_id))
     assert question_receipt.receipt_key == f"draft.question:{first_question.question_id}"
+    persisted_events = await store.read_draft_session_events(draft_id, 0)
+    assert persisted_events[-1].event_type == "session.draft_revision.confirmed"
+    assert persisted_events[-1].data == {"revision": 2}
 
     restarted_flow = _flow(artifacts)
     restarted_flow.finalize_alignment()
