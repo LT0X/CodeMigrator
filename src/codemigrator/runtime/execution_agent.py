@@ -14,6 +14,7 @@ from codemigrator.core import (
     MigrationSlice,
     ModelProfile,
     Phase,
+    PlanEdgeKind,
     RunId,
     RunStatus,
     SessionKind,
@@ -23,6 +24,7 @@ from codemigrator.core import (
     WriteScope,
     canonical_json_bytes,
 )
+from codemigrator.planning import FrozenPlan
 from codemigrator.workspace import CheckpointReceipt, checkpoint_receipt_digest
 
 from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
@@ -221,7 +223,11 @@ class ExecutionWorkItem:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionRoundPlan:
-    """A host materialized view of frozen Slices and pending terminal recovery facts."""
+    """A host view of frozen work and Actor-committed execution facts.
+
+    ``completed_slice_ids`` is retained for compatibility; it means formally
+    integrated Slices, never candidate checkpoints or completed AgentRuns.
+    """
 
     run_id: RunId
     work_items: tuple[ExecutionWorkItem, ...]
@@ -229,6 +235,8 @@ class ExecutionRoundPlan:
     all_slice_ids: frozenset[str]
     available_pools: frozenset[ResourcePool]
     recovered_terminals: tuple[ExecutionRecoveredTerminal, ...] = ()
+    terminal_slice_failures: frozenset[str] = frozenset()
+    pending_integrations: frozenset[tuple[str, int]] = frozenset()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "work_items", tuple(self.work_items))
@@ -236,6 +244,8 @@ class ExecutionRoundPlan:
         object.__setattr__(self, "all_slice_ids", frozenset(self.all_slice_ids))
         object.__setattr__(self, "available_pools", frozenset(self.available_pools))
         object.__setattr__(self, "recovered_terminals", tuple(self.recovered_terminals))
+        object.__setattr__(self, "terminal_slice_failures", frozenset(self.terminal_slice_failures))
+        object.__setattr__(self, "pending_integrations", frozenset(self.pending_integrations))
         ids = [item.ready.slice_id for item in self.work_items]
         recovered_ids = [
             str(terminal.record.slice_ref.slice_id)
@@ -246,8 +256,25 @@ class ExecutionRoundPlan:
             len(ids) != len(set(ids))
             or len(recovered_ids) != len(set(recovered_ids))
             or not self.completed_slice_ids.issubset(self.all_slice_ids)
+            or not self.terminal_slice_failures.issubset(self.all_slice_ids)
+            or any(
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or not isinstance(item[0], str)
+                for item in self.pending_integrations
+            )
+            or any(
+                type(generation) is not int
+                or generation < 0
+                or slice_id not in self.all_slice_ids
+                for slice_id, generation in self.pending_integrations
+            )
             or not self.completed_slice_ids.isdisjoint((*ids, *recovered_ids))
             or not set(ids).isdisjoint(recovered_ids)
+            or any(
+                (item.ready.slice_id, item.ready.generation) in self.pending_integrations
+                for item in self.work_items
+            )
             or any(
                 item.material.run_id != self.run_id or item.ready.run_id != str(self.run_id)
                 for item in self.work_items
@@ -293,7 +320,14 @@ class ExecutionRoundPlan:
 
 
 class ExecutionRoundLoader(Protocol):
-    """Resolve current frozen plan, candidate facts and dispatch materials."""
+    """Resolve the plan and durable owner facts required to build one round.
+
+    ``completed_slice_ids`` must be sourced from successful M-11 integration
+    receipts. ``terminal_slice_failures`` must be sourced from RunActor facts.
+    ``pending_integrations`` must contain accepted M-08 candidate Slice/generation
+    pairs without a corresponding M-11 integration receipt. A candidate checkpoint
+    or terminal AgentRun alone satisfies neither completion nor readiness.
+    """
 
     async def load(self, run_id: RunId, logical_key: str) -> ExecutionRoundPlan: ...
 
@@ -308,6 +342,42 @@ class ExecutionSessionFactoryPort(Protocol):
 
 class ExecutionScheduleStalled(RuntimeError):
     """No DAG-ready, resource-available work exists for an incomplete Run."""
+
+
+@dataclass(frozen=True, slots=True)
+class SliceDependencyProjection:
+    """Typed predecessor sets projected from one immutable FrozenPlan."""
+
+    requires: frozenset[str] = frozenset()
+    ordered_before: frozenset[str] = frozenset()
+
+
+def project_frozen_plan_dependencies(plan: FrozenPlan) -> dict[str, SliceDependencyProjection]:
+    """Preserve Requires and OrderedBefore kinds while projecting a FrozenPlan DAG."""
+
+    if not isinstance(plan, FrozenPlan):
+        raise TypeError("dependency projection requires a FrozenPlan")
+    slice_ids = {str(slice_.id) for slice_ in plan.slices}
+    requires_by_slice: dict[str, set[str]] = {slice_id: set() for slice_id in slice_ids}
+    ordered_by_slice: dict[str, set[str]] = {slice_id: set() for slice_id in slice_ids}
+    for edge in plan.edges:
+        predecessor = str(edge.from_)
+        successor = str(edge.to)
+        if predecessor not in slice_ids or successor not in slice_ids:
+            raise ValueError("FrozenPlan edge endpoint is absent from its Slice set")
+        if edge.kind is PlanEdgeKind.Requires:
+            requires_by_slice[successor].add(predecessor)
+        elif edge.kind is PlanEdgeKind.OrderedBefore:
+            ordered_by_slice[successor].add(predecessor)
+        else:
+            raise ValueError("FrozenPlan edge kind is not supported by the runtime scheduler")
+    return {
+        slice_id: SliceDependencyProjection(
+            requires=frozenset(requires_by_slice[slice_id]),
+            ordered_before=frozenset(ordered_by_slice[slice_id]),
+        )
+        for slice_id in slice_ids
+    }
 
 
 class PersistentExecutionScheduler:
@@ -342,8 +412,15 @@ class PersistentExecutionScheduler:
         if not isinstance(plan, ExecutionRoundPlan) or plan.run_id != run_id:
             raise ValueError("EXECUTE round loader returned facts for another Run")
         run_key = str(run_id)
-        for slice_id in plan.completed_slice_ids:
-            self.fair_scheduler.complete(run_key, slice_id)
+        self.fair_scheduler.restore_committed_facts(
+            run_key,
+            integrated_slice_ids=plan.completed_slice_ids,
+            terminal_failure_slice_ids=plan.terminal_slice_failures,
+        )
+        for slice_id, generation in plan.pending_integrations:
+            self.fair_scheduler.await_integration(
+                run_key, slice_id, generation=generation
+            )
         for item in plan.work_items:
             self.fair_scheduler.submit(item.ready)
         if plan.complete:
@@ -380,12 +457,15 @@ class PersistentExecutionScheduler:
         completed_write_ids: list[AgentRunId] = []
         candidate_claims: list[CandidateCheckpointClaim] = []
         terminal_ids = [terminal.record.agent_run_id for terminal in plan.recovered_terminals]
-        completed_slices = set(plan.completed_slice_ids)
         for terminal in plan.recovered_terminals:
             if terminal.candidate_receipt is None:
                 continue
             assert terminal.record.slice_ref is not None
-            completed_slices.add(str(terminal.record.slice_ref.slice_id))
+            self.fair_scheduler.await_integration(
+                run_key,
+                str(terminal.record.slice_ref.slice_id),
+                generation=terminal.record.slice_ref.generation,
+            )
             completed_write_ids.append(terminal.record.agent_run_id)
             candidate_claims.append(
                 CandidateCheckpointClaim(terminal.record.agent_run_id, terminal.candidate_receipt)
@@ -432,16 +512,15 @@ class PersistentExecutionScheduler:
                     run_key, item.ready.slice_id, generation=item.ready.generation
                 )
                 continue
-            self.fair_scheduler.complete(
+            self.fair_scheduler.await_integration(
                 run_key, item.ready.slice_id, generation=item.ready.generation
             )
-            completed_slices.add(item.ready.slice_id)
             completed_write_ids.append(record.agent_run_id)
             candidate_claims.append(
                 CandidateCheckpointClaim(record.agent_run_id, outcome.candidate_receipt)
             )
         return ExecutionRoundDecision(
-            complete=plan.all_slice_ids.issubset(completed_slices),
+            complete=plan.complete,
             dispatch_count=len(selected),
             completed_write_agent_run_ids=tuple(completed_write_ids),
             candidate_claims=tuple(candidate_claims),
@@ -796,4 +875,6 @@ __all__ = [
     "ExecutionWorkItem",
     "PersistentExecutionAgentSessionFactory",
     "PersistentExecutionScheduler",
+    "SliceDependencyProjection",
+    "project_frozen_plan_dependencies",
 ]
