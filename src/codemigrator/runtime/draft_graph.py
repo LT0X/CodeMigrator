@@ -25,8 +25,13 @@ from .contracts import (
     agent_run_lifecycle_spec,
 )
 from .create_run import CreateRunService
-from .draft import DraftConflictError, DraftFlow
-from .draft_models import AskUserAnswer, AskUserQuestion, DraftFreezeReceipt
+from .draft import DraftConflictError, DraftFlow, DraftLedger
+from .draft_models import (
+    AskUserAnswer,
+    AskUserQuestion,
+    DraftFreezeReceipt,
+    TaskDraftRevision,
+)
 from .loop_contracts import SessionExit, SessionState
 from .store import RuntimeStore, StoreCommitError
 
@@ -77,6 +82,12 @@ class DraftOwnerPort(Protocol):
 
     async def commit_answer(self, answer: AskUserAnswer) -> DraftOwnerReceipt: ...
 
+    async def persist_current_revision(self) -> DraftOwnerReceipt: ...
+
+    async def persist_freeze_receipt(self) -> DraftOwnerReceipt: ...
+
+    async def restore_ledger(self) -> None: ...
+
     async def has_receipt(self, receipt_key: str) -> bool: ...
 
     async def commit_lifecycle_fact(
@@ -91,7 +102,7 @@ class DraftOwnerPort(Protocol):
 
 
 class DraftFlowOwner:
-    """Commit DraftFlow questions and answers behind durable Draft receipts."""
+    """Commit and recover Draft business facts behind durable owner receipts."""
 
     def __init__(self, *, draft_id: UUID, flow: DraftFlow, store: RuntimeStore) -> None:
         self.draft_id = draft_id
@@ -107,11 +118,99 @@ class DraftFlowOwner:
     ) -> tuple[DraftOwnerReceipt, dict[str, object]] | None:
         return await self.store.load_draft_owner_fact(self.draft_id, receipt_key)
 
+    async def persist_current_revision(self) -> DraftOwnerReceipt:
+        revision = self.flow.ledger.current_revision
+        if revision is None:
+            raise DraftConflictError("Draft revision must exist before it can be persisted")
+        persisted = await self._load_persisted_ledger()
+        receipt_key = _revision_receipt_key(revision.revision_number)
+        existing = await self.store.load_draft_owner_fact(self.draft_id, receipt_key)
+        body = revision.model_dump(mode="json", by_alias=True)
+        if existing is not None:
+            if existing[0].category != "draft.task_revision" or existing[1] != body:
+                raise StoreCommitError("Draft revision receipt replay mismatch")
+            if persisted.current_revision != revision:
+                raise DraftConflictError("persisted Draft revision is no longer current")
+            return existing[0]
+        if persisted.freeze_receipt is not None:
+            raise DraftConflictError("a frozen Draft cannot append another revision")
+        if revision.revision_number != len(persisted.revisions) + 1:
+            raise DraftConflictError("Draft revision persistence must remain contiguous")
+        return await self.store.commit_draft_owner_fact(
+            self.draft_id,
+            receipt_key,
+            "draft.task_revision",
+            body,
+        )
+
+    async def persist_freeze_receipt(self) -> DraftOwnerReceipt:
+        freeze_receipt = self.flow.ledger.freeze_receipt
+        if freeze_receipt is None:
+            raise DraftConflictError("Draft must be explicitly confirmed before freeze persistence")
+        await self.persist_current_revision()
+        persisted = await self._load_persisted_ledger()
+        if persisted.questions != self.flow.ledger.questions or (
+            persisted.answers != self.flow.ledger.answers
+        ):
+            raise DraftConflictError("Draft questions and answers must be committed before freeze")
+        if persisted.freeze_receipt is not None and persisted.freeze_receipt != freeze_receipt:
+            raise StoreCommitError("Draft freeze receipt conflicts with the committed receipt")
+        return await self.store.commit_draft_owner_fact(
+            self.draft_id,
+            "draft.freeze",
+            "draft.freeze",
+            freeze_receipt.model_dump(mode="json", by_alias=True),
+        )
+
+    async def restore_ledger(self) -> None:
+        self.flow.ledger = await self._load_persisted_ledger()
+
+    async def _load_persisted_ledger(self) -> DraftLedger:
+        revisions: list[TaskDraftRevision] = []
+        questions: list[AskUserQuestion] = []
+        answers: list[AskUserAnswer] = []
+        freeze_receipt: DraftFreezeReceipt | None = None
+        for receipt, fact in await self.store.list_draft_owner_facts(self.draft_id):
+            try:
+                if receipt.category == "draft.task_revision":
+                    revision = TaskDraftRevision.model_validate(fact)
+                    if receipt.receipt_key != _revision_receipt_key(revision.revision_number):
+                        raise StoreCommitError("Draft revision receipt key is inconsistent")
+                    revisions.append(revision)
+                elif receipt.category == "draft.ask_user.question":
+                    question = AskUserQuestion.model_validate(fact)
+                    if receipt.receipt_key != _question_receipt_key(question.question_id):
+                        raise StoreCommitError("Draft question receipt key is inconsistent")
+                    questions.append(question)
+                elif receipt.category == "draft.ask_user.answer":
+                    answer = AskUserAnswer.model_validate(fact)
+                    if receipt.receipt_key != _answer_receipt_key(answer.question_id):
+                        raise StoreCommitError("Draft answer receipt key is inconsistent")
+                    answers.append(answer)
+                elif receipt.category == "draft.freeze":
+                    if receipt.receipt_key != "draft.freeze" or freeze_receipt is not None:
+                        raise StoreCommitError("Draft freeze receipt key is inconsistent")
+                    freeze_receipt = DraftFreezeReceipt.model_validate(fact)
+            except StoreCommitError:
+                raise
+            except (TypeError, ValueError) as exc:
+                raise StoreCommitError("stored Draft ledger fact is invalid") from exc
+        try:
+            return DraftLedger.restore(
+                revisions=revisions,
+                questions=questions,
+                answers=answers,
+                freeze_receipt=freeze_receipt,
+            )
+        except DraftConflictError as exc:
+            raise StoreCommitError("stored Draft ledger facts are inconsistent") from exc
+
     async def commit_question(self, question: AskUserQuestion) -> DraftOwnerReceipt:
         if self.flow.ledger.current_revision is None or (
             self.flow.ledger.current_revision.revision_id != question.revision_id
         ):
             raise DraftConflictError("AskUser question must target the current Draft revision")
+        await self.persist_current_revision()
         receipt_key = _question_receipt_key(question.question_id)
         body = question.model_dump(mode="json")
         previous = await self.store.load_draft_owner_fact(self.draft_id, receipt_key)
@@ -414,6 +513,7 @@ class MigrationSessionGraph:
         frozen = self.owner.freeze_receipt
         if frozen is None or request.frozen_artifacts != frozen.frozen_artifact_bundle:
             raise DraftConflictError("CreateRun requires the confirmed Draft artifact freeze")
+        await self.owner.persist_freeze_receipt()
         if self.create_run_service is None:
             raise RuntimeError("Draft graph has no CreateRun service")
         receipt = await self.create_run_service.create(run_id, request)
@@ -695,6 +795,10 @@ def coordinator_task_key() -> str:
 
 def trial_translation_task_key(file_path: str) -> str:
     return f"draft.trial:{_key_digest(_normalize_path(file_path))}"
+
+
+def _revision_receipt_key(revision_number: int) -> str:
+    return f"draft.revision:{revision_number}"
 
 
 def _question_receipt_key(question_id: object) -> str:

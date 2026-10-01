@@ -31,7 +31,7 @@ from codemigrator.runtime.draft_models import (
     ExplorationReport,
     QuestionOption,
 )
-from codemigrator.runtime.store import InMemoryRuntimeStore
+from codemigrator.runtime.store import InMemoryRuntimeStore, StoreCommitError
 
 
 def _flow(artifacts) -> tuple[DraftFlow, AskUserQuestion]:
@@ -1057,6 +1057,11 @@ async def test_create_run_rejection_keeps_draft_without_run_side_effects(
 
     with pytest.raises(DraftConflictError, match="confirmed Draft artifact freeze"):
         await graph.attach_to_run(run_id, _create_request(None))
+    await graph.owner.persist_current_revision()
+    store.fail_next_commit()
+    with pytest.raises(StoreCommitError, match="injected commit failure"):
+        await graph.attach_to_run(run_id, _create_request(freeze.frozen_artifact_bundle))
+    assert await store.load_draft_owner_fact(draft_id, "draft.freeze") is None
     with pytest.raises(CreateRunRejected):
         await graph.attach_to_run(run_id, _create_request(freeze.frozen_artifact_bundle))
 
@@ -1127,6 +1132,10 @@ async def test_successful_attach_commits_once_then_releases_draft_threads(
 
     request = _create_request(freeze.frozen_artifact_bundle)
     attached = await graph.attach_to_run(run_id, request)
+    freeze_fact = await store.load_draft_owner_fact(draft_id, "draft.freeze")
+    assert freeze_fact is not None
+    assert freeze_fact[0].category == "draft.freeze"
+    assert freeze_fact[1] == freeze.model_dump(mode="json", by_alias=True)
     assert (await store.read_draft_session_events(draft_id, 0))[-1].data == {"run_id": str(run_id)}
 
     assert attached == receipt

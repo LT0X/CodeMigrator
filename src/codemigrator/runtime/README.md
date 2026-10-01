@@ -28,6 +28,8 @@ EXECUTE 的可组合实现由 `PersistentExecutionScheduler`、`PersistentExecut
 
 外层图 checkpoint、AgentRun checkpoint 和候选代码 checkpoint 属于不同恢复边界。LangGraph checkpoint 正文经 host CAS 保存，PG 只保留索引与引用；Draft/只读会话可恢复既有 thread，EXECUTE/Repair 写会话从 M-08 候选代码 checkpoint 重建并创建新 AgentRun/thread。
 
+`DraftFlowOwner` 将 TaskDraftRevision、AskUser 与确认冻结事实保存在 Draft owner ledger；恢复方显式调用 `restore_ledger()`，从已提交 facts 校验并重建业务账本，CreateRun attach 只接纳已持久化且与当前 ledger 一致的 freeze receipt。此为 runtime owner 能力，Draft REST owner/materializer 与生产 session SSE 仍由后续宿主接线提供；未接线时 Draft API 写路径保持 fail closed。
+
 PLAN factory 以 `plan:{RunId}` 作为 logical task key，并核对 loader 的冻结工件与 Run 已提交的 CreateRun 请求一致。`PlanSessionMaterial` 在构造时捕获完整 `PlanningInputs` 规范 JSON 快照，完整 payload digest（包含分析事实与 `snapshot_oid`）绑定到 PLAN AgentRun context identity；同任务键的不同输入不能恢复到旧 thread。all-zero optional planning digest 不进入通用 AgentRun digest，以保持既有非 PLAN session 的恢复 identity 稳定。结构化 `PlanProposal` schema 纳入 toolset digest 与精确 schema token budget；CAS checkpoint 反序列化只显式允许该受信 core 类型，pickle fallback 保持关闭。Run、Draft、AgentRun 的 CAS saver 实例按 owner 单独绑定；thread 删除把 graph family 与 owner identity 传入 store，PostgreSQL 在锁定 graph-thread 行的同一事务中校验并删除 checkpoint 与 pending-write-only 索引。
 
 ## Provider 响应失败边界
