@@ -17,6 +17,8 @@ def test_spec_view_does_not_expose_command_fields() -> None:
 
 
 def test_run_event_type_contains_judgement_and_repair_lifecycle() -> None:
+    assert RunEventType.RunCreated.value == "run.created"
+    assert RunEventType.PlanAccepted.value == "run.plan.accepted"
     assert RunEventType.AdviceProposed.value == "advice.proposed"
     assert RunEventType.RepairSessionCompleted.value == "repair.session.completed"
     assert RunEventType.SliceSegmentContinued.value == "slice.segment_continued"
@@ -116,3 +118,45 @@ def test_agent_run_event_summary_rejects_unbounded_or_invalid_public_fields() ->
                 "generation": 1,
             },
         )
+
+
+def test_run_lifecycle_events_project_only_safe_receipt_fields() -> None:
+    run_id = uuid4()
+    agent_run_id = uuid4()
+    created = MigrationEvent.from_record(
+        event(run_id, 1, "run.created"),
+        data={
+            "status": "PLANNING",
+            "state_version": 1,
+            "receipt_key": f"run.created:{run_id}",
+            "debug_metadata": "private",
+        },
+    )
+    accepted = MigrationEvent.from_record(
+        event(run_id, 5, "run.plan.accepted"),
+        data={
+            "agent_run_id": str(agent_run_id),
+            "plan_sha256": "a" * 64,
+            "receipt_key": f"run.plan.accepted:{run_id}",
+            "prompt": "private",
+        },
+    )
+
+    assert created.data == {"status": "PLANNING", "state_version": 1}
+    assert accepted.data == {"agent_run_id": str(agent_run_id), "plan_sha256": "a" * 64}
+
+
+@pytest.mark.parametrize(
+    ("event_type", "data"),
+    [
+        ("run.created", {"status": "NOT_A_STATUS", "state_version": 1}),
+        ("run.created", {"status": "PLANNING", "state_version": 0}),
+        ("run.plan.accepted", {"agent_run_id": "invalid", "plan_sha256": "a" * 64}),
+        ("run.plan.accepted", {"agent_run_id": str(uuid4()), "plan_sha256": "g" * 64}),
+    ],
+)
+def test_run_lifecycle_event_projection_rejects_invalid_safe_fields(
+    event_type: str, data: dict[str, object]
+) -> None:
+    with pytest.raises(ValueError, match="run event summary"):
+        MigrationEvent.from_record(event(uuid4(), 1, event_type), data=data)

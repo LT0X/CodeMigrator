@@ -92,6 +92,8 @@ class AsgiHttpServer:
     def __init__(self, app: ASGIApp) -> None:
         self._app = app
         self._server: asyncio.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
+        self._handlers: set[asyncio.Task[None]] = set()
 
     async def start(self) -> int:
         self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -101,11 +103,32 @@ class AsgiHttpServer:
     async def close(self) -> None:
         if self._server is not None:
             self._server.close()
+        writers = tuple(self._writers)
+        for writer in writers:
+            writer.close()
+        if writers:
+            await asyncio.gather(
+                *(writer.wait_closed() for writer in writers), return_exceptions=True
+            )
+        if self._server is not None:
             await self._server.wait_closed()
+        current = asyncio.current_task()
+        handlers = tuple(task for task in self._handlers if task is not current)
+        if handlers:
+            done, pending = await asyncio.wait(handlers, timeout=1)
+            del done
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        current = asyncio.current_task()
+        self._writers.add(writer)
+        if current is not None:
+            self._handlers.add(current)
         response_started = False
         try:
             request_line = await reader.readline()
@@ -206,11 +229,40 @@ class AsgiHttpServer:
                 except ConnectionError:
                     pass
         finally:
+            self._writers.discard(writer)
+            if current is not None:
+                self._handlers.discard(current)
             writer.close()
             try:
                 await writer.wait_closed()
             except ConnectionError:
                 pass
+
+
+@pytest.mark.asyncio
+async def test_asgi_http_server_close_disconnects_active_responses() -> None:
+    disconnected = asyncio.Event()
+
+    async def app(_scope: Scope, receive, send) -> None:  # type: ignore[no-untyped-def]
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"event", "more_body": True})
+        await receive()
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            disconnected.set()
+
+    server = AsgiHttpServer(app)
+    port = await server.start()
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+    await writer.drain()
+    await reader.readuntil(b"\r\n\r\n")
+
+    await server.close()
+    await asyncio.wait_for(disconnected.wait(), timeout=1)
+
+    writer.close()
+    await writer.wait_closed()
 
 
 def find_chromium() -> str | None:
@@ -250,13 +302,28 @@ async def wait_for_http_server(process: asyncio.subprocess.Process, port: int) -
 
 
 async def run_browser_driver(
-    node: str, driver: Path, *, url: str, run_id: str, chromium: str, sentinels: list[str]
+    node: str,
+    driver: Path,
+    *,
+    url: str,
+    run_id: str,
+    chromium: str,
+    sentinels: list[str],
+    full_event_ids: list[str] | None = None,
+    replay_event_ids: list[str] | None = None,
+    expected_ui_cursor: int = 3,
+    ui_timeout_ms: int = 20_000,
+    timeout_seconds: int = 45,
 ) -> tuple[int, bytes]:
     environment = child_environment(
         CODEMIGRATOR_BROWSER_URL=url,
         CODEMIGRATOR_BROWSER_RUN_ID=run_id,
         CODEMIGRATOR_BROWSER_CHROMIUM=chromium,
         CODEMIGRATOR_BROWSER_SENSITIVE_MARKERS=json.dumps(sentinels),
+        CODEMIGRATOR_BROWSER_FULL_EVENT_IDS=json.dumps(full_event_ids or ["1", "2", "3"]),
+        CODEMIGRATOR_BROWSER_REPLAY_EVENT_IDS=json.dumps(replay_event_ids or ["2", "3"]),
+        CODEMIGRATOR_BROWSER_UI_CURSOR=str(expected_ui_cursor),
+        CODEMIGRATOR_BROWSER_UI_TIMEOUT_MS=str(ui_timeout_ms),
     )
     process = await asyncio.create_subprocess_exec(
         node,
@@ -267,7 +334,9 @@ async def run_browser_driver(
         start_new_session=True,
     )
     try:
-        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=45)
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(), timeout=timeout_seconds
+        )
     except TimeoutError:
         try:
             os.killpg(process.pid, signal.SIGTERM)

@@ -7,6 +7,10 @@ const chromiumPath = process.env.CODEMIGRATOR_BROWSER_CHROMIUM;
 const baseUrl = process.env.CODEMIGRATOR_BROWSER_URL;
 const runId = process.env.CODEMIGRATOR_BROWSER_RUN_ID;
 const sensitiveMarkers = JSON.parse(process.env.CODEMIGRATOR_BROWSER_SENSITIVE_MARKERS ?? "[]");
+const fullEventIds = JSON.parse(process.env.CODEMIGRATOR_BROWSER_FULL_EVENT_IDS ?? '["1","2","3"]');
+const replayEventIds = JSON.parse(process.env.CODEMIGRATOR_BROWSER_REPLAY_EVENT_IDS ?? '["2","3"]');
+const expectedUiCursor = Number(process.env.CODEMIGRATOR_BROWSER_UI_CURSOR ?? "3");
+const uiTimeoutMs = Number(process.env.CODEMIGRATOR_BROWSER_UI_TIMEOUT_MS ?? "20000");
 
 function requireEnvironment() {
   if (!chromiumPath || !baseUrl || !runId || !Array.isArray(sensitiveMarkers)) {
@@ -77,12 +81,16 @@ async function waitForUi(cdp) {
   const expression = `(() => {
     const summary = document.querySelector('[aria-label="AgentRun 执行摘要"] span[data-agent-run-state="TERMINAL"]');
     const activity = document.querySelector('[aria-label="运行事件活动条"] [aria-live="polite"]');
-    return { summary: summary?.textContent?.replace(/\\s+/g, " ").trim() ?? "", activity: activity?.textContent ?? "" };
+    const activityText = activity?.textContent ?? "";
+    return {
+      summary: summary?.textContent?.replace(/\\s+/g, " ").trim() ?? "",
+      cursor: Number(activityText.match(/sequence (\\d+)/)?.[1] ?? -1)
+    };
   })()`;
-  const deadline = Date.now() + 20000;
+  const deadline = Date.now() + uiTimeoutMs;
   while (Date.now() < deadline) {
     const value = await evaluate(cdp, expression);
-    if (value?.summary === "PLAN · PLAN_AUXILIARY · COMPLETED" && value.activity.includes("sequence 3")) {
+    if (value?.summary === "PLAN · PLAN_AUXILIARY · COMPLETED" && value.cursor === expectedUiCursor) {
       return value;
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -92,12 +100,29 @@ async function waitForUi(cdp) {
 
 async function inspectReplay(cdp, afterSequence, expectedIds) {
   const result = await evaluate(cdp, `(() => (async () => {
+    const expectedIds = ${JSON.stringify(expectedIds)};
     const response = await fetch("/api/v1/migrations/${runId}/events", {
-      headers: { Accept: "text/event-stream", "Last-Event-ID": "${afterSequence}" }
+      headers: { Accept: "text/event-stream", "Last-Event-ID": "${afterSequence}" },
+      signal: AbortSignal.timeout(15000)
     });
-    const raw = await response.text();
-    const blocks = raw.split(/\\r?\\n\\r?\\n/).filter((block) => block.includes("data:"));
-    const events = blocks.map((block) => {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    const blocks = [];
+    try {
+      while (blocks.length < expectedIds.length) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pending += decoder.decode(value, { stream: true });
+        const parts = pending.split(/\\r?\\n\\r?\\n/);
+        pending = parts.pop() ?? "";
+        blocks.push(...parts.filter((block) => block.includes("data:")));
+      }
+    } finally {
+      await reader.cancel();
+    }
+    const rawBlocks = blocks;
+    const events = rawBlocks.map((block) => {
       const id = block.match(/^id:\\s*(.*)$/m)?.[1]?.trim() ?? "";
       const data = block.split(/\\r?\\n/).filter((line) => line.startsWith("data:"))
         .map((line) => line.slice(5).trim()).join("\\n");
@@ -105,9 +130,10 @@ async function inspectReplay(cdp, afterSequence, expectedIds) {
     });
     const markers = ${JSON.stringify(sensitiveMarkers)};
     const json = JSON.stringify(events);
-    const forbiddenNames = ["prompt", "source", "tool_body", "provider_response", "thread_id", "checkpoint_ref"];
-    const expectedIds = ${JSON.stringify(expectedIds)};
+    const forbiddenNames = ["prompt", "source", "tool_body", "provider_response", "thread_id", "checkpoint_ref", "receipt_key"];
     const allowedKeys = {
+      "run.created": ["status", "state_version"],
+      "run.plan.accepted": ["agent_run_id", "plan_sha256"],
       "agent_run.started": ["agent_run_id", "phase", "session_kind", "slice_id", "generation"],
       "agent_run.terminal": ["agent_run_id", "phase", "session_kind", "slice_id", "generation", "exit", "receipt_category"],
       "run.status_changed": ["run_status"]
@@ -165,8 +191,8 @@ async function main() {
     await cdp.call("Page.navigate", { url: `${baseUrl}/runs/${runId}` });
     await waitForUi(cdp);
 
-    const full = await inspectReplay(cdp, 0, ["1", "2", "3"]);
-    const replay = await inspectReplay(cdp, 1, ["2", "3"]);
+    const full = await inspectReplay(cdp, 0, fullEventIds);
+    const replay = await inspectReplay(cdp, 1, replayEventIds);
     const ui = await evaluate(cdp, `(() => {
       const summary = document.querySelector('[aria-label="AgentRun 执行摘要"] span[data-agent-run-state="TERMINAL"]');
       const activity = document.querySelector('[aria-label="运行事件活动条"] [aria-live="polite"]');

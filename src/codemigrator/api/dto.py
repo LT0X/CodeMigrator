@@ -225,7 +225,7 @@ class MigrationEvent(ApiModel):
 
     @model_validator(mode="after")
     def event_data_is_redacted(self) -> MigrationEvent:
-        self.data = _project_agent_run_event_data(self.type, self.data)
+        self.data = _project_public_event_data(self.type, self.data)
         _assert_redacted(self.data)
         return self
 
@@ -250,7 +250,7 @@ class MigrationEvent(ApiModel):
         if not isinstance(record, EventRecord):
             raise TypeError("record must use EventRecord")
         event_data = record.data if data is None else data
-        event_data = _project_agent_run_event_data(record.event_type, event_data)
+        event_data = _project_public_event_data(record.event_type, event_data)
         if secret_registry is not None:
             event_data = _redact_event_data(event_data, secret_registry)
         return cls(
@@ -295,7 +295,7 @@ class SessionEvent(ApiModel):
 
     @model_validator(mode="after")
     def event_data_is_redacted(self) -> SessionEvent:
-        self.data = _project_agent_run_event_data(self.type, self.data)
+        self.data = _project_public_event_data(self.type, self.data)
         _assert_redacted(self.data)
         return self
 
@@ -320,7 +320,7 @@ class SessionEvent(ApiModel):
         if not isinstance(record, EventRecord):
             raise TypeError("record must use EventRecord")
         event_data = record.data if data is None else data
-        event_data = _project_agent_run_event_data(record.event_type, event_data)
+        event_data = _project_public_event_data(record.event_type, event_data)
         if secret_registry is not None:
             event_data = _redact_event_data(event_data, secret_registry)
         return cls(
@@ -349,7 +349,9 @@ def _redact_event_data(
     return cast(dict[str, object], result.value)
 
 
-_AGENT_RUN_EVENT_FIELDS: dict[str, tuple[str, ...]] = {
+_PUBLIC_EVENT_FIELDS: dict[str, tuple[str, ...]] = {
+    "run.created": ("status", "state_version"),
+    "run.plan.accepted": ("agent_run_id", "plan_sha256"),
     "agent_run.started": ("agent_run_id", "phase", "session_kind", "slice_id", "generation"),
     "agent_run.terminal": (
         "agent_run_id",
@@ -365,14 +367,35 @@ _AGENT_RUN_EXITS = frozenset(
     {"COMPLETED", "FAILED", "BUDGET_EXHAUSTED", "SEGMENT_STOPPED", "INVALIDATED"}
 )
 _RECEIPT_CATEGORY = re.compile(r"[a-z][a-z0-9._-]{0,63}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
-def _project_agent_run_event_data(event_type: str, value: dict[str, object]) -> dict[str, object]:
-    fields = _AGENT_RUN_EVENT_FIELDS.get(event_type)
+def _project_public_event_data(event_type: str, value: dict[str, object]) -> dict[str, object]:
+    fields = _PUBLIC_EVENT_FIELDS.get(event_type)
     if fields is None:
         return value
     try:
         projected = {key: value[key] for key in fields if key in value}
+        if event_type == "run.created":
+            state_version = projected.get("state_version")
+            if (
+                projected.get("status") not in {item.value for item in RunStatus}
+                or not isinstance(state_version, int)
+                or isinstance(state_version, bool)
+                or state_version < 1
+            ):
+                raise ValueError
+            return projected
+        if event_type == "run.plan.accepted":
+            plan_sha256 = projected.get("plan_sha256")
+            if (
+                str(UUID(str(projected.get("agent_run_id", ""))))
+                != projected.get("agent_run_id")
+                or not isinstance(plan_sha256, str)
+                or _SHA256.fullmatch(plan_sha256) is None
+            ):
+                raise ValueError
+            return projected
         if str(UUID(str(projected.get("agent_run_id", "")))) != projected.get("agent_run_id"):
             raise ValueError
         if projected.get("phase") not in {item.value for item in Phase}:
@@ -397,7 +420,8 @@ def _project_agent_run_event_data(event_type: str, value: dict[str, object]) -> 
         ):
             raise ValueError
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("AgentRun event summary is invalid") from exc
+        summary_kind = "AgentRun" if event_type.startswith("agent_run.") else "run"
+        raise ValueError(f"{summary_kind} event summary is invalid") from exc
     return projected
 
 
