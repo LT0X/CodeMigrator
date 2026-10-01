@@ -83,7 +83,11 @@ def _safe_provider_shape_for_diagnostics(
 def _safe_plan_proposal_argument_shape(raw_arguments: object) -> dict[str, object]:
     """Summarize structured output validation without retaining provider data."""
 
-    from codemigrator.runtime.plan_agent_output import parse_plan_proposal_agent_output
+    from codemigrator.runtime.plan_agent_output import (
+        PlanProposalAgentOutput,
+        _normalize_agent_output_wire,
+        parse_plan_proposal_agent_output,
+    )
 
     fields = frozenset({"slices", "edges", "integration_ranks", "planner_rationale"})
     if not isinstance(raw_arguments, str) or len(raw_arguments) > 1_000_000:
@@ -94,7 +98,126 @@ def _safe_plan_proposal_argument_shape(raw_arguments: object) -> dict[str, objec
         return {"root_kind": "invalid_json", "known_field_count": 0, "missing_field_count": 4}
     if not isinstance(value, dict):
         return {"root_kind": "non_object", "known_field_count": 0, "missing_field_count": 4}
-    value = parse_plan_proposal_agent_output(value) or value
+    raw_value = value
+    schema_fields: set[str] = set()
+
+    def visit_schema(node: object) -> None:
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            schema_fields.update(str(key) for key in properties)
+            for child in properties.values():
+                visit_schema(child)
+        visit_schema(node.get("items"))
+        definitions = node.get("$defs")
+        if isinstance(definitions, dict):
+            for child in definitions.values():
+                visit_schema(child)
+
+    visit_schema(PlanProposal.model_json_schema())
+    wire_projection_errors = ()
+    try:
+        wire_output = PlanProposalAgentOutput.model_validate(
+            _normalize_agent_output_wire(raw_value)
+        )
+    except Exception as error:
+        wire_schema_valid = False
+        wire_schema_error_kind = (
+            type(error).__name__
+            if type(error).__name__ in {"ValidationError", "ValueError", "TypeError"}
+            else "other"
+        )
+        wire_projection_valid = False
+        wire_projection_error_kind = "not_attempted"
+        wire_projection_error_paths = ()
+        wire_projection_errors = ()
+    else:
+        wire_schema_valid = True
+        wire_schema_error_kind = "none"
+        try:
+            wire_output.to_plan_proposal()
+        except Exception as error:
+            wire_projection_valid = False
+            wire_projection_error_kind = (
+                type(error).__name__
+                if type(error).__name__ in {"ValidationError", "ValueError", "TypeError"}
+                else "other"
+            )
+            raw_errors = (
+                error.errors(include_input=True, include_url=False)
+                if hasattr(error, "errors")
+                else ()
+            )
+            paths = []
+            safe_errors = []
+            for item in raw_errors[:16]:
+                path = []
+                for part in item.get("loc", ()):
+                    if isinstance(part, int):
+                        path.append(min(max(part, 0), 1_000_000))
+                    elif isinstance(part, str):
+                        path.append(part if part in schema_fields else "<field>")
+                paths.append(tuple(path[:12]))
+                error_type = str(item.get("type", "other"))
+                safe_errors.append(
+                    (
+                        tuple(path[:12]),
+                        (
+                            error_type
+                            if error_type.isascii()
+                            and error_type.replace("_", "").isalnum()
+                            else "other"
+                        ),
+                        type(item.get("input", "<missing>")).__name__,
+                    )
+                )
+            wire_projection_error_paths = tuple(paths)
+            wire_projection_errors = tuple(safe_errors)
+        else:
+            wire_projection_valid = True
+            wire_projection_error_kind = "none"
+            wire_projection_error_paths = ()
+    try:
+        PlanProposalAgentOutput.model_validate(raw_value)
+    except Exception as error:
+        errors = (
+            error.errors(include_input=True, include_url=False)
+            if hasattr(error, "errors")
+            else ()
+        )
+        wire_schema_fields: set[str] = set()
+
+        def visit_wire_schema(node: object) -> None:
+            if not isinstance(node, dict):
+                return
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                wire_schema_fields.update(str(key) for key in properties)
+                for child in properties.values():
+                    visit_wire_schema(child)
+            visit_wire_schema(node.get("items"))
+            definitions = node.get("$defs")
+            if isinstance(definitions, dict):
+                for child in definitions.values():
+                    visit_wire_schema(child)
+
+        visit_wire_schema(PlanProposalAgentOutput.model_json_schema())
+        input_shapes = []
+        for item in errors[:16]:
+            path = []
+            for part in item.get("loc", ()):
+                if isinstance(part, int):
+                    path.append(min(max(part, 0), 1_000_000))
+                elif isinstance(part, str):
+                    path.append(part if part in wire_schema_fields else "<field>")
+            input = item.get("input", "<missing>")
+            input_shapes.append((tuple(path[:12]), type(input).__name__))
+        wire_validation_input_types = tuple(input_shapes)
+    else:
+        wire_validation_input_types = ()
+
+    value = parse_plan_proposal_agent_output(raw_value) or raw_value
 
     keys = set(value)
     result: dict[str, object] = {
@@ -102,6 +225,13 @@ def _safe_plan_proposal_argument_shape(raw_arguments: object) -> dict[str, objec
         "known_field_count": min(len(keys & fields), 4),
         "missing_field_count": min(len(fields - keys), 4),
         "unknown_field_count": min(len(keys - fields), 64),
+        "wire_schema_valid": wire_schema_valid,
+        "wire_schema_error_kind": wire_schema_error_kind,
+        "wire_projection_valid": wire_projection_valid,
+        "wire_projection_error_kind": wire_projection_error_kind,
+        "wire_projection_error_paths": wire_projection_error_paths,
+        "wire_projection_errors": wire_projection_errors,
+        "wire_validation_input_types": wire_validation_input_types,
     }
     categories = {
         "missing": "missing",
@@ -114,24 +244,6 @@ def _safe_plan_proposal_argument_shape(raw_arguments: object) -> dict[str, objec
         "list_type": "type",
         "dict_type": "type",
     }
-    schema_fields: set[str] = set()
-
-    def visit_schema(node: object) -> None:
-        if not isinstance(node, dict):
-            return
-        properties = node.get("properties")
-        if isinstance(properties, dict):
-            schema_fields.update(str(key) for key in properties)
-            for child in properties.values():
-                visit_schema(child)
-        items = node.get("items")
-        visit_schema(items)
-        definitions = node.get("$defs")
-        if isinstance(definitions, dict):
-            for child in definitions.values():
-                visit_schema(child)
-
-    visit_schema(PlanProposal.model_json_schema())
     try:
         PlanProposal.model_validate(value)
     except Exception as error:
@@ -2332,6 +2444,82 @@ async def test_production_asgi_projects_committed_run_views_and_resumes_sse_from
             assert '"run_status":"FAILED"' in replay.text
 
 
+async def _run_real_opencode_browser_acceptance(
+    app: object, run_id: str
+) -> tuple[int, dict[str, object] | None]:
+    import shutil
+
+    from tests.e2e.test_browser_run_sse import (
+        AsgiHttpServer,
+        child_environment,
+        find_chromium,
+        free_port,
+        node_has_builtin_websocket,
+        run_browser_driver,
+        wait_for_http_server,
+    )
+
+    chromium = find_chromium()
+    node = shutil.which("node")
+    repo_root = Path(__file__).resolve().parents[2]
+    vite_script = repo_root / "web/node_modules/vite/bin/vite.js"
+    driver = repo_root / "web/scripts/browser-sse-e2e.mjs"
+    assert (
+        chromium
+        and node
+        and node_has_builtin_websocket(node)
+        and vite_script.is_file()
+        and driver.is_file()
+    ), "real OpenCode browser acceptance prerequisites are unavailable"
+
+    api_server = AsgiHttpServer(app)  # type: ignore[arg-type]
+    api_port = await api_server.start()
+    vite_port = await free_port()
+    vite = await asyncio.create_subprocess_exec(
+        node,
+        str(vite_script),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(vite_port),
+        "--strictPort",
+        cwd=repo_root / "web",
+        env=child_environment(
+            CODEMIGRATOR_WEB_API_TARGET=f"http://127.0.0.1:{api_port}"
+        ),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        await wait_for_http_server(vite, vite_port)
+        driver_code, browser_stdout = await run_browser_driver(
+            node,
+            driver,
+            url=f"http://127.0.0.1:{vite_port}",
+            run_id=run_id,
+            chromium=chromium,
+            sentinels=[],
+            full_event_ids=["1", "2", "3", "4", "5", "6"],
+            replay_event_ids=["2", "3", "4", "5", "6"],
+            expected_ui_cursor=6,
+            ui_timeout_ms=160_000,
+            timeout_seconds=180,
+        )
+    finally:
+        vite.terminate()
+        try:
+            await asyncio.wait_for(vite.wait(), timeout=5)
+        except TimeoutError:
+            vite.kill()
+            await vite.wait()
+        await api_server.close()
+    try:
+        summary = json.loads(browser_stdout)
+    except (TypeError, ValueError):
+        summary = None
+    return driver_code, summary if isinstance(summary, dict) else None
+
+
 @pytest.mark.asyncio
 async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execute(
     tmp_path: Path,
@@ -2474,7 +2662,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                 calls = self.calls.setdefault(agent_run_id, {})
                 if call_id in calls:
                     return calls[call_id]
-                round_limit = 1 if real_opencode else 4
+                round_limit = 4
                 if len(calls) >= min(max_rounds, round_limit):
                     return None
                 round_index = len(calls) + 1
@@ -2546,6 +2734,9 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
             "1",
             "true",
         }
+        real_opencode_browser = os.environ.get(
+            "CODEMIGRATOR_REAL_OPENCODE_BROWSER", ""
+        ).casefold() in {"1", "true"}
         if real_opencode:
             configured_path = os.environ.get("CODEMIGRATOR_OPENCODE_CONFIG")
             candidates = (
@@ -2577,7 +2768,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                 profile=ModelProfile.Reasoning,
                 config_revision=config_revision,
                 context_window=int(opencode["Context Window"]),
-                output_cap=min(2_048, int(opencode["模型输出上限"])),
+                output_cap=min(8_192, int(opencode["模型输出上限"])),
             )
             delegate = OpenAICompatibleProvider(
                 endpoint=str(opencode["Base URL"]), api_key=str(opencode["API Key"])
@@ -2724,12 +2915,13 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
         request_body["frozen_artifacts"] = planning_inputs.frozen_artifacts.model_dump(mode="json")
         app = create_production_app(
             dsn,
-            config=ApiConfig(token="synthetic-token"),
+            config=ApiConfig(token="browser-e2e-token"),
             run_components_factory=components_factory,
             stop_server=noop_server_stop,
             pool_server_settings={"search_path": schema},
         )
         test_failure: Exception | None = None
+        browser_result: tuple[int, dict[str, object] | None] | None = None
         try:
             async with app.router.lifespan_context(app):
                 try:
@@ -2740,12 +2932,16 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                             "/api/v1/migrations",
                             json=request_body,
                             headers={
-                                "Authorization": "Bearer synthetic-token",
+                                "Authorization": "Bearer browser-e2e-token",
                                 "Idempotency-Key": "production-plan-agent-run",
                             },
                         )
                         assert response.status_code == 201
                         run_id = RunId(UUID(response.json()["run_id"]))
+                        if real_opencode_browser:
+                            browser_result = await _run_real_opencode_browser_acceptance(
+                                app, str(run_id)
+                            )
                         await asyncio.wait_for(
                             plan_result_ready.wait(),
                             timeout=150 if real_opencode else 45,
@@ -2758,7 +2954,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                     assert entered_after_plan.is_set(), (
                         "production PLAN returned without reaching its acceptance pause"
                     )
-                    assert 1 <= len(requests) <= (1 if real_opencode else 4)
+                    assert 1 <= len(requests) <= 4
                     assert len(actors) == 1
                     run_events = await actors[0].store.read_run_events(run_id, 0)
                     assert [event.event_type for event in run_events][-4:] == [
@@ -2776,6 +2972,35 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                         await actors[0].store.get_cas_reference("run", run_id, "frozen-plan")
                         is not None
                     )
+                    if real_opencode_browser:
+                        assert browser_result is not None
+                        driver_code, browser_summary = browser_result
+                        assert driver_code == 0 and isinstance(browser_summary, dict), (
+                            "real OpenCode browser SSE scenario failed"
+                        )
+                        assert browser_summary.get("ui_summary") == (
+                            "PLAN · PLAN_AUXILIARY · COMPLETED"
+                        )
+                        assert browser_summary.get("ui_cursor") == 6
+                        assert browser_summary.get("full_event_ids") == [
+                            "1",
+                            "2",
+                            "3",
+                            "4",
+                            "5",
+                            "6",
+                        ]
+                        assert browser_summary.get("replay_event_ids") == [
+                            "2",
+                            "3",
+                            "4",
+                            "5",
+                            "6",
+                        ]
+                        assert browser_summary.get("full_envelope_valid") is True
+                        assert browser_summary.get("replay_envelope_valid") is True
+                        assert browser_summary.get("forbidden_field_name_in_full_sse") is False
+                        assert browser_summary.get("forbidden_field_name_in_sse") is False
                 except Exception as error:
                     test_failure = error
         finally:

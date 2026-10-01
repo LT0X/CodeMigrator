@@ -494,6 +494,90 @@ async def test_create_agent_returns_structured_output_without_gateway_dispatch()
 
 
 @pytest.mark.asyncio
+async def test_create_agent_retries_a_plan_with_an_invalid_write_path() -> None:
+    binding = _binding()
+    run = _run(binding)
+    invalid = {
+        "slices": [
+            {
+                "local_ref": "A",
+                "kind": "IMPLEMENTATION",
+                "source_modules": [],
+                "write_paths": ["../outside.py"],
+                "create_roots": [],
+                "rationale": [],
+                "required_checks": [],
+                "artifact_tasks": [],
+                "generated": True,
+                "generation_tag": "GENERATED",
+                "minimum_nontrivial_assertions": 1,
+                "information_firewall": True,
+            }
+        ],
+        "edges": [],
+        "integration_ranks": [{"local_ref": "A", "rank": 0}],
+        "planner_rationale": [],
+    }
+    accepted = {
+        "slices": [
+            {
+                **invalid["slices"][0],
+                "write_paths": ["target/a.py"],
+                "generated": False,
+                "generation_tag": None,
+                "minimum_nontrivial_assertions": 0,
+                "information_firewall": False,
+            }
+        ],
+        "edges": [],
+        "integration_ranks": [{"local_ref": "A", "rank": 0}],
+        "planner_rationale": [],
+    }
+    provider = FakeProvider(
+        [
+            _response(
+                "",
+                tools=(ProviderToolCall("PlanProposal", json.dumps(invalid), "plan-invalid"),),
+            ),
+            _response(
+                "",
+                tools=(ProviderToolCall("PlanProposal", json.dumps(accepted), "plan-accepted"),),
+            ),
+        ]
+    )
+    gateway = FakeGateway()
+    bound = create_bound_agent(
+        agent_run=run,
+        binding=binding,
+        registry=ProviderRegistry({"openai-compatible": provider}),
+        context_manager=ContextManager(
+            token_counter=ExactCounter(), net_input_cap=FormulaNetInputCap()
+        ),
+        template="plan role",
+        envelope=ContextEnvelope(stable=(ContextSegment("stable", "frozen facts"),)),
+        gateway=gateway,
+        context_identity=_context_identity(run, binding),
+        response_format=PlanProposal,
+    )
+
+    result = await bound.ainvoke(task="Return a structured plan")
+
+    assert result.structured_response == PlanProposal.model_validate(
+        {
+            **accepted,
+            "integration_ranks": {"A": 0},
+        }
+    )
+    assert len(provider.requests) == 2
+    assert any(
+        "write_paths" in message.content
+        for message in provider.requests[1].messages
+        if isinstance(message.content, str)
+    )
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
 async def test_create_agent_accepts_valid_structured_json_content_without_tool_dispatch() -> None:
     binding = _binding()
     run = _run(binding)

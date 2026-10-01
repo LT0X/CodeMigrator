@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any
 
 from pydantic import Field, StrictInt, ValidationError, field_validator, model_validator
@@ -104,8 +105,9 @@ def parse_plan_proposal_agent_output(raw: object) -> dict[str, Any] | None:
 
     if not isinstance(raw, dict):
         return None
+    normalized = _normalize_agent_output_wire(raw)
     try:
-        wire_output = PlanProposalAgentOutput.model_validate(raw)
+        wire_output = PlanProposalAgentOutput.model_validate(normalized)
     except ValidationError:
         try:
             proposal = PlanProposal.model_validate(raw)
@@ -117,6 +119,95 @@ def parse_plan_proposal_agent_output(raw: object) -> dict[str, Any] | None:
     except (ValidationError, ValueError):
         return None
     return proposal.model_dump(mode="json", by_alias=True)
+
+
+def _normalize_agent_output_wire(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize equivalent provider representations to the strict PLAN wire form.
+
+    Some OpenAI-compatible endpoints return the canonical object representation
+    of M-00's opaque anchors even though strict JSON tool schemas require each
+    anchor to be carried as a JSON string. They may also omit the redundant
+    ``kind`` in the ``planner_rationale`` collection; that field is implied by
+    the collection's owner. Generated-test annotations are derived from the
+    authoritative slice kind, matching the core model's own normalization.
+    An unanchored entry is downgraded to advisory when the provider incorrectly
+    marks it as factual, preserving the core invariant that unsupported
+    rationale cannot be accepted as anchored evidence. Other missing or
+    malformed fields remain untouched for Pydantic to reject.
+    """
+
+    normalized = deepcopy(payload)
+    slices = normalized.get("slices")
+    if isinstance(slices, list):
+        for item in slices:
+            if isinstance(item, dict):
+                _normalize_generated_metadata(item)
+                _normalize_dossier_entries(item.get("rationale"))
+    planner_rationale = normalized.get("planner_rationale")
+    _normalize_dossier_entries(planner_rationale, planner_owned=True)
+    return normalized
+
+
+def _normalize_generated_metadata(slice_payload: dict[str, Any]) -> None:
+    """Re-derive test-generation annotations from the authoritative slice kind."""
+
+    kind = slice_payload.get("kind")
+    if kind == SliceKind.TestGeneration.value:
+        slice_payload["generated"] = True
+        slice_payload["generation_tag"] = "GENERATED"
+        minimum = slice_payload.get("minimum_nontrivial_assertions", 0)
+        if type(minimum) is int:
+            slice_payload["minimum_nontrivial_assertions"] = max(minimum, 1)
+        slice_payload["information_firewall"] = True
+    elif kind in {item.value for item in SliceKind}:
+        slice_payload["generated"] = False
+        slice_payload["generation_tag"] = None
+        slice_payload["minimum_nontrivial_assertions"] = 0
+        slice_payload["information_firewall"] = False
+
+
+def _normalize_dossier_entries(entries: object, *, planner_owned: bool = False) -> None:
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if planner_owned:
+            entry.setdefault("kind", "planner")
+        anchors = entry.get("anchors")
+        if not isinstance(anchors, list):
+            continue
+        valid_anchors = [
+            normalized_anchor
+            for anchor in anchors
+            if (normalized_anchor := _canonical_anchor_json(anchor)) is not None
+        ]
+        entry["anchors"] = valid_anchors
+        if not valid_anchors and entry.get("advisory") is False:
+            entry["advisory"] = True
+
+
+def _canonical_anchor_json(anchor: object) -> str | None:
+    """Return a JSON-object anchor string without inventing missing evidence."""
+
+    decoded: object = anchor
+    if isinstance(anchor, str):
+        for _ in range(2):
+            try:
+                decoded = json.loads(anchor)
+            except (TypeError, ValueError):
+                return None
+            if isinstance(decoded, dict):
+                break
+            if isinstance(decoded, str):
+                anchor = decoded
+                continue
+            return None
+        else:
+            return None
+    if not isinstance(decoded, dict):
+        return None
+    return json.dumps(decoded, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _decode_dossier_entry(payload: dict[str, Any]) -> dict[str, Any]:
