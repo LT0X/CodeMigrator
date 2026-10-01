@@ -106,7 +106,9 @@ async def test_run_facts_and_api_response_replay_share_one_owner_transaction():
         assert replay["response"] == first["response"]
         assert replay["replayed"] is True
         assert calls == 1
-        assert len((await store.load(run_id)).events) == 1
+        assert [
+            event.event_type for event in (await store.load(run_id)).events
+        ] == ["run.created", "run.status_changed"]
         assert await table_count(store, "api_command_receipts") == 1
         assert await table_count(store, "run_graph_start_handoffs") == 1
 
@@ -154,7 +156,9 @@ async def test_same_key_different_canonical_body_conflicts_without_owner_write()
         assert conflict["conflict"] is True
         assert await table_count(store, "api_command_receipts") == 1
         assert await table_count(store, "run_graph_start_handoffs") == 1
-        assert len((await store.load(run_id)).events) == 1
+        assert [
+            event.event_type for event in (await store.load(run_id)).events
+        ] == ["run.created", "run.status_changed"]
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from codemigrator.api.dto import MigrationListView, MigrationView, SliceView, WorkspaceView
 from codemigrator.core import MigrationSlice, RunId, SliceAttemptStatus, SliceId
+from codemigrator.planning import FrozenPlan, compute_plan_hash
 
 from .runtime.cas import CasIntegrityError, FileHostCAS
 from .runtime.contracts import RunState, RuntimeSnapshot
@@ -71,43 +72,32 @@ class RuntimeRunReadModel:
             return (), ()
         run_id = snapshot.state.run_id
         plan_ref = await self._store.get_cas_reference("run", run_id, "frozen-plan")
-        if plan_ref is None or plan_ref.digest != expected_digest:
-            raise StoreCommitError("Run frozen-plan reference does not match committed state")
+        if plan_ref is None:
+            raise StoreCommitError("Run frozen-plan reference is missing")
         try:
             body = self._host_cas.read(plan_ref)
             payload = json.loads(body)
         except (CasIntegrityError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise StoreCommitError("Run frozen-plan object is unavailable") from exc
-        if (
-            not isinstance(payload, dict)
-            or not isinstance(payload.get("slices"), list)
-            or not isinstance(payload.get("integration_order"), list)
-        ):
-            raise StoreCommitError("Run frozen-plan projection is invalid")
         try:
-            slices = tuple(MigrationSlice.model_validate(item) for item in payload["slices"])
+            if not isinstance(payload, dict) or "plan_hash" in payload:
+                raise ValueError("Run frozen-plan payload is not canonical")
+            frozen_plan = FrozenPlan.model_validate(
+                {**payload, "plan_hash": expected_digest}
+            )
+            if (
+                not frozen_plan.validation.accepted
+                or compute_plan_hash(frozen_plan) != expected_digest
+                or frozen_plan.canonical_payload() != body
+            ):
+                raise ValueError("Run frozen-plan hash does not match committed state")
         except (TypeError, ValueError, ValidationError) as exc:
-            raise StoreCommitError("Run frozen-plan slices are invalid") from exc
+            raise StoreCommitError("Run frozen-plan projection is invalid") from exc
+        slices = frozen_plan.slices
+        integration_order = frozen_plan.integration_order
         identifiers = tuple(slice_.id for slice_ in slices)
         if len(set(identifiers)) != len(identifiers):
             raise StoreCommitError("Run frozen-plan contains duplicate Slice identifiers")
-        try:
-            integration_order = tuple(
-                SliceId(UUID(str(value))) for value in payload["integration_order"]
-            )
-        except (TypeError, ValueError) as exc:
-            raise StoreCommitError("Run frozen integration order is invalid") from exc
-        expected_order = tuple(
-            slice_.id
-            for slice_ in sorted(
-                slices, key=lambda item: (item.integration_rank, item.id.bytes)
-            )
-        )
-        if (
-            len(set(integration_order)) != len(integration_order)
-            or integration_order != expected_order
-        ):
-            raise StoreCommitError("Run frozen integration order does not match its slices")
         return slices, integration_order
 
     @staticmethod
@@ -150,12 +140,13 @@ class RuntimeRunReadModel:
             elif event.event_type == "integration.started":
                 status_by_id[slice_id] = SliceAttemptStatus.Integrating
             elif event.event_type in {
+                "test.failure_attributed",
                 "candidate.generation_started",
                 "candidate.generation_invalidated",
             }:
                 status_by_id[slice_id] = SliceAttemptStatus.Regenerating
-            elif event.event_type == "verified.advanced":
-                status_by_id[slice_id] = SliceAttemptStatus.Integrated
+            elif event.event_type == "integration.completed":
+                status_by_id[slice_id] = SliceAttemptStatus.IntegrationQueued
 
         result: dict[SliceId, SliceView] = {}
         for slice_ in slices:

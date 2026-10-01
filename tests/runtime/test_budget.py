@@ -55,7 +55,13 @@ async def test_budget_100_closes_new_calls_and_fails_run_in_order(run_id):
     assert snapshot.state.failure_reason is FailureReason.BudgetExhausted
     assert snapshot.state.new_calls_enabled is False
     types = [event.event_type for event in snapshot.events]
-    assert types[-4:] == ["checkpoint.pre", "run.archived", "run.failed", "budget.exhausted"]
+    assert types[-5:] == [
+        "checkpoint.pre",
+        "run.archived",
+        "run.failed",
+        "budget.exhausted",
+        "run.status_changed",
+    ]
     await actor.stop()
 
 

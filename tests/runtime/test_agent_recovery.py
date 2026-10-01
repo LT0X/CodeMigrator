@@ -237,12 +237,13 @@ async def test_actor_accepts_only_matching_persisted_candidate_checkpoint() -> N
     assert result.complete is True
     assert snapshot.state.candidate_checkpoints[0].candidate_oid == CANDIDATE_OID
     assert snapshot.state.candidate_checkpoints[0].agent_run_id == record.agent_run_id
-    assert [event.event_type for event in snapshot.events[-2:]] == [
+    assert [event.event_type for event in snapshot.events[-3:]] == [
         "slice.candidate.accepted",
         "run.execute.round",
+        "run.status_changed",
     ]
-    assert "candidate_oid" not in snapshot.events[-2].data
-    assert "candidate_checkpoint_sha256" not in snapshot.events[-2].data
+    assert "candidate_oid" not in snapshot.events[-3].data
+    assert "candidate_checkpoint_sha256" not in snapshot.events[-3].data
     await actor.stop()
 
 

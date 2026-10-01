@@ -9,46 +9,29 @@ from codemigrator.api import ApiConfig, create_app
 from codemigrator.api.backend import ProductionApiBackend
 from codemigrator.api_read_model import RuntimeRunReadModel
 from codemigrator.core import (
-    MigrationSlice,
     RunId,
     RunStatus,
     SliceAttemptStatus,
-    SliceKind,
     canonical_json_bytes,
 )
 from codemigrator.runtime.cas import FileHostCAS
 from codemigrator.runtime.contracts import EventSpec, RunState
 from codemigrator.runtime.store import InMemoryRuntimeStore
 
-
-def _slice(slice_id: UUID, integration_rank: int) -> MigrationSlice:
-    return MigrationSlice(
-        id=slice_id,
-        kind=SliceKind.Implementation,
-        source_modules=[UUID(int=300 + integration_rank)],
-        write_scope={
-            "out": {"write_paths": [f"src/module_{integration_rank}.py"], "create_roots": []}
-        },
-        required_checks=[],
-        integration_rank=integration_rank,
-        proposal_ref=None,
-    )
+from .conftest import build_frozen_plan
 
 
 async def _create_planned_run(store, cas, run_id: UUID):  # type: ignore[no-untyped-def]
-    slices = (_slice(UUID(int=20), 0), _slice(UUID(int=10), 1))
-    payload = {
-        "slices": [slice_.model_dump(mode="json") for slice_ in slices],
-        "integration_order": [str(slice_.id) for slice_ in slices],
-    }
-    body = canonical_json_bytes(payload)
-    plan_ref = cas.put(body)
+    frozen_plan = build_frozen_plan()
+    slices = frozen_plan.slices
+    plan_ref = cas.put(frozen_plan.canonical_payload())
+    assert plan_ref.digest != frozen_plan.plan_hash
     await store.create(
         RunState(
             run_id=RunId(run_id),
             status=RunStatus.Executing,
             version=7,
-            frozen_plan_sha256=plan_ref.digest,
+            frozen_plan_sha256=frozen_plan.plan_hash,
         ),
         (
             EventSpec("dispatch.started", {"slice_id": str(slices[0].id), "generation": 2}),
@@ -67,6 +50,18 @@ async def _create_planned_run(store, cas, run_id: UUID):  # type: ignore[no-unty
                     "status": SliceAttemptStatus.Ready.value,
                     "generation": 1,
                 },
+            ),
+            EventSpec(
+                "test.failure_attributed",
+                {"slice_id": str(slices[0].id), "generation": 2},
+            ),
+            EventSpec(
+                "integration.completed",
+                {"slice_id": str(slices[1].id), "generation": 1},
+            ),
+            EventSpec(
+                "verified.advanced",
+                {"slice_id": str(slices[1].id), "generation": 1},
             ),
         ),
     )
@@ -87,14 +82,14 @@ async def test_workspace_projection_uses_frozen_plan_allowlist_and_committed_eve
     assert workspace.run_id == run_id
     assert [item.slice_id for item in workspace.slices] == [slice_.id for slice_ in slices]
     assert [item.status for item in workspace.slices] == [
-        SliceAttemptStatus.Running,
-        SliceAttemptStatus.Integrated,
+        SliceAttemptStatus.Regenerating,
+        SliceAttemptStatus.IntegrationQueued,
     ]
     assert [item.generation for item in workspace.slices] == [2, 1]
     assert [item["slice_id"] for item in workspace.integration_queue] == [
         str(slice_.id) for slice_ in slices
     ]
-    assert workspace.latest_sequence == 3
+    assert workspace.latest_sequence == 6
     assert "plan_hash" not in workspace.model_dump()
     assert "planner_rationale" not in workspace.model_dump()
 
@@ -186,7 +181,7 @@ async def test_existing_read_routes_delegate_to_projection_and_missing_capabilit
     assert listing.status_code == detail.status_code == workspace.status_code == 200
     assert listing.json()["items"][0]["run_id"] == str(run_id)
     assert detail.json()["status"] == RunStatus.Executing.value
-    assert workspace.json()["latest_sequence"] == 3
+    assert workspace.json()["latest_sequence"] == 6
     assert len(workspace.json()["slices"]) == 2
     assert missing.status_code == 404
 

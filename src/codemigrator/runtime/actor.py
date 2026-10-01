@@ -596,6 +596,12 @@ class RunActor:
         ):
             raise ValueError("PLAN acceptance facts failed deterministic owner checks")
         terminal_event = agent_run_lifecycle_spec(record, agent_receipt)
+        next_state = replace(
+            state,
+            status=RunStatus.Executing,
+            frozen_plan_sha256=plan_hash,
+            version=state.version + 1,
+        )
         events = (
             terminal_event,
             EventSpec(
@@ -606,12 +612,7 @@ class RunActor:
                     "plan_sha256": plan_hash,
                 },
             ),
-        )
-        next_state = replace(
-            state,
-            status=RunStatus.Executing,
-            frozen_plan_sha256=plan_hash,
-            version=state.version + 1,
+            _run_status_changed_event(next_state),
         )
         await self.store.commit_agent_run_receipt(
             record,
@@ -988,6 +989,7 @@ class RunActor:
                         "state_version": state.version,
                     },
                 ),
+                _run_status_changed_event(state),
             ),
             transaction=transaction,
         )
@@ -1364,8 +1366,12 @@ class RunActor:
                 self.last_error = exc
 
     async def _commit(self, state: RunState, events: tuple[EventSpec, ...]) -> bool:
+        previous_state = self._state
+        committed_events = events
+        if previous_state is not None and previous_state.status is not state.status:
+            committed_events = (*events, _run_status_changed_event(state))
         try:
-            snapshot = await self.store.commit(state, events)
+            snapshot = await self.store.commit(state, committed_events)
         except StoreCommitError as exc:
             self.last_error = exc
             return False
@@ -1376,6 +1382,13 @@ class RunActor:
 _TERMINAL_STATUSES = frozenset(
     {RunStatus.Completed, RunStatus.PartiallyCompleted, RunStatus.Failed, RunStatus.Cancelled}
 )
+
+
+def _run_status_changed_event(state: RunState) -> EventSpec:
+    data: dict[str, object] = {"run_status": state.status.value}
+    if state.failure_reason is not None:
+        data["failure_reason"] = state.failure_reason.value
+    return EventSpec("run.status_changed", data)
 
 
 def _dispatch_key(dispatch: ActiveDispatch, run_id: RunId) -> tuple[str, bytes, str]:
