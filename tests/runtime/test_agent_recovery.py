@@ -123,8 +123,15 @@ class _OneRoundScheduler:
     def __init__(self, decision: ExecutionRoundDecision) -> None:
         self.decision = decision
 
-    async def advance_one_round(self, run_id, logical_key, *, on_agent_run_started=None):
-        del on_agent_run_started
+    async def advance_one_round(
+        self,
+        run_id,
+        logical_key,
+        *,
+        on_agent_run_started=None,
+        on_agent_run_terminal=None,
+    ):
+        del on_agent_run_started, on_agent_run_terminal
         return self.decision
 
 

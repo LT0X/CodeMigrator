@@ -26,8 +26,9 @@ from codemigrator.planning import FrozenPlan
 from codemigrator.workspace import CheckpointReceipt, checkpoint_receipt_digest
 
 from .advice import AdviceValidationContext, evaluate_advice
-from .agent_runs import AgentRunId
+from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from .budget import BudgetLimits, evaluate_budget
+from .cas import CasObject
 from .contracts import (
     ActorPhaseReceipt,
     AdviceMessage,
@@ -94,6 +95,9 @@ class ExecutionSchedulerPort(Protocol):
         logical_key: str,
         *,
         on_agent_run_started: Callable[[RunId, AgentRunId], Awaitable[ActorPhaseReceipt]],
+        on_agent_run_terminal: Callable[
+            [RunId, AgentRun, AgentRunReceipt, CasObject], Awaitable[ActorPhaseReceipt]
+        ],
     ) -> ExecutionRoundDecision:
         """Idempotently schedule ready Slice AgentRuns and return round status."""
 
@@ -291,6 +295,23 @@ class RunActor:
             raise StoreCommitError("AgentRun cannot proceed without its committed start receipt")
         return receipt
 
+    async def record_agent_run_terminal(
+        self,
+        run_id: RunId,
+        record: AgentRun,
+        receipt: AgentRunReceipt,
+        result_object: CasObject,
+    ) -> ActorPhaseReceipt:
+        return cast(
+            ActorPhaseReceipt,
+            await self._workflow_command(
+                "agent_run_terminal",
+                run_id,
+                f"agent_run.terminal:{record.agent_run_id}",
+                (record, receipt, result_object),
+            ),
+        )
+
     async def advance_execution_round(self, run_id: RunId, logical_key: str) -> ExecuteRoundResult:
         return cast(
             ExecuteRoundResult,
@@ -405,6 +426,8 @@ class RunActor:
         snapshot = await self.store.load(self.run_id)
         event = _event_for_receipt(snapshot, command.logical_key)
         if event is not None:
+            if command.kind == "agent_run_terminal":
+                await self._validate_agent_run_terminal_replay(command)
             receipt = ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
             if command.kind == "execute_round":
                 command.response.set_result(
@@ -422,6 +445,8 @@ class RunActor:
             self._schedule_execution_round(command, state)
         elif command.kind == "agent_run_started":
             await self._record_agent_run_started(command, state)
+        elif command.kind == "agent_run_terminal":
+            await self._record_agent_run_terminal(command, state, snapshot)
         elif command.kind == "verification":
             await self._commit_verification(command, state)
         elif command.kind == "report":
@@ -454,6 +479,91 @@ class RunActor:
         command.response.set_result(
             ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
         )
+
+    async def _record_agent_run_terminal(
+        self,
+        command: WorkflowCommandMessage,
+        state: RunState,
+        snapshot: RuntimeSnapshot,
+    ) -> None:
+        if not isinstance(command.payload, tuple) or len(command.payload) != 3:
+            raise ValueError("AgentRun terminal payload is invalid")
+        record, receipt, result_object = command.payload
+        if not isinstance(record, AgentRun) or not isinstance(receipt, AgentRunReceipt):
+            raise ValueError("AgentRun terminal facts have invalid types")
+        if not isinstance(result_object, CasObject):
+            raise ValueError("AgentRun result object is invalid")
+        current = await self.store.load_agent_run(record.agent_run_id)
+        if (
+            state.status is not RunStatus.Executing
+            or record.owner_kind != "run"
+            or record.owner_id != self.run_id
+            or record.phase is not Phase.Execute
+            or record.session_kind
+            not in {
+                SessionKind.Contract,
+                SessionKind.Implementation,
+                SessionKind.TestTranslation,
+                SessionKind.TestGeneration,
+                SessionKind.RepairSession,
+            }
+            or record.slice_ref is None
+            or record.write_scope_sha256 is None
+            or not record.is_terminal
+            or record.result_sha256 != result_object.digest
+            or receipt.agent_run_id != record.agent_run_id
+            or receipt.category != "session.terminal"
+            or current is None
+            or not current.same_frozen_identity(record)
+            or not _has_agent_run_event(snapshot, "agent_run.started", record.agent_run_id)
+            or (record.exit is SessionExit.Completed and record.candidate_checkpoint_sha256 is None)
+            or (
+                record.exit is not SessionExit.Completed
+                and record.candidate_checkpoint_sha256 is not None
+            )
+            or command.logical_key != f"agent_run.terminal:{record.agent_run_id}"
+        ):
+            raise StoreCommitError("EXECUTE terminal AgentRun facts failed owner validation")
+        next_state = replace(state, version=state.version + 1)
+        terminal_event = agent_run_lifecycle_spec(record, receipt)
+        await self.store.commit_agent_run_receipt(
+            record,
+            receipt,
+            state=next_state,
+            events=(terminal_event,),
+            cas_references=((f"agent-result:{record.agent_run_id}", result_object),),
+        )
+        self._state = next_state
+        committed = await self.store.load(self.run_id)
+        event = _event_for_receipt(committed, command.logical_key)
+        if event is None:
+            raise StoreCommitError("committed AgentRun terminal receipt cannot be reloaded")
+        command.response.set_result(
+            ActorPhaseReceipt(self.run_id, command.logical_key, event.sequence)
+        )
+
+    async def _validate_agent_run_terminal_replay(self, command: WorkflowCommandMessage) -> None:
+        if not isinstance(command.payload, tuple) or len(command.payload) != 3:
+            raise ValueError("AgentRun terminal payload is invalid")
+        record, receipt, result_object = command.payload
+        if not isinstance(record, AgentRun) or not isinstance(receipt, AgentRunReceipt):
+            raise ValueError("AgentRun terminal facts have invalid types")
+        if not isinstance(result_object, CasObject):
+            raise ValueError("AgentRun result object is invalid")
+        stored = await self.store.load_agent_run(record.agent_run_id)
+        stored_receipt = await self.store.load_agent_run_receipt(record.agent_run_id)
+        result_ref = await self.store.get_cas_reference(
+            "run", self.run_id, f"agent-result:{record.agent_run_id}"
+        )
+        if (
+            stored != record
+            or stored_receipt is None
+            or stored_receipt != receipt
+            or result_ref != result_object
+            or receipt.category != "session.terminal"
+            or command.logical_key != f"agent_run.terminal:{record.agent_run_id}"
+        ):
+            raise StoreCommitError("AgentRun terminal replay differs from committed facts")
 
     async def _accept_plan(self, command: WorkflowCommandMessage, state: RunState) -> None:
         if not isinstance(command.payload, tuple) or len(command.payload) != 2:
@@ -547,6 +657,7 @@ class RunActor:
                 self.run_id,
                 logical_key,
                 on_agent_run_started=self.record_agent_run_started,
+                on_agent_run_terminal=self.record_agent_run_terminal,
             )
             if not isinstance(decision, ExecutionRoundDecision):
                 raise TypeError("Actor scheduler returned an invalid execution round")

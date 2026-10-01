@@ -13,11 +13,14 @@ from codemigrator.core import (
     AdviceKind,
     BranchPrefix,
     FailureReason,
+    GitOid,
     Phase,
     ResidentRole,
     RunStatus,
     SessionKind,
     Sha256,
+    SliceGenerationRef,
+    SliceId,
 )
 from codemigrator.runtime.actor import ActorRegistry, RunActor
 from codemigrator.runtime.advice import AdviceValidationContext, advice_proposal_hash
@@ -64,8 +67,15 @@ class RecordingScheduler:
     def __init__(self) -> None:
         self.calls = []
 
-    async def advance_one_round(self, run_id, logical_key, *, on_agent_run_started=None):
-        del on_agent_run_started
+    async def advance_one_round(
+        self,
+        run_id,
+        logical_key,
+        *,
+        on_agent_run_started=None,
+        on_agent_run_terminal=None,
+    ):
+        del on_agent_run_started, on_agent_run_terminal
         self.calls.append((run_id, logical_key))
         return ExecutionRoundDecision(
             complete=len(self.calls) == 2,
@@ -198,7 +208,15 @@ async def test_execute_agent_run_start_is_committed_while_scheduler_is_still_run
             self.started = asyncio.Event()
             self.resume = asyncio.Event()
 
-        async def advance_one_round(self, owner_run_id, logical_key, *, on_agent_run_started):
+        async def advance_one_round(
+            self,
+            owner_run_id,
+            logical_key,
+            *,
+            on_agent_run_started,
+            on_agent_run_terminal,
+        ):
+            del on_agent_run_terminal
             receipt = await on_agent_run_started(owner_run_id, self.agent_run_id)
             assert receipt.receipt_key == f"agent_run.started:{self.agent_run_id}"
             self.started.set()
@@ -252,13 +270,209 @@ async def test_execute_agent_run_start_is_committed_while_scheduler_is_still_run
 
 
 @pytest.mark.asyncio
+async def test_execute_agent_run_terminal_is_committed_by_actor_and_replays_exactly(run_id):
+    slice_id = SliceId(uuid4())
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(
+            run_id=run_id,
+            status=RunStatus.Executing,
+            version=1,
+            frozen_plan_sha256="c" * 64,
+        ),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    created = AgentRun(
+        agent_run_id=AgentRunId(uuid4()),
+        owner_kind="run",
+        owner_id=run_id,
+        logical_task_key="execute:slice-1:g1",
+        phase=Phase.Execute,
+        session_kind=SessionKind.Implementation,
+        thread_id=str(uuid4()),
+        model_binding_sha256="a" * 64,
+        context_sha256="b" * 64,
+        toolset_sha256="c" * 64,
+        template_sha256="d" * 64,
+        slice_ref=SliceGenerationRef(
+            slice_id=slice_id, generation=1, baseline_candidate_oid=GitOid("1" * 40)
+        ),
+        write_scope_sha256="e" * 64,
+    )
+    await store.create_or_get_agent_run(created)
+    actor = RunActor(run_id, store)
+    await actor.start()
+
+    body = b'{"agent_run_id":"private","exit":"COMPLETED"}'
+    result = CasObject(hashlib.sha256(body).hexdigest(), len(body))
+    terminal = replace(
+        created,
+        state=SessionState.Closed,
+        exit=SessionExit.Completed,
+        result_sha256=result.digest,
+        candidate_checkpoint_sha256="f" * 64,
+    )
+    receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, "session.terminal")
+
+    try:
+        with pytest.raises(StoreCommitError, match="owner validation"):
+            await actor.record_agent_run_terminal(run_id, terminal, receipt, result)
+        assert await store.load_agent_run(terminal.agent_run_id) == created
+
+        await actor.record_agent_run_started(run_id, created.agent_run_id)
+        store.fail_next_commit()
+        with pytest.raises(StoreCommitError, match="injected commit failure"):
+            await actor.record_agent_run_terminal(run_id, terminal, receipt, result)
+        after_rollback = await store.snapshot(run_id)
+        assert after_rollback.state.version == 2
+        assert [event.event_type for event in after_rollback.events] == [
+            "run.created",
+            "agent_run.started",
+        ]
+        assert await store.load_agent_run(terminal.agent_run_id) == created
+        assert await store.load_agent_run_receipt(terminal.agent_run_id) is None
+        assert (
+            await store.get_cas_reference(
+                "run", run_id, f"agent-result:{terminal.agent_run_id}"
+            )
+            is None
+        )
+
+        first = await actor.record_agent_run_terminal(run_id, terminal, receipt, result)
+        replay = await actor.record_agent_run_terminal(run_id, terminal, receipt, result)
+        with pytest.raises(StoreCommitError, match="replay differs"):
+            await actor.record_agent_run_terminal(
+                run_id,
+                terminal,
+                replace(receipt, receipt_id=uuid4()),
+                result,
+            )
+        altered_result = CasObject("3" * 64, 8)
+        with pytest.raises(StoreCommitError, match="replay differs"):
+            await actor.record_agent_run_terminal(
+                run_id,
+                replace(terminal, result_sha256=altered_result.digest),
+                receipt,
+                altered_result,
+            )
+
+        snapshot = await store.snapshot(run_id)
+        assert first == replay
+        assert first.receipt_key == f"agent_run.terminal:{terminal.agent_run_id}"
+        assert await store.load_agent_run(terminal.agent_run_id) == terminal
+        assert await store.load_agent_run_receipt(terminal.agent_run_id) == receipt
+        assert (
+            await store.get_cas_reference("run", run_id, f"agent-result:{terminal.agent_run_id}")
+            == result
+        )
+        assert snapshot.state.version == 3
+        lifecycle = [event for event in snapshot.events if event.event_type == "agent_run.terminal"]
+        assert len(lifecycle) == 1
+        assert lifecycle[0].data == {
+            "receipt_key": f"agent_run.terminal:{terminal.agent_run_id}",
+            "agent_run_id": str(terminal.agent_run_id),
+            "phase": "EXECUTE",
+            "session_kind": "IMPLEMENTATION",
+            "slice_id": str(slice_id),
+            "generation": 1,
+            "exit": "COMPLETED",
+            "receipt_category": "session.terminal",
+        }
+    finally:
+        await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_execute_scheduler_terminal_facts_return_through_actor_mailbox(run_id):
+    slice_id = SliceId(uuid4())
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(
+            run_id=run_id,
+            status=RunStatus.Executing,
+            version=1,
+            frozen_plan_sha256="c" * 64,
+        ),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    created = AgentRun(
+        agent_run_id=AgentRunId(uuid4()),
+        owner_kind="run",
+        owner_id=run_id,
+        logical_task_key="execute:slice-1:g1",
+        phase=Phase.Execute,
+        session_kind=SessionKind.Implementation,
+        thread_id=str(uuid4()),
+        model_binding_sha256="a" * 64,
+        context_sha256="b" * 64,
+        toolset_sha256="c" * 64,
+        template_sha256="d" * 64,
+        slice_ref=SliceGenerationRef(
+            slice_id=slice_id, generation=1, baseline_candidate_oid=GitOid("1" * 40)
+        ),
+        write_scope_sha256="e" * 64,
+    )
+    await store.create_or_get_agent_run(created)
+    result = CasObject("2" * 64, 8)
+    terminal = replace(
+        created,
+        state=SessionState.Failed,
+        exit=SessionExit.Failed,
+        result_sha256=result.digest,
+    )
+    receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, "session.terminal")
+
+    class TerminalScheduler:
+        async def advance_one_round(
+            self,
+            owner_run_id,
+            logical_key,
+            *,
+            on_agent_run_started,
+            on_agent_run_terminal,
+        ):
+            del logical_key
+            await on_agent_run_started(owner_run_id, created.agent_run_id)
+            await on_agent_run_terminal(owner_run_id, terminal, receipt, result)
+            return ExecutionRoundDecision(
+                complete=False,
+                dispatch_count=1,
+                terminal_agent_run_ids=(terminal.agent_run_id,),
+            )
+
+    actor = RunActor(run_id, store, execution_scheduler=TerminalScheduler())
+    await actor.start()
+    try:
+        result_round = await actor.advance_execution_round(run_id, "execute-round-terminal")
+        snapshot = await store.snapshot(run_id)
+        assert result_round.complete is False
+        assert snapshot.state.version == 4
+        assert await store.load_agent_run(terminal.agent_run_id) == terminal
+        assert [event.event_type for event in snapshot.events[-3:]] == [
+            "agent_run.started",
+            "agent_run.terminal",
+            "run.execute.round",
+        ]
+    finally:
+        await actor.stop()
+
+
+@pytest.mark.asyncio
 async def test_stop_cancels_and_awaits_execution_scheduler_before_return(run_id):
     class BlockingScheduler:
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
 
-        async def advance_one_round(self, owner_run_id, logical_key, *, on_agent_run_started):
+        async def advance_one_round(
+            self,
+            owner_run_id,
+            logical_key,
+            *,
+            on_agent_run_started,
+            on_agent_run_terminal,
+        ):
+            del on_agent_run_terminal
             del owner_run_id, logical_key, on_agent_run_started
             self.started.set()
             try:

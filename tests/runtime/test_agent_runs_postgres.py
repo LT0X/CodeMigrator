@@ -11,6 +11,8 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
+from codemigrator.core import GitOid, Phase, RunStatus, SessionKind, SliceGenerationRef, SliceId
+from codemigrator.runtime.actor import RunActor
 from codemigrator.runtime.agent_runs import AgentRunId, AgentRunReceipt
 from codemigrator.runtime.cas import CasObject
 from codemigrator.runtime.contracts import EventSpec, RunState
@@ -115,6 +117,69 @@ async def test_postgres_receipt_failure_rolls_back_run_agent_and_event():
             await store.get_cas_reference("run", record.owner_id, cas_references[0][0])
             == cas_references[0][1]
         )
+
+
+@pytest.mark.asyncio
+async def test_postgres_actor_commits_execute_agent_terminal_and_result_reference():
+    async with isolated_store() as store:
+        created = replace(
+            run_record(key="execute:slice-1:g1"),
+            phase=Phase.Execute,
+            session_kind=SessionKind.Implementation,
+            slice_ref=SliceGenerationRef(
+                slice_id=SliceId(uuid4()),
+                generation=1,
+                baseline_candidate_oid=GitOid("1" * 40),
+            ),
+            write_scope_sha256="d" * 64,
+        )
+        await store.create(
+            RunState(
+                run_id=created.owner_id,
+                status=RunStatus.Executing,
+                version=1,
+                frozen_plan_sha256="c" * 64,
+            ),
+            (EventSpec("run.created", {"receipt_key": f"run.created:{created.owner_id}"}),),
+        )
+        await store.create_or_get_agent_run(created)
+        result = CasObject("e" * 64, 16)
+        terminal = replace(
+            created,
+            state=SessionState.Closed,
+            exit=SessionExit.SegmentStopped,
+            result_sha256=result.digest,
+        )
+        receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, "session.terminal")
+        actor = RunActor(created.owner_id, store)
+        await actor.start()
+        try:
+            await actor.record_agent_run_started(created.owner_id, created.agent_run_id)
+            terminal_receipt = await actor.record_agent_run_terminal(
+                created.owner_id, terminal, receipt, result
+            )
+            with pytest.raises(StoreCommitError, match="replay differs"):
+                await actor.record_agent_run_terminal(
+                    created.owner_id,
+                    terminal,
+                    replace(receipt, receipt_id=uuid4()),
+                    result,
+                )
+            snapshot = await store.load(created.owner_id)
+            assert snapshot is not None
+            assert snapshot.state.version == 3
+            assert snapshot.events[-1].event_type == "agent_run.terminal"
+            assert await store.load_agent_run(terminal.agent_run_id) == terminal
+            assert await store.load_agent_run_receipt(terminal.agent_run_id) == receipt
+            assert (
+                await store.get_cas_reference(
+                    "run", created.owner_id, f"agent-result:{terminal.agent_run_id}"
+                )
+                == result
+            )
+            assert terminal_receipt.receipt_key == f"agent_run.terminal:{terminal.agent_run_id}"
+        finally:
+            await actor.stop()
 
 
 @pytest.mark.asyncio
