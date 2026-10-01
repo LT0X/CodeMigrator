@@ -19,6 +19,7 @@ from codemigrator.core import (
     load_resource,
 )
 from codemigrator.core.models.plan import PlanProposal
+from codemigrator.runtime import langchain_agent
 from codemigrator.runtime.agent_runs import AgentRun
 from codemigrator.runtime.binding import LockedModelBinding
 from codemigrator.runtime.context import ContextEnvelope, ContextSegment
@@ -108,6 +109,32 @@ class CountingRegistry(ProviderRegistry):
     def resolve(self, binding):
         self.resolve_calls += 1
         return super().resolve(binding)
+
+
+def test_agent_tool_definitions_exposes_the_exact_structured_plan_schema() -> None:
+    definition_builder = getattr(langchain_agent, "agent_tool_definitions", None)
+    assert callable(definition_builder)
+    definitions = definition_builder(
+        phase=Phase.Plan,
+        session_kind=SessionKind.PlanAuxiliary,
+        owner_kind="run",
+        response_format=PlanProposal,
+    )
+
+    assert tuple(definition.name for definition in definitions) == (
+        "ReadFile",
+        "QuerySourceAst",
+        "Exec",
+        "PlanProposal",
+    )
+    proposal = definitions[-1]
+    assert proposal.parameters["additionalProperties"] is False
+    assert set(proposal.parameters["properties"]) == {
+        "slices",
+        "edges",
+        "integration_ranks",
+        "planner_rationale",
+    }
 
 
 def _binding(profile=ModelProfile.Reasoning):

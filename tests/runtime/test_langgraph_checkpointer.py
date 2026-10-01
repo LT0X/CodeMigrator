@@ -75,6 +75,30 @@ async def test_checkpoint_and_pending_writes_survive_saver_restart(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_owner_scoped_saver_cannot_delete_another_owners_thread(tmp_path: Path):
+    store = InMemoryRuntimeStore()
+    cas = FileHostCAS(tmp_path)
+    owner_a, owner_b = uuid4(), uuid4()
+    saver_a = CasCheckpointSaver(
+        cas, store, graph_family="agent", owner_kind="run", owner_id=owner_a
+    )
+    saver_b = CasCheckpointSaver(
+        cas, store, graph_family="agent", owner_kind="run", owner_id=owner_b
+    )
+    thread = str(uuid4())
+    await saver_a.aput(
+        config(thread), checkpoint(str(uuid4()), "owner-a"), {"source": "input"}, {}
+    )
+
+    with pytest.raises(ValueError, match="checkpoint owner identity mismatch"):
+        await saver_b.adelete_thread(thread)
+
+    restored = await saver_a.aget_tuple(config(thread))
+    assert restored is not None
+    assert restored.checkpoint["channel_values"]["value"] == "owner-a"
+
+
+@pytest.mark.asyncio
 async def test_namespace_isolation_filter_before_and_delete(tmp_path: Path):
     store = InMemoryRuntimeStore()
     instance = saver(tmp_path, store)

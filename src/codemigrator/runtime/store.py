@@ -155,6 +155,12 @@ class RuntimeStore(Protocol):
     ) -> CasObject | None:
         """Load a durable owner reference to an opaque CAS object."""
 
+    async def list_checkpoint_indexes(
+        self, thread_id: str | None = None, namespace: str | None = None
+    ) -> tuple[CheckpointIndex, ...]:
+        """Load checkpoint references without retrieving CAS checkpoint bodies."""
+        ...
+
     async def commit_agent_run_receipt(
         self,
         record: AgentRun,

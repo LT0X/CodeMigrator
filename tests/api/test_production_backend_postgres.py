@@ -29,7 +29,7 @@ from codemigrator.runtime.create_run import (
 )
 from codemigrator.runtime.store import PostgreSQLRuntimeStore
 
-from .conftest import create_run_payload
+from .conftest import build_plan_agent_inputs, create_run_payload
 
 
 async def noop_server_stop() -> None:
@@ -1370,6 +1370,370 @@ async def test_production_asgi_composes_run_graph_from_locked_store_and_actor_fa
             assert len(factory_calls) == 1
             assert factory_calls[0][1] is stage_actors[0].store
             assert stage_actors == created_actors
+
+
+@pytest.mark.asyncio
+async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execute(
+    tmp_path: Path,
+):
+    dsn = os.environ.get("CODEMIGRATOR_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("CODEMIGRATOR_TEST_PG_DSN is not configured")
+    import json
+
+    from codemigrator.asgi import ProductionRunComponents
+    from codemigrator.core import ModelProfile, Phase, SessionKind, load_resource
+    from codemigrator.core.enums import SliceKind
+    from codemigrator.core.models.plan import PlanProposal, PlanSliceProposal
+    from codemigrator.runtime.binding import LockedModelBinding
+    from codemigrator.runtime.cas import FileHostCAS
+    from codemigrator.runtime.checkpointer import CasCheckpointSaver
+    from codemigrator.runtime.context import ContextEnvelope, ContextSegment
+    from codemigrator.runtime.graph_composition import (
+        AgentGraphInfrastructure,
+        RuntimeGraphAssembly,
+    )
+    from codemigrator.runtime.memory import ContextManager, FormulaNetInputCap
+    from codemigrator.runtime.plan_agent import (
+        PersistentPlanStageFactory,
+        PlanSessionMaterial,
+    )
+    from codemigrator.runtime.provider import (
+        OpenAICompatibleProvider,
+        ProviderRegistry,
+        ProviderResponse,
+        ProviderToolCall,
+        TokenUsage,
+        provider_adapter_id_for_label,
+        select_unique_provider_config,
+    )
+    from codemigrator.workspace import GatewayContext
+    async with isolated_store() as (_store, schema):
+        planning_inputs = build_plan_agent_inputs()
+        source_modules = planning_inputs.analysis.modules
+        proposal = PlanProposal(
+            slices=[
+                PlanSliceProposal(
+                    local_ref="A",
+                    kind=SliceKind.Implementation,
+                    source_modules=[source_modules[0].module_id],
+                    write_paths=["target/a.py"],
+                    create_roots=["target/a"],
+                ),
+                PlanSliceProposal(
+                    local_ref="B",
+                    kind=SliceKind.Implementation,
+                    source_modules=[source_modules[1].module_id],
+                    write_paths=["target/b.py"],
+                    create_roots=["target/b"],
+                ),
+            ],
+            edges=[],
+            integration_ranks={"A": 0, "B": 1},
+            planner_rationale=[],
+        )
+        entered_after_plan = asyncio.Event()
+        plan_result_ready = asyncio.Event()
+        release_plan = asyncio.Event()
+        actors = []
+        requests = []
+        stage_error_types = []
+
+        class StructuredProvider:
+            async def complete(self, request):
+                return ProviderResponse(
+                    content="",
+                    tool_calls=(
+                        ProviderToolCall(
+                            "PlanProposal",
+                            json.dumps(proposal.model_dump(mode="json", by_alias=True)),
+                            f"production-plan-{len(requests)}",
+                        ),
+                    ),
+                    finish_reason="tool_calls",
+                    usage=TokenUsage(12, 9),
+                    model=request.binding.model_id,
+                    provider_receipt_id=f"production-receipt-{len(requests)}",
+                )
+
+        class ExactCounter:
+            def count(self, messages):
+                return sum(len(message.content) for message in messages)
+
+            def count_tool_schemas(self, tools):
+                return sum(len(json.dumps(dict(tool.parameters))) for tool in tools)
+
+        class UsageSink:
+            def __init__(self):
+                self.calls = {}
+
+            async def reserve_round(self, agent_run_id, call_id, *, max_rounds):
+                calls = self.calls.setdefault(agent_run_id, {})
+                if call_id in calls:
+                    return calls[call_id]
+                if calls:
+                    return None
+                calls[call_id] = 1
+                return 1
+
+            async def record(self, agent_run_id, usage, receipt):
+                return None
+
+        class Gateway:
+            def __init__(self, context):
+                self.context = context
+
+            def dispatch(self, raw_call, *, cancellation_token=None):
+                raise AssertionError("the synthetic PLAN proposal requires no exploration")
+
+        class MaterialLoader:
+            async def load(self, run_id):
+                return PlanSessionMaterial(
+                    planning_inputs,
+                    binding,
+                    envelope,
+                )
+
+        class ProviderSpy:
+            def __init__(self, delegate):
+                self.delegate = delegate
+
+            async def complete(self, request):
+                requests.append(request)
+                return await self.delegate.complete(request)
+
+        real_opencode = os.environ.get("CODEMIGRATOR_REAL_OPENCODE", "").casefold() in {
+            "1",
+            "true",
+        }
+        if real_opencode:
+            configured_path = os.environ.get("CODEMIGRATOR_OPENCODE_CONFIG")
+            candidates = (
+                [Path(configured_path)]
+                if configured_path
+                else [
+                    Path(__file__).resolve().parents[2] / "my_space/model_api_key.json",
+                    Path("/home/xtc/project/CodeM/CodeMigrator/my_space/model_api_key.json"),
+                ]
+            )
+            config_path = next((path for path in candidates if path.is_file()), None)
+            if config_path is None:
+                pytest.fail("local OpenCode provider config is unavailable")
+            opencode = select_unique_provider_config(
+                config_path.read_text(encoding="utf-8"), "OpenCode"
+            )
+            provider_id = provider_adapter_id_for_label(str(opencode["Provider"]))
+            model_id = str(opencode["模型"])
+            config_revision = hashlib.sha256(
+                json.dumps(
+                    {key: value for key, value in opencode.items() if key != "API Key"},
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            binding = LockedModelBinding(
+                provider_id=provider_id,
+                model_id=model_id,
+                profile=ModelProfile.Reasoning,
+                config_revision=config_revision,
+                context_window=int(opencode["Context Window"]),
+                output_cap=min(2_048, int(opencode["模型输出上限"])),
+            )
+            delegate = OpenAICompatibleProvider(
+                endpoint=str(opencode["Base URL"]), api_key=str(opencode["API Key"])
+            )
+            class ConservativeCounter:
+                def count(self, messages):
+                    return sum(max(1, len(message.content.encode("utf-8"))) for message in messages)
+
+                def count_tool_schemas(self, tools):
+                    return sum(
+                        len(json.dumps(dict(tool.parameters), ensure_ascii=False).encode("utf-8"))
+                        for tool in tools
+                    )
+
+            token_counter = ConservativeCounter()
+            envelope = ContextEnvelope(
+                stable=(
+                    ContextSegment(
+                        "stable",
+                        "All planning data is synthetic. Create exactly two IMPLEMENTATION "
+                        "slices: A uses source module "
+                        f"{source_modules[0].module_id}, writes target/a.py, and owns target/a; "
+                        "B uses source module "
+                        f"{source_modules[1].module_id}, writes target/b.py, and owns target/b. "
+                        "Use no edges, rank A as 0 and B as 1, and do not call tools.",
+                        required=True,
+                    ),
+                )
+            )
+        else:
+            provider_id = "synthetic"
+            binding = LockedModelBinding(
+                provider_id=provider_id,
+                model_id="fixed-plan-test",
+                profile=ModelProfile.Reasoning,
+                config_revision="production-plan-test-v1",
+                context_window=64_000,
+                output_cap=2_048,
+            )
+            delegate = StructuredProvider()
+            token_counter = ExactCounter()
+            envelope = ContextEnvelope()
+        provider = ProviderSpy(delegate)
+
+        def components_factory(store, pool, lock_connection):
+            assert isinstance(store, PostgreSQLRuntimeStore)
+            assert store.pool is pool
+            assert store._write_connection is lock_connection
+            cas = FileHostCAS(tmp_path / "cas")
+            prototype_owner = uuid4()
+            context_manager = ContextManager(
+                token_counter=token_counter,
+                net_input_cap=FormulaNetInputCap(),
+            )
+            infrastructure = AgentGraphInfrastructure(
+                provider_registry=ProviderRegistry({provider_id: provider}),
+                context_manager=context_manager,
+                tool_gateway=object(),
+                runtime_store=store,
+                host_cas=cas,
+                cas_references=store,
+                usage_sink=UsageSink(),
+                run_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="run",
+                    owner_kind="run",
+                    owner_id=prototype_owner,
+                ),
+                draft_graph_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="draft",
+                    owner_kind="draft",
+                    owner_id=prototype_owner,
+                ),
+                agent_run_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="agent",
+                    owner_kind="run",
+                    owner_id=prototype_owner,
+                ),
+            )
+            stage_factory = PersistentPlanStageFactory(
+                material_loader=MaterialLoader(),
+                gateway_factory=lambda record: Gateway(
+                    GatewayContext(
+                        run_id=RunId(record.owner_id),
+                        agent_run_id=record.agent_run_id,
+                        phase_policy_sha256=load_resource(
+                            "core://phase-tool-policy/v2"
+                        ).sha256,
+                        phase=Phase.Plan,
+                        session_kind=SessionKind.PlanAuxiliary,
+                    )
+                ),
+            )
+
+            def actor_factory(run_id, actor_store):
+                actor = RunActor(run_id, actor_store)
+                actors.append(actor)
+                return actor
+
+            def plan_factory(infra, actor):
+                workflow = stage_factory(infra, actor)
+
+                class PauseAfterAcceptance:
+                    async def run(self, run_id):
+                        try:
+                            receipt = await workflow.run(run_id)
+                        except Exception as error:
+                            stage_error_types.append(type(error).__name__)
+                            plan_result_ready.set()
+                            raise
+                        plan_result_ready.set()
+                        entered_after_plan.set()
+                        await release_plan.wait()
+                        return receipt
+
+                return PauseAfterAcceptance()
+
+            return ProductionRunComponents(
+                preflight=PassingPreflight(),
+                graph_assembly=RuntimeGraphAssembly(
+                    infrastructure,
+                    plan_stage_factory=plan_factory,
+                    verifier_factory=lambda _infra, _actor: object(),
+                    reporter_factory=lambda _infra, _actor: object(),
+                    draft_agent_runner_factory=lambda _infra, _owner: object(),
+                    create_run_service_factory=lambda _infra, _owner: object(),
+                ),
+                actor_factory=actor_factory,
+                durable_checkpointer=True,
+            )
+
+        request_body = create_run_payload()
+        request_body["frozen_artifacts"] = planning_inputs.frozen_artifacts.model_dump(
+            mode="json"
+        )
+        app = create_production_app(
+            dsn,
+            config=ApiConfig(token="synthetic-token"),
+            run_components_factory=components_factory,
+            stop_server=noop_server_stop,
+            pool_server_settings={"search_path": schema},
+        )
+        test_failure: Exception | None = None
+        try:
+            async with app.router.lifespan_context(app):
+                try:
+                    async with httpx.AsyncClient(
+                        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+                    ) as client:
+                        response = await client.post(
+                            "/api/v1/migrations",
+                            json=request_body,
+                            headers={
+                                "Authorization": "Bearer synthetic-token",
+                                "Idempotency-Key": "production-plan-agent-run",
+                            },
+                        )
+                    assert response.status_code == 201
+                    run_id = RunId(UUID(response.json()["run_id"]))
+                    await asyncio.wait_for(plan_result_ready.wait(), timeout=45)
+                    assert not stage_error_types, (
+                        "production PLAN stage failed with exception types: "
+                        f"{stage_error_types}"
+                    )
+                    assert entered_after_plan.is_set(), (
+                        "production PLAN returned without reaching its acceptance pause"
+                    )
+                    assert len(requests) == 1
+                    assert len(actors) == 1
+                    run_events = await actors[0].store.read_run_events(run_id, 0)
+                    assert [event.event_type for event in run_events][-3:] == [
+                        "agent_run.started",
+                        "agent_run.terminal",
+                        "run.plan.accepted",
+                    ]
+                    records = await actors[0].store.list_agent_runs_by_owner("run", run_id)
+                    assert len(records) == 1
+                    assert records[0].state.value == "CLOSED"
+                    assert records[0].checkpoint_sha256 is not None
+                    assert (
+                        await actors[0].store.load(run_id)
+                    ).state.frozen_plan_sha256 is not None
+                    assert await actors[0].store.get_cas_reference(
+                        "run", run_id, "frozen-plan"
+                    ) is not None
+                except Exception as error:
+                    test_failure = error
+        finally:
+            release_plan.set()
+        if test_failure is not None:
+            raise test_failure
 
 
 def test_production_run_owner_rejects_assembly_for_another_store(tmp_path: Path):

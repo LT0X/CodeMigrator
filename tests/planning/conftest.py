@@ -30,6 +30,7 @@ from codemigrator.core import (
     validate_spec_bytes,
 )
 from codemigrator.core.spec import SpecArtifact
+from codemigrator.planning import PlanningInputs
 
 
 def module_id(number: int) -> uuid.UUID:
@@ -136,12 +137,12 @@ def analysis_result() -> AnalysisResult:
     )
 
 
-@pytest.fixture
-def planning_inputs() -> object:
-    from codemigrator.planning import PlanningInputs
-
+def build_planning_inputs(
+    frozen_artifacts: FrozenArtifactBundle | None = None,
+) -> PlanningInputs:
     return PlanningInputs(
-        frozen_artifacts=FrozenArtifactBundle(
+        frozen_artifacts=frozen_artifacts
+        or FrozenArtifactBundle(
             spec=artifact_ref("1"),
             understanding_dossier=artifact_ref("2"),
             target_project_blueprint=artifact_ref("3"),
@@ -161,3 +162,8 @@ def planning_inputs() -> object:
         analysis=analysis_result(),
         snapshot_oid="snapshot-1",
     )
+
+
+@pytest.fixture
+def planning_inputs() -> PlanningInputs:
+    return build_planning_inputs()
