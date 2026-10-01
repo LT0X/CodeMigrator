@@ -92,6 +92,8 @@ from .execution_agent import (
     ExecutionWorkItem,
     PersistentExecutionAgentSessionFactory,
     PersistentExecutionScheduler,
+    SliceDependencyProjection,
+    project_frozen_plan_dependencies,
 )
 from .graph_composition import (
     AgentGraphInfrastructure,
@@ -371,12 +373,14 @@ __all__ = [
     "ExecutionRoundLoader",
     "ExecutionRoundPlan",
     "ExecutionScheduleStalled",
+    "SliceDependencyProjection",
     "ExecutionSessionFactoryPort",
     "ExecutionSessionMaterial",
     "ExecutionSessionRecoveryRequired",
     "ExecutionWorkItem",
     "PersistentExecutionAgentSessionFactory",
     "PersistentExecutionScheduler",
+    "project_frozen_plan_dependencies",
     "RunWallet",
     "CancelCommand",
     "CheckpointRestore",

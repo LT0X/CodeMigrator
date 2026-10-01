@@ -587,8 +587,33 @@ async def test_execution_scheduler_honors_dependencies_scopes_and_actor_receipts
     assert first_round.complete is False
     assert first_round.terminal_agent_run_ids == (sessions.sessions[0].created.agent_run_id,)
     assert second_round.dispatch_count == 2
-    assert second_round.complete is True
+    assert second_round.complete is False
     assert len(second_round.completed_write_agent_run_ids) == 2
+
+
+def test_frozen_plan_dependency_projection_preserves_edge_kinds() -> None:
+    from types import SimpleNamespace
+
+    from codemigrator.core import PlanEdgeKind, SliceId
+    from codemigrator.core.models.plan import PlanEdge
+    from codemigrator.planning import FrozenPlan
+    from codemigrator.runtime.execution_agent import project_frozen_plan_dependencies
+
+    base_id, requires_id, ordered_id = SliceId(uuid4()), SliceId(uuid4()), SliceId(uuid4())
+    frozen_plan = FrozenPlan.model_construct(
+        slices=tuple(SimpleNamespace(id=item) for item in (base_id, requires_id, ordered_id)),
+        edges=(
+            PlanEdge(from_=base_id, to=requires_id, kind=PlanEdgeKind.Requires),
+            PlanEdge(from_=base_id, to=ordered_id, kind=PlanEdgeKind.OrderedBefore),
+        ),
+    )
+
+    projected = project_frozen_plan_dependencies(frozen_plan)
+
+    assert projected[str(requires_id)].requires == frozenset({str(base_id)})
+    assert projected[str(requires_id)].ordered_before == frozenset()
+    assert projected[str(ordered_id)].requires == frozenset()
+    assert projected[str(ordered_id)].ordered_before == frozenset({str(base_id)})
 
 
 @pytest.mark.asyncio
@@ -929,8 +954,54 @@ async def test_execution_scheduler_replays_committed_terminal_before_round_recei
         on_agent_run_terminal=callback,
     )
 
-    assert decision.complete is True
+    assert decision.complete is False
     assert decision.dispatch_count == 0
     assert decision.terminal_agent_run_ids == (terminal.agent_run_id,)
     assert decision.completed_write_agent_run_ids == (terminal.agent_run_id,)
     assert decision.candidate_claims[0].receipt == candidate_receipt
+
+
+@pytest.mark.asyncio
+async def test_pending_candidate_without_integration_receipt_stalls_without_redispatch() -> None:
+    from codemigrator.runtime.execution_agent import (
+        ExecutionRoundPlan,
+        ExecutionScheduleStalled,
+        PersistentExecutionScheduler,
+    )
+    from codemigrator.runtime.scheduler import FairScheduler, ResourcePool
+
+    run_id, slice_id = RunId(uuid4()), SliceId(uuid4())
+    plan = ExecutionRoundPlan(
+        run_id=run_id,
+        work_items=(),
+        completed_slice_ids=frozenset(),
+        all_slice_ids=frozenset({str(slice_id)}),
+        available_pools=frozenset({ResourcePool.Model}),
+        pending_integrations=frozenset({(str(slice_id), 0)}),
+    )
+
+    class Loader:
+        async def load(self, requested_run_id, logical_key):
+            assert requested_run_id == run_id
+            return plan
+
+    class Sessions:
+        async def get_or_create(self, material):
+            raise AssertionError("a candidate awaiting integration must not be redispatched")
+
+    scheduler = PersistentExecutionScheduler(
+        round_loader=Loader(),
+        sessions=Sessions(),
+        fair_scheduler=FairScheduler(),
+    )
+
+    async def callback(*args):
+        raise AssertionError("a pending candidate must not call the Agent")
+
+    with pytest.raises(ExecutionScheduleStalled):
+        await scheduler.advance_one_round(
+            run_id,
+            "round:await-integration",
+            on_agent_run_started=callback,
+            on_agent_run_terminal=callback,
+        )

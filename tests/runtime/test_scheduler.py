@@ -136,8 +136,64 @@ def test_stale_generation_completion_cannot_complete_the_current_generation():
     scheduler.complete("run-a", "slice-a", generation=1)
     scheduler.submit(generation_two)
     assert scheduler.next(frozenset(), frozenset(ResourcePool)) == generation_two
-
     scheduler.complete("run-a", "slice-a", generation=1)
     scheduler.release("run-a", "slice-a", generation=2)
 
     assert scheduler.next(frozenset(), frozenset(ResourcePool)) == generation_two
+
+
+def test_requires_waits_for_integration_while_ordered_before_accepts_independent_failure():
+    scheduler = FairScheduler()
+    scheduler.submit(
+        ReadySlice(
+            "run-a",
+            "requires-child",
+            frozenset({"failed-parent"}),
+            frozenset({"src/child.py"}),
+            ResourcePool.Model,
+        )
+    )
+    scheduler.submit(
+        ReadySlice(
+            "run-a",
+            "ordered-child",
+            frozenset({"failed-parent"}),
+            frozenset({"src/ordered.py"}),
+            ResourcePool.Model,
+            ordered_before_dependencies=frozenset({"failed-parent"}),
+        )
+    )
+
+    scheduler.restore_committed_facts(
+        "run-a",
+        integrated_slice_ids=frozenset(),
+        terminal_failure_slice_ids=frozenset({"failed-parent"}),
+    )
+
+    ready = scheduler.next(frozenset(), frozenset(ResourcePool))
+    assert ready is not None
+    assert ready.slice_id == "ordered-child"
+    assert scheduler.next(frozenset(), frozenset(ResourcePool)) is None
+
+
+def test_candidate_release_does_not_unblock_requires_until_integration():
+    scheduler = FairScheduler()
+    parent = ReadySlice(
+        "run-a", "parent", frozenset(), frozenset({"src/parent.py"}), ResourcePool.Model
+    )
+    child = ReadySlice(
+        "run-a",
+        "child",
+        frozenset({"parent"}),
+        frozenset({"src/child.py"}),
+        ResourcePool.Model,
+    )
+    scheduler.submit(parent)
+    scheduler.submit(child)
+
+    assert scheduler.next(frozenset(), frozenset(ResourcePool)) == parent
+    scheduler.await_integration("run-a", "parent", generation=0)
+
+    assert scheduler.next(frozenset(), frozenset(ResourcePool)) is None
+    scheduler.mark_integrated("run-a", "parent", generation=0)
+    assert scheduler.next(frozenset(), frozenset(ResourcePool)) == child
