@@ -132,12 +132,60 @@ def test_agent_tool_definitions_exposes_the_exact_structured_plan_schema() -> No
     )
     proposal = definitions[-1]
     assert proposal.parameters["additionalProperties"] is False
+    assert proposal.strict is True
     assert set(proposal.parameters["properties"]) == {
         "slices",
         "edges",
         "integration_ranks",
         "planner_rationale",
     }
+    assert set(proposal.parameters["required"]) == set(proposal.parameters["properties"])
+    assert "$defs" not in proposal.parameters
+    assert proposal.parameters["properties"]["integration_ranks"]["type"] == "array"
+    rationale = proposal.parameters["properties"]["slices"]["items"]["properties"][
+        "rationale"
+    ]["items"]
+    assert rationale["properties"]["anchors"]["items"]["type"] == "string"
+
+    def assert_strict_objects(schema: object) -> None:
+        if isinstance(schema, dict):
+            assert "default" not in schema
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                assert schema.get("additionalProperties") is False
+                assert set(schema.get("required", ())) == set(properties)
+                for child in properties.values():
+                    assert_strict_objects(child)
+            items = schema.get("items")
+            if isinstance(items, dict):
+                assert_strict_objects(items)
+            for child in schema.get("anyOf", ()):
+                assert_strict_objects(child)
+
+    assert_strict_objects(proposal.parameters)
+    base_digest = agent_toolset_digest(
+        phase=Phase.Plan,
+        session_kind=SessionKind.PlanAuxiliary,
+        owner_kind="run",
+    )
+    expected_digest = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "toolset_sha256": base_digest,
+                "structured_output": {
+                    "name": PlanProposal.__name__,
+                    "description": PlanProposal.__doc__ or "",
+                    "parameters": PlanProposal.model_json_schema(),
+                },
+            }
+        )
+    ).hexdigest()
+    assert agent_toolset_digest(
+        phase=Phase.Plan,
+        session_kind=SessionKind.PlanAuxiliary,
+        owner_kind="run",
+        response_format=PlanProposal,
+    ) == expected_digest
 
 
 def _binding(profile=ModelProfile.Reasoning):

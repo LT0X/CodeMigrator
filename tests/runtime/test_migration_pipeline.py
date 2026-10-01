@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
+from codemigrator.core.models.plan import PlanProposal
 from codemigrator.planning import FrozenPlan, compute_plan_hash
 from codemigrator.runtime import (
     ProjectMigrationPipeline,
@@ -15,12 +17,16 @@ from codemigrator.runtime import (
     record_generated_repairs,
     repair_generated_file,
 )
-from codemigrator.runtime.migration_pipeline import _PipelineCheckpoint
+from codemigrator.runtime.migration_pipeline import _legacy_planner_advice, _PipelineCheckpoint
 
 
 class FakeTranslator:
     def __init__(self) -> None:
         self.calls: list[str] = []
+
+    @property
+    def _endpoint(self) -> str:
+        raise AssertionError("compatibility pipeline must not inspect translator credentials")
 
     def translate(self, source_path: str, source_text: str) -> TranslationResult:
         del source_text
@@ -51,6 +57,31 @@ def make_source(root: Path) -> Path:
     (root / "pkg" / "value.go").write_text("package pkg\n\ntype Value struct{}\n", encoding="utf-8")
     (root / "README.md").write_text("demo\n", encoding="utf-8")
     return root
+
+
+def test_default_legacy_planning_has_no_advisory_without_explicit_port() -> None:
+    advice = _legacy_planner_advice(
+        None,
+        cast(Any, None),
+        cast(Any, None),
+    )
+
+    assert advice == {"status": "UNAVAILABLE", "reason": "no planner advisory port"}
+
+
+def test_legacy_advisor_cannot_supply_a_plan_proposal() -> None:
+    class ProposalShapedAdvisor:
+        def advise(self, analysis: object, artifacts: object) -> object:
+            del analysis, artifacts
+            return PlanProposal.model_construct()
+
+    advice = _legacy_planner_advice(
+        cast(Any, ProposalShapedAdvisor()),
+        cast(Any, None),
+        cast(Any, None),
+    )
+
+    assert advice == {"status": "UNAVAILABLE", "reason": "invalid planner advisory"}
 
 
 def test_pipeline_materializes_full_v6_stage_evidence(tmp_path: Path) -> None:

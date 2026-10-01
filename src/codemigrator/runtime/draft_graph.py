@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, TypedDict
+from typing import Any, Protocol, TypeAlias, TypedDict, cast
 from uuid import UUID, uuid4
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
+from pydantic import ValidationError
 
 from codemigrator.core import CreateRun, RunId, canonical_json_bytes
 from codemigrator.core.paths import normalize_repo_relative_paths
 
 from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
-from .cas import CasObject
+from .cas import CasObject, FileHostCAS
 from .contracts import (
     DraftOwnerReceipt,
     DraftSessionEventSpec,
@@ -25,12 +28,17 @@ from .contracts import (
     agent_run_lifecycle_spec,
 )
 from .create_run import CreateRunService
-from .draft import DraftConflictError, DraftFlow, DraftLedger
+from .draft import DraftConflictError, DraftFlow, DraftLedger, select_trial_paths
 from .draft_models import (
     AskUserAnswer,
     AskUserQuestion,
     DraftFreezeReceipt,
+    DraftStage,
+    ExplorationMerge,
+    ExplorationReport,
+    ExploreReassignment,
     TaskDraftRevision,
+    TrialTranslation,
 )
 from .loop_contracts import SessionExit, SessionState
 from .store import (
@@ -47,6 +55,10 @@ class DraftAgentRecoveryError(ValueError):
 
 class DraftAgentResultUnavailable(RuntimeError):
     """A terminal Draft AgentRun has no matching durable result reference."""
+
+
+class DraftAgentResultInvalid(ValueError):
+    """A durable Draft AgentRun result does not match a Draft result contract."""
 
 
 class DraftAgentExecutionTerminated(RuntimeError):
@@ -69,11 +81,45 @@ class _DraftGraphState(TypedDict, total=False):
     question_id: str
     question_receipt_key: str
     answer_receipt_key: str
+    agent_run_id: str
+    agent_receipt_id: str
+    result_reference_key: str
+    result_sha256: str
+    owner_result_receipt_key: str
+
+
+class _DraftAgentGraphState(TypedDict, total=False):
+    """Agent subgraph checkpoints contain references only, never task or result bodies."""
+
+    draft_id: str
+    cursor: str
+    agent_run_id: str
+    agent_receipt_id: str
+    result_reference_key: str
+    result_sha256: str
+    owner_result_receipt_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DraftAgentContext:
+    """Invocation-only data; LangGraph context is not part of persisted graph state."""
+
+    logical_task_key: str
+    expected_category: str
+    task: str
+    trial_group_paths: tuple[str, ...] | None = None
+    trial_revision_id: str | None = None
+
+
+DraftAgentResult: TypeAlias = (
+    ExplorationReport | ExploreReassignment | ExplorationMerge | TrialTranslation
+)
 
 
 class DraftOwnerPort(Protocol):
     draft_id: UUID
     freeze_receipt: DraftFreezeReceipt | None
+    current_revision_id: str | None
 
     async def load_fact(
         self, receipt_key: str
@@ -105,6 +151,19 @@ class DraftOwnerPort(Protocol):
         self, record: AgentRun, receipt: AgentRunReceipt
     ) -> DraftOwnerReceipt: ...
 
+    async def materialize_agent_result(
+        self,
+        record: AgentRun,
+        receipt: AgentRunReceipt,
+        result_reference: CasObject,
+        result: DraftAgentResult,
+        *,
+        trial_group_paths: Sequence[str] | None = None,
+        trial_revision_id: str | None = None,
+    ) -> DraftOwnerReceipt: ...
+
+    def validate_trial_group(self, paths: Sequence[str]) -> tuple[str, ...]: ...
+
 
 class DraftFlowOwner:
     """Commit and recover Draft business facts behind durable owner receipts."""
@@ -113,10 +172,36 @@ class DraftFlowOwner:
         self.draft_id = draft_id
         self.flow = flow
         self.store = store
+        self._materialized_agent_results: set[str] = set()
+        self._trial_agent_results: dict[str, TrialTranslation] = {}
+        self._trial_group_paths: tuple[str, ...] | None = None
+        self._trial_revision_id: str | None = None
 
     @property
     def freeze_receipt(self) -> DraftFreezeReceipt | None:
         return self.flow.ledger.freeze_receipt
+
+    @property
+    def current_revision_id(self) -> str | None:
+        revision = self.flow.ledger.current_revision
+        return str(revision.revision_id) if revision is not None else None
+
+    def validate_trial_group(self, paths: Sequence[str]) -> tuple[str, ...]:
+        selected = select_trial_paths(paths)
+        revision_id = self.current_revision_id
+        if revision_id is None:
+            raise DraftConflictError("trial translation requires a current TaskDraftRevision")
+        if self.flow.stage is not DraftStage.Calibrate:
+            raise DraftConflictError("trial results can only be materialized in Calibrate")
+        if self._trial_revision_id != revision_id:
+            self._trial_agent_results.clear()
+            self._trial_group_paths = None
+            self.flow._trial_results = ()
+            self._trial_revision_id = revision_id
+        if self._trial_group_paths is not None and self._trial_group_paths != selected:
+            raise DraftConflictError("Draft trial replay changed the selected file group")
+        self._trial_group_paths = selected
+        return selected
 
     async def load_fact(
         self, receipt_key: str
@@ -180,7 +265,275 @@ class DraftFlowOwner:
             ) from exc
 
     async def restore_ledger(self) -> None:
-        self.flow.ledger = await self._load_persisted_ledger()
+        facts = await self.store.list_draft_owner_facts(self.draft_id)
+        self.flow.ledger = await self._load_persisted_ledger(facts)
+        materialized = [
+            (receipt, fact) for receipt, fact in facts if receipt.category == "draft.agent.result"
+        ]
+        initial_stage = self.flow.stage
+        if materialized:
+            self.flow._stage = DraftStage.Explore
+            self.flow._reports.clear()
+            self.flow._reassignments.clear()
+            self.flow._merged_exploration = None
+            self.flow._trial_results = ()
+            self._materialized_agent_results.clear()
+            self._trial_agent_results.clear()
+            self._trial_group_paths = None
+            self._trial_revision_id = None
+        for receipt, fact in sorted(materialized, key=_agent_result_restore_key):
+            result, logical_task_key, agent_run_id = _agent_result_from_fact(receipt, fact)
+            trial_group_paths: tuple[str, ...] | None = None
+            trial_revision_id: str | None = None
+            if isinstance(result, TrialTranslation):
+                raw_trial_group = fact.get("trial_group_paths")
+                raw_trial_revision = fact.get("draft_revision_id")
+                if (
+                    not isinstance(raw_trial_group, (list, tuple))
+                    or not all(isinstance(path, str) for path in raw_trial_group)
+                    or not isinstance(raw_trial_revision, str)
+                ):
+                    raise StoreCommitError("stored trial result has no Draft revision identity")
+                trial_group_paths = tuple(raw_trial_group)
+                trial_revision_id = raw_trial_revision
+                if trial_revision_id != self.current_revision_id:
+                    # Old AgentRun output remains auditable but cannot affect the current Draft.
+                    continue
+                self._trial_revision_id = trial_revision_id
+            self._validate_agent_result(
+                result,
+                logical_task_key,
+                trial_group_paths=trial_group_paths,
+                trial_revision_id=trial_revision_id,
+                restoring=True,
+            )
+            self._apply_agent_result(
+                receipt.receipt_key,
+                result,
+                trial_group_paths=trial_group_paths,
+                restoring=True,
+            )
+            if receipt.receipt_key != f"draft.agent.result:{agent_run_id}":
+                raise StoreCommitError("Draft agent result receipt key is inconsistent")
+
+        if self.flow.ledger.freeze_receipt is not None:
+            if self._trial_agent_results:
+                self.flow._stage = DraftStage.Confirmed
+            else:
+                self.flow._stage = initial_stage
+        elif self._trial_group_paths is not None:
+            self.flow._stage = DraftStage.Calibrate
+            self._apply_trial_results()
+        elif self.flow.ledger.current_revision is not None:
+            self.flow._stage = (
+                DraftStage.Draft if self.flow.merged_exploration is not None else DraftStage.Align
+            )
+
+    async def materialize_agent_result(
+        self,
+        record: AgentRun,
+        receipt: AgentRunReceipt,
+        result_reference: CasObject,
+        result: DraftAgentResult,
+        *,
+        trial_group_paths: Sequence[str] | None = None,
+        trial_revision_id: str | None = None,
+    ) -> DraftOwnerReceipt:
+        """Persist a typed AgentRun result and apply it through the DraftFlow owner."""
+
+        if (
+            record.owner_kind != "draft"
+            or record.owner_id != self.draft_id
+            or record.exit is not SessionExit.Completed
+            or receipt.agent_run_id != record.agent_run_id
+            or result_reference.digest != record.result_sha256
+        ):
+            raise DraftAgentResultUnavailable(
+                "Draft result materialization requires its completed AgentRun CAS receipt"
+            )
+        if await self.has_receipt("draft.closed") or await self.has_receipt("draft.attached"):
+            raise DraftConflictError("Draft session is already closed or attached to a Run")
+        if self.freeze_receipt is not None:
+            raise DraftConflictError("a frozen Draft cannot accept another AgentRun result")
+
+        logical_task_key = record.logical_task_key
+        receipt_key = f"draft.agent.result:{record.agent_run_id}"
+        fact: dict[str, object] = {
+            "agent_run_id": str(record.agent_run_id),
+            "logical_task_key": logical_task_key,
+            "agent_receipt_id": str(receipt.receipt_id),
+            "result_sha256": result_reference.digest,
+            "result_type": type(result).__name__,
+            "result": result.model_dump(mode="json"),
+            "trial_group_paths": (
+                list(trial_group_paths)
+                if isinstance(result, TrialTranslation) and trial_group_paths is not None
+                else None
+            ),
+            "draft_revision_id": (
+                trial_revision_id if isinstance(result, TrialTranslation) else None
+            ),
+        }
+        previous = await self.store.load_draft_owner_fact(self.draft_id, receipt_key)
+        if previous is not None:
+            if previous[0].category != "draft.agent.result" or previous[1] != fact:
+                raise StoreCommitError("Draft AgentRun result receipt replay mismatch")
+            if receipt_key in self._materialized_agent_results:
+                return previous[0]
+
+        self._validate_agent_result(
+            result,
+            logical_task_key,
+            trial_group_paths=trial_group_paths,
+            trial_revision_id=trial_revision_id,
+        )
+        if isinstance(result, TrialTranslation):
+            await self.persist_current_revision()
+        owner_receipt = (
+            previous[0]
+            if previous is not None
+            else await self.store.commit_draft_owner_fact(
+                self.draft_id,
+                receipt_key,
+                "draft.agent.result",
+                fact,
+            )
+        )
+        if receipt_key not in self._materialized_agent_results:
+            self._apply_agent_result(
+                receipt_key,
+                result,
+                trial_group_paths=trial_group_paths,
+            )
+            self._materialized_agent_results.add(receipt_key)
+        return owner_receipt
+
+    def _validate_agent_result(
+        self,
+        result: DraftAgentResult,
+        logical_task_key: str,
+        *,
+        trial_group_paths: Sequence[str] | None = None,
+        trial_revision_id: str | None = None,
+        restoring: bool = False,
+    ) -> None:
+        if isinstance(result, ExplorationReport):
+            if logical_task_key != exploration_task_key(result.domain_path):
+                raise DraftAgentResultInvalid(
+                    "exploration result domain does not match its logical task"
+                )
+            if not restoring and self.flow.stage is not DraftStage.Explore:
+                raise DraftConflictError("exploration reports can only be materialized in Explore")
+            if any(report.domain_path == result.domain_path for report in self.flow.reports):
+                if result not in self.flow.reports:
+                    raise DraftConflictError("exploration domain already has a different report")
+            return
+        if isinstance(result, ExploreReassignment):
+            if _coordinator_task_round(logical_task_key) is None:
+                raise DraftAgentResultInvalid(
+                    "reassignment result does not match the coordinator task"
+                )
+            if not restoring and self.flow.stage not in {DraftStage.Explore, DraftStage.Align}:
+                raise DraftConflictError("exploration reassignment is outside its Draft stage")
+            return
+        if isinstance(result, ExplorationMerge):
+            if _coordinator_task_round(logical_task_key) is None:
+                raise DraftAgentResultInvalid("merge result does not match the coordinator task")
+            if not restoring and self.flow.stage is not DraftStage.Explore:
+                raise DraftConflictError("exploration merge can only be materialized in Explore")
+            if self.flow.merged_exploration is None:
+                expected = self._preview_exploration_merge()
+                if expected != result:
+                    raise DraftAgentResultInvalid(
+                        "coordinator merge does not match DraftFlow coverage validation"
+                    )
+            elif self.flow.merged_exploration != result:
+                raise DraftConflictError("Draft exploration already has a different merge")
+            return
+        if isinstance(result, TrialTranslation):
+            if (
+                trial_revision_id is None
+                or trial_revision_id != self.current_revision_id
+                or logical_task_key
+                != trial_translation_task_key(result.file_path, trial_revision_id)
+            ):
+                raise DraftAgentResultInvalid(
+                    "trial result does not match the current Draft revision and logical task"
+                )
+            if not restoring and self.flow.stage is not DraftStage.Calibrate:
+                raise DraftConflictError("trial results can only be materialized in Calibrate")
+            selected_paths = _normalize_trial_group(trial_group_paths)
+            if result.file_path not in selected_paths:
+                raise DraftAgentResultInvalid("trial result is outside its selected file group")
+            if (
+                self._trial_group_paths is not None
+                and self._trial_group_paths != selected_paths
+            ):
+                raise DraftConflictError("Draft trial replay changed the selected file group")
+            if set(self._trial_agent_results).difference(selected_paths):
+                raise DraftConflictError("Draft trial has results outside its selected file group")
+            return
+        raise DraftAgentResultInvalid("Draft AgentRun result type is unsupported")
+
+    def _preview_exploration_merge(self) -> ExplorationMerge:
+        if self.flow.merged_exploration is not None:
+            return self.flow.merged_exploration
+        expected_files = self._expected_exploration_files()
+        candidate = DraftFlow(
+            self.flow.ledger,
+            module_files=self.flow._module_files,
+            max_fanout=self.flow._max_fanout,
+        )
+        for report in self.flow.reports:
+            candidate.submit_report(report)
+        return candidate.finish_exploration(expected_files)
+
+    def _expected_exploration_files(self) -> tuple[str, ...]:
+        if self.flow._module_files is not None:
+            return tuple(
+                file_path
+                for module_path in sorted(self.flow._module_files)
+                for file_path in self.flow._module_files[module_path]
+            )
+        return tuple(file_path for report in self.flow.reports for file_path in report.coverage)
+
+    def _apply_agent_result(
+        self,
+        receipt_key: str,
+        result: DraftAgentResult,
+        *,
+        trial_group_paths: Sequence[str] | None = None,
+        restoring: bool = False,
+    ) -> None:
+        if isinstance(result, ExplorationReport):
+            if result not in self.flow.reports:
+                self.flow.submit_report(result)
+        elif isinstance(result, ExploreReassignment):
+            if result not in self.flow.reassignments:
+                self.flow.record_reassignment(result)
+        elif isinstance(result, ExplorationMerge):
+            if self.flow.merged_exploration != result:
+                self.flow.finish_exploration(self._expected_exploration_files())
+        elif isinstance(result, TrialTranslation):
+            selected_paths = _normalize_trial_group(trial_group_paths)
+            revision_id = self.current_revision_id
+            if revision_id is None or revision_id != self._trial_revision_id:
+                raise DraftConflictError("trial result belongs to a stale Draft revision")
+            self._trial_group_paths = selected_paths
+            self._trial_agent_results[result.file_path] = result
+            if set(self._trial_agent_results) == set(selected_paths):
+                self._apply_trial_results()
+        self._materialized_agent_results.add(receipt_key)
+
+    def _apply_trial_results(self) -> None:
+        paths = self._trial_group_paths
+        if paths is None or set(self._trial_agent_results) != set(paths):
+            return
+        self.flow.trial_translate(
+            paths,
+            {path: self._trial_agent_results[path].constrained_output for path in paths},
+            {path: self._trial_agent_results[path].freeform_output for path in paths},
+        )
 
     async def _load_persisted_ledger(
         self,
@@ -364,11 +717,12 @@ class DraftAgentRunStore(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class DraftAgentCompletion:
-    """A durable terminal receipt and optional successful result reference."""
+    """A durable AgentRun receipt, opaque result reference and typed owner result."""
 
     record: AgentRun
     receipt: AgentRunReceipt
     result: CasObject | None
+    materialized: DraftAgentResult | None = None
 
 
 class DraftAgentRunnerPort(Protocol):
@@ -436,10 +790,30 @@ class MigrationSessionGraph:
             raise ValueError("Draft graph thread must be independent of its owner id")
         self.create_run_service = create_run_service
         self.agent_runner = agent_runner
-        builder = StateGraph(_DraftGraphState)
+        agent_builder = StateGraph(
+            _DraftAgentGraphState,
+            context_schema=_DraftAgentContext,
+        )
+        agent_builder.add_node("execute_agent", self._execute_agent_node)
+        agent_builder.add_node("materialize_result", self._materialize_result_node)
+        agent_builder.set_entry_point("execute_agent")
+        agent_builder.add_edge("execute_agent", "materialize_result")
+        agent_builder.add_edge("materialize_result", END)
+        self._draft_agent_graph = agent_builder.compile()
+
+        builder = StateGraph(
+            _DraftGraphState,
+            context_schema=_DraftAgentContext,
+        )
         builder.add_node("ask_user", self._ask_user)
-        builder.set_entry_point("ask_user")
+        builder.add_node("draft_agent", self._invoke_draft_agent_subgraph)
+        builder.add_conditional_edges(
+            START,
+            self._route_entry,
+            {"ask_user": "ask_user", "draft_agent": "draft_agent"},
+        )
         builder.add_edge("ask_user", END)
+        builder.add_edge("draft_agent", END)
         self._graph = builder.compile(checkpointer=checkpointer)
 
     @property
@@ -506,17 +880,41 @@ class MigrationSessionGraph:
         return await self.agent_runs.create_or_get_agent_run(candidate)
 
     async def explore_domain(self, domain_path: str, task: str) -> DraftAgentCompletion:
-        return await self._run_agent(
+        return await self._run_agent_graph(
             exploration_task_key(domain_path), task, "draft.exploration.completed"
         )
 
-    async def coordinate_exploration(self, task: str) -> DraftAgentCompletion:
-        return await self._run_agent(coordinator_task_key(), task, "draft.coordinator.completed")
-
-    async def trial_translate(self, file_path: str, task: str) -> DraftAgentCompletion:
-        return await self._run_agent(
-            trial_translation_task_key(file_path), task, "draft.trial.completed"
+    async def coordinate_exploration(
+        self, task: str, *, round_number: int = 1
+    ) -> DraftAgentCompletion:
+        return await self._run_agent_graph(
+            coordinator_task_key(round_number), task, "draft.coordinator.completed"
         )
+
+    async def trial_translate(
+        self, risk_hotspots: Sequence[str], tasks_by_file: Mapping[str, str]
+    ) -> tuple[DraftAgentCompletion, ...]:
+        paths = self.owner.validate_trial_group(risk_hotspots)
+        revision_id = self.owner.current_revision_id
+        if revision_id is None:
+            raise DraftConflictError("trial translation requires a current TaskDraftRevision")
+        if set(tasks_by_file) != set(paths):
+            raise ValueError("trial tasks must cover exactly the selected 2 or 3 files")
+        completions: list[DraftAgentCompletion] = []
+        for path in paths:
+            task = tasks_by_file[path]
+            if not isinstance(task, str) or not task.strip():
+                raise ValueError("each Draft trial task must be non-empty text")
+            completions.append(
+                await self._run_agent_graph(
+                    trial_translation_task_key(path, revision_id),
+                    task,
+                    "draft.trial.completed",
+                    trial_group_paths=paths,
+                    trial_revision_id=revision_id,
+                )
+            )
+        return tuple(completions)
 
     async def attach_to_run(self, run_id: RunId, request: CreateRun) -> RunCreatedReceipt:
         if await self.owner.has_receipt("draft.closed"):
@@ -601,6 +999,208 @@ class MigrationSessionGraph:
         ):
             raise ValueError("Draft graph cannot advance before the answer receipt")
         return {"cursor": "ASK_USER_ANSWERED", "answer_receipt_key": answer_receipt_key}
+
+    @staticmethod
+    def _route_entry(state: _DraftGraphState) -> str:
+        cursor = state.get("cursor")
+        if cursor == "ASK_USER":
+            return "ask_user"
+        if cursor == "DRAFT_AGENT":
+            return "draft_agent"
+        raise ValueError("Draft graph request cursor is invalid")
+
+    async def _invoke_draft_agent_subgraph(
+        self,
+        state: _DraftGraphState,
+        runtime: Runtime[_DraftAgentContext],
+    ) -> _DraftGraphState:
+        context = runtime.context
+        if not isinstance(context, _DraftAgentContext):
+            raise ValueError("Draft Agent graph invocation context is missing")
+        if state.get("draft_id") != str(self.owner.draft_id):
+            raise ValueError("Draft Agent graph state has a different owner")
+        result = await self._draft_agent_graph.ainvoke(
+            {"draft_id": str(self.owner.draft_id), "cursor": "AGENT_RUN"},
+            context=context,
+        )
+        return cast(
+            _DraftGraphState,
+            {
+                key: result[key]
+                for key in (
+                    "cursor",
+                    "agent_run_id",
+                    "agent_receipt_id",
+                    "result_reference_key",
+                    "result_sha256",
+                    "owner_result_receipt_key",
+                )
+            },
+        )
+
+    async def _execute_agent_node(
+        self,
+        state: _DraftAgentGraphState,
+        runtime: Runtime[_DraftAgentContext],
+    ) -> _DraftAgentGraphState:
+        context = runtime.context
+        if not isinstance(context, _DraftAgentContext):
+            raise ValueError("Draft Agent graph invocation context is missing")
+        if state.get("draft_id") != str(self.owner.draft_id):
+            raise ValueError("Draft Agent graph state has a different owner")
+        completion = await self._run_agent(
+            context.logical_task_key,
+            context.task,
+            context.expected_category,
+        )
+        if completion.result is None:
+            raise DraftAgentResultUnavailable(
+                "completed Draft AgentRun did not return a durable result reference"
+            )
+        return {
+            "cursor": "AGENT_RUN_COMPLETED",
+            "agent_run_id": str(completion.record.agent_run_id),
+            "agent_receipt_id": str(completion.receipt.receipt_id),
+            "result_reference_key": _agent_result_reference_key(completion.record.agent_run_id),
+            "result_sha256": completion.result.digest,
+        }
+
+    async def _materialize_result_node(
+        self,
+        state: _DraftAgentGraphState,
+        runtime: Runtime[_DraftAgentContext],
+    ) -> _DraftAgentGraphState:
+        context = runtime.context
+        agent_run_id = state.get("agent_run_id")
+        receipt_id = state.get("agent_receipt_id")
+        reference_key = state.get("result_reference_key")
+        result_sha256 = state.get("result_sha256")
+        if (
+            not isinstance(context, _DraftAgentContext)
+            or state.get("cursor") != "AGENT_RUN_COMPLETED"
+            or not isinstance(agent_run_id, str)
+            or not isinstance(receipt_id, str)
+            or not isinstance(reference_key, str)
+            or not isinstance(result_sha256, str)
+        ):
+            raise ValueError("Draft Agent result materialization state is incomplete")
+        run_id = AgentRunId(UUID(agent_run_id))
+        record = await self.agent_runs.load_agent_run(run_id)
+        receipt = await self.agent_runs.load_agent_run_receipt(run_id)
+        if (
+            record is None
+            or receipt is None
+            or receipt.receipt_id != UUID(receipt_id)
+            or record.logical_task_key != context.logical_task_key
+            or record.exit is not SessionExit.Completed
+        ):
+            raise DraftAgentRecoveryError(
+                "Draft Agent result materialization requires its durable completed receipt"
+            )
+        result_reference = await self._load_result_reference(record)
+        if (
+            reference_key != _agent_result_reference_key(record.agent_run_id)
+            or result_reference.digest != result_sha256
+        ):
+            raise DraftAgentResultUnavailable(
+                "Draft Agent result cursor does not match its durable CAS reference"
+            )
+        cas = getattr(self.agent_checkpointer, "cas", None)
+        if not isinstance(cas, FileHostCAS):
+            raise DraftAgentResultUnavailable(
+                "Draft Agent result materialization needs the owner-bound CAS reader"
+            )
+        body = await asyncio.to_thread(cas.read, result_reference)
+        result = _parse_draft_agent_result(context.logical_task_key, body)
+        owner_receipt = await self.owner.materialize_agent_result(
+            record,
+            receipt,
+            result_reference,
+            result,
+            trial_group_paths=context.trial_group_paths,
+            trial_revision_id=context.trial_revision_id,
+        )
+        return {
+            "cursor": "DRAFT_AGENT_COMPLETED",
+            "agent_run_id": agent_run_id,
+            "agent_receipt_id": receipt_id,
+            "result_reference_key": reference_key,
+            "result_sha256": result_sha256,
+            "owner_result_receipt_key": owner_receipt.receipt_key,
+        }
+
+    async def _run_agent_graph(
+        self,
+        logical_task_key: str,
+        task: str,
+        expected_category: str,
+        *,
+        trial_group_paths: tuple[str, ...] | None = None,
+        trial_revision_id: str | None = None,
+    ) -> DraftAgentCompletion:
+        await self._ensure_open()
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("Draft Agent task must be non-empty text")
+        snapshot = await self._graph.aget_state(self.config)
+        if snapshot is not None and _has_interrupt(snapshot):
+            raise DraftConflictError("Draft graph is waiting for an AskUser answer")
+        context = _DraftAgentContext(
+            logical_task_key=logical_task_key,
+            expected_category=expected_category,
+            task=task,
+            trial_group_paths=trial_group_paths,
+            trial_revision_id=trial_revision_id,
+        )
+        state = await self._graph.ainvoke(
+            {"draft_id": str(self.owner.draft_id), "cursor": "DRAFT_AGENT"},
+            config=self.config,
+            context=context,
+        )
+        return await self._load_materialized_completion(state)
+
+    async def _load_materialized_completion(
+        self, state: Mapping[str, object]
+    ) -> DraftAgentCompletion:
+        agent_run_id = state.get("agent_run_id")
+        agent_receipt_id = state.get("agent_receipt_id")
+        reference_key = state.get("result_reference_key")
+        result_sha256 = state.get("result_sha256")
+        owner_receipt_key = state.get("owner_result_receipt_key")
+        if (
+            not isinstance(agent_run_id, str)
+            or not isinstance(agent_receipt_id, str)
+            or not isinstance(reference_key, str)
+            or not isinstance(result_sha256, str)
+            or not isinstance(owner_receipt_key, str)
+        ):
+            raise DraftAgentRecoveryError("Draft graph did not return complete receipt references")
+        run_id = AgentRunId(UUID(agent_run_id))
+        record = await self.agent_runs.load_agent_run(run_id)
+        receipt = await self.agent_runs.load_agent_run_receipt(run_id)
+        result_reference = await self.agent_runs.get_cas_reference(
+            "draft", self.owner.draft_id, reference_key
+        )
+        owner_fact = await self.owner.load_fact(owner_receipt_key)
+        if (
+            record is None
+            or receipt is None
+            or result_reference is None
+            or owner_fact is None
+            or str(receipt.receipt_id) != agent_receipt_id
+            or record.result_sha256 != result_sha256
+            or result_reference.digest != result_sha256
+            or owner_fact[0].receipt_key != owner_receipt_key
+            or owner_fact[0].category != "draft.agent.result"
+            or owner_fact[1].get("agent_receipt_id") != agent_receipt_id
+            or owner_fact[1].get("result_sha256") != result_sha256
+        ):
+            raise DraftAgentRecoveryError("Draft graph receipt references failed revalidation")
+        materialized, logical_task_key, fact_run_id = _agent_result_from_fact(
+            owner_fact[0], owner_fact[1]
+        )
+        if fact_run_id != run_id or record.logical_task_key != logical_task_key:
+            raise DraftAgentRecoveryError("Draft result fact has a different AgentRun identity")
+        return DraftAgentCompletion(record, receipt, result_reference, materialized)
 
     async def _run_agent(
         self, logical_task_key: str, task: str, expected_category: str
@@ -824,12 +1424,36 @@ def exploration_task_key(domain_path: str) -> str:
     return f"draft.explore:{_key_digest(_normalize_path(domain_path))}"
 
 
-def coordinator_task_key() -> str:
-    return "draft.explore.coordinator"
+def coordinator_task_key(round_number: int = 1) -> str:
+    if type(round_number) is not int or round_number < 1:
+        raise ValueError("coordinator round number must be a positive integer")
+    return f"draft.explore.coordinator:round:{round_number}"
 
 
-def trial_translation_task_key(file_path: str) -> str:
-    return f"draft.trial:{_key_digest(_normalize_path(file_path))}"
+def trial_translation_task_key(file_path: str, revision_id: str | UUID) -> str:
+    return f"draft.trial:{revision_id}:{_key_digest(_normalize_path(file_path))}"
+
+
+def _coordinator_task_round(logical_task_key: str) -> int | None:
+    prefix = "draft.explore.coordinator:round:"
+    if not logical_task_key.startswith(prefix):
+        return None
+    raw_round = logical_task_key.removeprefix(prefix)
+    if not raw_round.isdecimal() or raw_round.startswith("0"):
+        return None
+    return int(raw_round)
+
+
+def _normalize_trial_group(paths: Sequence[str] | None) -> tuple[str, ...]:
+    if paths is None:
+        raise DraftAgentResultInvalid("trial result is missing its selected file group")
+    try:
+        selected = tuple(select_trial_paths(paths))
+    except (TypeError, ValueError) as exc:
+        raise DraftAgentResultInvalid("trial result has an invalid selected file group") from exc
+    if len(selected) not in {2, 3}:
+        raise DraftAgentResultInvalid("trial group must contain exactly two or three files")
+    return selected
 
 
 def _revision_receipt_key(revision_number: int) -> str:
@@ -846,6 +1470,105 @@ def _answer_receipt_key(question_id: object) -> str:
 
 def _agent_result_reference_key(agent_run_id: AgentRunId) -> str:
     return f"agent-result:{agent_run_id}"
+
+
+def _parse_draft_agent_result(logical_task_key: str, body: bytes) -> DraftAgentResult:
+    if logical_task_key.startswith("draft.explore:"):
+        models: tuple[type[DraftAgentResult], ...] = (ExplorationReport,)
+    elif _coordinator_task_round(logical_task_key) is not None:
+        models = (ExploreReassignment, ExplorationMerge)
+    elif logical_task_key.startswith("draft.trial:"):
+        models = (TrialTranslation,)
+    else:
+        raise DraftAgentResultInvalid("Draft AgentRun has an unsupported logical task")
+
+    errors: list[ValidationError] = []
+    for model in models:
+        try:
+            return model.model_validate_json(body)
+        except ValidationError as exc:
+            errors.append(exc)
+    raise DraftAgentResultInvalid(
+        "Draft AgentRun CAS body does not match a typed Draft result"
+    ) from errors[-1]
+
+
+def _agent_result_from_fact(
+    receipt: DraftOwnerReceipt,
+    fact: Mapping[str, object],
+) -> tuple[DraftAgentResult, str, UUID]:
+    agent_run_value = fact.get("agent_run_id")
+    logical_task_value = fact.get("logical_task_key")
+    result_digest = fact.get("result_sha256")
+    result_type = fact.get("result_type")
+    result_body = fact.get("result")
+    if (
+        receipt.category != "draft.agent.result"
+        or not isinstance(agent_run_value, str)
+        or not isinstance(logical_task_value, str)
+        or not isinstance(result_digest, str)
+        or not isinstance(result_type, str)
+        or not isinstance(result_body, Mapping)
+    ):
+        raise StoreCommitError("stored Draft AgentRun result fact is invalid")
+    result_types = {
+        model.__name__: model
+        for model in (
+            ExplorationReport,
+            ExploreReassignment,
+            ExplorationMerge,
+            TrialTranslation,
+        )
+    }
+    model = result_types.get(result_type)
+    if model is None:
+        raise StoreCommitError("stored Draft AgentRun result has an unknown type")
+    try:
+        agent_run_id = UUID(agent_run_value)
+        result = model.model_validate(result_body)
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored Draft AgentRun result is invalid") from exc
+    if len(result_digest) != 64 or any(c not in "0123456789abcdef" for c in result_digest):
+        raise StoreCommitError("stored Draft AgentRun result digest is invalid")
+    if receipt.receipt_key != f"draft.agent.result:{agent_run_id}":
+        raise StoreCommitError("Draft AgentRun result receipt key is inconsistent")
+    return result, logical_task_value, agent_run_id
+
+
+def _agent_result_restore_key(
+    item: tuple[DraftOwnerReceipt, dict[str, object]],
+) -> tuple[int, int, str, str]:
+    receipt, fact = item
+    result_type = fact.get("result_type")
+    result_body = fact.get("result")
+    priorities = {
+        "ExplorationReport": 0,
+        "ExploreReassignment": 1,
+        "ExplorationMerge": 2,
+        "TrialTranslation": 4,
+    }
+    if not isinstance(result_body, Mapping):
+        return (len(priorities), 0, "", receipt.receipt_key)
+    sort_value = ""
+    round_number = 0
+    if result_type == "ExplorationReport":
+        domain_path = result_body.get("domain_path")
+        sort_value = domain_path if isinstance(domain_path, str) else ""
+    elif result_type == "TrialTranslation":
+        file_path = result_body.get("file_path")
+        sort_value = file_path if isinstance(file_path, str) else ""
+    elif result_type in {"ExploreReassignment", "ExplorationMerge"}:
+        logical_task_key = fact.get("logical_task_key")
+        if isinstance(logical_task_key, str):
+            round_number = _coordinator_task_round(logical_task_key) or 0
+    return (
+        priorities.get(result_type, len(priorities))
+        if isinstance(result_type, str)
+        else len(priorities),
+        round_number,
+        sort_value,
+        receipt.receipt_key,
+    )
 
 
 def _agent_terminal_contract(
@@ -889,6 +1612,7 @@ __all__ = [
     "DraftAgentCompletion",
     "DraftAgentExecutionTerminated",
     "DraftAgentExecutionFailed",
+    "DraftAgentResultInvalid",
     "DraftAgentRecoveryError",
     "DraftAgentResultUnavailable",
     "DraftAgentRunnerPort",

@@ -121,6 +121,91 @@ def _agent_run(draft_id, logical_task_key: str, *, thread_id: str | None = None)
     )
 
 
+def _exploration_result_bytes(domain_path: str, file_path: str) -> bytes:
+    import json
+
+    return json.dumps(
+        {
+            "domain_path": domain_path,
+            "anchors": [
+                {
+                    "file_path": file_path,
+                    "start": {"line": 1, "column": 0},
+                    "end": {"line": 1, "column": 6},
+                }
+            ],
+            "coverage": [file_path],
+            "confidence_reason": "The fixture has one source file.",
+            "unresolved_conflict_count": 0,
+        }
+    ).encode("utf-8")
+
+
+def _coordinator_result_bytes(domain_path: str = "src") -> bytes:
+    import json
+
+    return json.dumps(
+        {
+            "op": "refocus",
+            "domain_paths": [domain_path],
+            "reason_summary": "The existing domain report remains the correct focus.",
+            "focus_brief": {
+                "domain_paths": [domain_path],
+                "highlights": [],
+                "budget_hint": "Inspect the reported domain.",
+            },
+        }
+    ).encode("utf-8")
+
+
+def _trial_result_bytes(file_path: str) -> bytes:
+    import json
+
+    return json.dumps(
+        {
+            "file_path": file_path,
+            "constrained_output": "constrained translation",
+            "freeform_output": "freeform translation",
+            "profile": "CODE",
+            "discarded": True,
+        }
+    ).encode("utf-8")
+
+
+def _exploration_merge_bytes(reports: list[dict[str, object]]) -> bytes:
+    import json
+
+    return json.dumps(
+        {
+            "reports": reports,
+            "coverage": {
+                "valid": True,
+                "missing_files": [],
+                "duplicate_files": [],
+                "unknown_files": [],
+            },
+            "unresolved_conflict_count": 0,
+        }
+    ).encode("utf-8")
+
+
+def _split_reassignment_bytes() -> bytes:
+    import json
+
+    return json.dumps(
+        {
+            "op": "split",
+            "domain_paths": ["src/a"],
+            "reason_summary": "Separate the second source domain for coverage.",
+            "focus_brief": {
+                "domain_paths": ["src/a", "src/b"],
+                "highlights": [],
+                "budget_hint": "Inspect each source domain once.",
+            },
+        }
+    ).encode("utf-8")
+
+
 @pytest.mark.asyncio
 async def test_draft_graph_interrupts_and_resumes_after_durable_answer_receipt(
     tmp_path, artifacts
@@ -246,7 +331,10 @@ async def test_draft_agent_runs_are_owner_scoped_reusable_and_thread_separate(
     replay_domain = _agent_run(draft_id, exploration_task_key("src/a"))
     second_domain = _agent_run(draft_id, exploration_task_key("src/b"))
     coordinator = _agent_run(draft_id, coordinator_task_key())
-    trial = _agent_run(draft_id, trial_translation_task_key("src/a.py"))
+    trial = _agent_run(
+        draft_id,
+        trial_translation_task_key("src/a.py", flow.ledger.current_revision.revision_id),
+    )
 
     stored_first = await graph.get_or_create_agent_run(first_domain)
     assert await graph.get_or_create_agent_run(replay_domain) == stored_first
@@ -262,6 +350,338 @@ async def test_draft_agent_runs_are_owner_scoped_reusable_and_thread_separate(
     )
     assert all(record.thread_id != graph.thread_id for record in [stored_first, *stored_records])
     assert len(await store.list_agent_runs_by_owner("draft", draft_id)) == 4
+
+
+@pytest.mark.asyncio
+async def test_trial_group_waits_for_every_selected_file_and_reuses_partial_results(
+    tmp_path, artifacts
+) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    paths = ("src/a.py", "src/b.py", "src/c.py")
+    class Runner:
+        def __init__(self) -> None:
+            self.calls: dict[str, int] = {}
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls[logical_task_key] = self.calls.get(logical_task_key, 0) + 1
+            created = await store.create_or_get_agent_run(
+                _agent_run(draft_id, logical_task_key)
+            )
+            await lifecycle.started(created)
+            if logical_task_key == trial_translation_task_key("src/c.py", revision_id) and (
+                self.calls[logical_task_key] == 1
+            ):
+                raise RuntimeError("third file is temporarily unavailable")
+            result_reference = await CasLedger(cas, store).put(
+                _trial_result_bytes(task_keys[logical_task_key]),
+                "draft",
+                draft_id,
+                f"agent-result:{created.agent_run_id}",
+            )
+            terminal = replace(
+                created,
+                state=SessionState.Closed,
+                exit=SessionExit.Completed,
+                result_sha256=result_reference.digest,
+            )
+            receipt = AgentRunReceipt(
+                uuid4(), terminal.agent_run_id, "draft.trial.completed"
+            )
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            return DraftAgentCompletion(terminal, receipt, result_reference)
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, _ = _flow(artifacts)
+    flow.finalize_alignment()
+    flow.begin_calibration()
+    revision_id = flow.ledger.current_revision.revision_id
+    task_keys = {trial_translation_task_key(path, revision_id): path for path in paths}
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    runner = Runner()
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
+    )
+    tasks_by_file = {path: f"translate {path}" for path in paths}
+    risk_hotspots = ("src/c.py", "src/a.py", "src/b.py")
+
+    with pytest.raises(RuntimeError, match="third file is temporarily unavailable"):
+        await graph.trial_translate(risk_hotspots, tasks_by_file)
+    with pytest.raises(DraftConflictError, match="completed trial translation"):
+        flow.confirm()
+
+    completions = await graph.trial_translate(risk_hotspots, tasks_by_file)
+
+    assert tuple(item.materialized.file_path for item in completions) == paths
+    assert runner.calls == {
+        trial_translation_task_key("src/a.py", revision_id): 1,
+        trial_translation_task_key("src/b.py", revision_id): 1,
+        trial_translation_task_key("src/c.py", revision_id): 2,
+    }
+    for completion in completions:
+        owner_fact = await owner.load_fact(
+            f"draft.agent.result:{completion.record.agent_run_id}"
+        )
+        assert owner_fact is not None
+        assert owner_fact[1]["trial_group_paths"] == list(paths)
+    assert len(flow._trial_results) == 3
+
+    previous_revision = flow.ledger.current_revision
+    assert previous_revision is not None
+    revised_blueprint = previous_revision.artifacts.target_project_blueprint.model_copy(
+        update={"version": previous_revision.artifacts.target_project_blueprint.version + 1}
+    )
+    revised_artifacts = previous_revision.artifacts.model_copy(
+        update={"target_project_blueprint": revised_blueprint}
+    )
+    next_revision = flow.revise_artifacts(revised_artifacts)
+    assert trial_translation_task_key("src/a.py", previous_revision.revision_id) != (
+        trial_translation_task_key("src/a.py", next_revision.revision_id)
+    )
+    await owner.persist_current_revision()
+    await owner.restore_ledger()
+
+    assert flow.ledger.current_revision == next_revision
+    assert flow._trial_results == ()
+    assert owner._trial_agent_results == {}
+
+
+@pytest.mark.asyncio
+async def test_coordinator_rounds_support_reassignment_then_merge(tmp_path) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class Runner:
+        def __init__(self) -> None:
+            self.calls: dict[str, int] = {}
+
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            self.calls[logical_task_key] = self.calls.get(logical_task_key, 0) + 1
+            created = await store.create_or_get_agent_run(
+                _agent_run(draft_id, logical_task_key)
+            )
+            await lifecycle.started(created)
+            if logical_task_key == exploration_task_key("src/a"):
+                result_body = _exploration_result_bytes("src/a", "src/a/a.py")
+            elif logical_task_key == exploration_task_key("src/b"):
+                result_body = _exploration_result_bytes("src/b", "src/b/b.py")
+            elif logical_task_key == coordinator_task_key(1):
+                result_body = _split_reassignment_bytes()
+            elif logical_task_key == coordinator_task_key(2):
+                import json
+
+                result_body = _exploration_merge_bytes(
+                    [
+                        json.loads(_exploration_result_bytes("src/a", "src/a/a.py")),
+                        json.loads(_exploration_result_bytes("src/b", "src/b/b.py")),
+                    ]
+                )
+            else:
+                raise AssertionError(f"unexpected coordinator round: {logical_task_key}")
+            result_reference = await CasLedger(cas, store).put(
+                result_body,
+                "draft",
+                draft_id,
+                f"agent-result:{created.agent_run_id}",
+            )
+            terminal = replace(
+                created,
+                state=SessionState.Closed,
+                exit=SessionExit.Completed,
+                result_sha256=result_reference.digest,
+            )
+            category = (
+                "draft.exploration.completed"
+                if logical_task_key.startswith("draft.explore:")
+                else "draft.coordinator.completed"
+            )
+            receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, category)
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            return DraftAgentCompletion(terminal, receipt, result_reference)
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow = DraftFlow(
+        module_files={"src/a": ["src/a/a.py"], "src/b": ["src/b/b.py"]}
+    )
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    runner = Runner()
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
+    )
+
+    await graph.explore_domain("src/a", "inspect first domain")
+    reassignment = await graph.coordinate_exploration(
+        "split the exploration", round_number=1
+    )
+    await graph.explore_domain("src/b", "inspect reassigned domain")
+    merged = await graph.coordinate_exploration("merge complete reports", round_number=2)
+    replayed = await graph.coordinate_exploration("split the exploration", round_number=1)
+
+    assert reassignment.materialized is not None
+    assert merged.materialized is not None
+    assert merged.record.agent_run_id != reassignment.record.agent_run_id
+    assert replayed.record == reassignment.record
+    assert {
+        key: count
+        for key, count in runner.calls.items()
+        if key.startswith("draft.explore.coordinator:")
+    } == {
+        coordinator_task_key(1): 1,
+        coordinator_task_key(2): 1,
+    }
+    assert flow.merged_exploration is not None
+    await owner.restore_ledger()
+    assert flow.merged_exploration is not None
+
+
+@pytest.mark.asyncio
+async def test_exploration_result_is_materialized_by_draft_owner_after_receipt_gate(
+    tmp_path,
+) -> None:
+    import json
+    from dataclasses import replace
+
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    report_body = {
+        "domain_path": "src/a",
+        "anchors": [
+            {
+                "file_path": "src/a/module.py",
+                "start": {"line": 1, "column": 0},
+                "end": {"line": 1, "column": 6},
+            }
+        ],
+        "coverage": ["src/a/module.py"],
+        "confidence_reason": "The module has one source file.",
+        "unresolved_conflict_count": 0,
+    }
+
+    class Runner:
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            created = await store.create_or_get_agent_run(_agent_run(draft_id, logical_task_key))
+            await lifecycle.started(created)
+            result_reference = await CasLedger(cas, store).put(
+                json.dumps(report_body).encode("utf-8"),
+                "draft",
+                draft_id,
+                f"agent-result:{created.agent_run_id}",
+            )
+            terminal = replace(
+                created,
+                state=SessionState.Closed,
+                exit=SessionExit.Completed,
+                result_sha256=result_reference.digest,
+            )
+            receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, "draft.exploration.completed")
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            return DraftAgentCompletion(terminal, receipt, result_reference)
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow = DraftFlow(module_files={"src/a": ["src/a/module.py"]})
+    owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=Runner(),
+    )
+
+    completion = await graph.explore_domain("src/a", "inspect the module")
+
+    assert completion.result is not None
+    assert completion.materialized == ExplorationReport.model_validate(report_body)
+    assert len(flow.reports) == 1
+    assert flow.reports[0].domain_path == "src/a"
+    assert flow.reports[0].coverage == ("src/a/module.py",)
+    result_fact = await owner.load_fact(f"draft.agent.result:{completion.record.agent_run_id}")
+    assert result_fact is not None
+    assert result_fact[0].category == "draft.agent.result"
+    assert result_fact[1]["result_sha256"] == completion.result.digest
+    snapshot = await graph._graph.aget_state(graph.config)
+    assert snapshot is not None
+    assert snapshot.values["cursor"] == "DRAFT_AGENT_COMPLETED"
+    assert "The module has one source file." not in repr(snapshot.values)
+    assert "inspect the module" not in repr(snapshot.values)
+
+    restored_flow = DraftFlow(module_files={"src/a": ["src/a/module.py"]})
+    restored_owner = DraftFlowOwner(draft_id=draft_id, flow=restored_flow, store=store)
+    await restored_owner.restore_ledger()
+    assert restored_flow.reports == (completion.materialized,)
+
+
+@pytest.mark.asyncio
+async def test_malformed_agent_result_does_not_become_a_draft_owner_fact(tmp_path) -> None:
+    from dataclasses import replace
+
+    from codemigrator.runtime.draft_graph import DraftAgentResultInvalid
+    from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+
+    class Runner:
+        async def run(self, draft_id, logical_task_key, task, *, lifecycle):
+            created = await store.create_or_get_agent_run(_agent_run(draft_id, logical_task_key))
+            await lifecycle.started(created)
+            result_reference = await CasLedger(cas, store).put(
+                b"not a typed Draft result",
+                "draft",
+                draft_id,
+                f"agent-result:{created.agent_run_id}",
+            )
+            terminal = replace(
+                created,
+                state=SessionState.Closed,
+                exit=SessionExit.Completed,
+                result_sha256=result_reference.digest,
+            )
+            receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, "draft.exploration.completed")
+            await store.commit_agent_run_receipt(terminal, receipt)
+            await lifecycle.terminal(terminal, receipt)
+            return DraftAgentCompletion(terminal, receipt, result_reference)
+
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    owner = DraftFlowOwner(
+        draft_id=draft_id,
+        flow=DraftFlow(module_files={"src/a": ["src/a/module.py"]}),
+        store=store,
+    )
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    graph = MigrationSessionGraph(
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=Runner(),
+    )
+
+    with pytest.raises(DraftAgentResultInvalid, match="typed Draft result"):
+        await graph.explore_domain("src/a", "inspect the module")
+
+    records = await store.list_agent_runs_by_owner("draft", draft_id)
+    assert len(records) == 1
+    assert await owner.load_fact(f"draft.agent.result:{records[0].agent_run_id}") is None
+    assert owner.flow.reports == ()
 
 
 @pytest.mark.asyncio
@@ -296,8 +716,36 @@ async def test_draft_exploration_coordinator_and_trial_use_committed_agentruns(
             assert (await self.store.read_draft_session_events(draft_id, 0))[
                 -1
             ].event_type == "agent_run.started"
+            if logical_task_key == exploration_task_key("src/a"):
+                result_body = _exploration_result_bytes("src/a", "src/a/module.py")
+            elif logical_task_key == exploration_task_key("src/b"):
+                result_body = _exploration_result_bytes("src/b", "src/b/module.py")
+            elif logical_task_key == coordinator_task_key():
+                import json
+
+                result_body = json.dumps(
+                    {
+                        "reports": [
+                            json.loads(_exploration_result_bytes("src/a", "src/a/module.py")),
+                            json.loads(_exploration_result_bytes("src/b", "src/b/module.py")),
+                        ],
+                        "coverage": {
+                            "valid": True,
+                            "missing_files": [],
+                            "duplicate_files": [],
+                            "unknown_files": [],
+                        },
+                        "unresolved_conflict_count": 0,
+                    }
+                ).encode("utf-8")
+            elif logical_task_key == trial_translation_task_key(
+                "src/a/module.py", flow.ledger.current_revision.revision_id
+            ):
+                result_body = _trial_result_bytes("src/a/module.py")
+            else:
+                result_body = _trial_result_bytes("src/b/module.py")
             result_reference = await CasLedger(cas, self.store).put(
-                logical_task_key.encode("utf-8"),
+                result_body,
                 "draft",
                 draft_id,
                 f"agent-result:{created.agent_run_id}",
@@ -316,7 +764,12 @@ async def test_draft_exploration_coordinator_and_trial_use_committed_agentruns(
 
     store = InMemoryRuntimeStore()
     draft_id = new_uuid7()
-    flow, _ = _flow(artifacts)
+    flow = DraftFlow(
+        module_files={
+            "src/a": ["src/a/module.py"],
+            "src/b": ["src/b/module.py"],
+        }
+    )
     cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
     runner = Runner(store, draft_id)
     graph = MigrationSessionGraph(
@@ -329,11 +782,19 @@ async def test_draft_exploration_coordinator_and_trial_use_committed_agentruns(
 
     first = await graph.explore_domain("src/a", "inspect domain a")
     assert first.result.digest == first.record.result_sha256
-    assert await store.get_cas_reference(
-        "draft", draft_id, f"agent-result:{first.record.agent_run_id}"
-    ) == first.result
+    assert first.materialized is not None
+    assert len(flow.reports) == 1
+    assert (
+        await store.get_cas_reference(
+            "draft", draft_id, f"agent-result:{first.record.agent_run_id}"
+        )
+        == first.result
+    )
     await graph.explore_domain("src/b", "inspect domain b")
     await graph.coordinate_exploration("merge domain reports")
+    flow.seed_artifacts(artifacts)
+    flow.finalize_alignment()
+    flow.begin_calibration()
     events = await store.read_draft_session_events(draft_id, 0)
     assert [event.event_type for event in events] == [
         "agent_run.started",
@@ -343,15 +804,23 @@ async def test_draft_exploration_coordinator_and_trial_use_committed_agentruns(
         "agent_run.started",
         "agent_run.terminal",
     ]
-    await graph.trial_translate("src/a.py", "compare translation approaches")
+    revision_id = flow.ledger.current_revision.revision_id
+    await graph.trial_translate(
+        ("src/a/module.py", "src/b/module.py"),
+        {
+            "src/a/module.py": "compare translation approaches",
+            "src/b/module.py": "compare translation approaches",
+        },
+    )
 
     assert runner.keys == [
         exploration_task_key("src/a"),
         exploration_task_key("src/b"),
         coordinator_task_key(),
-        trial_translation_task_key("src/a.py"),
+        trial_translation_task_key("src/a/module.py", revision_id),
+        trial_translation_task_key("src/b/module.py", revision_id),
     ]
-    assert len(await store.list_agent_runs_by_owner("draft", draft_id)) == 4
+    assert len(await store.list_agent_runs_by_owner("draft", draft_id)) == 5
 
 
 @pytest.mark.asyncio
@@ -378,7 +847,7 @@ async def test_draft_agent_lifecycle_recovery_replays_without_new_events(
             if self.terminal_record is None:
                 self.provider_calls += 1
                 self.result_reference = await CasLedger(cas, store).put(
-                    logical_task_key.encode("utf-8"),
+                    _coordinator_result_bytes(),
                     "draft",
                     draft_id,
                     f"agent-result:{self.created.agent_run_id}",
@@ -394,9 +863,7 @@ async def test_draft_agent_lifecycle_recovery_replays_without_new_events(
                 )
                 await store.commit_agent_run_receipt(self.terminal_record, self.receipt)
             await lifecycle.terminal(self.terminal_record, self.receipt)
-            return DraftAgentCompletion(
-                self.terminal_record, self.receipt, self.result_reference
-            )
+            return DraftAgentCompletion(self.terminal_record, self.receipt, self.result_reference)
 
     store = InMemoryRuntimeStore()
     draft_id = new_uuid7()
@@ -437,7 +904,7 @@ async def test_fresh_draft_runner_recovers_terminal_receipt_after_crash(
             created = await store.create_or_get_agent_run(_agent_run(draft_id, logical_task_key))
             await lifecycle.started(created)
             self.result_reference = await CasLedger(cas, store).put(
-                logical_task_key.encode("utf-8"),
+                _coordinator_result_bytes(),
                 "draft",
                 draft_id,
                 f"agent-result:{created.agent_run_id}",
@@ -448,9 +915,7 @@ async def test_fresh_draft_runner_recovers_terminal_receipt_after_crash(
                 exit=SessionExit.Completed,
                 result_sha256=self.result_reference.digest,
             )
-            receipt = AgentRunReceipt(
-                uuid4(), terminal.agent_run_id, "draft.coordinator.completed"
-            )
+            receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, "draft.coordinator.completed")
             await store.commit_agent_run_receipt(terminal, receipt)
             raise RuntimeError("process died before Draft checkpoint")
 
@@ -468,8 +933,11 @@ async def test_fresh_draft_runner_recovers_terminal_receipt_after_crash(
     owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
     first_runner = CrashedRunner()
     first_graph = MigrationSessionGraph(
-        owner=owner, agent_runs=store, checkpointer=draft_saver,
-        agent_checkpointer=agent_saver, agent_runner=first_runner,
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=first_runner,
     )
     with pytest.raises(RuntimeError, match="process died"):
         await first_graph.coordinate_exploration("merge")
@@ -480,8 +948,11 @@ async def test_fresh_draft_runner_recovers_terminal_receipt_after_crash(
 
     fresh_runner = FreshRunner()
     fresh_graph = MigrationSessionGraph(
-        owner=owner, agent_runs=store, checkpointer=draft_saver,
-        agent_checkpointer=agent_saver, agent_runner=fresh_runner,
+        owner=owner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=fresh_runner,
         thread_id=first_graph.thread_id,
     )
     recovered = await fresh_graph.coordinate_exploration("merge")
@@ -493,9 +964,7 @@ async def test_fresh_draft_runner_recovers_terminal_receipt_after_crash(
     assert first_runner.calls == 1
     events = await store.read_draft_session_events(draft_id, 0)
     assert [event.sequence for event in events] == [1, 2]
-    assert [event.event_type for event in events] == [
-        "agent_run.started", "agent_run.terminal"
-    ]
+    assert [event.event_type for event in events] == ["agent_run.started", "agent_run.terminal"]
     terminal_fact = await owner.load_fact(f"draft.agent.terminal:{persisted.agent_run_id}")
     assert terminal_fact is not None
     assert terminal_fact[0].category == "draft.agent.terminal"
@@ -536,8 +1005,10 @@ async def test_terminal_draft_agent_without_start_owner_receipt_fails_closed(
     runner = FreshRunner()
     graph = MigrationSessionGraph(
         owner=DraftFlowOwner(draft_id=draft_id, flow=flow, store=store),
-        agent_runs=store, checkpointer=draft_saver,
-        agent_checkpointer=agent_saver, agent_runner=runner,
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        agent_runner=runner,
     )
     with pytest.raises(ValueError, match="start receipt"):
         await graph.coordinate_exploration("merge")
@@ -623,9 +1094,7 @@ async def test_new_draft_completion_requires_matching_result_cas_reference(
                 exit=SessionExit.Completed,
                 result_sha256="e" * 64,
             )
-            receipt = AgentRunReceipt(
-                uuid4(), terminal.agent_run_id, "draft.coordinator.completed"
-            )
+            receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, "draft.coordinator.completed")
             await store.commit_agent_run_receipt(terminal, receipt)
             await lifecycle.terminal(terminal, receipt)
             return DraftAgentCompletion(terminal, receipt, result_reference)
@@ -647,9 +1116,9 @@ async def test_new_draft_completion_requires_matching_result_cas_reference(
         await graph.coordinate_exploration("merge")
 
     assert runner.calls == 1
-    assert [
-        event.event_type for event in await store.read_draft_session_events(draft_id, 0)
-    ] == ["agent_run.started"]
+    assert [event.event_type for event in await store.read_draft_session_events(draft_id, 0)] == [
+        "agent_run.started"
+    ]
 
 
 @pytest.mark.asyncio
@@ -736,9 +1205,7 @@ async def test_recovered_noncompleted_draft_agent_publishes_terminal_without_rer
     flow, _ = _flow(artifacts)
     _, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
     owner = DraftFlowOwner(draft_id=draft_id, flow=flow, store=store)
-    created = await store.create_or_get_agent_run(
-        _agent_run(draft_id, coordinator_task_key())
-    )
+    created = await store.create_or_get_agent_run(_agent_run(draft_id, coordinator_task_key()))
     await owner.commit_agent_started(created)
     terminal = replace(created, state=session_state, exit=session_exit)
     receipt = AgentRunReceipt(uuid4(), created.agent_run_id, category)
@@ -805,9 +1272,7 @@ async def test_returned_noncompleted_draft_agent_uses_same_typed_outcome_on_repl
 
         async def run(self, draft_id, logical_task_key, task, *, lifecycle):
             self.calls += 1
-            created = await store.create_or_get_agent_run(
-                _agent_run(draft_id, logical_task_key)
-            )
+            created = await store.create_or_get_agent_run(_agent_run(draft_id, logical_task_key))
             await lifecycle.started(created)
             terminal = replace(
                 created,
@@ -861,9 +1326,7 @@ async def test_failed_draft_terminal_category_mismatch_is_not_published(
             created = await store.create_or_get_agent_run(_agent_run(draft_id, logical_task_key))
             await lifecycle.started(created)
             failed = replace(created, state=SessionState.Failed, exit=SessionExit.Failed)
-            receipt = AgentRunReceipt(
-                uuid4(), failed.agent_run_id, "draft.coordinator.completed"
-            )
+            receipt = AgentRunReceipt(uuid4(), failed.agent_run_id, "draft.coordinator.completed")
             await store.commit_agent_run_receipt(failed, receipt)
             await lifecycle.terminal(failed, receipt)
             raise AssertionError("invalid terminal receipt should not be accepted")
@@ -916,18 +1379,14 @@ async def test_noncompleted_draft_terminal_category_mismatch_is_not_published(
 
     class Runner:
         async def run(self, draft_id, logical_task_key, task, *, lifecycle):
-            created = await store.create_or_get_agent_run(
-                _agent_run(draft_id, logical_task_key)
-            )
+            created = await store.create_or_get_agent_run(_agent_run(draft_id, logical_task_key))
             await lifecycle.started(created)
             terminal = replace(
                 created,
                 state=getattr(SessionState, state_name),
                 exit=getattr(SessionExit, exit_name),
             )
-            receipt = AgentRunReceipt(
-                uuid4(), terminal.agent_run_id, category
-            )
+            receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, category)
             await store.commit_agent_run_receipt(terminal, receipt)
             await lifecycle.terminal(terminal, receipt)
             raise AssertionError("invalid terminal receipt should not be accepted")

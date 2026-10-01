@@ -435,7 +435,9 @@ def _proposal_task(
     return (
         f"{_PLAN_TASK_PREFIX} from the frozen artifacts and mechanical "
         "analysis facts below. Use only the authorized read-only tools when exploration is "
-        "needed. Return the required structured PlanProposal.\n"
+        "needed. Return the required structured PlanProposal. In its structured response, "
+        "represent integration_ranks as an array of {local_ref, rank} objects; encode each "
+        "opaque dossier anchor as a JSON string.\n"
         + canonical_json_bytes(payload).decode("utf-8")
     )
 

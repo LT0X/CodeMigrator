@@ -16,6 +16,7 @@ from codemigrator.runtime.provider import (
     ProviderRegistry,
     ProviderRequest,
     TokenUsage,
+    ToolDefinition,
     decode_concatenated_json_objects,
     provider_adapter_id_for_label,
     retry_delay_for_attempt,
@@ -317,6 +318,53 @@ async def test_openai_provider_maps_langchain_any_tool_choice_to_required() -> N
     payload = seen["payload"]
     assert isinstance(payload, dict)
     assert payload["tool_choice"] == "required"
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_preserves_strict_structured_output_tools() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["payload"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-strict-tool",
+                "model": "test-model",
+                "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    request = replace(
+        _request(_binding()),
+        tools=(
+            ToolDefinition(
+                name="PlanProposal",
+                description="Return a plan proposal.",
+                parameters={
+                    "type": "object",
+                    "properties": {"slices": {"type": "array", "items": {"type": "string"}}},
+                    "required": ["slices"],
+                    "additionalProperties": False,
+                },
+                strict=True,
+            ),
+        ),
+    )
+    await OpenAICompatibleProvider(
+        endpoint="https://provider.invalid/v1",
+        api_key="secret",
+        client=client,
+    ).complete(request)
+    await client.aclose()
+
+    payload = seen["payload"]
+    assert isinstance(payload, dict)
+    tools = payload["tools"]
+    assert isinstance(tools, list)
+    assert tools[0]["function"]["strict"] is True
 
 
 @pytest.mark.asyncio

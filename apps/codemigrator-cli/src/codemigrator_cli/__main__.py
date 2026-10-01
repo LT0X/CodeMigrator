@@ -41,8 +41,8 @@ def _parser() -> argparse.ArgumentParser:
     project.add_argument(
         "--workflow",
         choices=("full", "legacy"),
-        default="full",
-        help="选择完整 V6 起草-规划-执行流程，或显式使用兼容 runner",
+        default=None,
+        help="显式选择本地 V6 兼容流水线或旧 runner；生产 Run 请使用 run create",
     )
     project.add_argument(
         "--from-phase",
@@ -52,6 +52,10 @@ def _parser() -> argparse.ArgumentParser:
     project.add_argument("--output", choices=("human", "json"), default="human")
     run = subparsers.add_parser("run", help="Run 操作")
     run_sub = run.add_subparsers(dest="run_command", required=True)
+    create = run_sub.add_parser("create", help="提交已冻结的 CreateRun 请求，启动生产 Run graph")
+    create.add_argument("request_file", type=Path)
+    create.add_argument("--idempotency-key", required=True)
+    create.add_argument("--output", choices=("human", "json", "jsonl"), default="human")
     watch = run_sub.add_parser("watch", help="观察 Run")
     watch.add_argument("run_id")
     _add_output_flags(watch)
@@ -121,6 +125,23 @@ def _render_project(report: dict[str, object], output: str) -> str:
 
 
 def _run_project_command(args: argparse.Namespace) -> tuple[int, str]:
+    if args.workflow is None:
+        return (
+            int(ExitCode.UNKNOWN),
+            _render_project(
+                {
+                    "status": "UNKNOWN",
+                    "stage": "PREFLIGHT",
+                    "errors": [
+                        "migrate project is a local compatibility workflow; "
+                        "pass --workflow full or legacy explicitly, or use run create "
+                        "for a V7 production Run"
+                    ],
+                },
+                args.output,
+            ),
+        )
+
     from codemigrator.runtime import (
         OpenAIProjectTranslator,
         ProjectMigrationPipeline,
@@ -228,6 +249,25 @@ def run_command(
     args = _parser().parse_args(list(argv))
     if args.command == "migrate" and args.migrate_command == "project":
         return _run_project_command(args)
+    if args.command == "run" and args.run_command == "create":
+        try:
+            request_payload = json.loads(args.request_file.read_text(encoding="utf-8"))
+            if not isinstance(request_payload, dict):
+                raise ValueError("CreateRun request must be a JSON object")
+            run_control = control if control is not None else _configured_run_control()
+            create_run = getattr(run_control, "create", None)
+            if not callable(create_run):
+                raise RuntimeError("production API configuration is required")
+            created = create_run(request_payload, args.idempotency_key)
+            if (
+                not isinstance(created, dict)
+                or not isinstance(created.get("run_id"), str)
+                or not isinstance(created.get("status"), str)
+            ):
+                raise ValueError("CreateRun response is invalid")
+            return int(ExitCode.COMPLETED), _render_payload(created, args.output)
+        except Exception:
+            return int(ExitCode.UNKNOWN), _render_payload({"status": "UNKNOWN"}, args.output)
     run_control = control or _configured_run_control()
     if args.command == "run" and args.run_command == "show":
         try:
