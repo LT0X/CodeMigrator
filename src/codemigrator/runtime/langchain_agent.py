@@ -30,7 +30,7 @@ from langchain_core.tools import StructuredTool
 from langchain_core.tracers.context import tracing_v2_callback_var
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langsmith import tracing_context
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel, PrivateAttr, ValidationError
 
 from codemigrator.core import (
     ContextPackIdentity,
@@ -473,8 +473,24 @@ class ProviderChatModel(BaseChatModel):
                     "type": "tool_call",
                 }
             )
+        content = response.content
+        if not tool_calls and self._structured_output is not None and content:
+            try:
+                structured_value = self._structured_output.model_validate_json(content)
+            except ValidationError:
+                pass
+            else:
+                tool_calls.append(
+                    {
+                        "name": self._structured_output.__name__,
+                        "args": structured_value.model_dump(mode="json", by_alias=True),
+                        "id": f"{call_id}:structured-output",
+                        "type": "tool_call",
+                    }
+                )
+                content = ""
         message = AIMessage(
-            content=response.content,
+            content=content,
             tool_calls=tool_calls,
             usage_metadata={
                 "input_tokens": response.usage.input_tokens,

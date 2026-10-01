@@ -102,6 +102,17 @@ CREATE TABLE IF NOT EXISTS draft_owner_facts (
     PRIMARY KEY (draft_id, receipt_key)
 );
 
+CREATE TABLE IF NOT EXISTS draft_graph_start_handoffs (
+    draft_id uuid NOT NULL,
+    receipt_key text NOT NULL CHECK (length(btrim(receipt_key)) BETWEEN 1 AND 256),
+    status text NOT NULL CHECK (status IN ('PENDING', 'STARTED')),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    started_at timestamptz,
+    PRIMARY KEY (draft_id, receipt_key),
+    FOREIGN KEY (draft_id, receipt_key)
+        REFERENCES draft_owner_facts(draft_id, receipt_key)
+);
+
 CREATE TABLE IF NOT EXISTS draft_session_events (
     draft_id uuid NOT NULL,
     receipt_key text NOT NULL,

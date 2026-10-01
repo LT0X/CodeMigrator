@@ -14,6 +14,7 @@ const client = (streamEvents: ApiClient["streamEvents"]): ApiClient => ({
   confirmSession: async () => ({ session_id: "s", status: "OPEN", revision: 1 }),
   confirmCorrection: async () => ({ session_id: "s", status: "OPEN", revision: 1 }),
   streamEvents,
+  streamSessionEvents: async function* () {},
 });
 
 async function* events() {

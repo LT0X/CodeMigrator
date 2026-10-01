@@ -53,11 +53,16 @@ class ApiCommandStorePort(Protocol):
         command: Callable[[object], Awaitable[object]],
         project_response: Callable[[object], object],
         owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+        create_draft_graph_handoff: bool = False,
     ) -> Mapping[str, object]: ...
 
     async def list_pending_graph_starts(self) -> tuple[tuple[UUID, str], ...]: ...
 
     async def mark_graph_start_started(self, run_id: UUID, receipt_key: str) -> None: ...
+
+    async def list_pending_draft_graph_starts(self) -> tuple[tuple[UUID, str], ...]: ...
+
+    async def mark_draft_graph_start_started(self, draft_id: UUID, receipt_key: str) -> None: ...
 
     async def read_run_events(
         self, run_id: UUID, after_sequence: int
@@ -101,6 +106,7 @@ class RunReadProjectionPort(Protocol):
 class DraftOwnerReceiptIdentity(Protocol):
     draft_id: UUID
     receipt_key: str
+    category: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +136,12 @@ class DraftCommandResult:
             or len(self.owner_receipt.receipt_key) > 256
         ):
             raise ValueError("Draft command receipt key must be non-empty and bounded")
+        if (
+            not isinstance(self.owner_receipt.category, str)
+            or not self.owner_receipt.category
+            or len(self.owner_receipt.category) > 64
+        ):
+            raise ValueError("Draft command receipt category must be non-empty and bounded")
 
 
 class DraftSessionCommandPort(Protocol):
@@ -156,11 +168,20 @@ class DraftSessionCommandPort(Protocol):
     ) -> DraftCommandResult: ...
 
 
+class DraftGraphStarterPort(Protocol):
+    """Start or restore a Draft graph for one committed owner receipt."""
+
+    supported_receipt_categories: frozenset[str]
+
+    async def start_graph(self, draft_id: UUID, receipt_key: str) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ApiProductionCapabilities:
     run_owner: RunCreationOwnerPort | None = None
     run_read_projection: RunReadProjectionPort | None = None
     draft_owner: DraftSessionCommandPort | None = None
+    draft_graph_starter: DraftGraphStarterPort | None = None
 
 
 class ProductionApiBackend:
@@ -173,6 +194,7 @@ class ProductionApiBackend:
         run_owner: RunCreationOwnerPort | None = None,
         run_read_projection: RunReadProjectionPort | None = None,
         draft_owner: DraftSessionCommandPort | None = None,
+        draft_graph_starter: DraftGraphStarterPort | None = None,
         shutdown: Callable[[], Awaitable[None]] | None = None,
         health_check: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
     ) -> None:
@@ -180,6 +202,7 @@ class ProductionApiBackend:
         self._run_owner = run_owner
         self._run_read_projection = run_read_projection
         self._draft_owner = draft_owner
+        self._draft_graph_starter = draft_graph_starter
         self._shutdown = shutdown
         self._health_check = health_check
         self._admission_lock = Lock()
@@ -188,6 +211,8 @@ class ProductionApiBackend:
         self._active_commands_drained = asyncio.Event()
         self._active_commands_drained.set()
         self._graph_start_tasks: dict[tuple[UUID, str], asyncio.Task[None]] = {}
+        self._draft_graph_start_tasks: dict[tuple[UUID, str], asyncio.Task[None]] = {}
+        self._draft_graph_locks: dict[UUID, asyncio.Lock] = {}
         self._close_lock = asyncio.Lock()
         self._closed = False
         if run_owner is not None and getattr(run_owner, "recovery_safe", None) is not True:
@@ -206,7 +231,7 @@ class ProductionApiBackend:
             failures = False
             owners: list[object] = []
             seen_owners: set[int] = set()
-            for owner in (self._run_owner, self._draft_owner):
+            for owner in (self._run_owner, self._draft_owner, self._draft_graph_starter):
                 if owner is not None and id(owner) not in seen_owners:
                     seen_owners.add(id(owner))
                     owners.append(owner)
@@ -241,6 +266,10 @@ class ProductionApiBackend:
             loop = task.get_loop()
             if not loop.is_closed():
                 loop.call_soon_threadsafe(task.cancel)
+        for task in tuple(self._draft_graph_start_tasks.values()):
+            loop = task.get_loop()
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(task.cancel)
         seen: set[int] = set()
         for owner in (self._run_owner, self._draft_owner):
             if owner is None or id(owner) in seen:
@@ -254,12 +283,16 @@ class ProductionApiBackend:
         await self._active_commands_drained.wait()
 
     async def cancel_graph_tasks(self) -> None:
-        tasks = tuple(self._graph_start_tasks.values())
+        tasks = (
+            *self._graph_start_tasks.values(),
+            *self._draft_graph_start_tasks.values(),
+        )
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._graph_start_tasks.clear()
+        self._draft_graph_start_tasks.clear()
 
     def _begin_command(self) -> None:
         task = asyncio.current_task()
@@ -497,6 +530,12 @@ class ProductionApiBackend:
                 result = _require_draft_command_result(value)
                 if request.resource_id is not None and result.session_id != request.resource_id:
                     raise ValueError("Draft owner returned a result for another session")
+                if (
+                    self._draft_graph_starter is not None
+                    and result.owner_receipt.category
+                    not in self._draft_graph_starter.supported_receipt_categories
+                ):
+                    raise ValueError("Draft graph has no continuation for this owner fact")
                 return "draft", result.owner_receipt.draft_id, result.owner_receipt.receipt_key
 
             project_response = project_draft_response
@@ -515,6 +554,7 @@ class ProductionApiBackend:
                 command=command,
                 project_response=project_response,
                 owner_receipt=owner_receipt,
+                create_draft_graph_handoff=self._draft_graph_starter is not None,
             )
         except ApiError:
             raise
@@ -544,6 +584,11 @@ class ProductionApiBackend:
             receipt_key = outcome.get("owner_receipt_key")
             if owner_id is not None and isinstance(receipt_key, str):
                 await self._try_start_pending_graph(UUID(str(owner_id)), receipt_key)
+        elif outcome.get("owner_kind") == "draft":
+            owner_id = outcome.get("owner_id")
+            receipt_key = outcome.get("owner_receipt_key")
+            if owner_id is not None and isinstance(receipt_key, str):
+                self._try_start_pending_draft_graph(UUID(str(owner_id)), receipt_key)
         return response
 
     async def read_events(self, run_id: UUID, after_sequence: int) -> Sequence[EventRecord]:
@@ -570,8 +615,11 @@ class ProductionApiBackend:
 
     async def recover_pending_graph_starts(self) -> None:
         pending = await self._store.list_pending_graph_starts()
+        pending_drafts = await self._store.list_pending_draft_graph_starts()
         if pending and self._run_owner is None:
             raise RuntimeError("Run graph-start recovery is not configured")
+        if pending_drafts and self._draft_graph_starter is None:
+            raise RuntimeError("Draft graph-start recovery is not configured")
         if (
             self._run_owner is not None
             and getattr(self._run_owner, "recovery_safe", None) is not True
@@ -579,9 +627,14 @@ class ProductionApiBackend:
             raise RuntimeError("Run graph starter does not guarantee receipt recovery")
         for run_id, receipt_key in pending:
             self._schedule_pending_graph_start(run_id, receipt_key)
+        for draft_id, receipt_key in pending_drafts:
+            self._schedule_pending_draft_graph_start(draft_id, receipt_key)
 
     async def _try_start_pending_graph(self, run_id: UUID, receipt_key: str) -> None:
         self._schedule_pending_graph_start(run_id, receipt_key)
+
+    def _try_start_pending_draft_graph(self, draft_id: UUID, receipt_key: str) -> None:
+        self._schedule_pending_draft_graph_start(draft_id, receipt_key)
 
     def _schedule_pending_graph_start(self, run_id: UUID, receipt_key: str) -> None:
         if self._run_owner is None or not self._is_admission_open():
@@ -597,11 +650,35 @@ class ProductionApiBackend:
         self._graph_start_tasks[task_key] = task
         task.add_done_callback(lambda completed: self._graph_start_finished(task_key, completed))
 
+    def _schedule_pending_draft_graph_start(self, draft_id: UUID, receipt_key: str) -> None:
+        if self._draft_graph_starter is None or not self._is_admission_open():
+            return
+        task_key = (draft_id, receipt_key)
+        existing = self._draft_graph_start_tasks.get(task_key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._run_pending_draft_graph_start(draft_id, receipt_key),
+            name=f"codemigrator-draft-graph-start-{draft_id}-{receipt_key}",
+        )
+        self._draft_graph_start_tasks[task_key] = task
+        task.add_done_callback(
+            lambda completed: self._draft_graph_start_finished(task_key, completed)
+        )
+
     def _graph_start_finished(
         self, task_key: tuple[UUID, str], task: asyncio.Task[None]
     ) -> None:
         if self._graph_start_tasks.get(task_key) is task:
             del self._graph_start_tasks[task_key]
+        if not task.cancelled():
+            task.exception()
+
+    def _draft_graph_start_finished(
+        self, task_key: tuple[UUID, str], task: asyncio.Task[None]
+    ) -> None:
+        if self._draft_graph_start_tasks.get(task_key) is task:
+            del self._draft_graph_start_tasks[task_key]
         if not task.cancelled():
             task.exception()
 
@@ -615,6 +692,26 @@ class ProductionApiBackend:
             receipt = await owner.load_run_created_receipt(run_id, receipt_key)
             await owner.start_graph(run_id, receipt)
             await self._store.mark_graph_start_started(run_id, receipt_key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The durable handoff remains pending for receipt-idempotent recovery.
+            return
+
+    async def _run_pending_draft_graph_start(self, draft_id: UUID, receipt_key: str) -> None:
+        starter = self._draft_graph_starter
+        if starter is None or not self._is_admission_open():
+            return
+        lock = self._draft_graph_locks.setdefault(draft_id, asyncio.Lock())
+        try:
+            async with lock:
+                if not self._is_admission_open():
+                    return
+                pending = await self._store.list_pending_draft_graph_starts()
+                if (draft_id, receipt_key) not in pending:
+                    return
+                await starter.start_graph(draft_id, receipt_key)
+                await self._store.mark_draft_graph_start_started(draft_id, receipt_key)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -656,6 +753,7 @@ def _create_run_gate_code(error: Exception) -> str | None:
 __all__ = [
     "ApiProductionCapabilities",
     "ApiCommandStorePort",
+    "DraftGraphStarterPort",
     "ProductionApiBackend",
     "RunCreationOwnerPort",
     "RunCreatedProjection",

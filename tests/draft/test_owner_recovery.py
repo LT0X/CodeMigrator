@@ -132,6 +132,83 @@ async def test_draft_owner_persists_and_restores_revision_qa_and_freeze(artifact
 
 
 @pytest.mark.asyncio
+async def test_stale_draft_owner_cannot_commit_question_after_freeze(artifacts) -> None:
+    store = InMemoryRuntimeStore()
+    draft_id = uuid4()
+    confirmed_flow = _flow(artifacts)
+    revision = confirmed_flow.ledger.current_revision
+    assert revision is not None
+    confirmed_owner = DraftFlowOwner(draft_id=draft_id, flow=confirmed_flow, store=store)
+    existing_question = _question(revision.revision_id, "Keep this boundary?")
+    await confirmed_owner.commit_question(existing_question)
+    await confirmed_owner.commit_answer(
+        AskUserAnswer(
+            question_id=existing_question.question_id,
+            revision_id=revision.revision_id,
+            selected_option="keep",
+        )
+    )
+    freeze = confirmed_flow.ledger.freeze(revision.revision_id)
+    await confirmed_owner.persist_freeze_receipt()
+
+    stale_ledger = DraftLedger.restore(revisions=(revision,), questions=(), answers=())
+    stale_flow = _flow(artifacts)
+    stale_flow.ledger = stale_ledger
+    stale_owner = DraftFlowOwner(
+        draft_id=draft_id,
+        flow=stale_flow,
+        store=store,
+    )
+    attempted_question = _question(revision.revision_id, "Write after the Draft froze?")
+
+    with pytest.raises(DraftConflictError, match="already frozen"):
+        await stale_owner.commit_question(attempted_question)
+
+    recovered_owner = DraftFlowOwner(draft_id=draft_id, flow=_flow(artifacts), store=store)
+    await recovered_owner.restore_ledger()
+    assert recovered_owner.freeze_receipt == freeze
+    assert recovered_owner.flow.ledger.questions == (existing_question,)
+
+
+@pytest.mark.asyncio
+async def test_stale_draft_owner_cannot_commit_answer_after_freeze(artifacts) -> None:
+    store = InMemoryRuntimeStore()
+    draft_id = uuid4()
+    confirmed_flow = _flow(artifacts)
+    revision = confirmed_flow.ledger.current_revision
+    assert revision is not None
+    confirmed_owner = DraftFlowOwner(draft_id=draft_id, flow=confirmed_flow, store=store)
+    freeze = confirmed_flow.ledger.freeze(revision.revision_id)
+    await confirmed_owner.persist_freeze_receipt()
+
+    stale_question = _question(revision.revision_id, "Question known to a stale owner?")
+    stale_ledger = DraftLedger.restore(
+        revisions=(revision,), questions=(stale_question,), answers=()
+    )
+    stale_flow = _flow(artifacts)
+    stale_flow.ledger = stale_ledger
+    stale_owner = DraftFlowOwner(
+        draft_id=draft_id,
+        flow=stale_flow,
+        store=store,
+    )
+    attempted_answer = AskUserAnswer(
+        question_id=stale_question.question_id,
+        revision_id=revision.revision_id,
+        selected_option="keep",
+    )
+
+    with pytest.raises(DraftConflictError, match="already frozen"):
+        await stale_owner.commit_answer(attempted_answer)
+
+    recovered_owner = DraftFlowOwner(draft_id=draft_id, flow=_flow(artifacts), store=store)
+    await recovered_owner.restore_ledger()
+    assert recovered_owner.freeze_receipt == freeze
+    assert recovered_owner.flow.ledger.questions == ()
+    assert recovered_owner.flow.ledger.answers == ()
+
+
+@pytest.mark.asyncio
 async def test_draft_owner_restore_rejects_orphan_question_fact(artifacts) -> None:
     store = InMemoryRuntimeStore()
     draft_id = uuid4()

@@ -189,6 +189,45 @@ async def test_draft_graph_interrupts_and_resumes_after_durable_answer_receipt(
 
 
 @pytest.mark.asyncio
+async def test_draft_graph_restore_rebuilds_owner_ledger_and_interrupt_after_restart(
+    tmp_path, artifacts
+) -> None:
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, question = _flow(artifacts)
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    first_graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=flow, store=store),
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        thread_id=str(new_uuid7()),
+    )
+    await first_graph.ask_user(question)
+
+    restarted_flow = DraftFlow()
+    restarted_graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=restarted_flow, store=store),
+        agent_runs=store,
+        checkpointer=CasCheckpointSaver(
+            cas, store, graph_family="draft", owner_kind="draft", owner_id=draft_id
+        ),
+        agent_checkpointer=CasCheckpointSaver(
+            cas, store, graph_family="agent", owner_kind="draft", owner_id=draft_id
+        ),
+        thread_id=first_graph.thread_id,
+    )
+
+    snapshot = await restarted_graph.restore()
+
+    assert snapshot is not None
+    assert snapshot.next == ("ask_user",)
+    assert snapshot.values["question_id"] == str(question.question_id)
+    assert restarted_flow.ledger.current_revision == flow.ledger.current_revision
+    assert restarted_flow.ledger.questions == (question,)
+
+
+@pytest.mark.asyncio
 async def test_draft_agent_runs_are_owner_scoped_reusable_and_thread_separate(
     tmp_path, artifacts
 ) -> None:

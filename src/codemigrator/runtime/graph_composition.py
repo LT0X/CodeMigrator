@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
@@ -229,6 +229,7 @@ class RuntimeGraphAssembly:
             agent_checkpointer=self.infrastructure.agent_run_checkpointer_for(
                 "draft", owner.draft_id
             ),
+            thread_id=str(uuid5(NAMESPACE_URL, f"codemigrator:draft-session:{owner.draft_id}")),
             create_run_service=create_run_service,
             agent_runner=runner,
         )

@@ -58,6 +58,9 @@ _RUN_TERMINAL_STATUSES = frozenset(
     }
 )
 _DRAFT_TERMINAL_EVENTS = frozenset({"session.closed", "session.attached_to_run"})
+_DRAFT_MUTABLE_LEDGER_CATEGORIES = frozenset(
+    {"draft.task_revision", "draft.ask_user.question", "draft.ask_user.answer"}
+)
 
 
 def _validate_run_page_limit(limit: int) -> None:
@@ -95,12 +98,17 @@ class RuntimeStore(Protocol):
         command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
         project_response: Callable[[object], object],
         owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+        create_draft_graph_handoff: bool = False,
     ) -> Mapping[str, object]:
         """Commit an API receipt with its owner command in one transaction."""
 
     async def list_pending_graph_starts(self) -> tuple[tuple[RunId, str], ...]: ...
 
     async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None: ...
+
+    async def list_pending_draft_graph_starts(self) -> tuple[tuple[UUID, str], ...]: ...
+
+    async def mark_draft_graph_start_started(self, draft_id: UUID, receipt_key: str) -> None: ...
 
     async def commit(
         self,
@@ -140,6 +148,7 @@ class RuntimeStore(Protocol):
         *,
         events: Sequence[DraftSessionEventSpec] = (),
         transaction: RuntimeStoreTransaction | None = None,
+        expected_existing_facts: Sequence[DraftOwnerReceipt] | None = None,
     ) -> DraftOwnerReceipt:
         """Persist an immutable Draft fact and its idempotency receipt."""
 
@@ -187,6 +196,14 @@ class RuntimeStore(Protocol):
 
 class StoreCommitError(RuntimeError):
     """Raised when the persistence transaction cannot be committed."""
+
+
+class DraftOwnerFrozenError(StoreCommitError):
+    """Raised when a new ledger fact is written after its Draft was frozen."""
+
+
+class DraftLedgerChangedError(StoreCommitError):
+    """Raised when a freeze's ledger snapshot changes before its atomic commit."""
 
 
 def _validate_new_agent_run(record: AgentRun) -> None:
@@ -302,6 +319,7 @@ class InMemoryRuntimeStore:
             tuple[str, str, str], tuple[str, Mapping[str, object], datetime]
         ] = {}
         self._graph_start_handoffs: dict[RunId, str] = {}
+        self._draft_graph_start_handoffs: dict[tuple[UUID, str], str] = {}
 
     async def add_cas_reference(
         self, object_ref: CasObject, owner_kind: str, owner_id: UUID, reference_key: str
@@ -335,13 +353,19 @@ class InMemoryRuntimeStore:
         *,
         events: Sequence[DraftSessionEventSpec] = (),
         transaction: RuntimeStoreTransaction | None = None,
+        expected_existing_facts: Sequence[DraftOwnerReceipt] | None = None,
     ) -> DraftOwnerReceipt:
         receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
         event_data = _prepare_draft_events(events, self.secret_registry)
         if transaction is None:
             async with self._agent_lock:
                 committed, _appended, created = await self._commit_draft_fact_locked(
-                    draft_id, receipt_key, receipt, payload, event_data
+                    draft_id,
+                    receipt_key,
+                    receipt,
+                    payload,
+                    event_data,
+                    expected_existing_facts,
                 )
             if created and event_data:
                 self._schedule_draft_event_notification(draft_id)
@@ -353,7 +377,12 @@ class InMemoryRuntimeStore:
         lock_transferred = False
         try:
             committed, appended, created = await self._commit_draft_fact_locked(
-                draft_id, receipt_key, receipt, payload, event_data
+                draft_id,
+                receipt_key,
+                receipt,
+                payload,
+                event_data,
+                expected_existing_facts,
             )
             if created:
                 transaction.after_rollback(
@@ -378,6 +407,7 @@ class InMemoryRuntimeStore:
         receipt: DraftOwnerReceipt,
         payload: dict[str, object],
         event_data: tuple[tuple[str, dict[str, object]], ...],
+        expected_existing_facts: Sequence[DraftOwnerReceipt] | None,
     ) -> tuple[DraftOwnerReceipt, tuple[DraftSessionEvent, ...], bool]:
         key = (draft_id, receipt_key)
         previous = self._draft_facts.get(key)
@@ -389,6 +419,26 @@ class InMemoryRuntimeStore:
             ):
                 raise StoreCommitError("Draft owner fact replay mismatch")
             return previous[0], (), False
+        if receipt.category == "draft.freeze" and expected_existing_facts is not None:
+            actual = tuple(
+                current_receipt
+                for (owner_id, _), (current_receipt, _) in sorted(
+                    self._draft_facts.items(), key=lambda item: item[0][1]
+                )
+                if owner_id == draft_id
+            )
+            expected = tuple(sorted(expected_existing_facts, key=lambda item: item.receipt_key))
+            if actual != expected:
+                raise DraftLedgerChangedError("Draft owner facts changed before freeze commit")
+        if (
+            receipt.category in _DRAFT_MUTABLE_LEDGER_CATEGORIES
+            and (
+                draft_id,
+                "draft.freeze",
+            )
+            in self._draft_facts
+        ):
+            raise DraftOwnerFrozenError("Draft is already frozen")
         if self._fail_next:
             self._fail_next = False
             raise StoreCommitError("injected commit failure")
@@ -847,6 +897,7 @@ class InMemoryRuntimeStore:
         command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
         project_response: Callable[[object], object],
         owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+        create_draft_graph_handoff: bool = False,
     ) -> Mapping[str, object]:
         scope = (principal_id, route, key)
         body_digest = sha256(canonical_body).hexdigest()
@@ -882,6 +933,18 @@ class InMemoryRuntimeStore:
                 )
                 if owner is not None and owner[0] == "run":
                     self._graph_start_handoffs[RunId(owner[1])] = owner[2]
+                if owner is not None and owner[0] == "draft" and create_draft_graph_handoff:
+                    draft_handoff_key = (owner[1], owner[2])
+                    previous_handoff_status = self._draft_graph_start_handoffs.get(
+                        draft_handoff_key
+                    )
+                    self._draft_graph_start_handoffs.setdefault(draft_handoff_key, "PENDING")
+                    if previous_handoff_status is None:
+                        transaction.after_rollback(
+                            lambda: self._draft_graph_start_handoffs.pop(
+                                draft_handoff_key, None
+                            )
+                        )
                 transaction.after_rollback(lambda: self._api_commands.pop(scope, None))
                 if owner is not None and owner[0] == "run":
                     transaction.after_rollback(
@@ -918,6 +981,20 @@ class InMemoryRuntimeStore:
         if self._graph_start_handoffs.get(run_id) != receipt_key:
             raise StoreCommitError("Run graph-start handoff is not pending")
         del self._graph_start_handoffs[run_id]
+
+    async def list_pending_draft_graph_starts(self) -> tuple[tuple[UUID, str], ...]:
+        return tuple(
+            key
+            for key, status in sorted(self._draft_graph_start_handoffs.items())
+            if status == "PENDING"
+        )
+
+    async def mark_draft_graph_start_started(self, draft_id: UUID, receipt_key: str) -> None:
+        key = (draft_id, receipt_key)
+        status = self._draft_graph_start_handoffs.get(key)
+        if status is None:
+            raise StoreCommitError("Draft graph-start handoff does not exist")
+        self._draft_graph_start_handoffs[key] = "STARTED"
 
     async def commit(
         self,
@@ -1024,6 +1101,7 @@ class PostgreSQLRuntimeStore:
         *,
         events: Sequence[DraftSessionEventSpec] = (),
         transaction: RuntimeStoreTransaction | None = None,
+        expected_existing_facts: Sequence[DraftOwnerReceipt] | None = None,
     ) -> DraftOwnerReceipt:
         receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
         event_data = _prepare_draft_events(events, self.secret_registry)
@@ -1038,6 +1116,42 @@ class PostgreSQLRuntimeStore:
             await connection.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", str(draft_id)
             )
+            existing = await connection.fetchval(
+                """SELECT 1 FROM draft_owner_facts
+                    WHERE draft_id=$1 AND receipt_key=$2""",
+                draft_id,
+                receipt_key,
+            )
+            if existing is None and category in _DRAFT_MUTABLE_LEDGER_CATEGORIES:
+                frozen = await connection.fetchval(
+                    """SELECT 1 FROM draft_owner_facts
+                        WHERE draft_id=$1 AND receipt_key='draft.freeze'""",
+                    draft_id,
+                )
+                if frozen is not None:
+                    raise DraftOwnerFrozenError("Draft is already frozen")
+            if (
+                existing is None
+                and category == "draft.freeze"
+                and expected_existing_facts is not None
+            ):
+                snapshot_rows = await connection.fetch(
+                    """SELECT receipt_key, category, fact_sha256 FROM draft_owner_facts
+                        WHERE draft_id=$1 ORDER BY receipt_key""",
+                    draft_id,
+                )
+                actual = tuple(
+                    DraftOwnerReceipt(
+                        draft_id,
+                        str(_row_value(row, "receipt_key")),
+                        str(_row_value(row, "category")),
+                        str(_row_value(row, "fact_sha256")).strip(),
+                    )
+                    for row in snapshot_rows
+                )
+                expected = tuple(sorted(expected_existing_facts, key=lambda item: item.receipt_key))
+                if actual != expected:
+                    raise DraftLedgerChangedError("Draft owner facts changed before freeze commit")
             inserted = await connection.fetchval(
                 """INSERT INTO draft_owner_facts(
                         draft_id, receipt_key, category, fact_sha256, fact
@@ -1720,6 +1834,7 @@ class PostgreSQLRuntimeStore:
         command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
         project_response: Callable[[object], object],
         owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+        create_draft_graph_handoff: bool = False,
     ) -> Mapping[str, object]:
         """Run one owner command and persist its replay result on the same connection."""
 
@@ -1805,6 +1920,14 @@ class PostgreSQLRuntimeStore:
                                     owner_id,
                                     receipt_key,
                                 )
+                            elif create_draft_graph_handoff:
+                                await connection.execute(
+                                    """INSERT INTO draft_graph_start_handoffs
+                                    (draft_id, receipt_key, status) VALUES ($1,$2,'PENDING')
+                                    ON CONFLICT (draft_id, receipt_key) DO NOTHING""",
+                                    owner_id,
+                                    receipt_key,
+                                )
                         if expired:
                             await connection.execute(
                                 """DELETE FROM api_command_receipts
@@ -1868,6 +1991,29 @@ class PostgreSQLRuntimeStore:
             )
         if updated.split()[-1] != "1":
             raise StoreCommitError("Run graph-start handoff does not exist")
+
+    async def list_pending_draft_graph_starts(self) -> tuple[tuple[UUID, str], ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT draft_id, receipt_key FROM draft_graph_start_handoffs
+                WHERE status='PENDING' ORDER BY created_at, draft_id, receipt_key"""
+            )
+        return tuple(
+            (UUID(str(_row_value(row, "draft_id"))), str(_row_value(row, "receipt_key")))
+            for row in rows
+        )
+
+    async def mark_draft_graph_start_started(self, draft_id: UUID, receipt_key: str) -> None:
+        async with self._acquire_write_connection() as connection:
+            updated = await connection.execute(
+                """UPDATE draft_graph_start_handoffs SET status='STARTED',
+                started_at=COALESCE(started_at, clock_timestamp())
+                WHERE draft_id=$1 AND receipt_key=$2""",
+                draft_id,
+                receipt_key,
+            )
+        if updated.split()[-1] != "1":
+            raise StoreCommitError("Draft graph-start handoff does not exist")
 
     async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
         async with self.pool.acquire() as connection:

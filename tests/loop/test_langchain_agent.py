@@ -446,6 +446,35 @@ async def test_create_agent_returns_structured_output_without_gateway_dispatch()
 
 
 @pytest.mark.asyncio
+async def test_create_agent_accepts_valid_structured_json_content_without_tool_dispatch() -> None:
+    binding = _binding()
+    run = _run(binding)
+    proposal = PlanProposal(
+        slices=[], edges=[], integration_ranks={}, planner_rationale=[]
+    )
+    provider = FakeProvider([_response(proposal.model_dump_json(by_alias=True))])
+    gateway = FakeGateway()
+    bound = create_bound_agent(
+        agent_run=run,
+        binding=binding,
+        registry=ProviderRegistry({"openai-compatible": provider}),
+        context_manager=ContextManager(
+            token_counter=ExactCounter(), net_input_cap=FormulaNetInputCap()
+        ),
+        template="plan role",
+        envelope=ContextEnvelope(stable=(ContextSegment("stable", "frozen facts"),)),
+        gateway=gateway,
+        context_identity=_context_identity(run, binding),
+        response_format=PlanProposal,
+    )
+
+    result = await bound.ainvoke(task="Return a structured plan")
+
+    assert result.structured_response == proposal
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
 async def test_create_agent_redacts_truncated_structured_tool_arguments() -> None:
     binding = _binding()
     run = _run(binding)
