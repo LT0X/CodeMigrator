@@ -83,12 +83,16 @@ class FairScheduler:
         self,
         active_scopes: frozenset[str],
         available_pools: frozenset[ResourcePool],
+        *,
+        only_run_id: str | None = None,
     ) -> ReadySlice | None:
         if not self._run_order:
             return None
         for offset in range(len(self._run_order)):
             index = (self._cursor + offset) % len(self._run_order)
             run_id = self._run_order[index]
+            if only_run_id is not None and run_id != only_run_id:
+                continue
             reserved_scopes = frozenset(
                 scope
                 for (reserved_run_id, _slice_id, _generation), scopes

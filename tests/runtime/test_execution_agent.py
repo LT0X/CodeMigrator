@@ -85,8 +85,9 @@ class UsageSink:
 
 
 class Gateway:
-    def __init__(self, context: GatewayContext) -> None:
+    def __init__(self, context: GatewayContext, write_scope: WriteScope | None = None) -> None:
         self.context = context
+        self.write_scope = write_scope
         self.calls: list[object] = []
 
     def dispatch(self, raw_call, *, cancellation_token=None):
@@ -215,9 +216,10 @@ def test_execution_round_rejects_run_and_generation_mismatches() -> None:
         )
 
 
+@pytest.mark.parametrize("gateway_scope_matches_slice", [True, False])
 @pytest.mark.asyncio
 async def test_persistent_execute_agent_uses_actor_start_and_terminal_receipts(
-    tmp_path: Path,
+    tmp_path: Path, gateway_scope_matches_slice: bool
 ) -> None:
     from codemigrator.runtime.execution_agent import (
         ExecutionSessionMaterial,
@@ -356,6 +358,14 @@ async def test_persistent_execute_agent_uses_actor_start_and_terminal_receipts(
     gateways: list[Gateway] = []
 
     def gateway_factory(record, session_material):
+        gateway_scope = session_material.slice.write_scope
+        if not gateway_scope_matches_slice:
+            gateway_scope = WriteScope(
+                out=WriteScopeOut(
+                    write_paths=["src/converted.py"],
+                    create_roots=["src"],
+                )
+            )
         gateway = Gateway(
             GatewayContext(
                 run_id=run_id,
@@ -365,7 +375,8 @@ async def test_persistent_execute_agent_uses_actor_start_and_terminal_receipts(
                 session_kind=SessionKind.Implementation,
                 slice_id=slice_id,
                 generation=generation,
-            )
+            ),
+            write_scope=gateway_scope,
         )
         gateways.append(gateway)
         return gateway
@@ -375,6 +386,12 @@ async def test_persistent_execute_agent_uses_actor_start_and_terminal_receipts(
         gateway_factory=gateway_factory,
     )
     try:
+        if not gateway_scope_matches_slice:
+            with pytest.raises(ValueError, match="write scope"):
+                await factory.get_or_create(material)
+            assert gateways and provider.requests == []
+            return
+
         session = await factory.get_or_create(material)
         outcome = await session.run(
             on_agent_run_started=actor.record_agent_run_started,
@@ -572,6 +589,180 @@ async def test_execution_scheduler_honors_dependencies_scopes_and_actor_receipts
     assert second_round.dispatch_count == 2
     assert second_round.complete is True
     assert len(second_round.completed_write_agent_run_ids) == 2
+
+
+@pytest.mark.asyncio
+async def test_execution_scheduler_keeps_shared_queue_work_with_its_run() -> None:
+    from codemigrator.runtime.execution_agent import (
+        ExecutionAgentOutcome,
+        ExecutionRoundPlan,
+        ExecutionWorkItem,
+        PersistentExecutionScheduler,
+    )
+    from codemigrator.runtime.scheduler import FairScheduler, ReadySlice, ResourcePool
+
+    first_run, second_run = RunId(uuid4()), RunId(uuid4())
+    first_id, second_id = SliceId(uuid4()), SliceId(uuid4())
+    first_material = _schedule_material(first_run, first_id, "src/first.py")
+    second_material = _schedule_material(second_run, second_id, "src/second.py")
+    work_by_run = {
+        str(first_run): ExecutionWorkItem(
+            ReadySlice(
+                str(first_run),
+                str(first_id),
+                frozenset(),
+                frozenset({"src/first.py"}),
+                ResourcePool.Model,
+                generation=1,
+            ),
+            first_material,
+        ),
+        str(second_run): ExecutionWorkItem(
+            ReadySlice(
+                str(second_run),
+                str(second_id),
+                frozenset(),
+                frozenset({"src/second.py"}),
+                ResourcePool.Model,
+                generation=1,
+            ),
+            second_material,
+        ),
+    }
+
+    class Loader:
+        async def load(self, requested_run_id, logical_key):
+            item = work_by_run[str(requested_run_id)]
+            return ExecutionRoundPlan(
+                run_id=requested_run_id,
+                work_items=(item,),
+                completed_slice_ids=frozenset(),
+                all_slice_ids=frozenset({item.ready.slice_id}),
+                available_pools=frozenset({ResourcePool.Model}),
+            )
+
+    class RecordingScheduler(PersistentExecutionScheduler):
+        def __init__(self, fair_scheduler):
+            super().__init__(
+                round_loader=Loader(), sessions=object(), fair_scheduler=fair_scheduler,
+                max_parallelism=2,
+            )
+            self.dispatched: list[str] = []
+
+        async def _dispatch(self, item, **_callbacks):
+            self.dispatched.append(item.ready.run_id)
+            material = item.material
+            receipt = material.candidate_checkpoint.receipt
+            record = AgentRun(
+                agent_run_id=AgentRunId(uuid4()),
+                owner_kind="run",
+                owner_id=material.run_id,
+                logical_task_key=material.logical_task_key,
+                phase=Phase.Execute,
+                session_kind=material.context_identity.session,
+                thread_id=str(uuid4()),
+                model_binding_sha256=material.binding.digest,
+                context_sha256="1" * 64,
+                toolset_sha256="2" * 64,
+                template_sha256="3" * 64,
+                slice_ref=material.slice_ref,
+                write_scope_sha256="4" * 64,
+            )
+            terminal = replace(
+                record,
+                state=SessionState.Closed,
+                exit=SessionExit.Completed,
+                result_sha256="5" * 64,
+                candidate_checkpoint_sha256=checkpoint_receipt_digest(receipt),
+            )
+            return ExecutionAgentOutcome(terminal, receipt)
+
+    shared = FairScheduler()
+    shared.submit(work_by_run[str(first_run)].ready)
+    shared.submit(work_by_run[str(second_run)].ready)
+    scheduler = RecordingScheduler(shared)
+
+    async def callback(*_args):
+        raise AssertionError("stubbed dispatch does not call actor callbacks")
+
+    first_decision = await scheduler.advance_one_round(
+        first_run, "first", on_agent_run_started=callback, on_agent_run_terminal=callback
+    )
+    second_decision = await scheduler.advance_one_round(
+        second_run, "second", on_agent_run_started=callback, on_agent_run_terminal=callback
+    )
+
+    assert first_decision.dispatch_count == second_decision.dispatch_count == 1
+    assert scheduler.dispatched == [str(first_run), str(second_run)]
+
+
+@pytest.mark.asyncio
+async def test_execution_scheduler_releases_prior_reservations_on_plan_mismatch() -> None:
+    from codemigrator.runtime.execution_agent import (
+        ExecutionRoundPlan,
+        ExecutionScheduleStalled,
+        ExecutionWorkItem,
+        PersistentExecutionScheduler,
+    )
+    from codemigrator.runtime.scheduler import FairScheduler, ReadySlice, ResourcePool
+
+    run_id, slice_id = RunId(uuid4()), SliceId(uuid4())
+    material = _schedule_material(run_id, slice_id, "src/expected.py")
+    item = ExecutionWorkItem(
+        ReadySlice(
+            str(run_id),
+            str(slice_id),
+            frozenset(),
+            frozenset({"src/expected.py"}),
+            ResourcePool.Model,
+            generation=1,
+        ),
+        material,
+    )
+    plan = ExecutionRoundPlan(
+        run_id=run_id,
+        work_items=(item,),
+        completed_slice_ids=frozenset(),
+        all_slice_ids=frozenset({str(slice_id)}),
+        available_pools=frozenset({ResourcePool.Model}),
+    )
+
+    class Loader:
+        async def load(self, requested_run_id, logical_key):
+            return plan
+
+    class InjectedMismatchScheduler(FairScheduler):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def next(self, active_scopes, available_pools, *, only_run_id=None):
+            self.calls += 1
+            if self.calls == 2:
+                return ReadySlice(
+                    str(run_id),
+                    "not-in-frozen-plan",
+                    frozenset(),
+                    frozenset({"src/unexpected.py"}),
+                    ResourcePool.Model,
+                    generation=1,
+                )
+            return super().next(active_scopes, available_pools)
+
+    shared = InjectedMismatchScheduler()
+    scheduler = PersistentExecutionScheduler(
+        round_loader=Loader(), sessions=object(), fair_scheduler=shared, max_parallelism=2
+    )
+
+    async def callback(*_args):
+        raise AssertionError("selection failure occurs before dispatch")
+
+    with pytest.raises(ExecutionScheduleStalled, match="frozen round plan"):
+        await scheduler.advance_one_round(
+            run_id, "mismatch", on_agent_run_started=callback, on_agent_run_terminal=callback
+        )
+
+    assert shared.next(frozenset(), frozenset({ResourcePool.Model})) == item.ready
 
 
 @pytest.mark.asyncio

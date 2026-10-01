@@ -20,6 +20,7 @@ from codemigrator.core import (
     Sha256,
     SliceGenerationRef,
     SliceKind,
+    WriteScope,
     canonical_json_bytes,
 )
 from codemigrator.workspace import CheckpointReceipt, checkpoint_receipt_digest
@@ -61,7 +62,14 @@ class ExecutionCandidateCheckpointPort(Protocol):
 class ExecutionGatewayFactory(Protocol):
     """Bind a ToolGateway to one persisted AgentRun and frozen Slice material."""
 
-    def __call__(self, record: AgentRun, material: ExecutionSessionMaterial) -> ToolGatewayPort: ...
+    def __call__(
+        self, record: AgentRun, material: ExecutionSessionMaterial
+    ) -> ExecutionToolGatewayPort: ...
+
+
+class ExecutionToolGatewayPort(ToolGatewayPort, Protocol):
+    @property
+    def write_scope(self) -> WriteScope | None: ...
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -345,7 +353,9 @@ class PersistentExecutionScheduler:
         active_scopes: set[str] = set()
         selected: list[ExecutionWorkItem] = []
         while len(selected) < self.max_parallelism:
-            ready = self.fair_scheduler.next(frozenset(active_scopes), plan.available_pools)
+            ready = self.fair_scheduler.next(
+                frozenset(active_scopes), plan.available_pools, only_run_id=run_key
+            )
             if ready is None:
                 break
             selected_item = work_by_slice.get(ready.slice_id)
@@ -353,6 +363,10 @@ class PersistentExecutionScheduler:
                 self.fair_scheduler.release(
                     ready.run_id, ready.slice_id, generation=ready.generation
                 )
+                for item in selected:
+                    self.fair_scheduler.release(
+                        run_key, item.ready.slice_id, generation=item.ready.generation
+                    )
                 raise ExecutionScheduleStalled(
                     "EXECUTE scheduler selected a Slice absent from the frozen round plan"
                 )
@@ -578,6 +592,16 @@ class PersistentExecutionAgentSessionFactory:
                 "started write AgentRun must rebuild from its latest M-08 candidate"
             )
 
+        gateway = self.gateway_factory(record, material)
+        gateway_scope = gateway.write_scope
+        expected_scope_digest = write_scope_digest(slice_.write_scope)
+        if (
+            not isinstance(gateway_scope, WriteScope)
+            or record.write_scope_sha256 != expected_scope_digest
+            or write_scope_digest(gateway_scope) != expected_scope_digest
+        ):
+            raise ValueError("EXECUTE gateway write scope differs from frozen Slice")
+
         bound = create_bound_agent(
             agent_run=record,
             binding=material.binding,
@@ -585,7 +609,7 @@ class PersistentExecutionAgentSessionFactory:
             context_manager=self.infrastructure.context_manager,
             template=template,
             envelope=material.envelope,
-            gateway=self.gateway_factory(record, material),
+            gateway=gateway,
             usage_sink=self.infrastructure.usage_sink,
             context_identity=identity,
             checkpointer=self.infrastructure.agent_run_checkpointer_for("run", material.run_id),
