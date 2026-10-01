@@ -40,6 +40,7 @@ from .contracts import (
     DraftSessionEventSpec,
     EventSpec,
     RunState,
+    RunStatePage,
     RuntimeEvent,
     RuntimeSnapshot,
     RuntimeStoreTransaction,
@@ -59,9 +60,19 @@ _RUN_TERMINAL_STATUSES = frozenset(
 _DRAFT_TERMINAL_EVENTS = frozenset({"session.closed", "session.attached_to_run"})
 
 
+def _validate_run_page_limit(limit: int) -> None:
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("Run page limit must be between 1 and 100")
+
+
 class RuntimeStore(Protocol):
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         """Load one Run and its append-only events."""
+
+    async def list_run_states(
+        self, *, limit: int, after_run_id: RunId | None = None
+    ) -> RunStatePage:
+        """Read a bounded Run page in stable UUID order."""
 
     async def create(
         self,
@@ -714,6 +725,22 @@ class InMemoryRuntimeStore:
 
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         return self._snapshots.get(run_id)
+
+    async def list_run_states(
+        self, *, limit: int, after_run_id: RunId | None = None
+    ) -> RunStatePage:
+        _validate_run_page_limit(limit)
+        cursor = after_run_id.bytes if after_run_id is not None else None
+        states = sorted(
+            (snapshot.state for snapshot in self._snapshots.values()),
+            key=lambda state: state.run_id.bytes,
+        )
+        if cursor is not None:
+            states = [state for state in states if state.run_id.bytes > cursor]
+        has_more = len(states) > limit
+        selected = tuple(states[:limit])
+        next_cursor = RunId(selected[-1].run_id) if has_more and selected else None
+        return RunStatePage(selected, next_cursor)
 
     async def create(
         self,
@@ -1812,33 +1839,58 @@ class PostgreSQLRuntimeStore:
 
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         async with self.pool.acquire() as connection:
-            row = await connection.fetchrow(
-                "SELECT state FROM runtime_runs WHERE run_id = $1",
-                run_id,
-            )
-            if row is None:
-                return None
-            event_rows = await connection.fetch(
+            rows = await connection.fetch(
                 """
-                SELECT sequence, event_type, data, timestamp_utc
-                FROM runtime_events
-                WHERE run_id = $1
-                ORDER BY sequence
+                SELECT r.state, e.sequence, e.event_type, e.data, e.timestamp_utc
+                FROM runtime_runs AS r
+                LEFT JOIN runtime_events AS e ON e.run_id = r.run_id
+                WHERE r.run_id = $1
+                ORDER BY e.sequence
                 """,
                 run_id,
             )
-        return RuntimeSnapshot(
-            state=_decode_state(_row_value(row, "state")),
-            events=tuple(
-                RuntimeEvent(
-                    sequence=int(_row_value(event, "sequence")),
-                    event_type=str(_row_value(event, "event_type")),
-                    data=_decode_event_data(_row_value(event, "data")),
-                    timestamp_utc=_row_value(event, "timestamp_utc"),
-                )
-                for event in event_rows
-            ),
+            if not rows:
+                return None
+        first_row = rows[0]
+        state = _decode_state(_row_value(first_row, "state"))
+        events = tuple(
+            RuntimeEvent(
+                sequence=int(_row_value(row, "sequence")),
+                event_type=str(_row_value(row, "event_type")),
+                data=_decode_event_data(_row_value(row, "data")),
+                timestamp_utc=_row_value(row, "timestamp_utc"),
+            )
+            for row in rows
+            if _row_value(row, "sequence") is not None
         )
+        return RuntimeSnapshot(state=state, events=events)
+
+    async def list_run_states(
+        self, *, limit: int, after_run_id: RunId | None = None
+    ) -> RunStatePage:
+        _validate_run_page_limit(limit)
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT run_id, state
+                FROM runtime_runs
+                WHERE ($1::uuid IS NULL OR run_id > $1::uuid)
+                ORDER BY run_id
+                LIMIT $2
+                """,
+                after_run_id,
+                limit + 1,
+            )
+        has_more = len(rows) > limit
+        selected_rows = rows[:limit]
+        states: list[RunState] = []
+        for row in selected_rows:
+            state = _decode_state(_row_value(row, "state"))
+            if state.run_id != RunId(_row_value(row, "run_id")):
+                raise StoreCommitError("stored Run identity does not match its index")
+            states.append(state)
+        next_cursor = RunId(states[-1].run_id) if has_more and states else None
+        return RunStatePage(tuple(states), next_cursor)
 
     async def create(
         self,

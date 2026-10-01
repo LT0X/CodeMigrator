@@ -107,6 +107,36 @@ async def isolated_store(*, max_size: int = 10):
         await admin.close()
 
 
+@pytest.mark.asyncio
+async def test_postgres_run_state_pages_and_state_event_snapshot_are_stable():
+    from codemigrator.core import RunStatus
+    from codemigrator.runtime.contracts import EventSpec, RunState
+
+    async with isolated_store() as (store, _schema):
+        run_ids = tuple(UUID(int=value) for value in range(601, 606))
+        for run_id in reversed(run_ids):
+            await store.create(
+                RunState(run_id=RunId(run_id), status=RunStatus.Created),
+                (EventSpec("run.status_changed", {"run_status": RunStatus.Created.value}),),
+            )
+
+        first = await store.list_run_states(limit=2)
+        second = await store.list_run_states(limit=2, after_run_id=first.next_cursor)
+        last = await store.list_run_states(limit=2, after_run_id=second.next_cursor)
+        snapshot = await store.load(RunId(run_ids[0]))
+
+        assert tuple(state.run_id for state in first.states) == run_ids[:2]
+        assert first.next_cursor == run_ids[1]
+        assert tuple(state.run_id for state in second.states) == run_ids[2:4]
+        assert second.next_cursor == run_ids[3]
+        assert tuple(state.run_id for state in last.states) == run_ids[4:]
+        assert last.next_cursor is None
+        assert snapshot is not None
+        assert snapshot.state.run_id == run_ids[0]
+        assert [event.sequence for event in snapshot.events] == [1]
+        assert snapshot.events[0].data["run_status"] == RunStatus.Created.value
+
+
 class PassingPreflight:
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -1422,6 +1452,180 @@ async def test_production_asgi_composes_run_graph_from_locked_store_and_actor_fa
             assert len(factory_calls) == 1
             assert factory_calls[0][1] is stage_actors[0].store
             assert stage_actors == created_actors
+
+
+@pytest.mark.asyncio
+async def test_production_asgi_projects_committed_run_views_and_resumes_sse_from_snapshot(
+    tmp_path: Path,
+):
+    dsn = os.environ.get("CODEMIGRATOR_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("CODEMIGRATOR_TEST_PG_DSN is not configured")
+    from codemigrator.asgi import ProductionRunComponents
+    from codemigrator.core import MigrationSlice, RunStatus, SliceAttemptStatus, SliceKind
+    from codemigrator.runtime.cas import FileHostCAS
+    from codemigrator.runtime.checkpointer import CasCheckpointSaver
+    from codemigrator.runtime.contracts import EventSpec, RunState
+    from codemigrator.runtime.graph_composition import (
+        AgentGraphInfrastructure,
+        RuntimeGraphAssembly,
+    )
+    from codemigrator.runtime.memory import ContextManager
+    from codemigrator.runtime.provider import ProviderRegistry
+
+    async with isolated_store() as (_test_store, schema):
+        captured: dict[str, object] = {}
+
+        def components_factory(store, pool, lock_connection):
+            del pool, lock_connection
+            cas = FileHostCAS(tmp_path / "cas")
+            captured["store"] = store
+            captured["cas"] = cas
+            app_owner_id = uuid4()
+            infrastructure = AgentGraphInfrastructure(
+                provider_registry=ProviderRegistry({}),
+                context_manager=ContextManager(),
+                tool_gateway=object(),
+                runtime_store=store,
+                host_cas=cas,
+                cas_references=store,
+                usage_sink=object(),
+                run_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="run",
+                    owner_kind="run",
+                    owner_id=app_owner_id,
+                ),
+                draft_graph_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="draft",
+                    owner_kind="draft",
+                    owner_id=app_owner_id,
+                ),
+                agent_run_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="agent",
+                    owner_kind="run",
+                    owner_id=app_owner_id,
+                ),
+            )
+            assembly = RuntimeGraphAssembly(
+                infrastructure,
+                plan_stage_factory=lambda _infra, _actor: object(),
+                verifier_factory=lambda _infra, _actor: object(),
+                reporter_factory=lambda _infra, _actor: object(),
+                draft_agent_runner_factory=lambda _infra, _owner: object(),
+                create_run_service_factory=lambda _infra, _owner: object(),
+            )
+            return ProductionRunComponents(
+                preflight=PassingPreflight(),
+                graph_assembly=assembly,
+                actor_factory=lambda run_id, actor_store: RunActor(run_id, actor_store),
+                durable_checkpointer=True,
+            )
+
+        app = create_production_app(
+            dsn,
+            config=ApiConfig(token="synthetic-token"),
+            run_components_factory=components_factory,
+            stop_server=noop_server_stop,
+            pool_server_settings={"search_path": schema},
+        )
+        async with app.router.lifespan_context(app):
+            store = captured["store"]
+            cas = captured["cas"]
+            assert isinstance(store, PostgreSQLRuntimeStore)
+            assert isinstance(cas, FileHostCAS)
+            run_id = uuid4()
+            slice_id = uuid4()
+            slice_ = MigrationSlice(
+                id=slice_id,
+                kind=SliceKind.Implementation,
+                source_modules=[uuid4()],
+                write_scope={
+                    "out": {
+                        "write_paths": ["src/generated.py"],
+                        "create_roots": ["src"],
+                    }
+                },
+                required_checks=[],
+                integration_rank=0,
+                proposal_ref=None,
+            )
+            plan_body = canonical_json_bytes(
+                {
+                    "slices": [slice_.model_dump(mode="json")],
+                    "integration_order": [str(slice_id)],
+                }
+            )
+            plan_ref = cas.put(plan_body)
+            await store.create(
+                RunState(run_id=RunId(run_id), status=RunStatus.Planning),
+                (EventSpec("run.status_changed", {"run_status": RunStatus.Planning.value}),),
+            )
+            await store.commit(
+                RunState(
+                    run_id=RunId(run_id),
+                    status=RunStatus.Failed,
+                    version=1,
+                    frozen_plan_sha256=plan_ref.digest,
+                ),
+                (
+                    EventSpec(
+                        "slice.status_changed",
+                        {
+                            "slice_id": str(slice_id),
+                            "status": SliceAttemptStatus.Integrated.value,
+                            "generation": 3,
+                        },
+                    ),
+                    EventSpec(
+                        "run.status_changed", {"run_status": RunStatus.Failed.value}
+                    ),
+                ),
+            )
+            await store.add_cas_reference(plan_ref, "run", run_id, "frozen-plan")
+            persisted_after_cursor = await store.read_run_events(RunId(run_id), 2)
+            assert [event.sequence for event in persisted_after_cursor] == [3]
+            assert await store.is_run_stream_terminal(RunId(run_id), 3)
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+            ) as client:
+                headers = {"Authorization": "Bearer synthetic-token"}
+                listing = await client.get("/api/v1/migrations?limit=10", headers=headers)
+                detail = await client.get(f"/api/v1/migrations/{run_id}", headers=headers)
+                workspace = await client.get(
+                    f"/api/v1/migrations/{run_id}/workspace", headers=headers
+                )
+                replay = await client.get(
+                    f"/api/v1/migrations/{run_id}/events",
+                    headers={**headers, "Last-Event-ID": "2"},
+                )
+
+            assert listing.status_code == detail.status_code == workspace.status_code == 200
+            assert listing.json()["items"][0]["run_id"] == str(run_id)
+            assert detail.json()["status"] == RunStatus.Failed.value
+            assert workspace.json()["latest_sequence"] == 3
+            assert workspace.json()["slices"] == [
+                {
+                    "slice_id": str(slice_id),
+                    "kind": SliceKind.Implementation.value,
+                    "status": SliceAttemptStatus.Integrated.value,
+                    "generation": 3,
+                    "write_scope": {
+                        "write_paths": ["src/generated.py"],
+                        "create_roots": ["src"],
+                    },
+                    "integration_rank": 0,
+                }
+            ]
+            assert replay.status_code == 200
+            assert "id: 3" in replay.text
+            assert '"run_status":"FAILED"' in replay.text
 
 
 @pytest.mark.asyncio

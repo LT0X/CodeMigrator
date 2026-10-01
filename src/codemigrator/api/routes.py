@@ -159,7 +159,7 @@ def create_app(
         async def replay_receive():  # type: ignore[no-untyped-def]
             if messages:
                 return messages.pop(0)
-            return {"type": "http.disconnect"}
+            return await receive()
 
         request._receive = replay_receive
         request.state.raw_body_size = raw_size

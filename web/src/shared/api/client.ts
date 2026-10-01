@@ -16,6 +16,7 @@ export interface ApiClientOptions {
 
 export interface ApiClient {
   listMigrations(): Promise<MigrationProjection[]>;
+  getMigration(runId: string): Promise<MigrationProjection>;
   getWorkspace(runId: string): Promise<WorkspaceProjection>;
   getReport(runId: string): Promise<ReportProjection>;
   getEvidence(runId: string, receiptId: string): Promise<EvidenceProjection>;
@@ -121,6 +122,7 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   });
   return {
     listMigrations: async () => (await readJson<{ items?: MigrationProjection[] }>(request("/migrations"))).items ?? [],
+    getMigration: async (runId) => readJson<MigrationProjection>(request(`/migrations/${encode(runId)}`)),
     getWorkspace: async (runId) => readJson<WorkspaceProjection>(request(`/migrations/${encode(runId)}/workspace`)),
     getReport: async (runId) => readJson<ReportProjection>(request(`/migrations/${encode(runId)}/report`)),
     getEvidence: async (runId, receiptId) => readJson<EvidenceProjection>(request(`/migrations/${encode(runId)}/evidence/${encode(receiptId)}`)),

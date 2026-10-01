@@ -15,6 +15,19 @@ describe("API boundary", () => {
     expect(new Headers(initValues[0].headers).get("Authorization")).toBe("Bearer test-token");
   });
 
+  it("loads the existing Run status projection through its encoded resource path", async () => {
+    const calls: string[] = [];
+    const fetchImpl = async (input: RequestInfo | URL): Promise<Response> => {
+      calls.push(String(input));
+      return new Response(JSON.stringify({ run_id: "run/1", status: "EXECUTING", version: 7 }), { status: 200 });
+    };
+
+    const migration = await createApiClient({ baseUrl: "/api/v1", fetchImpl }).getMigration("run/1");
+
+    expect(calls).toEqual(["/api/v1/migrations/run%2F1"]);
+    expect(migration).toEqual({ run_id: "run/1", status: "EXECUTING", version: 7 });
+  });
+
   it("adds an idempotency key to session writes", async () => {
     let init: RequestInit | undefined;
     const fetchImpl = async (_input: RequestInfo | URL, requestInit?: RequestInit): Promise<Response> => {
