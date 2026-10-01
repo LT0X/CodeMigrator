@@ -340,10 +340,12 @@ class InMemoryRuntimeStore:
         event_data = _prepare_draft_events(events, self.secret_registry)
         if transaction is None:
             async with self._agent_lock:
-                committed, _appended, _created = await self._commit_draft_fact_locked(
-                    draft_id, receipt_key, receipt, payload, event_data, notify=True
+                committed, _appended, created = await self._commit_draft_fact_locked(
+                    draft_id, receipt_key, receipt, payload, event_data
                 )
-                return committed
+            if created and event_data:
+                self._schedule_draft_event_notification(draft_id)
+            return committed
         if transaction.store is not self or not transaction.active:
             raise StoreCommitError("runtime transaction does not belong to this store")
 
@@ -351,7 +353,7 @@ class InMemoryRuntimeStore:
         lock_transferred = False
         try:
             committed, appended, created = await self._commit_draft_fact_locked(
-                draft_id, receipt_key, receipt, payload, event_data, notify=False
+                draft_id, receipt_key, receipt, payload, event_data
             )
             if created:
                 transaction.after_rollback(
@@ -376,8 +378,6 @@ class InMemoryRuntimeStore:
         receipt: DraftOwnerReceipt,
         payload: dict[str, object],
         event_data: tuple[tuple[str, dict[str, object]], ...],
-        *,
-        notify: bool,
     ) -> tuple[DraftOwnerReceipt, tuple[DraftSessionEvent, ...], bool]:
         key = (draft_id, receipt_key)
         previous = self._draft_facts.get(key)
@@ -406,10 +406,6 @@ class InMemoryRuntimeStore:
                 terminal = self._draft_terminals.get(draft_id)
                 if terminal is None or event.sequence < terminal:
                     self._draft_terminals[draft_id] = event.sequence
-        condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
-        if notify and event_data:
-            async with condition:
-                condition.notify_all()
         return receipt, appended, True
 
     def _schedule_draft_event_notification(self, draft_id: UUID) -> None:
@@ -451,34 +447,35 @@ class InMemoryRuntimeStore:
     async def read_draft_session_events(
         self, draft_id: UUID, after_sequence: int
     ) -> tuple[DraftSessionEvent, ...]:
-        return tuple(
-            DraftSessionEvent(
-                event.draft_id,
-                event.sequence,
-                event.event_type,
-                dict(event.data),
-                event.timestamp_utc,
+        async with self._agent_lock:
+            return tuple(
+                DraftSessionEvent(
+                    event.draft_id,
+                    event.sequence,
+                    event.event_type,
+                    dict(event.data),
+                    event.timestamp_utc,
+                )
+                for event in self._draft_events.get(draft_id, ())
+                if event.sequence > after_sequence
             )
-            for event in self._draft_events.get(draft_id, ())
-            if event.sequence > after_sequence
-        )
 
     async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None:
         condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
         async with condition:
-            await condition.wait_for(
-                lambda: (
-                    len(self._draft_events.get(draft_id, ())) > after_sequence
-                    or (
+            while True:
+                async with self._agent_lock:
+                    if len(self._draft_events.get(draft_id, ())) > after_sequence or (
                         self._draft_terminals.get(draft_id) is not None
                         and self._draft_terminals[draft_id] <= after_sequence
-                    )
-                )
-            )
+                    ):
+                        return
+                await condition.wait()
 
     async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool:
-        terminal_sequence = self._draft_terminals.get(draft_id)
-        return terminal_sequence is not None and terminal_sequence <= after_sequence
+        async with self._agent_lock:
+            terminal_sequence = self._draft_terminals.get(draft_id)
+            return terminal_sequence is not None and terminal_sequence <= after_sequence
 
     async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
         snapshot = self._snapshots.get(run_id)
@@ -526,28 +523,31 @@ class InMemoryRuntimeStore:
     async def load_draft_owner_fact(
         self, draft_id: UUID, receipt_key: str
     ) -> tuple[DraftOwnerReceipt, dict[str, object]] | None:
-        value = self._draft_facts.get((draft_id, receipt_key))
-        if value is None:
-            return None
-        receipt, fact = value
-        _verify_draft_fact_digest(receipt, fact)
-        return receipt, _decode_draft_fact(canonical_json_bytes(fact))
+        async with self._agent_lock:
+            value = self._draft_facts.get((draft_id, receipt_key))
+            if value is None:
+                return None
+            receipt, fact = value
+            _verify_draft_fact_digest(receipt, fact)
+            return receipt, _decode_draft_fact(canonical_json_bytes(fact))
 
     async def list_draft_owner_facts(
         self, draft_id: UUID
     ) -> tuple[tuple[DraftOwnerReceipt, dict[str, object]], ...]:
-        values = tuple(
-            value
-            for (owner_id, _), value in sorted(
-                self._draft_facts.items(), key=lambda item: item[0][1]
+        async with self._agent_lock:
+            values = tuple(
+                value
+                for (owner_id, _), value in sorted(
+                    self._draft_facts.items(), key=lambda item: item[0][1]
+                )
+                if owner_id == draft_id
             )
-            if owner_id == draft_id
-        )
-        for receipt, fact in values:
-            _verify_draft_fact_digest(receipt, fact)
-        return tuple(
-            (receipt, _decode_draft_fact(canonical_json_bytes(fact))) for receipt, fact in values
-        )
+            for receipt, fact in values:
+                _verify_draft_fact_digest(receipt, fact)
+            return tuple(
+                (receipt, _decode_draft_fact(canonical_json_bytes(fact)))
+                for receipt, fact in values
+            )
 
     async def release_cas_reference(
         self, owner_kind: str, owner_id: UUID, reference_key: str
@@ -887,7 +887,7 @@ class InMemoryRuntimeStore:
                     transaction.after_rollback(
                         lambda: self._graph_start_handoffs.pop(RunId(owner[1]), None)
                     )
-            except Exception:
+            except BaseException:
                 transaction.finish(committed=False)
                 raise
             transaction.finish(committed=True)

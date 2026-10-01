@@ -318,6 +318,82 @@ async def test_api_command_projection_failure_rolls_back_draft_fact_and_event() 
     assert len(await store.read_draft_session_events(draft_id, 0)) == 1
 
 
+@pytest.mark.asyncio
+async def test_cancelled_draft_command_hides_staged_data_and_restores_terminal_state() -> None:
+    store = InMemoryRuntimeStore()
+    draft_id = uuid4()
+    staged = asyncio.Event()
+    attempts = 0
+
+    async def command(transaction):
+        nonlocal attempts
+        attempts += 1
+        receipt = await store.commit_draft_owner_fact(
+            draft_id,
+            "draft.closed",
+            "draft.closed",
+            {},
+            events=(DraftSessionEventSpec("session.closed", {"status": "CLOSED"}),),
+            transaction=transaction,
+        )
+        if attempts == 1:
+            staged.set()
+            await asyncio.Event().wait()
+        return receipt
+
+    async def execute_command():
+        return await store.execute_api_command(
+            principal_id="local",
+            route="/api/v1/sessions",
+            key="cancel-draft-command",
+            canonical_body=b'{"kind":"DRAFT"}',
+            status_code=201,
+            command=command,
+            project_response=lambda receipt: {"session_id": str(receipt.draft_id)},
+            owner_receipt=lambda receipt: (
+                "draft",
+                receipt.draft_id,
+                receipt.receipt_key,
+            ),
+        )
+
+    owner_task = asyncio.create_task(execute_command())
+    readers = []
+    try:
+        await asyncio.wait_for(staged.wait(), 1)
+        readers = [
+            asyncio.create_task(store.load_draft_owner_fact(draft_id, "draft.closed")),
+            asyncio.create_task(store.read_draft_session_events(draft_id, 0)),
+            asyncio.create_task(store.is_draft_session_terminal(draft_id, 1)),
+            asyncio.create_task(store.wait_for_draft_session_events(draft_id, 0)),
+        ]
+        await asyncio.sleep(0)
+        assert all(not reader.done() for reader in readers)
+
+        owner_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner_task
+
+        assert await asyncio.wait_for(readers[0], 1) is None
+        assert await asyncio.wait_for(readers[1], 1) == ()
+        assert await asyncio.wait_for(readers[2], 1) is False
+        await asyncio.sleep(0)
+        assert not readers[3].done()
+    finally:
+        if not owner_task.done():
+            owner_task.cancel()
+        for reader in readers:
+            if not reader.done():
+                reader.cancel()
+        await asyncio.gather(owner_task, *readers, return_exceptions=True)
+
+    committed = await execute_command()
+    assert committed["replayed"] is False
+    assert await store.load_draft_owner_fact(draft_id, "draft.closed") is not None
+    assert await store.is_draft_session_terminal(draft_id, 1) is True
+    assert [event.sequence for event in await store.read_draft_session_events(draft_id, 0)] == [1]
+
+
 def test_session_event_projection_discards_internal_details_and_redacts_secret() -> None:
     registry = SecretRegistry()
     registry.register("sensitive-token")
