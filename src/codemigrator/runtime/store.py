@@ -155,6 +155,12 @@ class RuntimeStore(Protocol):
     ) -> CasObject | None:
         """Load a durable owner reference to an opaque CAS object."""
 
+    async def list_checkpoint_indexes(
+        self, thread_id: str | None = None, namespace: str | None = None
+    ) -> tuple[CheckpointIndex, ...]:
+        """Load checkpoint references without retrieving CAS checkpoint bodies."""
+        ...
+
     async def commit_agent_run_receipt(
         self,
         record: AgentRun,
@@ -552,7 +558,14 @@ class InMemoryRuntimeStore:
             if key[:3] == (thread_id, namespace, checkpoint_id)
         )
 
-    async def delete_checkpoint_thread(self, thread_id: str) -> tuple[CasObject, ...]:
+    async def delete_checkpoint_thread(
+        self,
+        thread_id: str,
+        *,
+        graph_family: str,
+        owner_kind: str,
+        owner_id: UUID,
+    ) -> tuple[CasObject, ...]:
         async with self._agent_lock:
             indexes: list[CheckpointIndex | PendingWriteIndex] = []
             indexes.extend(
@@ -561,6 +574,12 @@ class InMemoryRuntimeStore:
             indexes.extend(
                 item for item in self._pending_writes.values() if item.thread_id == thread_id
             )
+            if any(
+                (item.graph_family, item.owner_kind, item.owner_id)
+                != (graph_family, owner_kind, owner_id)
+                for item in indexes
+            ):
+                raise ValueError("checkpoint owner identity mismatch")
             for item in indexes:
                 self._cas_refs.pop((item.owner_kind, item.owner_id, item.reference_key), None)
             self._checkpoints = {
@@ -1486,15 +1505,29 @@ class PostgreSQLRuntimeStore:
             for row in rows
         )
 
-    async def delete_checkpoint_thread(self, thread_id: str) -> tuple[CasObject, ...]:
+    async def delete_checkpoint_thread(
+        self,
+        thread_id: str,
+        *,
+        graph_family: str,
+        owner_kind: str,
+        owner_id: UUID,
+    ) -> tuple[CasObject, ...]:
         async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 thread = await connection.fetchrow(
-                    "SELECT owner_kind, owner_id FROM graph_threads WHERE thread_id=$1 FOR UPDATE",
+                    """SELECT graph_family, owner_kind, owner_id FROM graph_threads
+                    WHERE thread_id=$1 FOR UPDATE""",
                     UUID(thread_id),
                 )
                 if thread is None:
                     return ()
+                if (
+                    str(_row_value(thread, "graph_family")),
+                    str(_row_value(thread, "owner_kind")),
+                    _row_value(thread, "owner_id"),
+                ) != (graph_family, owner_kind, owner_id):
+                    raise ValueError("checkpoint owner identity mismatch")
                 indexes = await _list_checkpoint_indexes_with_connection(
                     connection, thread_id, None
                 )

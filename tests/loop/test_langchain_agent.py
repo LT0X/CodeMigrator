@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from uuid import uuid4
@@ -16,9 +17,11 @@ from codemigrator.core import (
     Phase,
     SessionBudgetProfile,
     SessionKind,
+    canonical_json_bytes,
     load_resource,
 )
 from codemigrator.core.models.plan import PlanProposal
+from codemigrator.runtime import langchain_agent
 from codemigrator.runtime.agent_runs import AgentRun
 from codemigrator.runtime.binding import LockedModelBinding
 from codemigrator.runtime.context import ContextEnvelope, ContextSegment
@@ -110,6 +113,32 @@ class CountingRegistry(ProviderRegistry):
         return super().resolve(binding)
 
 
+def test_agent_tool_definitions_exposes_the_exact_structured_plan_schema() -> None:
+    definition_builder = getattr(langchain_agent, "agent_tool_definitions", None)
+    assert callable(definition_builder)
+    definitions = definition_builder(
+        phase=Phase.Plan,
+        session_kind=SessionKind.PlanAuxiliary,
+        owner_kind="run",
+        response_format=PlanProposal,
+    )
+
+    assert tuple(definition.name for definition in definitions) == (
+        "ReadFile",
+        "QuerySourceAst",
+        "Exec",
+        "PlanProposal",
+    )
+    proposal = definitions[-1]
+    assert proposal.parameters["additionalProperties"] is False
+    assert set(proposal.parameters["properties"]) == {
+        "slices",
+        "edges",
+        "integration_ranks",
+        "planner_rationale",
+    }
+
+
 def _binding(profile=ModelProfile.Reasoning):
     return LockedModelBinding(
         provider_id="openai-compatible",
@@ -158,6 +187,56 @@ def _context_identity(run, binding):
         phase_policy_sha256="2" * 64,
         contract_refs_sha256="3" * 64,
     )
+
+
+def test_agent_context_digest_keeps_legacy_hash_without_plan_material() -> None:
+    binding = _binding()
+    run = _run(binding)
+    identity = _context_identity(run, binding)
+    template = "plan role"
+    template_sha256 = agent_template_digest(session=run.session_kind.value, template=template)
+    envelope = ContextEnvelope()
+    budget = SessionBudgetCatalog.from_core().profile(run.session_kind)
+
+    legacy_identity = identity.model_dump(mode="json", by_alias=True)
+    legacy_identity.pop("planning_material_sha256")
+    legacy_identity["template_sha256"] = template_sha256
+    expected = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "phase": run.phase.value,
+                "session_kind": run.session_kind.value,
+                "template_sha256": template_sha256,
+                "context_identity": legacy_identity,
+                "envelope": {"stable": [], "evolving": [], "targeted": []},
+                "budget": {
+                    "session": budget.session.value,
+                    "max_rounds": budget.max_rounds,
+                    "eviction_watermark_pct": budget.eviction_watermark_pct,
+                },
+            }
+        )
+    ).hexdigest()
+
+    assert agent_context_digest(
+        context_identity=identity,
+        envelope=envelope,
+        phase=run.phase,
+        session_kind=run.session_kind,
+        template_sha256=template_sha256,
+        budget=budget,
+    ) == expected
+    plan_material_identity = identity.model_copy(
+        update={"planning_material_sha256": "f" * 64}
+    )
+    assert agent_context_digest(
+        context_identity=plan_material_identity,
+        envelope=envelope,
+        phase=run.phase,
+        session_kind=run.session_kind,
+        template_sha256=template_sha256,
+        budget=budget,
+    ) != expected
 
 
 _default_usage_sink = UsageSink()

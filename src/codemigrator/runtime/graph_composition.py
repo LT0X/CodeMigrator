@@ -9,6 +9,8 @@ from uuid import UUID
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from codemigrator.core import RunId
+
 from .actor import RunActor
 from .cas import CasReferenceStore, FileHostCAS
 from .checkpointer import CasCheckpointSaver
@@ -102,6 +104,37 @@ class AgentGraphInfrastructure:
                     f"production {name} must use the application host CAS"
                 )
 
+    def run_checkpointer_for(self, run_id: RunId) -> BaseCheckpointSaver[Any]:
+        if not isinstance(run_id, UUID):
+            raise RuntimeGraphConfigurationError("Run checkpointer requires a UUID RunId")
+        return self._checkpointer_for_owner(
+            self.run_checkpointer, owner_kind="run", owner_id=run_id
+        )
+
+    def agent_run_checkpointer_for(
+        self, owner_kind: str, owner_id: UUID
+    ) -> BaseCheckpointSaver[Any]:
+        if owner_kind not in {"run", "draft"} or not isinstance(owner_id, UUID):
+            raise RuntimeGraphConfigurationError("AgentRun checkpointer owner is invalid")
+        return self._checkpointer_for_owner(
+            self.agent_run_checkpointer, owner_kind=owner_kind, owner_id=owner_id
+        )
+
+    def draft_checkpointer_for(self, draft_id: UUID) -> BaseCheckpointSaver[Any]:
+        if not isinstance(draft_id, UUID):
+            raise RuntimeGraphConfigurationError("Draft checkpointer requires a UUID DraftId")
+        return self._checkpointer_for_owner(
+            self.draft_graph_checkpointer, owner_kind="draft", owner_id=draft_id
+        )
+
+    @staticmethod
+    def _checkpointer_for_owner(
+        prototype: BaseCheckpointSaver[Any], *, owner_kind: str, owner_id: UUID
+    ) -> BaseCheckpointSaver[Any]:
+        if isinstance(prototype, CasCheckpointSaver):
+            return prototype.for_owner(owner_kind=owner_kind, owner_id=owner_id)
+        return prototype
+
 
 PlanStageFactory = Callable[[AgentGraphInfrastructure, RunGraphActorPort], PlanStagePort]
 DeterministicStageFactory = Callable[
@@ -146,6 +179,9 @@ class RuntimeGraphAssembly:
         self.create_run_service_factory = create_run_service_factory
 
     def build_run_graph(self, actor: RunGraphActorPort) -> RunWorkflowGraph:
+        run_id = getattr(actor, "run_id", None)
+        if not isinstance(run_id, UUID):
+            raise RuntimeGraphConfigurationError("Run graph actor must expose a UUID RunId")
         planner = self.plan_stage_factory(self.infrastructure, actor)
         verifier = self.verifier_factory(self.infrastructure, actor)
         reporter = self.reporter_factory(self.infrastructure, actor)
@@ -156,7 +192,7 @@ class RuntimeGraphAssembly:
             planner=planner,
             verifier=verifier,
             reporter=reporter,
-            checkpointer=self.infrastructure.run_checkpointer,
+            checkpointer=self.infrastructure.run_checkpointer_for(RunId(run_id)),
         )
 
     def build_run_graph_starter(
@@ -189,8 +225,10 @@ class RuntimeGraphAssembly:
         return MigrationSessionGraph(
             owner=owner,
             agent_runs=self.infrastructure.runtime_store,
-            checkpointer=self.infrastructure.draft_graph_checkpointer,
-            agent_checkpointer=self.infrastructure.agent_run_checkpointer,
+            checkpointer=self.infrastructure.draft_checkpointer_for(owner.draft_id),
+            agent_checkpointer=self.infrastructure.agent_run_checkpointer_for(
+                "draft", owner.draft_id
+            ),
             create_run_service=create_run_service,
             agent_runner=runner,
         )

@@ -40,6 +40,9 @@ class ContextPackIdentity(CoreModel):
     model_binding_sha256: Sha256
     phase_policy_sha256: Sha256
     contract_refs_sha256: Sha256
+    planning_material_sha256: Sha256 = Field(
+        default=Sha256("0" * 64), pattern=r"^[0-9a-f]{64}$"
+    )
     plan_revision_sha256: Sha256 = Field(default=Sha256("0" * 64), pattern=r"^[0-9a-f]{64}$")
     skill_catalog_sha256: Sha256 = Field(default=Sha256("0" * 64), pattern=r"^[0-9a-f]{64}$")
     # Zero is the backwards-compatible value for callers that predate the

@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
+from codemigrator.core import RunId
 from codemigrator.runtime.cas import FileHostCAS
 from codemigrator.runtime.checkpointer import CasCheckpointSaver
 from codemigrator.runtime.graph_composition import (
@@ -136,7 +137,7 @@ def test_assembly_compiles_both_graphs_with_the_injected_runtime_dependencies(tm
         draft_agent_runner_factory=draft_runner_factory,
         create_run_service_factory=create_run_factory,
     )
-    actor = SimpleNamespace()
+    actor = SimpleNamespace(run_id=RunId(uuid4()))
     run_graph = assembly.build_run_graph(actor)
     owner = SimpleNamespace(draft_id=uuid4(), freeze_receipt=None)
     draft_graph = assembly.build_draft_graph(owner)
@@ -155,6 +156,59 @@ def test_assembly_compiles_both_graphs_with_the_injected_runtime_dependencies(tm
         "draft_runner",
         "create_run",
     }
+
+
+def test_durable_run_graph_checkpointer_is_scoped_to_the_actor_run_id(tmp_path):
+    infra = durable_infrastructure(tmp_path)
+    assembly = assembly_for(infra)
+    first_run_id = RunId(uuid4())
+    second_run_id = RunId(uuid4())
+
+    first = assembly.build_run_graph(SimpleNamespace(run_id=first_run_id))
+    second = assembly.build_run_graph(SimpleNamespace(run_id=second_run_id))
+
+    assert first.checkpointer is not second.checkpointer
+    assert first.checkpointer.owner_kind == "run"
+    assert first.checkpointer.owner_id == first_run_id
+    assert second.checkpointer.owner_kind == "run"
+    assert second.checkpointer.owner_id == second_run_id
+    assert first.checkpointer.store is infra.runtime_store
+    assert second.checkpointer.store is infra.runtime_store
+    assert first.checkpointer.cas is infra.host_cas
+    assert second.checkpointer.cas is infra.host_cas
+
+
+def test_durable_draft_and_agent_checkpointers_are_scoped_to_the_owner(tmp_path):
+    infra = durable_infrastructure(tmp_path)
+    assembly = assembly_for(infra)
+    first_draft_id = uuid4()
+    second_draft_id = uuid4()
+
+    first_draft = assembly.build_draft_graph(
+        SimpleNamespace(draft_id=first_draft_id, freeze_receipt=None)
+    )
+    second_draft = assembly.build_draft_graph(
+        SimpleNamespace(draft_id=second_draft_id, freeze_receipt=None)
+    )
+    run_agent_checkpointer = infra.agent_run_checkpointer_for("run", uuid4())
+    draft_agent_checkpointer = infra.agent_run_checkpointer_for("draft", first_draft_id)
+
+    assert first_draft.checkpointer.owner_kind == "draft"
+    assert first_draft.checkpointer.owner_id == first_draft_id
+    assert second_draft.checkpointer.owner_id == second_draft_id
+    assert first_draft.checkpointer is not second_draft.checkpointer
+    assert first_draft.agent_checkpointer.owner_kind == "draft"
+    assert first_draft.agent_checkpointer.owner_id == first_draft_id
+    assert run_agent_checkpointer.owner_kind == "run"
+    assert draft_agent_checkpointer.owner_kind == "draft"
+    assert run_agent_checkpointer.owner_id != draft_agent_checkpointer.owner_id
+
+
+def test_durable_run_saver_rejects_non_run_owner(tmp_path):
+    infra = durable_infrastructure(tmp_path)
+
+    with pytest.raises(ValueError, match="Run graph checkpoints require a Run owner"):
+        infra.run_checkpointer.for_owner(owner_kind="draft", owner_id=uuid4())
 
 
 def test_run_graph_starter_is_bound_to_assembly_and_requires_durable_attestation(tmp_path):

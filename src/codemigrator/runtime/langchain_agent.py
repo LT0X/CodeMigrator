@@ -128,16 +128,18 @@ def agent_toolset_digest(
 
     if owner_kind not in {"run", "draft"}:
         raise ValueError("AgentRun owner kind must be run or draft")
+    definitions = agent_tool_definitions(
+        phase=phase,
+        session_kind=session_kind,
+        owner_kind=owner_kind,
+    )
     toolset = tuple(
         {
             "name": definition.name,
             "description": definition.description,
             "parameters": dict(definition.parameters),
         }
-        for definition in (
-            _tool_definition(name)
-            for name in allowed_tool_names(phase, session_kind, draft=owner_kind == "draft")
-        )
+        for definition in definitions
     )
     payload = {
         "policy_resource": "core://phase-tool-policy/v2",
@@ -164,6 +166,30 @@ def agent_toolset_digest(
     ).hexdigest()
 
 
+def agent_tool_definitions(
+    *,
+    phase: Phase,
+    session_kind: SessionKind,
+    owner_kind: str,
+    response_format: type[BaseModel] | None = None,
+) -> tuple[ToolDefinition, ...]:
+    """Return the exact closed schemas used for one phase/session AgentRun."""
+
+    if owner_kind not in {"run", "draft"}:
+        raise ValueError("AgentRun owner kind must be run or draft")
+    if response_format is not None and (
+        not isinstance(response_format, type) or not issubclass(response_format, BaseModel)
+    ):
+        raise TypeError("structured response format must be a Pydantic model class")
+    definitions = tuple(
+        _tool_definition(name)
+        for name in allowed_tool_names(phase, session_kind, draft=owner_kind == "draft")
+    )
+    if response_format is None:
+        return definitions
+    return (*definitions, _structured_output_tool_definition(response_format))
+
+
 def _structured_output_tool_definition(schema: type[BaseModel]) -> ToolDefinition:
     json_schema = schema.model_json_schema()
     return ToolDefinition(
@@ -186,6 +212,10 @@ def agent_context_digest(
 
     if isinstance(context_identity, ContextPackIdentity):
         identity: dict[str, object] = context_identity.model_dump(mode="json", by_alias=True)
+        if identity.get("planning_material_sha256") == "0" * 64:
+            # Preserve persisted digests for non-PLAN AgentRuns created before
+            # this optional PLAN identity component existed.
+            identity.pop("planning_material_sha256", None)
         identity["template_sha256"] = template_sha256
     elif isinstance(context_identity, DraftContextIdentity):
         identity = {
@@ -638,12 +668,17 @@ def create_bound_agent(
         raise ValueError("gateway context differs from AgentRun")
     if agent_run.phase in (Phase.Verify, Phase.Report):
         raise ValueError("deterministic phases cannot create an AgentRun model")
-    tool_names = allowed_tool_names(
-        agent_run.phase, agent_run.session_kind, draft=agent_run.owner_kind == "draft"
-    )
-    definitions = tuple(_tool_definition(name) for name in tool_names)
     if response_format is not None and not isinstance(response_format, type):
         raise TypeError("structured response format must be a Pydantic model class")
+    schema_definitions = agent_tool_definitions(
+        phase=agent_run.phase,
+        session_kind=agent_run.session_kind,
+        owner_kind=agent_run.owner_kind,
+        response_format=response_format,
+    )
+    definitions = schema_definitions[: len(allowed_tool_names(
+        agent_run.phase, agent_run.session_kind, draft=agent_run.owner_kind == "draft"
+    ))]
     if (
         agent_toolset_digest(
             phase=agent_run.phase,
@@ -656,10 +691,6 @@ def create_bound_agent(
         raise ValueError("AgentRun toolset digest differs from the authorized tool schemas")
     counter = context_manager.token_counter
     count_schemas = getattr(counter, "count_tool_schemas", None)
-    structured_definition = (
-        _structured_output_tool_definition(response_format) if response_format is not None else None
-    )
-    schema_definitions = definitions + ((structured_definition,) if structured_definition else ())
     if schema_definitions and not callable(count_schemas):
         raise ContextBudgetError(
             "exact provider tool schema counter is required", code="CONTEXT_CAPABILITY_INVALID"
@@ -788,6 +819,7 @@ __all__ = [
     "ProviderChatModel",
     "agent_context_digest",
     "agent_template_digest",
+    "agent_tool_definitions",
     "agent_toolset_digest",
     "allowed_tool_names",
     "create_bound_agent",

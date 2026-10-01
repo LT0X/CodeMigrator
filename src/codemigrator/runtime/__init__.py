@@ -183,6 +183,12 @@ from .observability import (
     SentinelSuite,
     serialize_observation,
 )
+from .plan_agent import (
+    PersistentPlanAgentSessionFactory,
+    PersistentPlanStageFactory,
+    PlanSessionMaterial,
+    PlanSessionMaterialLoader,
+)
 from .project_migration import (
     OpenAIProjectTranslator,
     ProjectMigrationReport,
@@ -383,8 +389,12 @@ __all__ = [
     "ProjectMigrationRunner",
     "PlannerAdvisor",
     "PlanAgentCompletion",
+    "PersistentPlanAgentSessionFactory",
+    "PersistentPlanStageFactory",
     "PlanProposalRejected",
     "PlanProposalWorkflow",
+    "PlanSessionMaterial",
+    "PlanSessionMaterialLoader",
     "ProjectMigrationPipeline",
     "ProjectMigrationPipelineReport",
     "ProjectMigrationPipelineRequest",

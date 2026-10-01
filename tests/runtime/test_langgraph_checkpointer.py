@@ -75,6 +75,30 @@ async def test_checkpoint_and_pending_writes_survive_saver_restart(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_owner_scoped_saver_cannot_delete_another_owners_thread(tmp_path: Path):
+    store = InMemoryRuntimeStore()
+    cas = FileHostCAS(tmp_path)
+    owner_a, owner_b = uuid4(), uuid4()
+    saver_a = CasCheckpointSaver(
+        cas, store, graph_family="agent", owner_kind="run", owner_id=owner_a
+    )
+    saver_b = CasCheckpointSaver(
+        cas, store, graph_family="agent", owner_kind="run", owner_id=owner_b
+    )
+    thread = str(uuid4())
+    await saver_a.aput(
+        config(thread), checkpoint(str(uuid4()), "owner-a"), {"source": "input"}, {}
+    )
+
+    with pytest.raises(ValueError, match="checkpoint owner identity mismatch"):
+        await saver_b.adelete_thread(thread)
+
+    restored = await saver_a.aget_tuple(config(thread))
+    assert restored is not None
+    assert restored.checkpoint["channel_values"]["value"] == "owner-a"
+
+
+@pytest.mark.asyncio
 async def test_namespace_isolation_filter_before_and_delete(tmp_path: Path):
     store = InMemoryRuntimeStore()
     instance = saver(tmp_path, store)
@@ -148,3 +172,31 @@ async def test_pending_write_freezes_thread_owner_before_checkpoint(tmp_path: Pa
     second = saver(tmp_path, store, uuid4())
     with pytest.raises(StoreCommitError, match="another owner"):
         await second.aput(config(thread), checkpoint(checkpoint_id, "intruder"), {}, {})
+
+
+@pytest.mark.asyncio
+async def test_owner_scoped_saver_cannot_delete_another_owners_pending_write_only_thread(
+    tmp_path: Path,
+):
+    store = InMemoryRuntimeStore()
+    cas = FileHostCAS(tmp_path)
+    thread = str(uuid4())
+    checkpoint_id = str(uuid4())
+    owner_a, owner_b = uuid4(), uuid4()
+    saver_a = CasCheckpointSaver(
+        cas, store, graph_family="agent", owner_kind="run", owner_id=owner_a
+    )
+    saver_b = CasCheckpointSaver(
+        cas, store, graph_family="agent", owner_kind="run", owner_id=owner_b
+    )
+    await saver_a.aput_writes(config(thread, checkpoint_id), [("result", "private")], "task-1")
+
+    with pytest.raises(ValueError, match="checkpoint owner identity mismatch"):
+        await saver_b.adelete_thread(thread)
+
+    pending = await store.list_pending_write_indexes(thread, "", checkpoint_id)
+    assert len(pending) == 1
+    assert cas.read(pending[0].object) != b""
+    await saver_a.adelete_thread(thread)
+    assert await store.list_pending_write_indexes(thread, "", checkpoint_id) == ()
+    assert list(cas.iter_objects()) == []

@@ -21,6 +21,8 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
+from codemigrator.core.models.plan import PlanProposal
+
 from .cas import CasObject, CheckpointIndex, FileHostCAS, PendingWriteIndex
 
 
@@ -33,7 +35,14 @@ class CheckpointIndexStore(Protocol):
     async def list_pending_write_indexes(
         self, thread_id: str, namespace: str, checkpoint_id: str
     ) -> tuple[PendingWriteIndex, ...]: ...
-    async def delete_checkpoint_thread(self, thread_id: str) -> tuple[CasObject, ...]: ...
+    async def delete_checkpoint_thread(
+        self,
+        thread_id: str,
+        *,
+        graph_family: str,
+        owner_kind: str,
+        owner_id: UUID,
+    ) -> tuple[CasObject, ...]: ...
     async def referenced_digests(self) -> frozenset[str]: ...
 
 
@@ -79,7 +88,12 @@ class CasCheckpointSaver(BaseCheckpointSaver[str]):
     ) -> None:
         # An empty module allowlist rejects untrusted Python object imports on read.
         super().__init__(
-            serde=JsonPlusSerializer(pickle_fallback=False, allowed_msgpack_modules=[])
+            serde=JsonPlusSerializer(
+                pickle_fallback=False,
+                # PLAN's structured AgentState result is a trusted core contract.
+                # Everything else remains blocked unless explicitly added here.
+                allowed_msgpack_modules=[PlanProposal],
+            )
         )
         if graph_family not in {"run", "draft", "agent"}:
             raise ValueError("unknown graph family")
@@ -90,6 +104,21 @@ class CasCheckpointSaver(BaseCheckpointSaver[str]):
         self.graph_family = graph_family
         self.owner_kind = owner_kind
         self.owner_id = owner_id
+
+    def for_owner(self, *, owner_kind: str, owner_id: UUID) -> CasCheckpointSaver:
+        """Create an isolated saver bound to one graph owner's CAS references."""
+
+        if self.graph_family == "run" and owner_kind != "run":
+            raise ValueError("Run graph checkpoints require a Run owner")
+        if self.graph_family == "draft" and owner_kind != "draft":
+            raise ValueError("Draft graph checkpoints require a Draft owner")
+        return CasCheckpointSaver(
+            self.cas,
+            self.store,
+            graph_family=self.graph_family,
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+        )
 
     def _encode(self, value: Any) -> bytes:
         type_name, payload = self.serde.dumps_typed(value)
@@ -255,7 +284,12 @@ class CasCheckpointSaver(BaseCheckpointSaver[str]):
 
     async def adelete_thread(self, thread_id: str) -> None:
         _config_parts(_saved_config(thread_id, "", ""))
-        candidates = await self.store.delete_checkpoint_thread(thread_id)
+        candidates = await self.store.delete_checkpoint_thread(
+            thread_id,
+            graph_family=self.graph_family,
+            owner_kind=self.owner_kind,
+            owner_id=self.owner_id,
+        )
         for item in candidates:
             async with self.cas.lock(item.digest):
                 if item.digest not in await self.store.referenced_digests():

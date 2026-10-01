@@ -34,7 +34,17 @@ class _RunState(TypedDict, total=False):
 
 
 class RunGraphActorPort(Protocol):
+    run_id: RunId
+
     async def has_receipt(self, run_id: RunId, receipt_key: str) -> bool: ...
+
+    async def record_agent_run_started(
+        self, run_id: RunId, agent_run_id: AgentRunId
+    ) -> ActorPhaseReceipt: ...
+
+    async def accept_plan(
+        self, run_id: RunId, completion: PlanAgentCompletion, frozen_plan: FrozenPlan
+    ) -> ActorPhaseReceipt: ...
 
     async def advance_execution_round(
         self, run_id: RunId, logical_key: str
@@ -67,7 +77,9 @@ class PlanAgentCompletion:
 
 class PlanAgentSessionPort(Protocol):
     agent_run: AgentRun
-    inputs: PlanningInputs
+
+    @property
+    def inputs(self) -> PlanningInputs: ...
 
     async def propose(self, feedback: tuple[object, ...]) -> PlanProposal: ...
 
@@ -81,6 +93,8 @@ class PlanAgentSessionFactory(Protocol):
 
 
 class PlanOwnerPort(Protocol):
+    run_id: RunId
+
     async def record_agent_run_started(
         self, run_id: RunId, agent_run_id: AgentRunId
     ) -> ActorPhaseReceipt: ...
