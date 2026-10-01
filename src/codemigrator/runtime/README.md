@@ -30,6 +30,12 @@ EXECUTE 的可组合实现由 `PersistentExecutionScheduler`、`PersistentExecut
 
 PLAN factory 以 `plan:{RunId}` 作为 logical task key，并核对 loader 的冻结工件与 Run 已提交的 CreateRun 请求一致。`PlanSessionMaterial` 在构造时捕获完整 `PlanningInputs` 规范 JSON 快照，完整 payload digest（包含分析事实与 `snapshot_oid`）绑定到 PLAN AgentRun context identity；同任务键的不同输入不能恢复到旧 thread。all-zero optional planning digest 不进入通用 AgentRun digest，以保持既有非 PLAN session 的恢复 identity 稳定。结构化 `PlanProposal` schema 纳入 toolset digest 与精确 schema token budget；CAS checkpoint 反序列化只显式允许该受信 core 类型，pickle fallback 保持关闭。Run、Draft、AgentRun 的 CAS saver 实例按 owner 单独绑定；thread 删除把 graph family 与 owner identity 传入 store，PostgreSQL 在锁定 graph-thread 行的同一事务中校验并删除 checkpoint 与 pending-write-only 索引。
 
+## Provider 响应失败边界
+
+OpenAI-compatible 与 Anthropic HTTP client 默认使用 10 秒 connect/write/pool timeout 和 120 秒 read timeout，宿主仍可注入覆盖值。`ProviderError.failure_code` 仅接受内部固定类别；`http_status_NNN` 限定为 100–599，范围外的状态收敛为 `http_status_out_of_range`。这些内部类别不扩展 M-00 公共错误契约。usage receipt 先记录，再检查模型完成原因与结构化工具参数；`length`、Anthropic `max_tokens`、`model_context_window_exceeded`、非 JSON 参数和非对象参数都 fail closed，且不会 dispatch ToolGateway。Provider adapter 将 JSON 中非字符串的 arguments 重新序列化后交给 bridge，使格式校验失败仍可先记录实际 usage。
+
+生产 PLAN 的 OpenCode 兼容性必须经 `POST /api/v1/migrations`、Run graph、AgentRun 与 Actor acceptance 完整验证。当前实测出现无 tool call 的普通文本与被长度上限截断的 tool-call JSON；这只能证明本次请求没有完成结构化协议，不能据此断言 provider 不支持工具调用。测试诊断只记录固定 failure code、异常类型/栈位置以及布尔形状标记和有界数字，不回显 provider 返回的 tool 名或 finish reason，也不记录 provider body、prompt、凭据或源码。8192 输出 cap 与 150 秒等待配置仍需后续真实 API 单请求复验。
+
 ## 观测装配
 
 `codemigrator.runtime.observability` 提供运行时观测组合件：事件经统一的 `SecretRegistry` 脱敏后，以 structlog JSONL、进程内核心指标、60 秒快照、固定名称 trace span 和可选的有界 exporter 投影。JSONL 按 64 MiB 分段并写 SHA-256 校验；事件正文上限为 64 KiB，超限只能外置为受控 ArtifactRef。exporter 队列容量为 4096，故障或积压只增加 dropped 计数，不反向修改 Run 状态。

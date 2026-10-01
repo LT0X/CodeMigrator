@@ -48,6 +48,17 @@ def test_provider_retry_hints_are_bounded_to_three_frozen_delays() -> None:
     assert [retry_delay_for_attempt(attempt) for attempt in (1, 2, 3, 4)] == [30, 60, 120, 120]
 
 
+@pytest.mark.parametrize(
+    "failure_code",
+    ["secret_text", "http_status_060", "http_status_600", "http_status_0401"],
+)
+def test_provider_error_rejects_codes_outside_the_fixed_category_set(
+    failure_code: str,
+) -> None:
+    with pytest.raises(ValueError, match="fixed safe category"):
+        ProviderError("provider request failed", retryable=False, failure_code=failure_code)
+
+
 def test_provider_registry_resolves_only_the_locked_provider() -> None:
     class StubProvider:
         async def complete(self, request: ProviderRequest):
@@ -150,6 +161,135 @@ async def test_openai_compatible_provider_maps_request_and_usage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openai_provider_classifies_invalid_json_without_exposing_body() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="private upstream detail")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderError) as caught:
+        await OpenAICompatibleProvider(
+            endpoint="https://provider.invalid/v1",
+            api_key="secret",
+            client=client,
+        ).complete(_request(_binding()))
+    await client.aclose()
+
+    assert caught.value.failure_code == "invalid_json"
+    assert "private upstream detail" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_classifies_model_identity_mismatch() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-1",
+                "model": "different-model",
+                "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderError) as caught:
+        await OpenAICompatibleProvider(
+            endpoint="https://provider.invalid/v1",
+            api_key="secret",
+            client=client,
+        ).complete(_request(_binding()))
+    await client.aclose()
+
+    assert caught.value.failure_code == "model_identity_mismatch"
+    assert "different-model" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_preserves_json_array_tool_arguments_for_usage_recording() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-invalid-args",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {"name": "PlanProposal", "arguments": []},
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        response = await OpenAICompatibleProvider(
+            endpoint="https://provider.invalid/v1",
+            api_key="synthetic",
+            client=client,
+        ).complete(_request(_binding()))
+    finally:
+        await client.aclose()
+
+    assert response.tool_calls[0].arguments == "[]"
+    assert response.usage == TokenUsage(input_tokens=12, output_tokens=4)
+
+
+def test_openai_provider_uses_a_generation_friendly_default_timeout() -> None:
+    provider = OpenAICompatibleProvider(
+        endpoint="https://provider.invalid/v1",
+        api_key="synthetic",
+    )
+
+    assert provider._client.timeout.as_dict() == {
+        "connect": 10.0,
+        "read": 120.0,
+        "write": 10.0,
+        "pool": 10.0,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "failure_code"),
+    [
+        (httpx.ConnectTimeout, "connect_timeout"),
+        (httpx.ReadTimeout, "read_timeout"),
+        (httpx.RemoteProtocolError, "remote_protocol_error"),
+    ],
+)
+async def test_openai_provider_classifies_transport_failure_without_details(
+    error_type: type[httpx.HTTPError], failure_code: str
+) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        raise error_type("private transport detail")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderError) as caught:
+        await OpenAICompatibleProvider(
+            endpoint="https://provider.invalid/v1",
+            api_key="secret",
+            client=client,
+        ).complete(_request(_binding()))
+    await client.aclose()
+
+    assert caught.value.failure_code == failure_code
+    assert "private transport detail" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
 async def test_openai_provider_maps_langchain_any_tool_choice_to_required() -> None:
     seen: dict[str, object] = {}
 
@@ -226,12 +366,52 @@ async def test_anthropic_provider_keeps_system_separate_and_maps_usage() -> None
 
 
 @pytest.mark.asyncio
-async def test_provider_protocol_error_does_not_expose_response_body() -> None:
+async def test_anthropic_provider_preserves_max_tokens_stop_reason() -> None:
+    binding = LockedModelBinding(
+        provider_id="anthropic",
+        model_id="claude-test",
+        profile=ModelProfile.Code,
+        config_revision="r1",
+        context_window=1000,
+        output_cap=200,
+    )
+
     def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(502, text="private upstream detail")
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg-truncated",
+                "model": "claude-test",
+                "content": [],
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": 8, "output_tokens": 200},
+            },
+        )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    with pytest.raises(Exception) as caught:
+    try:
+        response = await AnthropicProvider(
+            endpoint="https://provider.invalid",
+            api_key="synthetic",
+            anthropic_version="2023-06-01",
+            client=client,
+        ).complete(_request(binding))
+    finally:
+        await client.aclose()
+
+    assert response.finish_reason == "max_tokens"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 502])
+async def test_provider_protocol_error_classifies_http_status_without_exposing_body(
+    status_code: int,
+) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, text="private upstream detail")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderError) as caught:
         await OpenAICompatibleProvider(
             endpoint="https://provider.invalid",
             api_key="secret",
@@ -239,5 +419,6 @@ async def test_provider_protocol_error_does_not_expose_response_body() -> None:
         ).complete(_request(_binding()))
     await client.aclose()
 
+    assert caught.value.failure_code == f"http_status_{status_code}"
     assert "private upstream detail" not in str(caught.value)
     assert "secret" not in str(caught.value)

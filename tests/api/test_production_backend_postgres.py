@@ -8,6 +8,7 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -30,6 +31,50 @@ from codemigrator.runtime.create_run import (
 from codemigrator.runtime.store import PostgreSQLRuntimeStore
 
 from .conftest import build_plan_agent_inputs, create_run_payload
+
+
+def _safe_provider_shape_for_diagnostics(request, response, *, content_is_plan_proposal: bool):
+    requested_names = frozenset(tool.name for tool in request.tools)
+    response_names = tuple(call.name for call in response.tool_calls)
+    finish_reason = response.finish_reason
+    truncated_reasons = {"length", "max_tokens", "model_context_window_exceeded"}
+    return {
+        "tool_choice_required": request.tool_choice == "any",
+        "request_tool_count": min(len(requested_names), 64),
+        "response_tool_count": min(len(response_names), 64),
+        "response_tools_match_request": all(
+            isinstance(name, str) and len(name) <= 64 and name in requested_names
+            for name in response_names
+        ),
+        "response_truncated": isinstance(finish_reason, str)
+        and len(finish_reason) <= 64
+        and finish_reason in truncated_reasons,
+        "response_content_length": min(len(response.content), 1_000_000)
+        if isinstance(response.content, str)
+        else 0,
+        "content_is_plan_proposal": bool(content_is_plan_proposal),
+    }
+
+
+def test_provider_shape_diagnostics_do_not_echo_untrusted_response_fields() -> None:
+    request = SimpleNamespace(
+        tool_choice="private request choice",
+        tools=(SimpleNamespace(name="ReadFile"),),
+    )
+    response = SimpleNamespace(
+        finish_reason="private finish reason marker",
+        tool_calls=(SimpleNamespace(name="private tool name marker"),),
+        content="private response body marker",
+    )
+
+    shape = _safe_provider_shape_for_diagnostics(
+        request, response, content_is_plan_proposal=False
+    )
+
+    assert shape["response_tools_match_request"] is False
+    assert shape["response_truncated"] is False
+    assert shape["response_content_length"] == len(response.content)
+    assert "private" not in repr(shape)
 
 
 async def noop_server_stop() -> None:
@@ -1407,6 +1452,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
     )
     from codemigrator.runtime.provider import (
         OpenAICompatibleProvider,
+        ProviderError,
         ProviderRegistry,
         ProviderResponse,
         ProviderToolCall,
@@ -1444,7 +1490,43 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
         release_plan = asyncio.Event()
         actors = []
         requests = []
+        provider_shapes = []
         stage_error_types = []
+
+        def safe_failure_code(error):
+            pending = [error]
+            seen = set()
+            while pending:
+                current = pending.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                if isinstance(current, ProviderError):
+                    return current.failure_code
+                for cause in (current.__cause__, current.__context__):
+                    if cause is not None:
+                        pending.append(cause)
+            return "unclassified"
+
+        def safe_failure_frames(error):
+            import traceback
+
+            frames = []
+            pending = [error]
+            seen = set()
+            while pending:
+                current = pending.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                frames.extend(
+                    (Path(frame.filename).name, frame.name, frame.lineno)
+                    for frame in traceback.extract_tb(current.__traceback__)
+                )
+                for cause in (current.__cause__, current.__context__):
+                    if cause is not None:
+                        pending.append(cause)
+            return tuple(frames[-12:])
 
         class StructuredProvider:
             async def complete(self, request):
@@ -1507,7 +1589,21 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
 
             async def complete(self, request):
                 requests.append(request)
-                return await self.delegate.complete(request)
+                response = await self.delegate.complete(request)
+                try:
+                    PlanProposal.model_validate_json(response.content)
+                except Exception:
+                    content_is_plan_proposal = False
+                else:
+                    content_is_plan_proposal = True
+                provider_shapes.append(
+                    _safe_provider_shape_for_diagnostics(
+                        request,
+                        response,
+                        content_is_plan_proposal=content_is_plan_proposal,
+                    )
+                )
+                return response
 
         real_opencode = os.environ.get("CODEMIGRATOR_REAL_OPENCODE", "").casefold() in {
             "1",
@@ -1544,7 +1640,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                 profile=ModelProfile.Reasoning,
                 config_revision=config_revision,
                 context_window=int(opencode["Context Window"]),
-                output_cap=min(2_048, int(opencode["模型输出上限"])),
+                output_cap=min(8_192, int(opencode["模型输出上限"])),
             )
             delegate = OpenAICompatibleProvider(
                 endpoint=str(opencode["Base URL"]), api_key=str(opencode["API Key"])
@@ -1657,7 +1753,13 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                         try:
                             receipt = await workflow.run(run_id)
                         except Exception as error:
-                            stage_error_types.append(type(error).__name__)
+                            stage_error_types.append(
+                                (
+                                    type(error).__name__,
+                                    safe_failure_code(error),
+                                    safe_failure_frames(error),
+                                )
+                            )
                             plan_result_ready.set()
                             raise
                         plan_result_ready.set()
@@ -1707,12 +1809,16 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                                 "Idempotency-Key": "production-plan-agent-run",
                             },
                         )
-                    assert response.status_code == 201
-                    run_id = RunId(UUID(response.json()["run_id"]))
-                    await asyncio.wait_for(plan_result_ready.wait(), timeout=45)
+                        assert response.status_code == 201
+                        run_id = RunId(UUID(response.json()["run_id"]))
+                        await asyncio.wait_for(
+                            plan_result_ready.wait(),
+                            timeout=150 if real_opencode else 45,
+                        )
                     assert not stage_error_types, (
                         "production PLAN stage failed with exception types: "
-                        f"{stage_error_types}"
+                        f"{stage_error_types}; provider_adapter_calls={len(requests)}; "
+                        f"provider_shapes={provider_shapes}"
                     )
                     assert entered_after_plan.is_set(), (
                         "production PLAN returned without reaching its acceptance pause"
