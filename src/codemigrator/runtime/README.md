@@ -28,6 +28,10 @@ EXECUTE 的可组合实现由 `PersistentExecutionScheduler`、`PersistentExecut
 
 外层图 checkpoint、AgentRun checkpoint 和候选代码 checkpoint 属于不同恢复边界。LangGraph checkpoint 正文经 host CAS 保存，PG 只保留索引与引用；Draft/只读会话可恢复既有 thread，EXECUTE/Repair 写会话从 M-08 候选代码 checkpoint 重建并创建新 AgentRun/thread。
 
+`DraftFlowOwner` 将 TaskDraftRevision、AskUser 与确认冻结事实保存在 Draft owner ledger；恢复方显式调用 `restore_ledger()`，从已提交 facts 校验并重建业务账本，CreateRun attach 只接纳已持久化且与当前 ledger 一致的 freeze receipt。根级生产 ASGI 提供 `draft_command_owner_factory` 与 `draft_graph_starter_factory` 两个宿主 seam；只有二者均构造成功时才开放 Draft 写命令。Draft owner fact、API 幂等回执和允许的 graph-start handoff 在同一 PostgreSQL 事务提交；提交后启动 graph，启动失败或进程中断留下的 PENDING handoff 在下次启动按 receipt 幂等恢复。Starter 的 receipt-category allowlist 在事实提交前校验，不支持的命令 fail closed。
+
+当前没有默认 M-16 Draft command owner/materializer，也没有从 HTTP message/answer/confirm DTO 到 DraftFlow service、AgentRun factories 与 CreateRun attach gate 的宿主实现。宿主必须按既有 M-16 契约提供上述两个 factory；仅实现注入 seam 和 handoff 恢复不等于生产 Draft Agent lifecycle 已完成。Web 的 Session SSE envelope/Last-Event-ID 回放保持在 API 层，图状态和 AgentState 不作为业务账本或公开响应。
+
 PLAN factory 以 `plan:{RunId}` 作为 logical task key，并核对 loader 的冻结工件与 Run 已提交的 CreateRun 请求一致。`PlanSessionMaterial` 在构造时捕获完整 `PlanningInputs` 规范 JSON 快照，完整 payload digest（包含分析事实与 `snapshot_oid`）绑定到 PLAN AgentRun context identity；同任务键的不同输入不能恢复到旧 thread。all-zero optional planning digest 不进入通用 AgentRun digest，以保持既有非 PLAN session 的恢复 identity 稳定。结构化 `PlanProposal` schema 纳入 toolset digest 与精确 schema token budget；CAS checkpoint 反序列化只显式允许该受信 core 类型，pickle fallback 保持关闭。Run、Draft、AgentRun 的 CAS saver 实例按 owner 单独绑定；thread 删除把 graph family 与 owner identity 传入 store，PostgreSQL 在锁定 graph-thread 行的同一事务中校验并删除 checkpoint 与 pending-write-only 索引。
 
 ## Provider 响应失败边界

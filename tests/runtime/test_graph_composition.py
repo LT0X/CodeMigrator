@@ -204,6 +204,18 @@ def test_durable_draft_and_agent_checkpointers_are_scoped_to_the_owner(tmp_path)
     assert run_agent_checkpointer.owner_id != draft_agent_checkpointer.owner_id
 
 
+def test_draft_graph_thread_identity_is_stable_across_rebuilds(tmp_path):
+    infra = durable_infrastructure(tmp_path)
+    assembly = assembly_for(infra)
+    draft_id = uuid4()
+    owner = SimpleNamespace(draft_id=draft_id, freeze_receipt=None)
+
+    first = assembly.build_draft_graph(owner)
+    restarted = assembly.build_draft_graph(owner)
+
+    assert first.thread_id == restarted.thread_id
+
+
 def test_durable_run_saver_rejects_non_run_owner(tmp_path):
     infra = durable_infrastructure(tmp_path)
 

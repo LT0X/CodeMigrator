@@ -68,8 +68,77 @@ class DraftLedger:
         return tuple(sorted(self._answers.values(), key=lambda answer: str(answer.question_id)))
 
     @property
+    def revisions(self) -> tuple[TaskDraftRevision, ...]:
+        return tuple(
+            sorted(self._revisions.values(), key=lambda revision: revision.revision_number)
+        )
+
+    @property
     def freeze_receipt(self) -> DraftFreezeReceipt | None:
         return self._freeze_receipt
+
+    @classmethod
+    def restore(
+        cls,
+        *,
+        revisions: Sequence[TaskDraftRevision],
+        questions: Sequence[AskUserQuestion],
+        answers: Sequence[AskUserAnswer],
+        freeze_receipt: DraftFreezeReceipt | None = None,
+    ) -> DraftLedger:
+        """Rebuild and validate the business ledger from durable Draft facts."""
+
+        ledger = cls()
+        ordered_revisions = sorted(revisions, key=lambda revision: revision.revision_number)
+        revision_ids: set[TaskDraftRevisionId] = set()
+        for expected_number, revision in enumerate(ordered_revisions, start=1):
+            if revision.revision_number != expected_number:
+                raise DraftConflictError("persisted Draft revisions must be contiguous")
+            if revision.revision_id in revision_ids:
+                raise DraftConflictError("persisted Draft revision id is duplicated")
+            try:
+                expected_snapshots = _artifact_snapshots(
+                    revision.artifacts, revision.revision_number
+                )
+            except (TypeError, ValueError) as exc:
+                raise DraftConflictError("persisted Draft revision artifacts are invalid") from exc
+            if revision.artifact_snapshots != expected_snapshots:
+                raise DraftConflictError("persisted Draft revision artifact snapshot mismatch")
+            revision_ids.add(revision.revision_id)
+            ledger._revisions[revision.revision_id] = revision.model_copy(deep=True)
+            ledger._current_revision_id = revision.revision_id
+
+        for question in questions:
+            if question.revision_id not in revision_ids:
+                raise DraftConflictError("persisted Draft question references an unknown revision")
+            if question.question_id in ledger._questions:
+                raise DraftConflictError("persisted Draft question id is duplicated")
+            ledger._questions[question.question_id] = question.model_copy(deep=True)
+
+        for answer in answers:
+            question_for_answer = ledger._questions.get(answer.question_id)
+            if question_for_answer is None:
+                raise DraftConflictError("persisted Draft answer references an unknown question")
+            if answer.question_id in ledger._answers:
+                raise DraftConflictError("persisted Draft answer id is duplicated")
+            if answer.revision_id != question_for_answer.revision_id:
+                raise DraftConflictError(
+                    "persisted Draft answer revision does not match its question"
+                )
+            _validate_answer_choice(question_for_answer, answer)
+            ledger._answers[answer.question_id] = answer.model_copy(deep=True)
+
+        if freeze_receipt is not None:
+            try:
+                computed = ledger.freeze(
+                    freeze_receipt.revision_id,
+                    answer_question_ids=freeze_receipt.answer_question_ids,
+                )
+            except DraftConflictError as exc:
+                raise DraftConflictError("persisted Draft freeze receipt is inconsistent") from exc
+            if computed != freeze_receipt:
+                raise DraftConflictError("persisted Draft freeze receipt does not match the ledger")
+        return ledger
 
     def create_revision(self, artifacts: DraftArtifacts) -> TaskDraftRevision:
         """Create the first revision, or revise the current one when already initialized."""
@@ -96,6 +165,8 @@ class DraftLedger:
             if previous == question:
                 return previous
             raise DraftConflictError("question id already exists")
+        if self._freeze_receipt is not None:
+            raise DraftConflictError("draft is already frozen")
         self._questions[question.question_id] = question
         return question
 
@@ -106,18 +177,15 @@ class DraftLedger:
             raise DraftConflictError("answer references an unknown question")
         if question.revision_id != answer.revision_id:
             raise DraftConflictError("answer is bound to a different revision")
-        if answer.selected_option is not None:
-            allowed = {option.key for option in question.options}
-            if answer.selected_option not in allowed:
-                raise DraftConflictError("answer selects an unknown option")
-        elif not question.allow_free_text:
-            raise DraftConflictError("free-text answer is not allowed")
+        _validate_answer_choice(question, answer)
 
         previous = self._answers.get(answer.question_id)
         if previous is not None:
             if _same_answer(previous, answer):
                 return previous
             raise DraftConflictError("answer conflicts with the existing answer")
+        if self._freeze_receipt is not None:
+            raise DraftConflictError("draft is already frozen")
         self._answers[answer.question_id] = answer
         return answer
 
@@ -480,6 +548,15 @@ def _same_answer(left: AskUserAnswer, right: AskUserAnswer) -> bool:
         and left.selected_option == right.selected_option
         and left.free_text == right.free_text
     )
+
+
+def _validate_answer_choice(question: AskUserQuestion, answer: AskUserAnswer) -> None:
+    if answer.selected_option is not None:
+        allowed = {option.key for option in question.options}
+        if answer.selected_option not in allowed:
+            raise DraftConflictError("answer selects an unknown option")
+    elif not question.allow_free_text:
+        raise DraftConflictError("free-text answer is not allowed")
 
 
 __all__ = [

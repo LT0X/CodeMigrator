@@ -38,6 +38,37 @@ describe("API boundary", () => {
     expect(new Headers(init?.headers).get("Idempotency-Key")).toBeTruthy();
   });
 
+  it("reads session events from the v1 envelope after the supplied replay cursor", async () => {
+    let requestUrl = "";
+    let requestInit: RequestInit | undefined;
+    const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      requestUrl = String(input);
+      requestInit = init;
+      return new Response(
+        'event: migration.session.event\nid: 8\ndata: {"schema":"migration.session.event","version":1,"type":"agent_run.started","sequence":8,"data":{"agent_run_id":"agent-1"},"timestamp_utc":"2026-10-01T10:00:00Z"}\n\n',
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      );
+    };
+    const received = [];
+
+    for await (const event of createApiClient({ baseUrl: "/api/v1", fetchImpl }).streamSessionEvents("session/1", 7)) {
+      received.push(event);
+    }
+
+    expect(requestUrl).toBe("/api/v1/sessions/session%2F1/events");
+    expect(new Headers(requestInit?.headers).get("Accept")).toBe("text/event-stream");
+    expect(new Headers(requestInit?.headers).get("Last-Event-ID")).toBe("7");
+    expect(received).toEqual([{
+      schema: "migration.session.event",
+      version: 1,
+      type: "agent_run.started",
+      sequence: 8,
+      data: { agent_run_id: "agent-1" },
+      timestamp_utc: "2026-10-01T10:00:00Z",
+      sse_id: "8",
+    }]);
+  });
+
   it("parses only bounded event envelope fields", () => {
     expect(parseSse('event: migration.event\nid: 2\ndata: {"schema":"migration.event","version":1,"type":"dispatch.started","sequence":2,"data":{"slice_id":"a"}}')).toEqual({
       type: "dispatch.started",

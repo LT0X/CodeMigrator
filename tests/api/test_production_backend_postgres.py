@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -28,6 +29,7 @@ from codemigrator.core import (
     StableErrorCode,
     canonical_json_bytes,
 )
+from codemigrator.core.models.plan import PlanProposal
 from codemigrator.runtime.actor import RunActor
 from codemigrator.runtime.contracts import (
     DraftSessionEventSpec,
@@ -48,7 +50,13 @@ from codemigrator.runtime.store import (
 from .conftest import build_frozen_plan, build_plan_agent_inputs, create_run_payload
 
 
-def _safe_provider_shape_for_diagnostics(request, response, *, content_is_plan_proposal: bool):
+def _safe_provider_shape_for_diagnostics(
+    request,
+    response,
+    *,
+    content_is_plan_proposal: bool,
+    tool_arguments_are_plan_proposal: bool = False,
+):
     requested_names = frozenset(tool.name for tool in request.tools)
     response_names = tuple(call.name for call in response.tool_calls)
     finish_reason = response.finish_reason
@@ -68,7 +76,91 @@ def _safe_provider_shape_for_diagnostics(request, response, *, content_is_plan_p
         if isinstance(response.content, str)
         else 0,
         "content_is_plan_proposal": bool(content_is_plan_proposal),
+        "tool_arguments_are_plan_proposal": bool(tool_arguments_are_plan_proposal),
     }
+
+
+def _safe_plan_proposal_argument_shape(raw_arguments: object) -> dict[str, object]:
+    """Summarize structured output validation without retaining provider data."""
+
+    fields = frozenset({"slices", "edges", "integration_ranks", "planner_rationale"})
+    if not isinstance(raw_arguments, str) or len(raw_arguments) > 1_000_000:
+        return {"root_kind": "unavailable", "known_field_count": 0, "missing_field_count": 4}
+    try:
+        value = json.loads(raw_arguments)
+    except (TypeError, ValueError):
+        return {"root_kind": "invalid_json", "known_field_count": 0, "missing_field_count": 4}
+    if not isinstance(value, dict):
+        return {"root_kind": "non_object", "known_field_count": 0, "missing_field_count": 4}
+
+    keys = set(value)
+    result: dict[str, object] = {
+        "root_kind": "object",
+        "known_field_count": min(len(keys & fields), 4),
+        "missing_field_count": min(len(fields - keys), 4),
+        "unknown_field_count": min(len(keys - fields), 64),
+    }
+    categories = {
+        "missing": "missing",
+        "extra_forbidden": "extra",
+        "enum": "enum",
+        "literal_error": "literal",
+        "value_error": "value",
+        "string_type": "type",
+        "int_type": "type",
+        "list_type": "type",
+        "dict_type": "type",
+    }
+    schema_fields: set[str] = set()
+
+    def visit_schema(node: object) -> None:
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            schema_fields.update(str(key) for key in properties)
+            for child in properties.values():
+                visit_schema(child)
+        items = node.get("items")
+        visit_schema(items)
+        definitions = node.get("$defs")
+        if isinstance(definitions, dict):
+            for child in definitions.values():
+                visit_schema(child)
+
+    visit_schema(PlanProposal.model_json_schema())
+    try:
+        PlanProposal.model_validate(value)
+    except Exception as error:
+        errors = (
+            error.errors(include_input=False, include_url=False)
+            if hasattr(error, "errors")
+            else ()
+        )
+        counts: dict[str, int] = {}
+        safe_paths = []
+        for item in errors:
+            category = categories.get(str(item.get("type")), "other")
+            counts[category] = min(counts.get(category, 0) + 1, 64)
+            path = []
+            for part in item.get("loc", ()):
+                if isinstance(part, int):
+                    path.append(min(max(part, 0), 1_000_000))
+                elif isinstance(part, str):
+                    path.append(part if part in schema_fields else "<field>")
+            safe_paths.append(tuple(path[:12]))
+        result["valid"] = False
+        result["validation_category_counts"] = counts
+        result["validation_exception_kind"] = (
+            type(error).__name__
+            if type(error).__name__ in {"ValidationError", "ValueError", "TypeError"}
+            else "other"
+        )
+        result["validation_paths"] = tuple(safe_paths[:16])
+    else:
+        result["valid"] = True
+        result["validation_category_counts"] = {}
+    return result
 
 
 def test_provider_shape_diagnostics_do_not_echo_untrusted_response_fields() -> None:
@@ -82,13 +174,32 @@ def test_provider_shape_diagnostics_do_not_echo_untrusted_response_fields() -> N
         content="private response body marker",
     )
 
-    shape = _safe_provider_shape_for_diagnostics(
-        request, response, content_is_plan_proposal=False
-    )
+    shape = _safe_provider_shape_for_diagnostics(request, response, content_is_plan_proposal=False)
 
     assert shape["response_tools_match_request"] is False
     assert shape["response_truncated"] is False
     assert shape["response_content_length"] == len(response.content)
+    assert "private" not in repr(shape)
+
+
+def test_plan_argument_shape_diagnostics_only_report_bounded_schema_metadata() -> None:
+    shape = _safe_plan_proposal_argument_shape(
+        json.dumps(
+            {
+                "slices": [],
+                "edges": [],
+                "integration_ranks": {},
+                "planner_rationale": [],
+                "private": "response body marker",
+            }
+        )
+    )
+
+    assert shape["root_kind"] == "object"
+    assert shape["known_field_count"] == 4
+    assert shape["missing_field_count"] == 0
+    assert shape["unknown_field_count"] == 1
+    assert "response body marker" not in repr(shape)
     assert "private" not in repr(shape)
 
 
@@ -392,6 +503,16 @@ class RecordingDraftSessionCommands:
         return await self._commit("session_confirm", session_id, 3, transaction)
 
 
+class RecordingDraftGraphStarter:
+    supported_receipt_categories = frozenset({"draft.api-command"})
+
+    def __init__(self) -> None:
+        self.receipts: list[tuple[UUID, str]] = []
+
+    async def start_graph(self, draft_id: UUID, receipt_key: str) -> None:
+        self.receipts.append((draft_id, receipt_key))
+
+
 class FailingDraftSessionCommands(RecordingDraftSessionCommands):
     async def create_session(self, payload, transaction):  # type: ignore[no-untyped-def]
         await super().create_session(payload, transaction)
@@ -451,9 +572,7 @@ async def test_create_receipt_replays_and_graph_handoff_recovers_after_restart()
         assert response_body["status"] == "PLANNING"
         assert preflight.calls == ["descriptor", "preindex", "dossier"]
         assert await store.read_run_events(run_id, 0)
-        assert await store.list_pending_graph_starts() == (
-            (run_id, f"run.created:{run_id}"),
-        )
+        assert await store.list_pending_graph_starts() == ((run_id, f"run.created:{run_id}"),)
 
         recovered_graph = RecordingGraphStarter()
         restarted_backend = ProductionApiBackend(
@@ -472,9 +591,10 @@ async def test_create_receipt_replays_and_graph_handoff_recovers_after_restart()
         assert len(recovered_graph.receipts) == 1
         assert recovered_graph.receipts[0].run_id == run_id
         assert await store.list_pending_graph_starts() == ()
-        assert [
-            event.event_type for event in await store.read_run_events(run_id, 0)
-        ] == ["run.created", "run.status_changed"]
+        assert [event.event_type for event in await store.read_run_events(run_id, 0)] == [
+            "run.created",
+            "run.status_changed",
+        ]
 
         replay_backend = ProductionApiBackend(
             store,
@@ -513,9 +633,7 @@ async def test_graph_effect_replay_after_handoff_mark_failure_is_receipt_idempot
         preflight = PassingPreflight()
         backend = ProductionApiBackend(
             store,
-            run_owner=RunCreationOwner(
-                store=store, preflight=preflight, graph_starter=graph
-            ),
+            run_owner=RunCreationOwner(store=store, preflight=preflight, graph_starter=graph),
         )
         mark_started = store.mark_graph_start_started
         fail_first_mark = True
@@ -529,9 +647,7 @@ async def test_graph_effect_replay_after_handoff_mark_failure_is_receipt_idempot
 
         store.mark_graph_start_started = mark_with_one_fault  # type: ignore[method-assign]
         payload = CreateRun.model_validate(create_run_payload())
-        request = ApiRequest(
-            operation="create_run", principal_id="local", payload=payload
-        )
+        request = ApiRequest(operation="create_run", principal_id="local", payload=payload)
         outcome = await backend.execute_idempotent(
             request,
             route="/api/v1/migrations",
@@ -620,9 +736,7 @@ async def test_graph_restart_uses_fresh_actor_and_pg_cas_checkpoint(tmp_path: Pa
                 run_id,
                 PlanAgentCompletion(
                     record=completed,
-                    receipt=AgentRunReceipt(
-                        uuid4(), created.agent_run_id, "plan.accepted"
-                    ),
+                    receipt=AgentRunReceipt(uuid4(), created.agent_run_id, "plan.accepted"),
                     result_object=result_object,
                     plan_object=plan_object,
                 ),
@@ -675,9 +789,7 @@ async def test_graph_restart_uses_fresh_actor_and_pg_cas_checkpoint(tmp_path: Pa
     class TrackingStarter:
         receipt_idempotent = True
 
-        def __init__(
-            self, store, cas_root: Path, effects, *, block_report: bool = False
-        ) -> None:  # type: ignore[no-untyped-def]
+        def __init__(self, store, cas_root: Path, effects, *, block_report: bool = False) -> None:  # type: ignore[no-untyped-def]
             self.store = store
             self.cas_root = cas_root
             self.effects = effects
@@ -688,9 +800,7 @@ async def test_graph_restart_uses_fresh_actor_and_pg_cas_checkpoint(tmp_path: Pa
             self.actors = []
             self.graphs = []
             self.savers = []
-            self._delegate = RunWorkflowGraphStarter(
-                self._graph_factory, durable_checkpointer=True
-            )
+            self._delegate = RunWorkflowGraphStarter(self._graph_factory, durable_checkpointer=True)
 
         def _graph_factory(self, actor):  # type: ignore[no-untyped-def]
             self.actors.append(actor)
@@ -706,9 +816,7 @@ async def test_graph_restart_uses_fresh_actor_and_pg_cas_checkpoint(tmp_path: Pa
             graph = RunWorkflowGraph(
                 actor=actor,
                 planner=SyntheticPlanStage(self.store, actor, self.effects),
-                verifier=CountedStage(
-                    "VERIFY", VerificationSummary(True, "e" * 64), self.effects
-                ),
+                verifier=CountedStage("VERIFY", VerificationSummary(True, "e" * 64), self.effects),
                 reporter=ReportStage(
                     self.effects,
                     block=self.block_report,
@@ -742,9 +850,7 @@ async def test_graph_restart_uses_fresh_actor_and_pg_cas_checkpoint(tmp_path: Pa
         starter1 = TrackingStarter(store, cas_root, effects, block_report=True)
         backend1 = ProductionApiBackend(
             store,
-            run_owner=RunCreationOwner(
-                store=store, preflight=preflight, graph_starter=starter1
-            ),
+            run_owner=RunCreationOwner(store=store, preflight=preflight, graph_starter=starter1),
         )
         headers = {
             "Authorization": "Bearer synthetic-token",
@@ -799,12 +905,8 @@ async def test_graph_restart_uses_fresh_actor_and_pg_cas_checkpoint(tmp_path: Pa
             await original_mark_started(run_id, receipt_key)
 
         store2.mark_graph_start_started = fail_first_handoff_mark  # type: ignore[method-assign]
-        owner2 = RunCreationOwner(
-            store=store2, preflight=preflight, graph_starter=starter2
-        )
-        backend2 = ProductionApiBackend(
-            store2, run_owner=owner2
-        )
+        owner2 = RunCreationOwner(store=store2, preflight=preflight, graph_starter=starter2)
+        backend2 = ProductionApiBackend(store2, run_owner=owner2)
         await backend2.recover_pending_graph_starts()
         recovery_tasks = tuple(backend2._graph_start_tasks.values())
         assert len(recovery_tasks) == 1
@@ -838,9 +940,7 @@ async def test_graph_restart_uses_fresh_actor_and_pg_cas_checkpoint(tmp_path: Pa
         starter3 = TrackingStarter(store3, cas_root, effects)
         backend3 = ProductionApiBackend(
             store3,
-            run_owner=RunCreationOwner(
-                store=store3, preflight=preflight, graph_starter=starter3
-            ),
+            run_owner=RunCreationOwner(store=store3, preflight=preflight, graph_starter=starter3),
         )
         await backend3.recover_pending_graph_starts()
         recovery_tasks = tuple(backend3._graph_start_tasks.values())
@@ -1050,8 +1150,7 @@ async def test_draft_api_write_commands_fail_closed_without_a_draft_owner():
 
     assert all(response.status_code == 503 for response in responses)
     assert all(
-        response.json()["type"].endswith("/dependency_unavailable")
-        for response in responses
+        response.json()["type"].endswith("/dependency_unavailable") for response in responses
     )
     assert store._api_commands == {}
     assert await store.list_draft_owner_facts(session_id) == ()
@@ -1147,6 +1246,7 @@ async def test_production_asgi_injects_draft_owner_for_all_four_atomic_commands(
         pytest.skip("CODEMIGRATOR_TEST_PG_DSN is not configured")
     async with isolated_store(max_size=1) as (inspection_store, schema):
         owners: list[RecordingDraftSessionCommands] = []
+        graph_starters: list[RecordingDraftGraphStarter] = []
 
         def draft_owner_factory(store, resources):  # type: ignore[no-untyped-def]
             assert store._write_connection is resources.write_connection
@@ -1154,10 +1254,18 @@ async def test_production_asgi_injects_draft_owner_for_all_four_atomic_commands(
             owners.append(owner)
             return owner
 
+        def draft_graph_starter_factory(store, resources, owner, assembly):  # type: ignore[no-untyped-def]
+            assert owner is owners[0]
+            assert assembly is None
+            starter = RecordingDraftGraphStarter()
+            graph_starters.append(starter)
+            return starter
+
         app = create_production_app(
             dsn,
             config=ApiConfig(token="synthetic-token"),
             draft_command_owner_factory=draft_owner_factory,
+            draft_graph_starter_factory=draft_graph_starter_factory,
             stop_server=noop_server_stop,
             pool_server_settings={"search_path": schema},
         )
@@ -1200,6 +1308,7 @@ async def test_production_asgi_injects_draft_owner_for_all_four_atomic_commands(
                 )
 
         assert len(owners) == 1
+        assert len(graph_starters) == 1
         owner = owners[0]
         assert [operation for operation, _transaction in owner.calls] == [
             "create_session",
@@ -1235,7 +1344,50 @@ async def test_production_asgi_injects_draft_owner_for_all_four_atomic_commands(
                 )
                 == 4
             )
+            assert await connection.fetchval("SELECT count(*) FROM draft_graph_start_handoffs") == 4
             assert await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs") == 0
+
+
+@pytest.mark.asyncio
+async def test_production_asgi_hides_draft_owner_without_graph_starter():
+    dsn = os.environ.get("CODEMIGRATOR_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("CODEMIGRATOR_TEST_PG_DSN is not configured")
+    async with isolated_store(max_size=1) as (inspection_store, schema):
+        owners: list[RecordingDraftSessionCommands] = []
+
+        def draft_owner_factory(store, resources):  # type: ignore[no-untyped-def]
+            owner = RecordingDraftSessionCommands(store)
+            owners.append(owner)
+            return owner
+
+        app = create_production_app(
+            dsn,
+            config=ApiConfig(token="synthetic-token"),
+            draft_command_owner_factory=draft_owner_factory,
+            stop_server=noop_server_stop,
+            pool_server_settings={"search_path": schema},
+        )
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+            ) as client:
+                response = await client.post(
+                    "/api/v1/sessions",
+                    json={"kind": "DRAFT", "payload": {}},
+                    headers={
+                        "Authorization": "Bearer synthetic-token",
+                        "Idempotency-Key": "draft-needs-graph-starter",
+                    },
+                )
+
+        assert response.status_code == 503
+        assert response.json()["type"].endswith("/dependency_unavailable")
+        assert len(owners) == 1
+        assert owners[0].calls == []
+        async with inspection_store.pool.acquire() as connection:
+            assert await connection.fetchval("SELECT count(*) FROM draft_owner_facts") == 0
+            assert await connection.fetchval("SELECT count(*) FROM api_command_receipts") == 0
 
 
 @pytest.mark.asyncio
@@ -1480,8 +1632,7 @@ async def test_cancelled_outer_command_finishes_rollback_callbacks_and_removes_r
                 assert await connection.fetchval("SELECT count(*) FROM runtime_events") == 0
                 assert await connection.fetchval("SELECT count(*) FROM api_command_receipts") == 0
                 assert (
-                    await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs")
-                    == 0
+                    await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs") == 0
                 )
         finally:
             if transactions and transactions[0].active:
@@ -1545,8 +1696,7 @@ async def test_cancelled_create_run_stops_actor_before_create_returns(monkeypatc
                 assert await connection.fetchval("SELECT count(*) FROM runtime_events") == 0
                 assert await connection.fetchval("SELECT count(*) FROM api_command_receipts") == 0
                 assert (
-                    await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs")
-                    == 0
+                    await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs") == 0
                 )
         finally:
             release_join.set()
@@ -1646,9 +1796,10 @@ async def test_concurrent_same_key_replay_starts_graph_once():
         await asyncio.wait_for(graph.completed.wait(), timeout=2)
         assert len(graph.receipts) == 1
         run_id = RunId(UUID(first.json()["run_id"]))
-        assert [
-            event.event_type for event in await store.read_run_events(run_id, 0)
-        ] == ["run.created", "run.status_changed"]
+        assert [event.event_type for event in await store.read_run_events(run_id, 0)] == [
+            "run.created",
+            "run.status_changed",
+        ]
         for _ in range(100):
             if await store.list_pending_graph_starts() == ():
                 break
@@ -1716,9 +1867,7 @@ async def test_two_unique_creates_do_not_need_extra_pool_connections():
         graph = RecordingGraphStarter()
         backend = ProductionApiBackend(
             store,
-            run_owner=RunCreationOwner(
-                store=store, preflight=preflight, graph_starter=graph
-            ),
+            run_owner=RunCreationOwner(store=store, preflight=preflight, graph_starter=graph),
         )
         app = create_app(backend, config=ApiConfig(token="synthetic-token"))
         async with httpx.AsyncClient(
@@ -1975,9 +2124,7 @@ async def test_production_asgi_composes_run_graph_from_locked_store_and_actor_fa
 
             assembly = RuntimeGraphAssembly(
                 infrastructure,
-                plan_stage_factory=lambda _infra, received_actor: WaitingPlanStage(
-                    received_actor
-                ),
+                plan_stage_factory=lambda _infra, received_actor: WaitingPlanStage(received_actor),
                 verifier_factory=lambda _infra, _actor: object(),
                 reporter_factory=lambda _infra, _actor: object(),
                 draft_agent_runner_factory=lambda _infra, _owner: object(),
@@ -2127,9 +2274,7 @@ async def test_production_asgi_projects_committed_run_views_and_resumes_sse_from
                             "generation": 3,
                         },
                     ),
-                    EventSpec(
-                        "run.status_changed", {"run_status": RunStatus.Failed.value}
-                    ),
+                    EventSpec("run.status_changed", {"run_status": RunStatus.Failed.value}),
                 ),
             )
             await store.add_cas_reference(plan_ref, "run", run_id, "frozen-plan")
@@ -2221,6 +2366,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
         select_unique_provider_config,
     )
     from codemigrator.workspace import GatewayContext
+
     async with isolated_store() as (_store, schema):
         planning_inputs = build_plan_agent_inputs()
         source_modules = planning_inputs.analysis.modules
@@ -2356,12 +2502,28 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                     content_is_plan_proposal = False
                 else:
                     content_is_plan_proposal = True
+                matching_calls = [
+                    call for call in response.tool_calls if call.name == "PlanProposal"
+                ]
+                plan_argument_shape = (
+                    _safe_plan_proposal_argument_shape(matching_calls[0].arguments)
+                    if len(matching_calls) == 1
+                    else {"root_kind": "tool_call_count", "known_field_count": 0}
+                )
+                tool_arguments_are_plan_proposal = plan_argument_shape.get("valid") is True
                 provider_shapes.append(
-                    _safe_provider_shape_for_diagnostics(
-                        request,
-                        response,
-                        content_is_plan_proposal=content_is_plan_proposal,
-                    )
+                    {
+                        **_safe_provider_shape_for_diagnostics(
+                            request,
+                            response,
+                            content_is_plan_proposal=content_is_plan_proposal,
+                            tool_arguments_are_plan_proposal=tool_arguments_are_plan_proposal,
+                        ),
+                        "plan_content_shape": _safe_plan_proposal_argument_shape(
+                            response.content
+                        ),
+                        "plan_argument_shape": plan_argument_shape,
+                    }
                 )
                 return response
 
@@ -2405,6 +2567,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
             delegate = OpenAICompatibleProvider(
                 endpoint=str(opencode["Base URL"]), api_key=str(opencode["API Key"])
             )
+
             class ConservativeCounter:
                 def count(self, messages):
                     return sum(max(1, len(message.content.encode("utf-8"))) for message in messages)
@@ -2491,9 +2654,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                     GatewayContext(
                         run_id=RunId(record.owner_id),
                         agent_run_id=record.agent_run_id,
-                        phase_policy_sha256=load_resource(
-                            "core://phase-tool-policy/v2"
-                        ).sha256,
+                        phase_policy_sha256=load_resource("core://phase-tool-policy/v2").sha256,
                         phase=Phase.Plan,
                         session_kind=SessionKind.PlanAuxiliary,
                     )
@@ -2544,9 +2705,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
             )
 
         request_body = create_run_payload()
-        request_body["frozen_artifacts"] = planning_inputs.frozen_artifacts.model_dump(
-            mode="json"
-        )
+        request_body["frozen_artifacts"] = planning_inputs.frozen_artifacts.model_dump(mode="json")
         app = create_production_app(
             dsn,
             config=ApiConfig(token="synthetic-token"),
@@ -2596,12 +2755,11 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                     assert len(records) == 1
                     assert records[0].state.value == "CLOSED"
                     assert records[0].checkpoint_sha256 is not None
+                    assert (await actors[0].store.load(run_id)).state.frozen_plan_sha256 is not None
                     assert (
-                        await actors[0].store.load(run_id)
-                    ).state.frozen_plan_sha256 is not None
-                    assert await actors[0].store.get_cas_reference(
-                        "run", run_id, "frozen-plan"
-                    ) is not None
+                        await actors[0].store.get_cas_reference("run", run_id, "frozen-plan")
+                        is not None
+                    )
                 except Exception as error:
                     test_failure = error
         finally:
@@ -2862,8 +3020,7 @@ async def test_lock_loss_drains_inflight_create_before_backend_and_server_shutdo
                 assert await connection.fetchval("SELECT count(*) FROM runtime_events") == 0
                 assert await connection.fetchval("SELECT count(*) FROM api_command_receipts") == 0
                 assert (
-                    await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs")
-                    == 0
+                    await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs") == 0
                 )
 
 

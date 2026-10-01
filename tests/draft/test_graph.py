@@ -31,7 +31,7 @@ from codemigrator.runtime.draft_models import (
     ExplorationReport,
     QuestionOption,
 )
-from codemigrator.runtime.store import InMemoryRuntimeStore
+from codemigrator.runtime.store import InMemoryRuntimeStore, StoreCommitError
 
 
 def _flow(artifacts) -> tuple[DraftFlow, AskUserQuestion]:
@@ -186,6 +186,45 @@ async def test_draft_graph_interrupts_and_resumes_after_durable_answer_receipt(
     assert (await resumed_graph._graph.aget_state(resumed_graph.config)).next == ()
     assert await resumed_graph.answer_user(answer) == answer_receipt
     assert len(flow.ledger.answers) == 1
+
+
+@pytest.mark.asyncio
+async def test_draft_graph_restore_rebuilds_owner_ledger_and_interrupt_after_restart(
+    tmp_path, artifacts
+) -> None:
+    store = InMemoryRuntimeStore()
+    draft_id = new_uuid7()
+    flow, question = _flow(artifacts)
+    cas, draft_saver, agent_saver = _savers(tmp_path, store, draft_id)
+    first_graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=flow, store=store),
+        agent_runs=store,
+        checkpointer=draft_saver,
+        agent_checkpointer=agent_saver,
+        thread_id=str(new_uuid7()),
+    )
+    await first_graph.ask_user(question)
+
+    restarted_flow = DraftFlow()
+    restarted_graph = MigrationSessionGraph(
+        owner=DraftFlowOwner(draft_id=draft_id, flow=restarted_flow, store=store),
+        agent_runs=store,
+        checkpointer=CasCheckpointSaver(
+            cas, store, graph_family="draft", owner_kind="draft", owner_id=draft_id
+        ),
+        agent_checkpointer=CasCheckpointSaver(
+            cas, store, graph_family="agent", owner_kind="draft", owner_id=draft_id
+        ),
+        thread_id=first_graph.thread_id,
+    )
+
+    snapshot = await restarted_graph.restore()
+
+    assert snapshot is not None
+    assert snapshot.next == ("ask_user",)
+    assert snapshot.values["question_id"] == str(question.question_id)
+    assert restarted_flow.ledger.current_revision == flow.ledger.current_revision
+    assert restarted_flow.ledger.questions == (question,)
 
 
 @pytest.mark.asyncio
@@ -1057,6 +1096,11 @@ async def test_create_run_rejection_keeps_draft_without_run_side_effects(
 
     with pytest.raises(DraftConflictError, match="confirmed Draft artifact freeze"):
         await graph.attach_to_run(run_id, _create_request(None))
+    await graph.owner.persist_current_revision()
+    store.fail_next_commit()
+    with pytest.raises(StoreCommitError, match="injected commit failure"):
+        await graph.attach_to_run(run_id, _create_request(freeze.frozen_artifact_bundle))
+    assert await store.load_draft_owner_fact(draft_id, "draft.freeze") is None
     with pytest.raises(CreateRunRejected):
         await graph.attach_to_run(run_id, _create_request(freeze.frozen_artifact_bundle))
 
@@ -1127,6 +1171,10 @@ async def test_successful_attach_commits_once_then_releases_draft_threads(
 
     request = _create_request(freeze.frozen_artifact_bundle)
     attached = await graph.attach_to_run(run_id, request)
+    freeze_fact = await store.load_draft_owner_fact(draft_id, "draft.freeze")
+    assert freeze_fact is not None
+    assert freeze_fact[0].category == "draft.freeze"
+    assert freeze_fact[1] == freeze.model_dump(mode="json", by_alias=True)
     assert (await store.read_draft_session_events(draft_id, 0))[-1].data == {"run_id": str(run_id)}
 
     assert attached == receipt

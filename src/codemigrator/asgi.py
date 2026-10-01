@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from codemigrator.api.backend import (
     ApiCommandStorePort,
     ApiProductionCapabilities,
+    DraftGraphStarterPort,
     DraftSessionCommandPort,
     RunCreationOwnerPort,
 )
@@ -67,6 +68,15 @@ ProductionRunComponentsFactory = Callable[
 DraftSessionCommandOwnerFactory = Callable[
     [RuntimeStore, ApiApplicationResources], DraftSessionCommandPort | None
 ]
+DraftGraphStarterFactory = Callable[
+    [
+        RuntimeStore,
+        ApiApplicationResources,
+        DraftSessionCommandPort,
+        RuntimeGraphAssembly | None,
+    ],
+    DraftGraphStarterPort | None,
+]
 
 
 def create_production_run_owner(
@@ -96,6 +106,7 @@ def create_production_app(
     graph_starter: RunGraphStarter | None = None,
     run_components_factory: ProductionRunComponentsFactory | None = None,
     draft_command_owner_factory: DraftSessionCommandOwnerFactory | None = None,
+    draft_graph_starter_factory: DraftGraphStarterFactory | None = None,
     stop_server: Callable[[], Awaitable[None]],
     shutdown: Callable[[], Awaitable[None]] | None = None,
     pool_server_settings: Mapping[str, str] | None = None,
@@ -123,17 +134,37 @@ def create_production_app(
         resources: ApiApplicationResources,
     ) -> RunCreationOwnerPort | ApiProductionCapabilities | None:
         runtime_store = cast(RuntimeStore, store)
-        draft_owner = (
+        draft_owner_candidate = (
             draft_command_owner_factory(runtime_store, resources)
             if draft_command_owner_factory is not None
             else None
         )
-        if run_components_factory is not None:
-            components = run_components_factory(
+        components = (
+            run_components_factory(
                 runtime_store,
                 resources.pool,
                 resources.write_connection,
             )
+            if run_components_factory is not None
+            else None
+        )
+        draft_graph_starter = (
+            draft_graph_starter_factory(
+                runtime_store,
+                resources,
+                draft_owner_candidate,
+                components.graph_assembly if components is not None else None,
+            )
+            if draft_graph_starter_factory is not None and draft_owner_candidate is not None
+            else None
+        )
+        # Draft commands are only a usable production capability when their
+        # committed receipts can be handed to a durable graph continuation.
+        draft_owner = (
+            draft_owner_candidate if draft_graph_starter is not None else None
+        )
+        if run_components_factory is not None:
+            assert components is not None
             components_run_owner = create_production_run_owner(runtime_store, components)
             return ApiProductionCapabilities(
                 run_owner=cast(RunCreationOwnerPort, components_run_owner),
@@ -141,6 +172,7 @@ def create_production_app(
                     runtime_store, components.graph_assembly.infrastructure.host_cas
                 ),
                 draft_owner=draft_owner,
+                draft_graph_starter=draft_graph_starter,
             )
         run_owner: RunCreationOwnerPort | None = None
         if preflight is not None and graph_starter is not None:
@@ -154,7 +186,11 @@ def create_production_app(
             )
         if run_owner is None and draft_owner is None:
             return None
-        return ApiProductionCapabilities(run_owner=run_owner, draft_owner=draft_owner)
+        return ApiProductionCapabilities(
+            run_owner=run_owner,
+            draft_owner=draft_owner,
+            draft_graph_starter=draft_graph_starter,
+        )
 
     return _create_api_app(
         dsn,
@@ -171,6 +207,7 @@ __all__ = [
     "ProductionRunComponents",
     "ProductionRunComponentsFactory",
     "DraftSessionCommandOwnerFactory",
+    "DraftGraphStarterFactory",
     "create_production_app",
     "create_production_run_owner",
 ]
