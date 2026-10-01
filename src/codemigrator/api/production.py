@@ -277,9 +277,11 @@ def create_production_app(
             if isinstance(owner_result, ApiProductionCapabilities):
                 owner = owner_result.run_owner
                 run_read_projection = owner_result.run_read_projection
+                draft_owner = owner_result.draft_owner
             else:
                 owner = owner_result
                 run_read_projection = None
+                draft_owner = None
 
             async def check_health() -> Mapping[str, object]:
                 if not app.state.runtime_ready or pool is None or pool.is_closing():
@@ -308,6 +310,7 @@ def create_production_app(
                 store,
                 run_owner=owner,
                 run_read_projection=run_read_projection,
+                draft_owner=draft_owner,
                 shutdown=shutdown,
                 health_check=check_health,
             )

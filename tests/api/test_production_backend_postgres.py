@@ -16,7 +16,7 @@ import httpx
 import pytest
 
 from codemigrator.api import ApiConfig, create_app
-from codemigrator.api.backend import ProductionApiBackend
+from codemigrator.api.backend import DraftCommandResult, ProductionApiBackend
 from codemigrator.api.deps import ApiRequest
 from codemigrator.api.sse import sse_events
 from codemigrator.asgi import create_production_app
@@ -32,7 +32,11 @@ from codemigrator.runtime.create_run import (
     RunCreationOwner,
     RunWorkflowGraphStarter,
 )
-from codemigrator.runtime.store import PostgreSQLRuntimeStore
+from codemigrator.runtime.store import (
+    InMemoryRuntimeStore,
+    PostgreSQLRuntimeStore,
+    RuntimeStore,
+)
 
 from .conftest import build_frozen_plan, build_plan_agent_inputs, create_run_payload
 
@@ -79,6 +83,16 @@ def test_provider_shape_diagnostics_do_not_echo_untrusted_response_fields() -> N
     assert shape["response_truncated"] is False
     assert shape["response_content_length"] == len(response.content)
     assert "private" not in repr(shape)
+
+
+def test_draft_command_result_requires_a_receipt_for_the_same_session() -> None:
+    with pytest.raises(ValueError, match="identify its session owner"):
+        DraftCommandResult(
+            session_id=uuid4(),
+            status="DRAFT",
+            revision=0,
+            owner_receipt=SimpleNamespace(draft_id=uuid4(), receipt_key="draft.receipt"),
+        )
 
 
 async def noop_server_stop() -> None:
@@ -307,6 +321,86 @@ class ReceiptEffectGraphStarter(RecordingGraphStarter):
                 self.domain_work_count += 1
         finally:
             self.completed.set()
+
+
+class RecordingDraftSessionCommands:
+    def __init__(self, store: RuntimeStore) -> None:
+        self.store = store
+        self.draft_id = uuid4()
+        self.calls: list[tuple[str, RuntimeStoreTransaction]] = []
+        self.connection_ids: list[int] = []
+
+    async def _commit(
+        self,
+        operation: str,
+        draft_id: UUID,
+        revision: int,
+        transaction: RuntimeStoreTransaction,
+    ) -> SimpleNamespace:
+        assert transaction.store is self.store
+        assert transaction.active
+        if transaction.connection is not None:
+            self.connection_ids.append(id(transaction.connection))
+            assert await transaction.connection.fetchval("SELECT 1") == 1
+        self.calls.append((operation, transaction))
+        receipt = await self.store.commit_draft_owner_fact(
+            draft_id,
+            f"draft.api-command:{len(self.calls)}",
+            "draft.api-command",
+            {"operation": operation, "revision": revision},
+            transaction=transaction,
+        )
+        return DraftCommandResult(
+            session_id=draft_id,
+            status="DRAFT",
+            revision=revision,
+            owner_receipt=receipt,
+        )
+
+    async def create_session(self, payload, transaction):  # type: ignore[no-untyped-def]
+        del payload
+        return await self._commit("create_session", self.draft_id, 0, transaction)
+
+    async def send_message(self, session_id, payload, transaction):  # type: ignore[no-untyped-def]
+        del payload
+        return await self._commit("session_message", session_id, 1, transaction)
+
+    async def answer_question(self, session_id, payload, transaction):  # type: ignore[no-untyped-def]
+        del payload
+        return await self._commit("session_answer", session_id, 2, transaction)
+
+    async def confirm_session(self, session_id, payload, transaction):  # type: ignore[no-untyped-def]
+        del payload
+        return await self._commit("session_confirm", session_id, 3, transaction)
+
+
+class FailingDraftSessionCommands(RecordingDraftSessionCommands):
+    async def create_session(self, payload, transaction):  # type: ignore[no-untyped-def]
+        await super().create_session(payload, transaction)
+        raise RuntimeError("synthetic Draft command failure")
+
+
+class InvalidDraftResultCommands(RecordingDraftSessionCommands):
+    async def create_session(self, payload, transaction):  # type: ignore[no-untyped-def]
+        await super().create_session(payload, transaction)
+        return SimpleNamespace(
+            session_id=self.draft_id,
+            status="DRAFT",
+            revision=0,
+        )
+
+
+class BlockingDraftSessionCommands(RecordingDraftSessionCommands):
+    def __init__(self, store: RuntimeStore) -> None:
+        super().__init__(store)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def create_session(self, payload, transaction):  # type: ignore[no-untyped-def]
+        result = await super().create_session(payload, transaction)
+        self.entered.set()
+        await self.release.wait()
+        return result
 
 
 @pytest.mark.asyncio
@@ -832,6 +926,298 @@ async def test_preflight_gates_share_the_api_transaction_connection_at_pool_size
             assert await connection.fetchval("SELECT count(*) FROM api_command_receipts") == 0
             assert await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs") == 0
         await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_draft_api_commands_delegate_through_the_api_transaction_without_run_handoff():
+    store = InMemoryRuntimeStore()
+    draft_owner = RecordingDraftSessionCommands(store)
+    backend = ProductionApiBackend(store, draft_owner=draft_owner)
+    app = create_app(backend, config=ApiConfig(token="synthetic-token"))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        auth = {"Authorization": "Bearer synthetic-token"}
+        headers = {**auth, "Idempotency-Key": "draft-api-create"}
+        created = await client.post(
+            "/api/v1/sessions",
+            json={"kind": "DRAFT", "payload": {}},
+            headers=headers,
+        )
+        replay = await client.post(
+            "/api/v1/sessions",
+            json={"kind": "DRAFT", "payload": {}},
+            headers=headers,
+        )
+        conflict = await client.post(
+            "/api/v1/sessions",
+            json={"kind": "OTHER", "payload": {}},
+            headers=headers,
+        )
+        session_id = str(draft_owner.draft_id)
+        message = await client.post(
+            f"/api/v1/sessions/{session_id}/messages",
+            json={"message": "add context", "revision": 0},
+            headers={**auth, "Idempotency-Key": "draft-api-message"},
+        )
+        answer = await client.post(
+            f"/api/v1/sessions/{session_id}/answers",
+            json={"question_id": str(uuid4()), "answer": "yes", "revision": 1},
+            headers={**auth, "Idempotency-Key": "draft-api-answer"},
+        )
+        confirmed = await client.post(
+            f"/api/v1/sessions/{session_id}/confirm",
+            json={"revision": 2},
+            headers={**auth, "Idempotency-Key": "draft-api-confirm"},
+        )
+
+    assert created.status_code == 201
+    assert replay.status_code == 201
+    assert replay.json() == created.json()
+    assert conflict.status_code == 409
+    assert conflict.json()["type"].endswith("/idempotency_conflict")
+    for response, revision in ((created, 0), (message, 1), (answer, 2), (confirmed, 3)):
+        assert response.status_code in {200, 201}
+        assert set(response.json()) == {"session_id", "status", "revision"}
+        assert response.json() == {
+            "session_id": session_id,
+            "status": "DRAFT",
+            "revision": revision,
+        }
+    assert [operation for operation, _transaction in draft_owner.calls] == [
+        "create_session",
+        "session_message",
+        "session_answer",
+        "session_confirm",
+    ]
+    assert all(transaction.store is store for _, transaction in draft_owner.calls)
+    assert len(await store.list_draft_owner_facts(draft_owner.draft_id)) == 4
+    assert await store.list_pending_graph_starts() == ()
+
+
+@pytest.mark.asyncio
+async def test_draft_api_write_commands_fail_closed_without_a_draft_owner():
+    store = InMemoryRuntimeStore()
+    backend = ProductionApiBackend(store)
+    app = create_app(backend, config=ApiConfig(token="synthetic-token"))
+    session_id = uuid4()
+    headers = {"Authorization": "Bearer synthetic-token"}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        responses = (
+            await client.post(
+                "/api/v1/sessions",
+                json={"kind": "DRAFT", "payload": {}},
+                headers={**headers, "Idempotency-Key": "missing-draft-create"},
+            ),
+            await client.post(
+                f"/api/v1/sessions/{session_id}/messages",
+                json={"message": "add context", "revision": 0},
+                headers={**headers, "Idempotency-Key": "missing-draft-message"},
+            ),
+            await client.post(
+                f"/api/v1/sessions/{session_id}/answers",
+                json={"question_id": str(uuid4()), "answer": "yes", "revision": 0},
+                headers={**headers, "Idempotency-Key": "missing-draft-answer"},
+            ),
+            await client.post(
+                f"/api/v1/sessions/{session_id}/confirm",
+                json={"revision": 0},
+                headers={**headers, "Idempotency-Key": "missing-draft-confirm"},
+            ),
+        )
+
+    assert all(response.status_code == 503 for response in responses)
+    assert all(
+        response.json()["type"].endswith("/dependency_unavailable")
+        for response in responses
+    )
+    assert store._api_commands == {}
+    assert await store.list_draft_owner_facts(session_id) == ()
+    assert await store.list_pending_graph_starts() == ()
+
+
+@pytest.mark.asyncio
+async def test_failed_draft_owner_command_rolls_back_fact_and_api_receipt():
+    store = InMemoryRuntimeStore()
+    draft_owner = FailingDraftSessionCommands(store)
+    backend = ProductionApiBackend(store, draft_owner=draft_owner)
+    app = create_app(backend, config=ApiConfig(token="synthetic-token"))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        response = await client.post(
+            "/api/v1/sessions",
+            json={"kind": "DRAFT", "payload": {}},
+            headers={
+                "Authorization": "Bearer synthetic-token",
+                "Idempotency-Key": "failed-draft-command",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["type"].endswith("/dependency_unavailable")
+    assert await store.list_draft_owner_facts(draft_owner.draft_id) == ()
+    assert store._api_commands == {}
+    assert await store.list_pending_graph_starts() == ()
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_draft_command_result_without_owner_receipt_is_rejected_and_rolled_back():
+    store = InMemoryRuntimeStore()
+    draft_owner = InvalidDraftResultCommands(store)
+    backend = ProductionApiBackend(store, draft_owner=draft_owner)
+    app = create_app(backend, config=ApiConfig(token="synthetic-token"))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        response = await client.post(
+            "/api/v1/sessions",
+            json={"kind": "DRAFT", "payload": {}},
+            headers={
+                "Authorization": "Bearer synthetic-token",
+                "Idempotency-Key": "invalid-draft-result",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["type"].endswith("/dependency_unavailable")
+    assert await store.list_draft_owner_facts(draft_owner.draft_id) == ()
+    assert store._api_commands == {}
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_draft_command_cancellation_rolls_back_owner_fact_and_api_receipt():
+    store = InMemoryRuntimeStore()
+    draft_owner = BlockingDraftSessionCommands(store)
+    backend = ProductionApiBackend(store, draft_owner=draft_owner)
+    app = create_app(backend, config=ApiConfig(token="synthetic-token"))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        request = asyncio.create_task(
+            client.post(
+                "/api/v1/sessions",
+                json={"kind": "DRAFT", "payload": {}},
+                headers={
+                    "Authorization": "Bearer synthetic-token",
+                    "Idempotency-Key": "cancelled-draft-command",
+                },
+            )
+        )
+        await asyncio.wait_for(draft_owner.entered.wait(), timeout=2)
+        backend.close_admission()
+        response = await asyncio.wait_for(request, timeout=2)
+
+    assert response.status_code == 503
+    assert response.json()["type"].endswith("/dependency_unavailable")
+    assert await store.list_draft_owner_facts(draft_owner.draft_id) == ()
+    assert store._api_commands == {}
+    assert await store.list_pending_graph_starts() == ()
+    await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_production_asgi_injects_draft_owner_for_all_four_atomic_commands():
+    dsn = os.environ.get("CODEMIGRATOR_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("CODEMIGRATOR_TEST_PG_DSN is not configured")
+    async with isolated_store(max_size=1) as (inspection_store, schema):
+        owners: list[RecordingDraftSessionCommands] = []
+
+        def draft_owner_factory(store, resources):  # type: ignore[no-untyped-def]
+            assert store._write_connection is resources.write_connection
+            owner = RecordingDraftSessionCommands(store)
+            owners.append(owner)
+            return owner
+
+        app = create_production_app(
+            dsn,
+            config=ApiConfig(token="synthetic-token"),
+            draft_command_owner_factory=draft_owner_factory,
+            stop_server=noop_server_stop,
+            pool_server_settings={"search_path": schema},
+        )
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+            ) as client:
+                auth = {"Authorization": "Bearer synthetic-token"}
+                create_headers = {**auth, "Idempotency-Key": "root-draft-create"}
+                created = await client.post(
+                    "/api/v1/sessions",
+                    json={"kind": "DRAFT", "payload": {}},
+                    headers=create_headers,
+                )
+                replay = await client.post(
+                    "/api/v1/sessions",
+                    json={"kind": "DRAFT", "payload": {}},
+                    headers=create_headers,
+                )
+                conflict = await client.post(
+                    "/api/v1/sessions",
+                    json={"kind": "OTHER", "payload": {}},
+                    headers=create_headers,
+                )
+                session_id = created.json()["session_id"]
+                message = await client.post(
+                    f"/api/v1/sessions/{session_id}/messages",
+                    json={"message": "add context", "revision": 0},
+                    headers={**auth, "Idempotency-Key": "root-draft-message"},
+                )
+                answer = await client.post(
+                    f"/api/v1/sessions/{session_id}/answers",
+                    json={"question_id": str(uuid4()), "answer": "yes", "revision": 1},
+                    headers={**auth, "Idempotency-Key": "root-draft-answer"},
+                )
+                confirmed = await client.post(
+                    f"/api/v1/sessions/{session_id}/confirm",
+                    json={"revision": 2},
+                    headers={**auth, "Idempotency-Key": "root-draft-confirm"},
+                )
+
+        assert len(owners) == 1
+        owner = owners[0]
+        assert [operation for operation, _transaction in owner.calls] == [
+            "create_session",
+            "session_message",
+            "session_answer",
+            "session_confirm",
+        ]
+        assert len(owner.connection_ids) == 4
+        assert len(set(owner.connection_ids)) == 1
+        assert [created.status_code, replay.status_code, conflict.status_code] == [201, 201, 409]
+        assert replay.json() == created.json()
+        assert conflict.json()["type"].endswith("/idempotency_conflict")
+        for response, revision in ((created, 0), (message, 1), (answer, 2), (confirmed, 3)):
+            assert response.status_code in {200, 201}
+            assert set(response.json()) == {"session_id", "status", "revision"}
+            assert response.json() == {
+                "session_id": session_id,
+                "status": "DRAFT",
+                "revision": revision,
+            }
+        async with inspection_store.pool.acquire() as connection:
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM draft_owner_facts WHERE draft_id=$1", owner.draft_id
+                )
+                == 4
+            )
+            assert (
+                await connection.fetchval(
+                    """SELECT count(*) FROM api_command_receipts
+                    WHERE owner_kind='draft' AND owner_id=$1""",
+                    owner.draft_id,
+                )
+                == 4
+            )
+            assert await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs") == 0
 
 
 @pytest.mark.asyncio
