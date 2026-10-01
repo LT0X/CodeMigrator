@@ -48,9 +48,13 @@ from codemigrator.runtime.store import (
     PostgreSQLRuntimeStore,
     RuntimeStore,
 )
-from tests.runtime.conftest import draft_question_event
 
-from .conftest import build_frozen_plan, build_plan_agent_inputs, create_run_payload
+from .conftest import (
+    build_frozen_plan,
+    build_plan_agent_inputs,
+    create_run_payload,
+    draft_question_event,
+)
 
 
 def _safe_provider_shape_for_diagnostics(

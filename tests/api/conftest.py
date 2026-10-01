@@ -41,6 +41,35 @@ from codemigrator.planning import (
     PlanProposal,
     PlanSliceProposal,
 )
+from codemigrator.runtime.contracts import DraftSessionEventSpec
+
+
+def draft_question_event(question_id: str | None = None) -> DraftSessionEventSpec:
+    """Build the complete public AskUser event accepted by the Draft allowlist."""
+
+    return DraftSessionEventSpec(
+        "session.question.asked",
+        {
+            "question_id": question_id or str(uuid4()),
+            "revision": 1,
+            "prompt": "Choose how this migration should handle compatibility.",
+            "options": [
+                {
+                    "key": "preserve",
+                    "label": "Preserve behavior",
+                    "impact": "Keeps current user-visible behavior.",
+                    "recommended": True,
+                },
+                {
+                    "key": "simplify",
+                    "label": "Simplify behavior",
+                    "impact": "May change existing edge cases.",
+                    "recommended": False,
+                },
+            ],
+            "allow_free_text": True,
+        },
+    )
 
 
 def build_plan_agent_inputs() -> PlanningInputs:
