@@ -43,6 +43,7 @@ from codemigrator.runtime.memory import (
     SessionBudgetCatalog,
 )
 from codemigrator.runtime.provider import (
+    ProviderError,
     ProviderRegistry,
     ProviderRequest,
     ProviderResponse,
@@ -441,6 +442,95 @@ async def test_create_agent_returns_structured_output_without_gateway_dispatch()
         "PlanProposal",
     ]
     assert provider.requests[0].tool_choice == "any"
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_agent_redacts_truncated_structured_tool_arguments() -> None:
+    binding = _binding()
+    run = _run(binding)
+    provider = FakeProvider(
+        [
+            _response(
+                "",
+                tools=(
+                    ProviderToolCall(
+                        "PlanProposal", "private truncated argument marker", "plan-1"
+                    ),
+                ),
+            )
+        ]
+    )
+    gateway = FakeGateway()
+    bound = create_bound_agent(
+        agent_run=run,
+        binding=binding,
+        registry=ProviderRegistry({"openai-compatible": provider}),
+        context_manager=ContextManager(
+            token_counter=ExactCounter(), net_input_cap=FormulaNetInputCap()
+        ),
+        template="plan role",
+        envelope=ContextEnvelope(stable=(ContextSegment("stable", "frozen facts"),)),
+        gateway=gateway,
+        context_identity=_context_identity(run, binding),
+        response_format=PlanProposal,
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        await bound.ainvoke(task="Return a structured plan")
+
+    assert caught.value.failure_code == "invalid_tool_arguments_json"
+    assert "private truncated argument marker" not in str(caught.value)
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_agent_rejects_provider_response_truncated_at_output_limit() -> None:
+    binding = _binding()
+    run = _run(binding)
+    provider = FakeProvider(
+        [
+            replace(
+                _response(
+                    "",
+                    tools=(
+                        ProviderToolCall(
+                            "PlanProposal",
+                            json.dumps(
+                                {
+                                    "slices": [],
+                                    "edges": [],
+                                    "integration_ranks": {},
+                                    "planner_rationale": [],
+                                }
+                            ),
+                            "plan-1",
+                        ),
+                    ),
+                ),
+                finish_reason="length",
+            )
+        ]
+    )
+    gateway = FakeGateway()
+    bound = create_bound_agent(
+        agent_run=run,
+        binding=binding,
+        registry=ProviderRegistry({"openai-compatible": provider}),
+        context_manager=ContextManager(
+            token_counter=ExactCounter(), net_input_cap=FormulaNetInputCap()
+        ),
+        template="plan role",
+        envelope=ContextEnvelope(stable=(ContextSegment("stable", "frozen facts"),)),
+        gateway=gateway,
+        context_identity=_context_identity(run, binding),
+        response_format=PlanProposal,
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        await bound.ainvoke(task="Return a structured plan")
+
+    assert caught.value.failure_code == "provider_response_truncated"
     assert gateway.calls == []
 
 

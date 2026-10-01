@@ -66,6 +66,7 @@ from .memory import (
 from .provider import (
     AsyncProvider,
     ProviderCallIdentity,
+    ProviderError,
     ProviderRegistry,
     ProviderRequest,
     TokenUsage,
@@ -438,11 +439,28 @@ class ProviderChatModel(BaseChatModel):
         )
         self._usages.append(response.usage)
         await self._usage_sink.record(self._agent_run_id, response.usage, receipt)
+        if response.finish_reason == "length":
+            raise ProviderError(
+                "provider request failed",
+                retryable=False,
+                failure_code="provider_response_truncated",
+            )
         tool_calls = []
         for index, call in enumerate(response.tool_calls):
-            arguments = json.loads(call.arguments)
+            try:
+                arguments = json.loads(call.arguments)
+            except (TypeError, ValueError):
+                raise ProviderError(
+                    "provider request failed",
+                    retryable=False,
+                    failure_code="invalid_tool_arguments_json",
+                ) from None
             if not isinstance(arguments, dict):
-                raise ValueError("provider tool arguments must be an object")
+                raise ProviderError(
+                    "provider request failed",
+                    retryable=False,
+                    failure_code="invalid_tool_arguments_shape",
+                )
             tool_calls.append(
                 {
                     "name": call.name,

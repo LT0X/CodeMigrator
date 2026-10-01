@@ -1444,7 +1444,44 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
         release_plan = asyncio.Event()
         actors = []
         requests = []
+        provider_shapes = []
         stage_error_types = []
+
+        def safe_failure_code(error):
+            pending = [error]
+            seen = set()
+            while pending:
+                current = pending.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                code = getattr(current, "failure_code", None)
+                if isinstance(code, str):
+                    return code
+                for cause in (current.__cause__, current.__context__):
+                    if cause is not None:
+                        pending.append(cause)
+            return "unclassified"
+
+        def safe_failure_frames(error):
+            import traceback
+
+            frames = []
+            pending = [error]
+            seen = set()
+            while pending:
+                current = pending.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                frames.extend(
+                    (Path(frame.filename).name, frame.name, frame.lineno)
+                    for frame in traceback.extract_tb(current.__traceback__)
+                )
+                for cause in (current.__cause__, current.__context__):
+                    if cause is not None:
+                        pending.append(cause)
+            return tuple(frames[-12:])
 
         class StructuredProvider:
             async def complete(self, request):
@@ -1507,7 +1544,26 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
 
             async def complete(self, request):
                 requests.append(request)
-                return await self.delegate.complete(request)
+                response = await self.delegate.complete(request)
+                try:
+                    PlanProposal.model_validate_json(response.content)
+                except Exception:
+                    content_is_plan_proposal = False
+                else:
+                    content_is_plan_proposal = True
+                provider_shapes.append(
+                    {
+                        "tool_choice": request.tool_choice,
+                        "request_tools": tuple(tool.name for tool in request.tools),
+                        "finish_reason": response.finish_reason,
+                        "response_tool_names": tuple(
+                            call.name for call in response.tool_calls
+                        ),
+                        "response_content_length": len(response.content),
+                        "content_is_plan_proposal": content_is_plan_proposal,
+                    }
+                )
+                return response
 
         real_opencode = os.environ.get("CODEMIGRATOR_REAL_OPENCODE", "").casefold() in {
             "1",
@@ -1544,7 +1600,7 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                 profile=ModelProfile.Reasoning,
                 config_revision=config_revision,
                 context_window=int(opencode["Context Window"]),
-                output_cap=min(2_048, int(opencode["模型输出上限"])),
+                output_cap=min(8_192, int(opencode["模型输出上限"])),
             )
             delegate = OpenAICompatibleProvider(
                 endpoint=str(opencode["Base URL"]), api_key=str(opencode["API Key"])
@@ -1657,7 +1713,13 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                         try:
                             receipt = await workflow.run(run_id)
                         except Exception as error:
-                            stage_error_types.append(type(error).__name__)
+                            stage_error_types.append(
+                                (
+                                    type(error).__name__,
+                                    safe_failure_code(error),
+                                    safe_failure_frames(error),
+                                )
+                            )
                             plan_result_ready.set()
                             raise
                         plan_result_ready.set()
@@ -1707,12 +1769,16 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                                 "Idempotency-Key": "production-plan-agent-run",
                             },
                         )
-                    assert response.status_code == 201
-                    run_id = RunId(UUID(response.json()["run_id"]))
-                    await asyncio.wait_for(plan_result_ready.wait(), timeout=45)
+                        assert response.status_code == 201
+                        run_id = RunId(UUID(response.json()["run_id"]))
+                        await asyncio.wait_for(
+                            plan_result_ready.wait(),
+                            timeout=150 if real_opencode else 45,
+                        )
                     assert not stage_error_types, (
                         "production PLAN stage failed with exception types: "
-                        f"{stage_error_types}"
+                        f"{stage_error_types}; provider_adapter_calls={len(requests)}; "
+                        f"provider_shapes={provider_shapes}"
                     )
                     assert entered_after_plan.is_set(), (
                         "production PLAN returned without reaching its acceptance pause"

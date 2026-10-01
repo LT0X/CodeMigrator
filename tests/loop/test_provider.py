@@ -150,6 +150,95 @@ async def test_openai_compatible_provider_maps_request_and_usage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_openai_provider_classifies_invalid_json_without_exposing_body() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="private upstream detail")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderError) as caught:
+        await OpenAICompatibleProvider(
+            endpoint="https://provider.invalid/v1",
+            api_key="secret",
+            client=client,
+        ).complete(_request(_binding()))
+    await client.aclose()
+
+    assert caught.value.failure_code == "invalid_json"
+    assert "private upstream detail" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_classifies_model_identity_mismatch() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-1",
+                "model": "different-model",
+                "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderError) as caught:
+        await OpenAICompatibleProvider(
+            endpoint="https://provider.invalid/v1",
+            api_key="secret",
+            client=client,
+        ).complete(_request(_binding()))
+    await client.aclose()
+
+    assert caught.value.failure_code == "model_identity_mismatch"
+    assert "different-model" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+
+
+def test_openai_provider_uses_a_generation_friendly_default_timeout() -> None:
+    provider = OpenAICompatibleProvider(
+        endpoint="https://provider.invalid/v1",
+        api_key="synthetic",
+    )
+
+    assert provider._client.timeout.as_dict() == {
+        "connect": 10.0,
+        "read": 120.0,
+        "write": 10.0,
+        "pool": 10.0,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "failure_code"),
+    [
+        (httpx.ConnectTimeout, "connect_timeout"),
+        (httpx.ReadTimeout, "read_timeout"),
+        (httpx.RemoteProtocolError, "remote_protocol_error"),
+    ],
+)
+async def test_openai_provider_classifies_transport_failure_without_details(
+    error_type: type[httpx.HTTPError], failure_code: str
+) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        raise error_type("private transport detail")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    with pytest.raises(ProviderError) as caught:
+        await OpenAICompatibleProvider(
+            endpoint="https://provider.invalid/v1",
+            api_key="secret",
+            client=client,
+        ).complete(_request(_binding()))
+    await client.aclose()
+
+    assert caught.value.failure_code == failure_code
+    assert "private transport detail" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.asyncio
 async def test_openai_provider_maps_langchain_any_tool_choice_to_required() -> None:
     seen: dict[str, object] = {}
 
@@ -226,12 +315,15 @@ async def test_anthropic_provider_keeps_system_separate_and_maps_usage() -> None
 
 
 @pytest.mark.asyncio
-async def test_provider_protocol_error_does_not_expose_response_body() -> None:
+@pytest.mark.parametrize("status_code", [401, 502])
+async def test_provider_protocol_error_classifies_http_status_without_exposing_body(
+    status_code: int,
+) -> None:
     def handler(_: httpx.Request) -> httpx.Response:
-        return httpx.Response(502, text="private upstream detail")
+        return httpx.Response(status_code, text="private upstream detail")
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    with pytest.raises(Exception) as caught:
+    with pytest.raises(ProviderError) as caught:
         await OpenAICompatibleProvider(
             endpoint="https://provider.invalid",
             api_key="secret",
@@ -239,5 +331,6 @@ async def test_provider_protocol_error_does_not_expose_response_body() -> None:
         ).complete(_request(_binding()))
     await client.aclose()
 
+    assert caught.value.failure_code == f"http_status_{status_code}"
     assert "private upstream detail" not in str(caught.value)
     assert "secret" not in str(caught.value)
