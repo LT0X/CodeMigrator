@@ -103,7 +103,12 @@ async def test_one_actor_serializes_mailbox_and_commits_state_with_events(run_id
     snapshot = await store.snapshot(run_id)
     assert snapshot.state.status is RunStatus.Planning
     assert snapshot.state.version == 3
-    assert [event.sequence for event in snapshot.events] == [1, 2, 3]
+    assert [event.sequence for event in snapshot.events] == [1, 2, 3, 4]
+    assert [event.event_type for event in snapshot.events[:2]] == [
+        "run.created",
+        "run.status_changed",
+    ]
+    assert snapshot.events[1].data["run_status"] == RunStatus.Planning.value
     assert store.commit_count == 3
     await actor.stop()
 
@@ -600,7 +605,13 @@ async def test_plan_acceptance_atomically_commits_frozen_plan_agent_and_owner_re
         "agent_run.started",
         "agent_run.terminal",
         "run.plan.accepted",
+        "run.status_changed",
     }
+    assert any(
+        event.event_type == "run.status_changed"
+        and event.data.get("run_status") == RunStatus.Executing.value
+        for event in snapshot.events
+    )
     event_types = [event.event_type for event in snapshot.events]
     assert event_types.index("agent_run.started") < event_types.index("agent_run.terminal")
     assert start_receipt.receipt_key == f"agent_run.started:{created.agent_run_id}"
@@ -663,6 +674,11 @@ async def test_execute_round_receipts_are_actor_idempotent_and_verify_report_are
     assert [event.event_type for event in snapshot.events].count("run.execute.round") == 2
     assert [event.event_type for event in snapshot.events].count("run.verify.completed") == 1
     assert [event.event_type for event in snapshot.events].count("run.report.completed") == 1
+    assert [
+        event.data["run_status"]
+        for event in snapshot.events
+        if event.event_type == "run.status_changed"
+    ] == [RunStatus.Verifying.value, RunStatus.Reporting.value, RunStatus.Completed.value]
     await actor.stop()
 
 

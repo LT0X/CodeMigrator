@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC
+from datetime import UTC, datetime
+from uuid import UUID
 
 import pytest
 
-from codemigrator.core import RunId, SecretRegistry
+from codemigrator.core import RunId, RunStatus, SecretRegistry
 from codemigrator.runtime.agent_runs import AgentRunId
 from codemigrator.runtime.contracts import CandidateCheckpointFact, EventSpec, RunState
 from codemigrator.runtime.memory import EvolutionSegmentDraft
 from codemigrator.runtime.schema import RUNTIME_SCHEMA_SQL
 from codemigrator.runtime.store import (
     InMemoryRuntimeStore,
+    PostgreSQLRuntimeStore,
     StoreCommitError,
     _decode_state,
     _dump_json,
@@ -102,6 +104,100 @@ async def test_in_memory_store_rejects_sensitive_event_without_status_change():
             (EventSpec("unsafe.event", {"content": "source"}),),
         )
     assert await store.load(run_id) is None
+
+
+@pytest.mark.asyncio
+async def test_in_memory_run_state_pages_use_stable_bounded_uuid_cursors():
+    store = InMemoryRuntimeStore()
+    run_ids = tuple(RunId(UUID(int=value)) for value in range(1, 6))
+    for run_id in reversed(run_ids):
+        await store.create(RunState(run_id=run_id, status=RunStatus.Created), ())
+
+    first = await store.list_run_states(limit=2)
+    second = await store.list_run_states(limit=2, after_run_id=first.next_cursor)
+    third = await store.list_run_states(limit=2, after_run_id=second.next_cursor)
+    empty = await store.list_run_states(limit=2, after_run_id=run_ids[-1])
+
+    assert tuple(state.run_id for state in first.states) == run_ids[:2]
+    assert first.next_cursor == run_ids[1]
+    assert tuple(state.run_id for state in second.states) == run_ids[2:4]
+    assert second.next_cursor == run_ids[3]
+    assert tuple(state.run_id for state in third.states) == run_ids[4:]
+    assert third.next_cursor is None
+    assert empty.states == ()
+    assert empty.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_in_memory_run_state_page_does_not_return_cursor_run_again():
+    store = InMemoryRuntimeStore()
+    run_ids = tuple(RunId(UUID(int=value)) for value in range(1, 4))
+    for run_id in run_ids:
+        await store.create(RunState(run_id=run_id), ())
+
+    page = await store.list_run_states(limit=2, after_run_id=run_ids[1])
+
+    assert tuple(state.run_id for state in page.states) == (run_ids[2],)
+    assert page.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_postgres_load_reads_run_state_and_event_ledger_in_one_statement():
+    from codemigrator.core import RunStatus
+
+    run_id = RunId(UUID(int=501))
+    state = RunState(run_id=run_id, status=RunStatus.Executing, version=4)
+    now = datetime.now(UTC)
+
+    class Connection:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        async def fetch(self, query: str, received_run_id: RunId):
+            self.queries.append(query)
+            assert received_run_id == run_id
+            return [
+                {
+                    "state": _dump_json(state),
+                    "sequence": 1,
+                    "event_type": "run.status_changed",
+                    "data": {"run_status": "PLANNING"},
+                    "timestamp_utc": now,
+                },
+                {
+                    "state": _dump_json(state),
+                    "sequence": 2,
+                    "event_type": "run.status_changed",
+                    "data": {"run_status": "EXECUTING"},
+                    "timestamp_utc": now,
+                },
+            ]
+
+    class Acquire:
+        def __init__(self, connection: Connection) -> None:
+            self.connection = connection
+
+        async def __aenter__(self):
+            return self.connection
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class Pool:
+        def __init__(self, connection: Connection) -> None:
+            self.connection = connection
+
+        def acquire(self):
+            return Acquire(self.connection)
+
+    connection = Connection()
+    snapshot = await PostgreSQLRuntimeStore(Pool(connection)).load(run_id)
+
+    assert snapshot is not None
+    assert snapshot.state == state
+    assert [event.sequence for event in snapshot.events] == [1, 2]
+    assert len(connection.queries) == 1
+    assert "LEFT JOIN runtime_events" in connection.queries[0]
 
 
 @pytest.mark.asyncio

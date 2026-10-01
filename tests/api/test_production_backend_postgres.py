@@ -30,7 +30,7 @@ from codemigrator.runtime.create_run import (
 )
 from codemigrator.runtime.store import PostgreSQLRuntimeStore
 
-from .conftest import build_plan_agent_inputs, create_run_payload
+from .conftest import build_frozen_plan, build_plan_agent_inputs, create_run_payload
 
 
 def _safe_provider_shape_for_diagnostics(request, response, *, content_is_plan_proposal: bool):
@@ -105,6 +105,36 @@ async def isolated_store(*, max_size: int = 10):
             await pool.close()
         await admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_run_state_pages_and_state_event_snapshot_are_stable():
+    from codemigrator.core import RunStatus
+    from codemigrator.runtime.contracts import EventSpec, RunState
+
+    async with isolated_store() as (store, _schema):
+        run_ids = tuple(UUID(int=value) for value in range(601, 606))
+        for run_id in reversed(run_ids):
+            await store.create(
+                RunState(run_id=RunId(run_id), status=RunStatus.Created),
+                (EventSpec("run.status_changed", {"run_status": RunStatus.Created.value}),),
+            )
+
+        first = await store.list_run_states(limit=2)
+        second = await store.list_run_states(limit=2, after_run_id=first.next_cursor)
+        last = await store.list_run_states(limit=2, after_run_id=second.next_cursor)
+        snapshot = await store.load(RunId(run_ids[0]))
+
+        assert tuple(state.run_id for state in first.states) == run_ids[:2]
+        assert first.next_cursor == run_ids[1]
+        assert tuple(state.run_id for state in second.states) == run_ids[2:4]
+        assert second.next_cursor == run_ids[3]
+        assert tuple(state.run_id for state in last.states) == run_ids[4:]
+        assert last.next_cursor is None
+        assert snapshot is not None
+        assert snapshot.state.run_id == run_ids[0]
+        assert [event.sequence for event in snapshot.events] == [1]
+        assert snapshot.events[0].data["run_status"] == RunStatus.Created.value
 
 
 class PassingPreflight:
@@ -326,7 +356,9 @@ async def test_create_receipt_replays_and_graph_handoff_recovers_after_restart()
         assert len(recovered_graph.receipts) == 1
         assert recovered_graph.receipts[0].run_id == run_id
         assert await store.list_pending_graph_starts() == ()
-        assert len(await store.read_run_events(run_id, 0)) == 1
+        assert [
+            event.event_type for event in await store.read_run_events(run_id, 0)
+        ] == ["run.created", "run.status_changed"]
 
         replay_backend = ProductionApiBackend(
             store,
@@ -1054,7 +1086,9 @@ async def test_concurrent_same_key_replay_starts_graph_once():
         await asyncio.wait_for(graph.completed.wait(), timeout=2)
         assert len(graph.receipts) == 1
         run_id = RunId(UUID(first.json()["run_id"]))
-        assert len(await store.read_run_events(run_id, 0)) == 1
+        assert [
+            event.event_type for event in await store.read_run_events(run_id, 0)
+        ] == ["run.created", "run.status_changed"]
         for _ in range(100):
             if await store.list_pending_graph_starts() == ():
                 break
@@ -1422,6 +1456,172 @@ async def test_production_asgi_composes_run_graph_from_locked_store_and_actor_fa
             assert len(factory_calls) == 1
             assert factory_calls[0][1] is stage_actors[0].store
             assert stage_actors == created_actors
+
+
+@pytest.mark.asyncio
+async def test_production_asgi_projects_committed_run_views_and_resumes_sse_from_snapshot(
+    tmp_path: Path,
+):
+    dsn = os.environ.get("CODEMIGRATOR_TEST_PG_DSN")
+    if not dsn:
+        pytest.skip("CODEMIGRATOR_TEST_PG_DSN is not configured")
+    from codemigrator.asgi import ProductionRunComponents
+    from codemigrator.core import RunStatus, SliceAttemptStatus, SliceKind
+    from codemigrator.runtime.cas import FileHostCAS
+    from codemigrator.runtime.checkpointer import CasCheckpointSaver
+    from codemigrator.runtime.contracts import EventSpec, RunState
+    from codemigrator.runtime.graph_composition import (
+        AgentGraphInfrastructure,
+        RuntimeGraphAssembly,
+    )
+    from codemigrator.runtime.memory import ContextManager
+    from codemigrator.runtime.provider import ProviderRegistry
+
+    async with isolated_store() as (_test_store, schema):
+        captured: dict[str, object] = {}
+
+        def components_factory(store, pool, lock_connection):
+            del pool, lock_connection
+            cas = FileHostCAS(tmp_path / "cas")
+            captured["store"] = store
+            captured["cas"] = cas
+            app_owner_id = uuid4()
+            infrastructure = AgentGraphInfrastructure(
+                provider_registry=ProviderRegistry({}),
+                context_manager=ContextManager(),
+                tool_gateway=object(),
+                runtime_store=store,
+                host_cas=cas,
+                cas_references=store,
+                usage_sink=object(),
+                run_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="run",
+                    owner_kind="run",
+                    owner_id=app_owner_id,
+                ),
+                draft_graph_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="draft",
+                    owner_kind="draft",
+                    owner_id=app_owner_id,
+                ),
+                agent_run_checkpointer=CasCheckpointSaver(
+                    cas,
+                    store,
+                    graph_family="agent",
+                    owner_kind="run",
+                    owner_id=app_owner_id,
+                ),
+            )
+            assembly = RuntimeGraphAssembly(
+                infrastructure,
+                plan_stage_factory=lambda _infra, _actor: object(),
+                verifier_factory=lambda _infra, _actor: object(),
+                reporter_factory=lambda _infra, _actor: object(),
+                draft_agent_runner_factory=lambda _infra, _owner: object(),
+                create_run_service_factory=lambda _infra, _owner: object(),
+            )
+            return ProductionRunComponents(
+                preflight=PassingPreflight(),
+                graph_assembly=assembly,
+                actor_factory=lambda run_id, actor_store: RunActor(run_id, actor_store),
+                durable_checkpointer=True,
+            )
+
+        app = create_production_app(
+            dsn,
+            config=ApiConfig(token="synthetic-token"),
+            run_components_factory=components_factory,
+            stop_server=noop_server_stop,
+            pool_server_settings={"search_path": schema},
+        )
+        async with app.router.lifespan_context(app):
+            store = captured["store"]
+            cas = captured["cas"]
+            assert isinstance(store, PostgreSQLRuntimeStore)
+            assert isinstance(cas, FileHostCAS)
+            run_id = uuid4()
+            frozen_plan = build_frozen_plan()
+            slice_id = frozen_plan.slices[0].id
+            plan_ref = cas.put(frozen_plan.canonical_payload())
+            await store.create(
+                RunState(run_id=RunId(run_id), status=RunStatus.Planning),
+                (EventSpec("run.status_changed", {"run_status": RunStatus.Planning.value}),),
+            )
+            await store.commit(
+                RunState(
+                    run_id=RunId(run_id),
+                    status=RunStatus.Failed,
+                    version=1,
+                    frozen_plan_sha256=frozen_plan.plan_hash,
+                ),
+                (
+                    EventSpec(
+                        "slice.status_changed",
+                        {
+                            "slice_id": str(slice_id),
+                            "status": SliceAttemptStatus.Integrated.value,
+                            "generation": 3,
+                        },
+                    ),
+                    EventSpec(
+                        "run.status_changed", {"run_status": RunStatus.Failed.value}
+                    ),
+                ),
+            )
+            await store.add_cas_reference(plan_ref, "run", run_id, "frozen-plan")
+            persisted_after_cursor = await store.read_run_events(RunId(run_id), 2)
+            assert [event.sequence for event in persisted_after_cursor] == [3]
+            assert await store.is_run_stream_terminal(RunId(run_id), 3)
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+            ) as client:
+                headers = {"Authorization": "Bearer synthetic-token"}
+                listing = await client.get("/api/v1/migrations?limit=10", headers=headers)
+                detail = await client.get(f"/api/v1/migrations/{run_id}", headers=headers)
+                workspace = await client.get(
+                    f"/api/v1/migrations/{run_id}/workspace", headers=headers
+                )
+                replay = await client.get(
+                    f"/api/v1/migrations/{run_id}/events",
+                    headers={**headers, "Last-Event-ID": "2"},
+                )
+
+            assert listing.status_code == detail.status_code == workspace.status_code == 200
+            assert listing.json()["items"][0]["run_id"] == str(run_id)
+            assert detail.json()["status"] == RunStatus.Failed.value
+            assert workspace.json()["latest_sequence"] == 3
+            assert workspace.json()["slices"] == [
+                {
+                    "slice_id": str(slice_id),
+                    "kind": SliceKind.Implementation.value,
+                    "status": SliceAttemptStatus.Integrated.value,
+                    "generation": 3,
+                    "write_scope": {
+                        "write_paths": ["target/a.py"],
+                        "create_roots": ["target/a"],
+                    },
+                    "integration_rank": 0,
+                },
+                {
+                    "slice_id": str(frozen_plan.slices[1].id),
+                    "kind": SliceKind.Implementation.value,
+                    "status": SliceAttemptStatus.Ready.value,
+                    "generation": 0,
+                    "write_scope": {
+                        "write_paths": ["target/b.py"],
+                        "create_roots": ["target/b"],
+                    },
+                    "integration_rank": 1,
+                },
+            ]
+            assert replay.status_code == 200
+            assert "id: 3" in replay.text
+            assert '"run_status":"FAILED"' in replay.text
 
 
 @pytest.mark.asyncio
@@ -1826,10 +2026,11 @@ async def test_production_asgi_runs_plan_agent_to_actor_acceptance_before_execut
                     assert len(requests) == 1
                     assert len(actors) == 1
                     run_events = await actors[0].store.read_run_events(run_id, 0)
-                    assert [event.event_type for event in run_events][-3:] == [
+                    assert [event.event_type for event in run_events][-4:] == [
                         "agent_run.started",
                         "agent_run.terminal",
                         "run.plan.accepted",
+                        "run.status_changed",
                     ]
                     records = await actors[0].store.list_agent_runs_by_owner("run", run_id)
                     assert len(records) == 1
@@ -2242,7 +2443,12 @@ async def test_cancel_routes_to_one_durable_run_actor_with_expected_version():
         assert rejected[0].json()["retryable"] is False
         assert owner.active_actor_count == 1
         run_events = await store.read_run_events(RunId(run_id), 0)
-        assert [event.event_type for event in run_events] == ["run.created", "run.cancelled"]
+        assert [event.event_type for event in run_events] == [
+            "run.created",
+            "run.status_changed",
+            "run.cancelled",
+            "run.status_changed",
+        ]
         await backend.close()
 
 
@@ -2286,5 +2492,10 @@ async def test_cancel_during_graph_start_uses_the_registered_create_actor():
         assert cancelled.json()["status"] == "CANCELLED"
         assert owner.active_actor_count == 1
         run_events = await store.read_run_events(run_id, 0)
-        assert [event.event_type for event in run_events] == ["run.created", "run.cancelled"]
+        assert [event.event_type for event in run_events] == [
+            "run.created",
+            "run.status_changed",
+            "run.cancelled",
+            "run.status_changed",
+        ]
         await backend.close()

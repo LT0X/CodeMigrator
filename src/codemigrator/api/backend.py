@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from threading import Lock
 from typing import Protocol, cast
 from uuid import UUID
@@ -77,6 +78,20 @@ class RunCreationOwnerPort(Protocol):
     ) -> RunCreatedProjection: ...
 
 
+class RunReadProjectionPort(Protocol):
+    async def list_migrations(self, *, limit: int, cursor: UUID | None) -> object: ...
+
+    async def get_migration(self, run_id: UUID) -> object: ...
+
+    async def get_workspace(self, run_id: UUID) -> object: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ApiProductionCapabilities:
+    run_owner: RunCreationOwnerPort | None = None
+    run_read_projection: RunReadProjectionPort | None = None
+
+
 class ProductionApiBackend:
     """Dispatch only commands and streams backed by durable owner capabilities."""
 
@@ -85,11 +100,13 @@ class ProductionApiBackend:
         store: ApiCommandStorePort,
         *,
         run_owner: RunCreationOwnerPort | None = None,
+        run_read_projection: RunReadProjectionPort | None = None,
         shutdown: Callable[[], Awaitable[None]] | None = None,
         health_check: Callable[[], Awaitable[Mapping[str, object]]] | None = None,
     ) -> None:
         self._store = store
         self._run_owner = run_owner
+        self._run_read_projection = run_read_projection
         self._shutdown = shutdown
         self._health_check = health_check
         self._admission_lock = Lock()
@@ -192,6 +209,34 @@ class ProductionApiBackend:
             self._finish_command()
 
     async def _execute_admitted(self, request: ApiRequest) -> object:
+        if request.operation in {"list_migrations", "get_migration", "get_workspace"}:
+            projection = self._run_read_projection
+            if projection is None:
+                raise _unavailable()
+            try:
+                if request.operation == "list_migrations":
+                    try:
+                        limit = int(request.query.get("limit", "100"))
+                    except ValueError as exc:
+                        raise ApiError(422, "limit is invalid", "INVALID_REQUEST") from exc
+                    if not 1 <= limit <= 100:
+                        raise ApiError(422, "limit must be between 1 and 100", "INVALID_REQUEST")
+                    raw_cursor = request.query.get("cursor", "")
+                    try:
+                        cursor = UUID(raw_cursor) if raw_cursor else None
+                    except ValueError as exc:
+                        raise ApiError(422, "cursor is invalid", "INVALID_REQUEST") from exc
+                    return await projection.list_migrations(limit=limit, cursor=cursor)
+                run_id = request.resource_id
+                if run_id is None:
+                    raise ApiError(422, "Run id is required", "INVALID_REQUEST")
+                if request.operation == "get_migration":
+                    return await projection.get_migration(run_id)
+                return await projection.get_workspace(run_id)
+            except ApiError:
+                raise
+            except KeyError:
+                raise ApiError(404, "resource not found", "NOT_FOUND") from None
         if request.operation == "health":
             if self._health_check is None:
                 raise _unavailable()
@@ -442,8 +487,10 @@ def _create_run_gate_code(error: Exception) -> str | None:
 
 
 __all__ = [
+    "ApiProductionCapabilities",
     "ApiCommandStorePort",
     "ProductionApiBackend",
     "RunCreationOwnerPort",
     "RunCreatedProjection",
+    "RunReadProjectionPort",
 ]

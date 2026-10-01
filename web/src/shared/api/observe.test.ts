@@ -4,6 +4,7 @@ import type { ApiClient } from "./client";
 
 const client = (streamEvents: ApiClient["streamEvents"]): ApiClient => ({
   listMigrations: async () => [],
+  getMigration: async (runId) => ({ run_id: runId, status: "EXECUTING", version: 1 }),
   getWorkspace: async () => ({ run_id: "run", slices: [], integration_queue: [], latest_sequence: 4 }),
   getReport: async () => ({ run_id: "run", status: "COMPLETED" }),
   getEvidence: async () => ({}),

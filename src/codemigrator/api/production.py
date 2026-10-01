@@ -13,7 +13,12 @@ import asyncpg  # type: ignore[import-untyped]
 from fastapi import FastAPI
 from starlette.types import Lifespan
 
-from .backend import ApiCommandStorePort, ProductionApiBackend, RunCreationOwnerPort
+from .backend import (
+    ApiCommandStorePort,
+    ApiProductionCapabilities,
+    ProductionApiBackend,
+    RunCreationOwnerPort,
+)
 from .deps import ApiBackend, ApiConfig, ApiRequest, EventRecord
 from .problems import ApiError
 from .routes import create_app
@@ -180,7 +185,8 @@ def create_production_app(
         ApiCommandStorePort,
     ],
     owner_factory: Callable[
-        [ApiCommandStorePort, ApiApplicationResources], RunCreationOwnerPort | None
+        [ApiCommandStorePort, ApiApplicationResources],
+        RunCreationOwnerPort | ApiProductionCapabilities | None,
     ],
     stop_server: Callable[[], Awaitable[None]],
     shutdown: Callable[[], Awaitable[None]] | None = None,
@@ -264,10 +270,16 @@ def create_production_app(
             async with pool.acquire() as connection:
                 if await connection.fetchval("SELECT 1") != 1:
                     raise RuntimeError("PostgreSQL readiness query failed")
-            owner = owner_factory(
+            owner_result = owner_factory(
                 store,
                 ApiApplicationResources(pool=pool, write_connection=lock_connection),
             )
+            if isinstance(owner_result, ApiProductionCapabilities):
+                owner = owner_result.run_owner
+                run_read_projection = owner_result.run_read_projection
+            else:
+                owner = owner_result
+                run_read_projection = None
 
             async def check_health() -> Mapping[str, object]:
                 if not app.state.runtime_ready or pool is None or pool.is_closing():
@@ -295,6 +307,7 @@ def create_production_app(
             backend = ProductionApiBackend(
                 store,
                 run_owner=owner,
+                run_read_projection=run_read_projection,
                 shutdown=shutdown,
                 health_check=check_health,
             )

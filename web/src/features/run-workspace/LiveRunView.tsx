@@ -17,7 +17,8 @@ export function LiveRunView({ client, runId }: { client: ApiClient; runId: strin
     void (async () => {
       try {
         const snapshot = await client.getWorkspace(runId);
-        const hydrated = hydrateStage(snapshot);
+        const migration = await client.getMigration(runId);
+        const hydrated = hydrateStage({ ...snapshot, run_status: migration.status });
         stageRef.current = hydrated;
         setState(hydrated);
         for await (const event of observeRun(client, runId, controller.signal, snapshot.latest_sequence, (phase) => {

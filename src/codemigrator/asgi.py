@@ -9,7 +9,11 @@ from typing import Literal, cast
 import asyncpg  # type: ignore[import-untyped]
 from fastapi import FastAPI
 
-from codemigrator.api.backend import ApiCommandStorePort, RunCreationOwnerPort
+from codemigrator.api.backend import (
+    ApiCommandStorePort,
+    ApiProductionCapabilities,
+    RunCreationOwnerPort,
+)
 from codemigrator.api.deps import ApiConfig
 from codemigrator.api.production import (
     ApiApplicationResources,
@@ -17,6 +21,7 @@ from codemigrator.api.production import (
 from codemigrator.api.production import (
     create_production_app as _create_api_app,
 )
+from codemigrator.api_read_model import RuntimeRunReadModel
 from codemigrator.runtime.actor import RunActorFactory
 from codemigrator.runtime.create_run import (
     CreateRunPreflightPort,
@@ -111,7 +116,7 @@ def create_production_app(
     def owner_factory(
         store: ApiCommandStorePort,
         resources: ApiApplicationResources,
-    ) -> RunCreationOwnerPort | None:
+    ) -> RunCreationOwnerPort | ApiProductionCapabilities | None:
         runtime_store = cast(RuntimeStore, store)
         if run_components_factory is not None:
             components = run_components_factory(
@@ -119,9 +124,12 @@ def create_production_app(
                 resources.pool,
                 resources.write_connection,
             )
-            return cast(
-                RunCreationOwnerPort,
-                create_production_run_owner(runtime_store, components),
+            run_owner = create_production_run_owner(runtime_store, components)
+            return ApiProductionCapabilities(
+                run_owner=cast(RunCreationOwnerPort, run_owner),
+                run_read_projection=RuntimeRunReadModel(
+                    runtime_store, components.graph_assembly.infrastructure.host_cas
+                ),
             )
         if preflight is None or graph_starter is None:
             return None

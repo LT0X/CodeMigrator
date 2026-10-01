@@ -25,12 +25,22 @@ from codemigrator.core import (
     FrozenArtifactBundle,
     MigrationRulebook,
     MigrationSpec,
+    PlanEdgeKind,
+    ProjectModuleId,
     RequiredCheckSelection,
+    SliceKind,
     SpecScope,
     TargetProjectBlueprint,
     UnderstandingDossier,
 )
-from codemigrator.planning import PlanningInputs
+from codemigrator.planning import (
+    EdgeProvenance,
+    PlanEdgeProposal,
+    PlanLedger,
+    PlanningInputs,
+    PlanProposal,
+    PlanSliceProposal,
+)
 
 
 def build_plan_agent_inputs() -> PlanningInputs:
@@ -122,6 +132,39 @@ def build_plan_agent_inputs() -> PlanningInputs:
         ),
         snapshot_oid="snapshot-production-plan",
     )
+
+
+def build_frozen_plan():
+    inputs = build_plan_agent_inputs()
+    proposal = PlanProposal(
+        slices=(
+            PlanSliceProposal(
+                local_ref="A",
+                kind=SliceKind.Implementation,
+                source_modules=[ProjectModuleId(inputs.analysis.modules[0].module_id)],
+                write_paths=["target/a.py"],
+                create_roots=["target/a"],
+            ),
+            PlanSliceProposal(
+                local_ref="B",
+                kind=SliceKind.Implementation,
+                source_modules=[ProjectModuleId(inputs.analysis.modules[1].module_id)],
+                write_paths=["target/b.py"],
+                create_roots=["target/b"],
+            ),
+        ),
+        edges=(
+            PlanEdgeProposal(
+                from_="A",
+                to="B",
+                kind=PlanEdgeKind.Requires,
+                provenance=EdgeProvenance.Structural,
+            ),
+        ),
+        integration_ranks={"A": 0, "B": 1},
+        planner_rationale=(),
+    )
+    return PlanLedger().freeze(proposal, inputs)
 
 
 class FakeBackend:

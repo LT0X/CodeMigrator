@@ -353,6 +353,12 @@ class RuntimeSnapshot:
     events: tuple[RuntimeEvent, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RunStatePage:
+    states: tuple[RunState, ...]
+    next_cursor: RunId | None = None
+
+
 def _is_sha256(value: str) -> bool:
     return (
         isinstance(value, str)
@@ -379,6 +385,7 @@ __all__ = [
     "ExecutionReceiptMessage",
     "RecoveryCommandMessage",
     "RunState",
+    "RunStatePage",
     "RuntimeEvent",
     "RuntimeMessage",
     "RuntimeSnapshot",
