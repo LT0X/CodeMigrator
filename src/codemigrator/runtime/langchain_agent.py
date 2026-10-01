@@ -212,6 +212,10 @@ def agent_context_digest(
 
     if isinstance(context_identity, ContextPackIdentity):
         identity: dict[str, object] = context_identity.model_dump(mode="json", by_alias=True)
+        if identity.get("planning_material_sha256") == "0" * 64:
+            # Preserve persisted digests for non-PLAN AgentRuns created before
+            # this optional PLAN identity component existed.
+            identity.pop("planning_material_sha256", None)
         identity["template_sha256"] = template_sha256
     elif isinstance(context_identity, DraftContextIdentity):
         identity = {

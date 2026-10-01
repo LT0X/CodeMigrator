@@ -35,7 +35,14 @@ class CheckpointIndexStore(Protocol):
     async def list_pending_write_indexes(
         self, thread_id: str, namespace: str, checkpoint_id: str
     ) -> tuple[PendingWriteIndex, ...]: ...
-    async def delete_checkpoint_thread(self, thread_id: str) -> tuple[CasObject, ...]: ...
+    async def delete_checkpoint_thread(
+        self,
+        thread_id: str,
+        *,
+        graph_family: str,
+        owner_kind: str,
+        owner_id: UUID,
+    ) -> tuple[CasObject, ...]: ...
     async def referenced_digests(self) -> frozenset[str]: ...
 
 
@@ -277,14 +284,12 @@ class CasCheckpointSaver(BaseCheckpointSaver[str]):
 
     async def adelete_thread(self, thread_id: str) -> None:
         _config_parts(_saved_config(thread_id, "", ""))
-        indexes = await self.store.list_checkpoint_indexes(thread_id)
-        if any(
-            (index.owner_kind, index.owner_id, index.graph_family)
-            != (self.owner_kind, self.owner_id, self.graph_family)
-            for index in indexes
-        ):
-            raise ValueError("checkpoint owner identity mismatch")
-        candidates = await self.store.delete_checkpoint_thread(thread_id)
+        candidates = await self.store.delete_checkpoint_thread(
+            thread_id,
+            graph_family=self.graph_family,
+            owner_kind=self.owner_kind,
+            owner_id=self.owner_id,
+        )
         for item in candidates:
             async with self.cas.lock(item.digest):
                 if item.digest not in await self.store.referenced_digests():

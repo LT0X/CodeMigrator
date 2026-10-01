@@ -69,3 +69,35 @@ async def test_postgres_checkpoint_restart_indexes_and_orphan_recovery(tmp_path:
         await reopened.adelete_thread(thread)
         assert await reopened.aget_tuple(config(thread)) is None
         assert list(cas.iter_objects()) == []
+
+
+@pytest.mark.asyncio
+async def test_postgres_pending_write_only_thread_delete_is_owner_scoped(tmp_path: Path):
+    async with isolated_store() as store:
+        cas = FileHostCAS(tmp_path)
+        owner_a, owner_b = uuid4(), uuid4()
+        thread = str(uuid4())
+        checkpoint_id = str(uuid4())
+        saver_a = CasCheckpointSaver(
+            cas, store, graph_family="agent", owner_kind="run", owner_id=owner_a
+        )
+        saver_b = CasCheckpointSaver(
+            cas, store, graph_family="agent", owner_kind="run", owner_id=owner_b
+        )
+        await saver_a.aput_writes(
+            config(thread, checkpoint_id), [("result", {"private": True})], "task-1"
+        )
+
+        with pytest.raises(ValueError, match="checkpoint owner identity mismatch"):
+            await saver_b.adelete_thread(thread)
+
+        pending = await store.list_pending_write_indexes(thread, "", checkpoint_id)
+        assert len(pending) == 1
+        assert saver_a._decode(cas.read(pending[0].object)) == [
+            "",
+            "result",
+            {"private": True},
+        ]
+        await saver_a.adelete_thread(thread)
+        assert await store.list_pending_write_indexes(thread, "", checkpoint_id) == ()
+        assert list(cas.iter_objects()) == []

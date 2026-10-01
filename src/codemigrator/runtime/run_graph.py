@@ -77,7 +77,9 @@ class PlanAgentCompletion:
 
 class PlanAgentSessionPort(Protocol):
     agent_run: AgentRun
-    inputs: PlanningInputs
+
+    @property
+    def inputs(self) -> PlanningInputs: ...
 
     async def propose(self, feedback: tuple[object, ...]) -> PlanProposal: ...
 

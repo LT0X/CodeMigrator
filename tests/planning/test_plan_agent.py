@@ -36,7 +36,7 @@ from codemigrator.runtime.provider import (
     ProviderToolCall,
     TokenUsage,
 )
-from codemigrator.runtime.store import InMemoryRuntimeStore
+from codemigrator.runtime.store import InMemoryRuntimeStore, StoreCommitError
 from codemigrator.workspace import GatewayContext
 
 
@@ -130,6 +130,28 @@ class PlanMaterialLoader:
         from codemigrator.runtime.plan_agent import PlanSessionMaterial
 
         return PlanSessionMaterial(self.inputs, self.binding, ContextEnvelope())
+
+
+def test_plan_session_material_snapshots_mutable_planning_inputs(planning_inputs) -> None:
+    from codemigrator.runtime.plan_agent import PlanSessionMaterial
+
+    original_snapshot = planning_inputs.snapshot_oid
+    binding = LockedModelBinding(
+        provider_id="openai-compatible",
+        model_id="fixed-model",
+        profile=ModelProfile.Reasoning,
+        config_revision="local-test-v1",
+        context_window=64_000,
+        output_cap=2_048,
+    )
+    material = PlanSessionMaterial(planning_inputs, binding)
+
+    planning_inputs.snapshot_oid = "mutated-after-material-capture"
+    material_view = material.planning_inputs
+    material_view.snapshot_oid = "mutated-material-view"
+
+    assert material.planning_inputs.snapshot_oid == original_snapshot
+    assert material.planning_material_sha256
 
 
 @pytest_asyncio.fixture
@@ -255,6 +277,14 @@ async def test_persistent_plan_stage_validates_with_same_persistent_agent_run(
         gateway_factory=gateway_factory,
     )
     session = await factory.get_or_create(run_id, f"plan:{run_id}")
+
+    changed_inputs = planning_inputs.model_copy(
+        update={"snapshot_oid": "different-snapshot-with-the-same-artifact-refs"}
+    )
+    material_loader.inputs = changed_inputs
+    with pytest.raises(StoreCommitError, match="AgentRun logical task identity mismatch"):
+        await factory.get_or_create(run_id, f"plan:{run_id}")
+    material_loader.inputs = planning_inputs
 
     with pytest.raises(ValueError, match="started AgentRun receipt"):
         await session.propose(())

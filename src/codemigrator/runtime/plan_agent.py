@@ -52,13 +52,39 @@ from .store import RuntimeStore
 _PLAN_TASK_PREFIX = "Propose a complete migration PlanProposal"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class PlanSessionMaterial:
-    """Trusted immutable inputs and locked model binding for one Run's PLAN."""
+    """Detached planning snapshot and locked model binding for one Run's PLAN."""
 
-    planning_inputs: PlanningInputs
+    _planning_inputs_payload: bytes
     binding: LockedModelBinding
     envelope: ContextEnvelope = ContextEnvelope()
+
+    def __init__(
+        self,
+        planning_inputs: PlanningInputs,
+        binding: LockedModelBinding,
+        envelope: ContextEnvelope = ContextEnvelope(),
+    ) -> None:
+        if not isinstance(planning_inputs, PlanningInputs):
+            raise TypeError("PLAN material must contain validated PlanningInputs")
+        object.__setattr__(
+            self,
+            "_planning_inputs_payload",
+            canonical_json_bytes(planning_inputs.model_dump(mode="json", by_alias=True)),
+        )
+        object.__setattr__(self, "binding", binding)
+        object.__setattr__(self, "envelope", envelope)
+
+    @property
+    def planning_inputs(self) -> PlanningInputs:
+        """Return a fresh model parsed from the immutable input snapshot."""
+
+        return PlanningInputs.model_validate_json(self._planning_inputs_payload)
+
+    @property
+    def planning_material_sha256(self) -> Sha256:
+        return Sha256(hashlib.sha256(self._planning_inputs_payload).hexdigest())
 
 
 class PlanSessionMaterialLoader(Protocol):
@@ -101,21 +127,26 @@ class PersistentPlanAgentSessionFactory(PlanAgentSessionFactory):
             raise TypeError("PLAN material loader returned an invalid result")
         if material.binding.profile is not ModelProfile.Reasoning:
             raise ValueError("PLAN AgentRun requires a Reasoning model binding")
-        if not isinstance(material.planning_inputs, PlanningInputs):
-            raise TypeError("PLAN material must contain validated PlanningInputs")
+        planning_inputs_payload = material._planning_inputs_payload
+        planning_inputs = PlanningInputs.model_validate_json(planning_inputs_payload)
         owner_snapshot = await self.infrastructure.runtime_store.load(run_id)
         if owner_snapshot is None or owner_snapshot.state.create_request is None:
             raise ValueError("PLAN material requires a committed CreateRun owner")
         if (
             owner_snapshot.state.create_request.frozen_artifacts
-            != material.planning_inputs.frozen_artifacts
+            != planning_inputs.frozen_artifacts
         ):
             raise ValueError("PLAN material differs from the Run's frozen artifacts")
 
         template = self.infrastructure.context_manager.template_catalog.template(
             SessionKind.PlanAuxiliary.value
         )
-        identity = _context_identity(run_id, material.planning_inputs, material.binding)
+        identity = _context_identity(
+            run_id,
+            planning_inputs,
+            material.binding,
+            material.planning_material_sha256,
+        )
         schema_definitions = agent_tool_definitions(
             phase=Phase.Plan,
             session_kind=SessionKind.PlanAuxiliary,
@@ -193,7 +224,7 @@ class PersistentPlanAgentSessionFactory(PlanAgentSessionFactory):
         )
         return _PersistentPlanAgentSession(
             agent_run=record,
-            inputs=material.planning_inputs,
+            planning_inputs_payload=planning_inputs_payload,
             actor=self.actor,
             runtime_store=self.infrastructure.runtime_store,
             host_cas=self.infrastructure.host_cas,
@@ -231,13 +262,19 @@ class PersistentPlanStageFactory:
 @dataclass(slots=True)
 class _PersistentPlanAgentSession(PlanAgentSessionPort):
     agent_run: AgentRun
-    inputs: PlanningInputs
+    planning_inputs_payload: bytes
     actor: PlanOwnerPort
     runtime_store: RuntimeStore
     host_cas: FileHostCAS
     bound: BoundAgentRun
     _latest_proposal: PlanProposal | None = None
     _completion: PlanAgentCompletion | None = None
+
+    @property
+    def inputs(self) -> PlanningInputs:
+        """Return an isolated model view of the AgentRun's frozen inputs."""
+
+        return PlanningInputs.model_validate_json(self.planning_inputs_payload)
 
     async def propose(self, feedback: tuple[object, ...]) -> PlanProposal:
         await self._require_started_receipt()
@@ -249,7 +286,8 @@ class _PersistentPlanAgentSession(PlanAgentSessionPort):
         max_proposals = PlanProposalWorkflow.feedback_limit + 1
         if feedback and await self._proposal_prompt_count() >= max_proposals:
             raise PlanProposalRejected("PLAN validation feedback limit exhausted")
-        task = _proposal_task(self.inputs, feedback)
+        inputs = PlanningInputs.model_validate_json(self.planning_inputs_payload)
+        task = _proposal_task(inputs, feedback)
         result = await self.bound.ainvoke(task=task)
         proposal = result.structured_response
         if (
@@ -350,7 +388,10 @@ class _PersistentPlanAgentSession(PlanAgentSessionPort):
 
 
 def _context_identity(
-    run_id: RunId, inputs: PlanningInputs, binding: LockedModelBinding
+    run_id: RunId,
+    inputs: PlanningInputs,
+    binding: LockedModelBinding,
+    planning_material_sha256: Sha256,
 ) -> ContextPackIdentity:
     frozen = inputs.frozen_artifacts
     contract_refs = {
@@ -369,6 +410,7 @@ def _context_identity(
         contract_refs_sha256=Sha256(
             hashlib.sha256(canonical_json_bytes(contract_refs)).hexdigest()
         ),
+        planning_material_sha256=planning_material_sha256,
     )
 
 
