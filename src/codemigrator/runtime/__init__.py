@@ -10,6 +10,7 @@ from .actor import (
     ExecutionSchedulerPort,
     RepairAdvicePort,
     RunActor,
+    RunActorFactory,
 )
 from .advice import (
     AdviceDisposition,
@@ -438,6 +439,7 @@ __all__ = [
     "build_repair_session_dispatch",
     "evaluate_joint_repair_dispatch",
     "RunActor",
+    "RunActorFactory",
     "RunCreatedReceipt",
     "RunState",
     "RunWorkflowGraph",

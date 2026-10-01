@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import cast
 from uuid import UUID
 
@@ -18,6 +19,14 @@ from .problems import ApiError
 from .routes import create_app
 
 _APPLICATION_LOCK_KEY = 0x436F64654D696772
+
+
+@dataclass(frozen=True, slots=True)
+class ApiApplicationResources:
+    """PostgreSQL resources available to the runtime composition factory."""
+
+    pool: asyncpg.Pool[asyncpg.Record]
+    write_connection: asyncpg.Connection[asyncpg.Record]
 
 
 class _BackendSlot:
@@ -170,7 +179,9 @@ def create_production_app(
         [asyncpg.Pool[asyncpg.Record], asyncpg.Connection[asyncpg.Record]],
         ApiCommandStorePort,
     ],
-    owner_factory: Callable[[ApiCommandStorePort], RunCreationOwnerPort | None],
+    owner_factory: Callable[
+        [ApiCommandStorePort, ApiApplicationResources], RunCreationOwnerPort | None
+    ],
     stop_server: Callable[[], Awaitable[None]],
     shutdown: Callable[[], Awaitable[None]] | None = None,
     pool_server_settings: Mapping[str, str] | None = None,
@@ -253,7 +264,10 @@ def create_production_app(
             async with pool.acquire() as connection:
                 if await connection.fetchval("SELECT 1") != 1:
                     raise RuntimeError("PostgreSQL readiness query failed")
-            owner = owner_factory(store)
+            owner = owner_factory(
+                store,
+                ApiApplicationResources(pool=pool, write_connection=lock_connection),
+            )
 
             async def check_health() -> Mapping[str, object]:
                 if not app.state.runtime_ready or pool is None or pool.is_closing():

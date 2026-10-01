@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from codemigrator.runtime.contracts import RunCreatedReceipt
-from codemigrator.runtime.create_run import CreateRunRejected, CreateRunService
+from codemigrator.runtime.actor import RunActor
+from codemigrator.runtime.contracts import RunCreatedReceipt, RuntimeStoreTransaction
+from codemigrator.runtime.create_run import (
+    CreateRunRejected,
+    CreateRunService,
+    RunCreationOwner,
+)
+from codemigrator.runtime.store import InMemoryRuntimeStore
 
 from .conftest import create_run
 
@@ -39,6 +45,8 @@ class RecordingActor:
 
 
 class RecordingGraphStarter:
+    receipt_idempotent = True
+
     def __init__(self) -> None:
         self.receipts: list[RunCreatedReceipt] = []
 
@@ -100,3 +108,35 @@ async def test_missing_actor_receipt_does_not_start_run_graph(run_id) -> None:
 
     with pytest.raises(CreateRunRejected, match="RunCreated receipt"):
         await service.create(run_id, create_run())
+
+
+@pytest.mark.asyncio
+async def test_run_creation_owner_uses_injected_factory_for_new_actor(run_id) -> None:
+    store = InMemoryRuntimeStore()
+    scheduler = object()
+    factory_calls = []
+
+    def actor_factory(received_run_id, received_store):
+        factory_calls.append((received_run_id, received_store))
+        return RunActor(
+            received_run_id,
+            received_store,
+            execution_scheduler=scheduler,
+        )
+
+    owner = RunCreationOwner(
+        store=store,
+        preflight=RecordingPreflight(),
+        graph_starter=RecordingGraphStarter(),
+        actor_factory=actor_factory,
+    )
+    transaction = RuntimeStoreTransaction(store, None)
+
+    receipt = await owner.create_run(create_run(), transaction)
+    transaction.finish(committed=True)
+    actor = await owner._get_actor(receipt.run_id)
+
+    assert actor is not None
+    assert actor.execution_scheduler is scheduler
+    assert factory_calls == [(receipt.run_id, store)]
+    await owner.close()
