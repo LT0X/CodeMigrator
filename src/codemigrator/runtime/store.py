@@ -139,6 +139,7 @@ class RuntimeStore(Protocol):
         fact: Mapping[str, object],
         *,
         events: Sequence[DraftSessionEventSpec] = (),
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> DraftOwnerReceipt:
         """Persist an immutable Draft fact and its idempotency receipt."""
 
@@ -333,76 +334,148 @@ class InMemoryRuntimeStore:
         fact: Mapping[str, object],
         *,
         events: Sequence[DraftSessionEventSpec] = (),
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> DraftOwnerReceipt:
         receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
         event_data = _prepare_draft_events(events, self.secret_registry)
-        async with self._agent_lock:
-            key = (draft_id, receipt_key)
-            previous = self._draft_facts.get(key)
-            if previous is not None:
-                if (
-                    previous[0] != receipt
-                    or previous[1] != payload
-                    or self._draft_event_specs[key] != event_data
-                ):
-                    raise StoreCommitError("Draft owner fact replay mismatch")
-                return previous[0]
-            if self._fail_next:
-                self._fail_next = False
-                raise StoreCommitError("injected commit failure")
-            self._draft_facts[key] = (receipt, payload)
-            self._draft_event_specs[key] = event_data
-            ledger = self._draft_events.setdefault(draft_id, [])
-            first_sequence = len(ledger) + 1
-            appended = tuple(
-                DraftSessionEvent(
-                    draft_id, first_sequence + index, event_type, data, datetime.now(UTC)
+        if transaction is None:
+            async with self._agent_lock:
+                committed, _appended, created = await self._commit_draft_fact_locked(
+                    draft_id, receipt_key, receipt, payload, event_data
                 )
-                for index, (event_type, data) in enumerate(event_data)
+            if created and event_data:
+                self._schedule_draft_event_notification(draft_id)
+            return committed
+        if transaction.store is not self or not transaction.active:
+            raise StoreCommitError("runtime transaction does not belong to this store")
+
+        await self._agent_lock.acquire()
+        lock_transferred = False
+        try:
+            committed, appended, created = await self._commit_draft_fact_locked(
+                draft_id, receipt_key, receipt, payload, event_data
             )
-            ledger.extend(appended)
-            for event in appended:
-                if event.event_type in _DRAFT_TERMINAL_EVENTS:
-                    terminal = self._draft_terminals.get(draft_id)
-                    if terminal is None or event.sequence < terminal:
-                        self._draft_terminals[draft_id] = event.sequence
-            condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
-            async with condition:
+            if created:
+                transaction.after_rollback(
+                    lambda: self._rollback_draft_fact(draft_id, receipt_key, appended)
+                )
+                transaction.after_rollback(self._agent_lock.release)
+                transaction.after_commit(self._agent_lock.release)
                 if event_data:
-                    condition.notify_all()
-            return receipt
+                    transaction.after_commit(
+                        lambda: self._schedule_draft_event_notification(draft_id)
+                    )
+                lock_transferred = True
+            return committed
+        finally:
+            if not lock_transferred:
+                self._agent_lock.release()
+
+    async def _commit_draft_fact_locked(
+        self,
+        draft_id: UUID,
+        receipt_key: str,
+        receipt: DraftOwnerReceipt,
+        payload: dict[str, object],
+        event_data: tuple[tuple[str, dict[str, object]], ...],
+    ) -> tuple[DraftOwnerReceipt, tuple[DraftSessionEvent, ...], bool]:
+        key = (draft_id, receipt_key)
+        previous = self._draft_facts.get(key)
+        if previous is not None:
+            if (
+                previous[0] != receipt
+                or previous[1] != payload
+                or self._draft_event_specs[key] != event_data
+            ):
+                raise StoreCommitError("Draft owner fact replay mismatch")
+            return previous[0], (), False
+        if self._fail_next:
+            self._fail_next = False
+            raise StoreCommitError("injected commit failure")
+        self._draft_facts[key] = (receipt, payload)
+        self._draft_event_specs[key] = event_data
+        ledger = self._draft_events.setdefault(draft_id, [])
+        first_sequence = len(ledger) + 1
+        appended = tuple(
+            DraftSessionEvent(draft_id, first_sequence + index, event_type, data, datetime.now(UTC))
+            for index, (event_type, data) in enumerate(event_data)
+        )
+        ledger.extend(appended)
+        for event in appended:
+            if event.event_type in _DRAFT_TERMINAL_EVENTS:
+                terminal = self._draft_terminals.get(draft_id)
+                if terminal is None or event.sequence < terminal:
+                    self._draft_terminals[draft_id] = event.sequence
+        return receipt, appended, True
+
+    def _schedule_draft_event_notification(self, draft_id: UUID) -> None:
+        loop = asyncio.get_running_loop()
+        loop.call_soon(lambda: loop.create_task(self._notify_draft_event_waiters(draft_id)))
+
+    async def _notify_draft_event_waiters(self, draft_id: UUID) -> None:
+        condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
+        async with condition:
+            condition.notify_all()
+
+    def _rollback_draft_fact(
+        self,
+        draft_id: UUID,
+        receipt_key: str,
+        appended: tuple[DraftSessionEvent, ...],
+    ) -> None:
+        self._draft_facts.pop((draft_id, receipt_key), None)
+        self._draft_event_specs.pop((draft_id, receipt_key), None)
+        removed_sequences = {event.sequence for event in appended}
+        ledger = self._draft_events.get(draft_id)
+        if ledger is not None and removed_sequences:
+            ledger[:] = [event for event in ledger if event.sequence not in removed_sequences]
+            if not ledger:
+                self._draft_events.pop(draft_id, None)
+        terminal = min(
+            (
+                event.sequence
+                for event in self._draft_events.get(draft_id, ())
+                if event.event_type in _DRAFT_TERMINAL_EVENTS
+            ),
+            default=None,
+        )
+        if terminal is None:
+            self._draft_terminals.pop(draft_id, None)
+        else:
+            self._draft_terminals[draft_id] = terminal
 
     async def read_draft_session_events(
         self, draft_id: UUID, after_sequence: int
     ) -> tuple[DraftSessionEvent, ...]:
-        return tuple(
-            DraftSessionEvent(
-                event.draft_id,
-                event.sequence,
-                event.event_type,
-                dict(event.data),
-                event.timestamp_utc,
+        async with self._agent_lock:
+            return tuple(
+                DraftSessionEvent(
+                    event.draft_id,
+                    event.sequence,
+                    event.event_type,
+                    dict(event.data),
+                    event.timestamp_utc,
+                )
+                for event in self._draft_events.get(draft_id, ())
+                if event.sequence > after_sequence
             )
-            for event in self._draft_events.get(draft_id, ())
-            if event.sequence > after_sequence
-        )
 
     async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None:
         condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
         async with condition:
-            await condition.wait_for(
-                lambda: (
-                    len(self._draft_events.get(draft_id, ())) > after_sequence
-                    or (
+            while True:
+                async with self._agent_lock:
+                    if len(self._draft_events.get(draft_id, ())) > after_sequence or (
                         self._draft_terminals.get(draft_id) is not None
                         and self._draft_terminals[draft_id] <= after_sequence
-                    )
-                )
-            )
+                    ):
+                        return
+                await condition.wait()
 
     async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool:
-        terminal_sequence = self._draft_terminals.get(draft_id)
-        return terminal_sequence is not None and terminal_sequence <= after_sequence
+        async with self._agent_lock:
+            terminal_sequence = self._draft_terminals.get(draft_id)
+            return terminal_sequence is not None and terminal_sequence <= after_sequence
 
     async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
         snapshot = self._snapshots.get(run_id)
@@ -450,28 +523,31 @@ class InMemoryRuntimeStore:
     async def load_draft_owner_fact(
         self, draft_id: UUID, receipt_key: str
     ) -> tuple[DraftOwnerReceipt, dict[str, object]] | None:
-        value = self._draft_facts.get((draft_id, receipt_key))
-        if value is None:
-            return None
-        receipt, fact = value
-        _verify_draft_fact_digest(receipt, fact)
-        return receipt, _decode_draft_fact(canonical_json_bytes(fact))
+        async with self._agent_lock:
+            value = self._draft_facts.get((draft_id, receipt_key))
+            if value is None:
+                return None
+            receipt, fact = value
+            _verify_draft_fact_digest(receipt, fact)
+            return receipt, _decode_draft_fact(canonical_json_bytes(fact))
 
     async def list_draft_owner_facts(
         self, draft_id: UUID
     ) -> tuple[tuple[DraftOwnerReceipt, dict[str, object]], ...]:
-        values = tuple(
-            value
-            for (owner_id, _), value in sorted(
-                self._draft_facts.items(), key=lambda item: item[0][1]
+        async with self._agent_lock:
+            values = tuple(
+                value
+                for (owner_id, _), value in sorted(
+                    self._draft_facts.items(), key=lambda item: item[0][1]
+                )
+                if owner_id == draft_id
             )
-            if owner_id == draft_id
-        )
-        for receipt, fact in values:
-            _verify_draft_fact_digest(receipt, fact)
-        return tuple(
-            (receipt, _decode_draft_fact(canonical_json_bytes(fact))) for receipt, fact in values
-        )
+            for receipt, fact in values:
+                _verify_draft_fact_digest(receipt, fact)
+            return tuple(
+                (receipt, _decode_draft_fact(canonical_json_bytes(fact)))
+                for receipt, fact in values
+            )
 
     async def release_cas_reference(
         self, owner_kind: str, owner_id: UUID, reference_key: str
@@ -804,32 +880,33 @@ class InMemoryRuntimeStore:
                     outcome,
                     now + timedelta(hours=24),
                 )
-                if owner is not None:
+                if owner is not None and owner[0] == "run":
                     self._graph_start_handoffs[RunId(owner[1])] = owner[2]
                 transaction.after_rollback(lambda: self._api_commands.pop(scope, None))
-                if owner is not None:
+                if owner is not None and owner[0] == "run":
                     transaction.after_rollback(
                         lambda: self._graph_start_handoffs.pop(RunId(owner[1]), None)
                     )
-            except Exception:
+            except BaseException:
                 transaction.finish(committed=False)
                 raise
             transaction.finish(committed=True)
             return outcome
 
-    def _record_in_memory_graph_handoff(
-        self, owner: tuple[str, UUID, str] | None
-    ) -> None:
+    def _record_in_memory_graph_handoff(self, owner: tuple[str, UUID, str] | None) -> None:
         if owner is None:
             return
         owner_kind, owner_id, receipt_key = owner
+        if owner_kind == "draft":
+            if (owner_id, receipt_key) not in self._draft_facts:
+                raise StoreCommitError("API command has no committed Draft owner receipt")
+            return
         if owner_kind != "run":
             raise StoreCommitError("unsupported API command owner receipt")
         run_id = RunId(owner_id)
         snapshot = self._snapshots.get(run_id)
         if snapshot is None or not any(
-            event.event_type == "run.created"
-            and event.data.get("receipt_key") == receipt_key
+            event.event_type == "run.created" and event.data.get("receipt_key") == receipt_key
             for event in snapshot.events
         ):
             raise StoreCommitError("API command has no committed RunCreated receipt")
@@ -946,81 +1023,94 @@ class PostgreSQLRuntimeStore:
         fact: Mapping[str, object],
         *,
         events: Sequence[DraftSessionEventSpec] = (),
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> DraftOwnerReceipt:
         receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
         event_data = _prepare_draft_events(events, self.secret_registry)
-        async with self._acquire_write_connection() as connection:
-            async with connection.transaction():
-                await connection.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", str(draft_id)
-                )
-                inserted = await connection.fetchval(
-                    """INSERT INTO draft_owner_facts(
+        if transaction is not None and (
+            transaction.store is not self
+            or not transaction.active
+            or transaction.connection is None
+        ):
+            raise StoreCommitError("runtime transaction does not belong to this store")
+
+        async def commit_on(connection: Any) -> DraftOwnerReceipt:
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", str(draft_id)
+            )
+            inserted = await connection.fetchval(
+                """INSERT INTO draft_owner_facts(
                         draft_id, receipt_key, category, fact_sha256, fact
                     ) VALUES ($1,$2,$3,$4,$5::jsonb)
                     ON CONFLICT (draft_id, receipt_key) DO NOTHING
                     RETURNING receipt_key""",
-                    draft_id,
-                    receipt_key,
-                    category,
-                    receipt.fact_sha256,
-                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
-                )
-                row = await connection.fetchrow(
-                    """SELECT category, fact_sha256, fact FROM draft_owner_facts
+                draft_id,
+                receipt_key,
+                category,
+                receipt.fact_sha256,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            )
+            row = await connection.fetchrow(
+                """SELECT category, fact_sha256, fact FROM draft_owner_facts
                     WHERE draft_id=$1 AND receipt_key=$2""",
-                    draft_id,
-                    receipt_key,
-                )
-                if row is None:
-                    raise StoreCommitError("Draft owner fact commit disappeared")
-                stored = _decode_draft_fact(_row_value(row, "fact"))
-                stored_receipt = DraftOwnerReceipt(
-                    draft_id,
-                    receipt_key,
-                    str(_row_value(row, "category")),
-                    str(_row_value(row, "fact_sha256")).strip(),
-                )
-                if stored_receipt != receipt or stored != payload:
-                    raise StoreCommitError("Draft owner fact replay mismatch")
-                if inserted is not None:
-                    first_sequence = await connection.fetchval(
-                        """SELECT COALESCE(MAX(sequence), 0) + 1
+                draft_id,
+                receipt_key,
+            )
+            if row is None:
+                raise StoreCommitError("Draft owner fact commit disappeared")
+            stored = _decode_draft_fact(_row_value(row, "fact"))
+            stored_receipt = DraftOwnerReceipt(
+                draft_id,
+                receipt_key,
+                str(_row_value(row, "category")),
+                str(_row_value(row, "fact_sha256")).strip(),
+            )
+            if stored_receipt != receipt or stored != payload:
+                raise StoreCommitError("Draft owner fact replay mismatch")
+            if inserted is not None:
+                first_sequence = await connection.fetchval(
+                    """SELECT COALESCE(MAX(sequence), 0) + 1
                         FROM draft_session_events WHERE draft_id=$1""",
-                        draft_id,
-                    )
-                    for index, (event_type, data) in enumerate(event_data):
-                        await connection.execute(
-                            """INSERT INTO draft_session_events
+                    draft_id,
+                )
+                for index, (event_type, data) in enumerate(event_data):
+                    await connection.execute(
+                        """INSERT INTO draft_session_events
                             (draft_id, receipt_key, sequence, event_type, data)
                             VALUES ($1,$2,$3,$4,$5::jsonb)""",
-                            draft_id,
-                            receipt_key,
-                            first_sequence + index,
-                            event_type,
-                            json.dumps(data, sort_keys=True, separators=(",", ":")),
-                        )
-                    if event_data:
-                        await connection.execute(
-                            "SELECT pg_notify('draft_session_events', $1)", str(draft_id)
-                        )
-                else:
-                    replay_rows = await connection.fetch(
-                        """SELECT event_type, data FROM draft_session_events
-                        WHERE draft_id=$1 AND receipt_key=$2 ORDER BY sequence""",
                         draft_id,
                         receipt_key,
+                        first_sequence + index,
+                        event_type,
+                        json.dumps(data, sort_keys=True, separators=(",", ":")),
                     )
-                    replay_events = tuple(
-                        (
-                            str(_row_value(row, "event_type")),
-                            _decode_draft_fact(_row_value(row, "data")),
-                        )
-                        for row in replay_rows
+                if event_data:
+                    await connection.execute(
+                        "SELECT pg_notify('draft_session_events', $1)", str(draft_id)
                     )
-                    if replay_events != event_data:
-                        raise StoreCommitError("Draft owner fact replay mismatch")
-                return stored_receipt
+            else:
+                replay_rows = await connection.fetch(
+                    """SELECT event_type, data FROM draft_session_events
+                        WHERE draft_id=$1 AND receipt_key=$2 ORDER BY sequence""",
+                    draft_id,
+                    receipt_key,
+                )
+                replay_events = tuple(
+                    (
+                        str(_row_value(row, "event_type")),
+                        _decode_draft_fact(_row_value(row, "data")),
+                    )
+                    for row in replay_rows
+                )
+                if replay_events != event_data:
+                    raise StoreCommitError("Draft owner fact replay mismatch")
+            return stored_receipt
+
+        if transaction is not None:
+            return await commit_on(transaction.connection)
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                return await commit_on(connection)
 
     async def read_draft_session_events(
         self, draft_id: UUID, after_sequence: int
@@ -1638,9 +1728,7 @@ class PostgreSQLRuntimeStore:
         if len(key) > 256:
             raise ValueError("API idempotency key is too long")
         body_digest = sha256(canonical_body).hexdigest()
-        scope_key = json.dumps(
-            [principal_id, route, key], ensure_ascii=True, separators=(",", ":")
-        )
+        scope_key = json.dumps([principal_id, route, key], ensure_ascii=True, separators=(",", ":"))
         transaction_context: RuntimeStoreTransaction | None = None
         outcome: dict[str, object]
         try:
@@ -1674,45 +1762,49 @@ class PostgreSQLRuntimeStore:
                                 "status_code": int(_row_value(existing, "status_code")),
                                 "owner_kind": _row_value(existing, "owner_kind"),
                                 "owner_id": _row_value(existing, "owner_id"),
-                                "owner_receipt_key": _row_value(
-                                    existing, "owner_receipt_key"
-                                ),
+                                "owner_receipt_key": _row_value(existing, "owner_receipt_key"),
                                 "replayed": True,
                             }
                     else:
                         transaction_context = RuntimeStoreTransaction(self, connection)
                         value = await command(transaction_context)
                         response = project_response(value)
-                        response_json = json.dumps(
-                            response, sort_keys=True, separators=(",", ":")
-                        )
+                        response_json = json.dumps(response, sort_keys=True, separators=(",", ":"))
                         owner = owner_receipt(value)
                         owner_kind: str | None = None
                         owner_id: UUID | None = None
                         receipt_key: str | None = None
                         if owner is not None:
                             owner_kind, owner_id, receipt_key = owner
-                            if owner_kind != "run" or not receipt_key:
-                                raise StoreCommitError(
-                                    "API command owner receipt is unsupported"
+                            if owner_kind not in {"run", "draft"} or not receipt_key:
+                                raise StoreCommitError("API command owner receipt is unsupported")
+                            if owner_kind == "run":
+                                committed_receipt = await connection.fetchval(
+                                    """SELECT 1 FROM runtime_events WHERE run_id=$1
+                                    AND sequence=1 AND event_type='run.created'
+                                    AND data->>'receipt_key'=$2""",
+                                    owner_id,
+                                    receipt_key,
                                 )
-                            committed_receipt = await connection.fetchval(
-                                """SELECT 1 FROM runtime_events WHERE run_id=$1
-                                AND sequence=1 AND event_type='run.created'
-                                AND data->>'receipt_key'=$2""",
-                                owner_id,
-                                receipt_key,
-                            )
+                            else:
+                                committed_receipt = await connection.fetchval(
+                                    """SELECT 1 FROM draft_owner_facts
+                                    WHERE draft_id=$1 AND receipt_key=$2""",
+                                    owner_id,
+                                    receipt_key,
+                                )
                             if committed_receipt is None:
+                                owner_fact = "RunCreated" if owner_kind == "run" else "Draft owner"
                                 raise StoreCommitError(
-                                    "API command has no committed RunCreated receipt"
+                                    f"API command has no committed {owner_fact} receipt"
                                 )
-                            await connection.execute(
-                                """INSERT INTO run_graph_start_handoffs
-                                (run_id, receipt_key, status) VALUES ($1,$2,'PENDING')""",
-                                owner_id,
-                                receipt_key,
-                            )
+                            if owner_kind == "run":
+                                await connection.execute(
+                                    """INSERT INTO run_graph_start_handoffs
+                                    (run_id, receipt_key, status) VALUES ($1,$2,'PENDING')""",
+                                    owner_id,
+                                    receipt_key,
+                                )
                         if expired:
                             await connection.execute(
                                 """DELETE FROM api_command_receipts
@@ -1762,8 +1854,7 @@ class PostgreSQLRuntimeStore:
                 WHERE status='PENDING' ORDER BY created_at, run_id"""
             )
         return tuple(
-            (RunId(_row_value(row, "run_id")), str(_row_value(row, "receipt_key")))
-            for row in rows
+            (RunId(_row_value(row, "run_id")), str(_row_value(row, "receipt_key"))) for row in rows
         )
 
     async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None:

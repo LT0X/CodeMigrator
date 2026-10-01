@@ -22,7 +22,11 @@ from codemigrator.api.sse import sse_events
 from codemigrator.asgi import create_production_app
 from codemigrator.core import CreateRun, FailureReason, RunId, StableErrorCode, canonical_json_bytes
 from codemigrator.runtime.actor import RunActor
-from codemigrator.runtime.contracts import RunCreatedReceipt, RuntimeStoreTransaction
+from codemigrator.runtime.contracts import (
+    DraftSessionEventSpec,
+    RunCreatedReceipt,
+    RuntimeStoreTransaction,
+)
 from codemigrator.runtime.create_run import (
     CreateRunRejected,
     RunCreationOwner,
@@ -828,6 +832,158 @@ async def test_preflight_gates_share_the_api_transaction_connection_at_pool_size
             assert await connection.fetchval("SELECT count(*) FROM api_command_receipts") == 0
             assert await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs") == 0
         await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_draft_owner_api_receipt_commits_and_replays_without_run_handoff():
+    async with isolated_store() as (store, _schema):
+        draft_id = uuid4()
+        event = DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())})
+
+        async def command(transaction: RuntimeStoreTransaction):
+            return await store.commit_draft_owner_fact(
+                draft_id,
+                "draft.created",
+                "draft.created",
+                {"revision": 0},
+                events=(event,),
+                transaction=transaction,
+            )
+
+        def project(receipt):
+            return {"session_id": str(receipt.draft_id), "revision": 0}
+
+        def owner(receipt):
+            return ("draft", receipt.draft_id, receipt.receipt_key)
+
+        first = await store.execute_api_command(
+            principal_id="local",
+            route="/api/v1/sessions",
+            key="create-draft-atomic",
+            canonical_body=b'{"kind":"DRAFT"}',
+            status_code=201,
+            command=command,
+            project_response=project,
+            owner_receipt=owner,
+        )
+        replay = await store.execute_api_command(
+            principal_id="local",
+            route="/api/v1/sessions",
+            key="create-draft-atomic",
+            canonical_body=b'{"kind":"DRAFT"}',
+            status_code=201,
+            command=lambda _transaction: pytest.fail("replayed Draft command ran twice"),
+            project_response=project,
+            owner_receipt=owner,
+        )
+        conflict = await store.execute_api_command(
+            principal_id="local",
+            route="/api/v1/sessions",
+            key="create-draft-atomic",
+            canonical_body=b'{"kind":"OTHER"}',
+            status_code=201,
+            command=lambda _transaction: pytest.fail("conflicting Draft command ran"),
+            project_response=project,
+            owner_receipt=owner,
+        )
+
+        assert first["replayed"] is False
+        assert replay["replayed"] is True
+        assert replay["response"] == {"session_id": str(draft_id), "revision": 0}
+        assert conflict == {"conflict": True, "replayed": False}
+        async with store.pool.acquire() as connection:
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM draft_owner_facts WHERE draft_id=$1", draft_id
+                )
+                == 1
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM draft_session_events WHERE draft_id=$1", draft_id
+                )
+                == 1
+            )
+            assert (
+                await connection.fetchval(
+                    """SELECT count(*) FROM api_command_receipts
+                WHERE route='/api/v1/sessions' AND idempotency_key='create-draft-atomic'
+                AND owner_kind='draft' AND owner_id=$1""",
+                    draft_id,
+                )
+                == 1
+            )
+            assert await connection.fetchval("SELECT count(*) FROM run_graph_start_handoffs") == 0
+
+            with pytest.raises(asyncpg.CheckViolationError):
+                async with connection.transaction():
+                    await connection.execute(
+                        """INSERT INTO api_command_receipts(
+                            principal_id, route, idempotency_key, body_sha256,
+                            status_code, response_body, owner_kind, owner_id,
+                            owner_receipt_key, expires_at
+                        ) VALUES ('local', '/api/v1/sessions', 'invalid-null-owner-kind',
+                            $1, 201, '{}'::jsonb, NULL, $2, 'draft.created',
+                            now() + interval '1 day')""",
+                        "a" * 64,
+                        draft_id,
+                    )
+
+
+@pytest.mark.asyncio
+async def test_draft_owner_api_receipt_rolls_back_fact_and_event_after_projection_error():
+    async with isolated_store() as (store, _schema):
+        draft_id = uuid4()
+        event = DraftSessionEventSpec("session.question.asked", {"question_id": str(uuid4())})
+
+        async def command(transaction: RuntimeStoreTransaction):
+            return await store.commit_draft_owner_fact(
+                draft_id,
+                "draft.created",
+                "draft.created",
+                {"revision": 0},
+                events=(event,),
+                transaction=transaction,
+            )
+
+        with pytest.raises(RuntimeError, match="projection failed"):
+            await store.execute_api_command(
+                principal_id="local",
+                route="/api/v1/sessions",
+                key="create-draft-rollback",
+                canonical_body=b'{"kind":"DRAFT"}',
+                status_code=201,
+                command=command,
+                project_response=lambda _receipt: (_ for _ in ()).throw(
+                    RuntimeError("projection failed")
+                ),
+                owner_receipt=lambda receipt: (
+                    "draft",
+                    receipt.draft_id,
+                    receipt.receipt_key,
+                ),
+            )
+
+        async with store.pool.acquire() as connection:
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM draft_owner_facts WHERE draft_id=$1", draft_id
+                )
+                == 0
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM draft_session_events WHERE draft_id=$1", draft_id
+                )
+                == 0
+            )
+            assert (
+                await connection.fetchval(
+                    """SELECT count(*) FROM api_command_receipts
+                    WHERE route='/api/v1/sessions' AND idempotency_key='create-draft-rollback'"""
+                )
+                == 0
+            )
 
 
 @pytest.mark.asyncio
