@@ -1,28 +1,48 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+from dataclasses import replace
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
 from codemigrator.core import (
     Advice,
     AdviceKind,
+    BranchPrefix,
     FailureReason,
+    GitOid,
+    Phase,
     ResidentRole,
     RunStatus,
+    SessionKind,
     Sha256,
+    SliceGenerationRef,
+    SliceId,
 )
 from codemigrator.runtime.actor import ActorRegistry, RunActor
 from codemigrator.runtime.advice import AdviceValidationContext, advice_proposal_hash
+from codemigrator.runtime.agent_runs import AgentRun, AgentRunId, AgentRunReceipt
+from codemigrator.runtime.cas import CasObject
 from codemigrator.runtime.contracts import (
+    ActorPhaseReceipt,
     AdviceMessage,
     ApiCommand,
     CancelCommand,
     CreateRunCommand,
+    EventSpec,
+    ExecutionRoundDecision,
+    ReportSummary,
+    RunState,
     SessionInputCommand,
+    VerificationSummary,
 )
 from codemigrator.runtime.integration import IntegrationCoordinator, IntegrationItem
-from codemigrator.runtime.store import InMemoryRuntimeStore
+from codemigrator.runtime.loop_contracts import SessionExit, SessionState
+from codemigrator.runtime.run_graph import PlanAgentCompletion
+from codemigrator.runtime.store import InMemoryRuntimeStore, StoreCommitError
 
 from .conftest import create_run, uid
 
@@ -41,6 +61,26 @@ class RecordingRepairDispatch:
 
     async def dispatch_adopted(self, advice):
         self.advices.append(advice)
+
+
+class RecordingScheduler:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def advance_one_round(
+        self,
+        run_id,
+        logical_key,
+        *,
+        on_agent_run_started=None,
+        on_agent_run_terminal=None,
+    ):
+        del on_agent_run_started, on_agent_run_terminal
+        self.calls.append((run_id, logical_key))
+        return ExecutionRoundDecision(
+            complete=len(self.calls) == 2,
+            dispatch_count=2 if len(self.calls) == 1 else 0,
+        )
 
 
 async def start_actor(run_id):
@@ -63,8 +103,582 @@ async def test_one_actor_serializes_mailbox_and_commits_state_with_events(run_id
     snapshot = await store.snapshot(run_id)
     assert snapshot.state.status is RunStatus.Planning
     assert snapshot.state.version == 3
-    assert [event.sequence for event in snapshot.events] == [1, 2, 3]
+    assert [event.sequence for event in snapshot.events] == [1, 2, 3, 4]
+    assert [event.event_type for event in snapshot.events[:2]] == [
+        "run.created",
+        "run.status_changed",
+    ]
+    assert snapshot.events[1].data["run_status"] == RunStatus.Planning.value
     assert store.commit_count == 3
+    await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_actor_registry_uses_injected_factory_when_restoring_active_run(run_id):
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(run_id=run_id, status=RunStatus.Planning, version=1),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    scheduler = RecordingScheduler()
+    calls = []
+
+    def actor_factory(received_run_id, received_store):
+        calls.append((received_run_id, received_store))
+        return RunActor(received_run_id, received_store, execution_scheduler=scheduler)
+
+    registry = ActorRegistry(store, actor_factory=actor_factory)
+    actor = await registry.get_or_create(run_id)
+
+    assert actor is not None
+    assert actor.execution_scheduler is scheduler
+    assert calls == [(run_id, store)]
+    assert await registry.get_or_create(run_id) is actor
+    assert len(calls) == 1
+    await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_actor_registry_rejects_factory_actor_with_wrong_owner(run_id):
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(run_id=run_id, status=RunStatus.Planning, version=1),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    mismatched = RunActor(uuid4(), store)
+    registry = ActorRegistry(store, actor_factory=lambda _run_id, _store: mismatched)
+
+    with pytest.raises(StoreCommitError, match="RunActor factory"):
+        await registry.get_or_create(run_id)
+
+    assert registry.active_actor_count == 0
+    assert mismatched._task is None
+
+
+@pytest.mark.asyncio
+async def test_actor_registry_rejects_factory_actor_with_wrong_store(run_id):
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(run_id=run_id, status=RunStatus.Planning, version=1),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    mismatched = RunActor(run_id, InMemoryRuntimeStore())
+    registry = ActorRegistry(store, actor_factory=lambda _run_id, _store: mismatched)
+
+    with pytest.raises(StoreCommitError, match="RunActor factory"):
+        await registry.get_or_create(run_id)
+
+    assert registry.active_actor_count == 0
+    assert mismatched._task is None
+
+
+@pytest.mark.asyncio
+async def test_run_created_receipt_is_recovered_from_committed_event(run_id):
+    store = InMemoryRuntimeStore()
+    actor = RunActor(run_id, store)
+    await actor.start()
+
+    receipt = await actor.create(create_run())
+
+    assert receipt is not None
+    snapshot = await store.snapshot(run_id)
+    assert receipt.run_id == run_id
+    assert receipt.event_sequence == 1
+    assert receipt.state_version == snapshot.state.version == 1
+    assert snapshot.state.create_request == create_run()
+    assert snapshot.events[0].data["receipt_key"] == receipt.receipt_key
+    await actor.submit(ApiCommand(SessionInputCommand(kind="advance", payload={})))
+    await actor.join()
+    await actor.stop()
+
+    recovered = RunActor(run_id, store)
+    await recovered.start()
+    commit_count = store.commit_count
+    assert await recovered.create(create_run()) == receipt
+    assert (
+        await recovered.create(
+            create_run().model_copy(update={"branch_prefix": BranchPrefix("other")})
+        )
+        is None
+    )
+    assert store.commit_count == commit_count
+    await recovered.stop()
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_run_start_is_committed_while_scheduler_is_still_running(run_id):
+    class PausingScheduler:
+        def __init__(self, agent_run_id):
+            self.agent_run_id = agent_run_id
+            self.started = asyncio.Event()
+            self.resume = asyncio.Event()
+
+        async def advance_one_round(
+            self,
+            owner_run_id,
+            logical_key,
+            *,
+            on_agent_run_started,
+            on_agent_run_terminal,
+        ):
+            del on_agent_run_terminal
+            receipt = await on_agent_run_started(owner_run_id, self.agent_run_id)
+            assert receipt.receipt_key == f"agent_run.started:{self.agent_run_id}"
+            self.started.set()
+            await self.resume.wait()
+            return ExecutionRoundDecision(complete=False, dispatch_count=1)
+
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(
+            run_id=run_id,
+            status=RunStatus.Executing,
+            version=1,
+            frozen_plan_sha256="c" * 64,
+        ),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    record = AgentRun(
+        agent_run_id=AgentRunId(uuid4()),
+        owner_kind="run",
+        owner_id=run_id,
+        logical_task_key="execute:slice-1:g0",
+        phase=Phase.Execute,
+        session_kind=SessionKind.Implementation,
+        thread_id=str(uuid4()),
+        model_binding_sha256="a" * 64,
+        context_sha256="b" * 64,
+        toolset_sha256="c" * 64,
+        template_sha256="d" * 64,
+    )
+    await store.create_or_get_agent_run(record)
+    scheduler = PausingScheduler(record.agent_run_id)
+    actor = RunActor(run_id, store, execution_scheduler=scheduler)
+    await actor.start()
+
+    round_task = asyncio.create_task(actor.advance_execution_round(run_id, "execute-round-0"))
+    await asyncio.wait_for(scheduler.started.wait(), timeout=1)
+    snapshot = await store.snapshot(run_id)
+    lifecycle = [event for event in snapshot.events if event.event_type == "agent_run.started"]
+    assert len(lifecycle) == 1
+    assert lifecycle[0].data["agent_run_id"] == str(record.agent_run_id)
+    assert snapshot.state.status is RunStatus.Executing
+    commits_after_start = store.commit_count
+    assert await actor.record_agent_run_started(run_id, record.agent_run_id) == ActorPhaseReceipt(
+        run_id, f"agent_run.started:{record.agent_run_id}", lifecycle[0].sequence
+    )
+    assert store.commit_count == commits_after_start
+
+    scheduler.resume.set()
+    await round_task
+    await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_execute_agent_run_terminal_is_committed_by_actor_and_replays_exactly(run_id):
+    slice_id = SliceId(uuid4())
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(
+            run_id=run_id,
+            status=RunStatus.Executing,
+            version=1,
+            frozen_plan_sha256="c" * 64,
+        ),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    created = AgentRun(
+        agent_run_id=AgentRunId(uuid4()),
+        owner_kind="run",
+        owner_id=run_id,
+        logical_task_key="execute:slice-1:g1",
+        phase=Phase.Execute,
+        session_kind=SessionKind.Implementation,
+        thread_id=str(uuid4()),
+        model_binding_sha256="a" * 64,
+        context_sha256="b" * 64,
+        toolset_sha256="c" * 64,
+        template_sha256="d" * 64,
+        slice_ref=SliceGenerationRef(
+            slice_id=slice_id, generation=1, baseline_candidate_oid=GitOid("1" * 40)
+        ),
+        write_scope_sha256="e" * 64,
+    )
+    await store.create_or_get_agent_run(created)
+    actor = RunActor(run_id, store)
+    await actor.start()
+
+    body = b'{"agent_run_id":"private","exit":"COMPLETED"}'
+    result = CasObject(hashlib.sha256(body).hexdigest(), len(body))
+    terminal = replace(
+        created,
+        state=SessionState.Closed,
+        exit=SessionExit.Completed,
+        result_sha256=result.digest,
+        candidate_checkpoint_sha256="f" * 64,
+    )
+    receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, "session.terminal")
+
+    try:
+        with pytest.raises(StoreCommitError, match="owner validation"):
+            await actor.record_agent_run_terminal(run_id, terminal, receipt, result)
+        assert await store.load_agent_run(terminal.agent_run_id) == created
+
+        await actor.record_agent_run_started(run_id, created.agent_run_id)
+        store.fail_next_commit()
+        with pytest.raises(StoreCommitError, match="injected commit failure"):
+            await actor.record_agent_run_terminal(run_id, terminal, receipt, result)
+        after_rollback = await store.snapshot(run_id)
+        assert after_rollback.state.version == 2
+        assert [event.event_type for event in after_rollback.events] == [
+            "run.created",
+            "agent_run.started",
+        ]
+        assert await store.load_agent_run(terminal.agent_run_id) == created
+        assert await store.load_agent_run_receipt(terminal.agent_run_id) is None
+        assert (
+            await store.get_cas_reference(
+                "run", run_id, f"agent-result:{terminal.agent_run_id}"
+            )
+            is None
+        )
+
+        first = await actor.record_agent_run_terminal(run_id, terminal, receipt, result)
+        replay = await actor.record_agent_run_terminal(run_id, terminal, receipt, result)
+        with pytest.raises(StoreCommitError, match="replay differs"):
+            await actor.record_agent_run_terminal(
+                run_id,
+                terminal,
+                replace(receipt, receipt_id=uuid4()),
+                result,
+            )
+        altered_result = CasObject("3" * 64, 8)
+        with pytest.raises(StoreCommitError, match="replay differs"):
+            await actor.record_agent_run_terminal(
+                run_id,
+                replace(terminal, result_sha256=altered_result.digest),
+                receipt,
+                altered_result,
+            )
+
+        snapshot = await store.snapshot(run_id)
+        assert first == replay
+        assert first.receipt_key == f"agent_run.terminal:{terminal.agent_run_id}"
+        assert await store.load_agent_run(terminal.agent_run_id) == terminal
+        assert await store.load_agent_run_receipt(terminal.agent_run_id) == receipt
+        assert (
+            await store.get_cas_reference("run", run_id, f"agent-result:{terminal.agent_run_id}")
+            == result
+        )
+        assert snapshot.state.version == 3
+        lifecycle = [event for event in snapshot.events if event.event_type == "agent_run.terminal"]
+        assert len(lifecycle) == 1
+        assert lifecycle[0].data == {
+            "receipt_key": f"agent_run.terminal:{terminal.agent_run_id}",
+            "agent_run_id": str(terminal.agent_run_id),
+            "phase": "EXECUTE",
+            "session_kind": "IMPLEMENTATION",
+            "slice_id": str(slice_id),
+            "generation": 1,
+            "exit": "COMPLETED",
+            "receipt_category": "session.terminal",
+        }
+    finally:
+        await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_execute_scheduler_terminal_facts_return_through_actor_mailbox(run_id):
+    slice_id = SliceId(uuid4())
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(
+            run_id=run_id,
+            status=RunStatus.Executing,
+            version=1,
+            frozen_plan_sha256="c" * 64,
+        ),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    created = AgentRun(
+        agent_run_id=AgentRunId(uuid4()),
+        owner_kind="run",
+        owner_id=run_id,
+        logical_task_key="execute:slice-1:g1",
+        phase=Phase.Execute,
+        session_kind=SessionKind.Implementation,
+        thread_id=str(uuid4()),
+        model_binding_sha256="a" * 64,
+        context_sha256="b" * 64,
+        toolset_sha256="c" * 64,
+        template_sha256="d" * 64,
+        slice_ref=SliceGenerationRef(
+            slice_id=slice_id, generation=1, baseline_candidate_oid=GitOid("1" * 40)
+        ),
+        write_scope_sha256="e" * 64,
+    )
+    await store.create_or_get_agent_run(created)
+    result = CasObject("2" * 64, 8)
+    terminal = replace(
+        created,
+        state=SessionState.Failed,
+        exit=SessionExit.Failed,
+        result_sha256=result.digest,
+    )
+    receipt = AgentRunReceipt(uuid4(), terminal.agent_run_id, "session.terminal")
+
+    class TerminalScheduler:
+        async def advance_one_round(
+            self,
+            owner_run_id,
+            logical_key,
+            *,
+            on_agent_run_started,
+            on_agent_run_terminal,
+        ):
+            del logical_key
+            await on_agent_run_started(owner_run_id, created.agent_run_id)
+            await on_agent_run_terminal(owner_run_id, terminal, receipt, result)
+            return ExecutionRoundDecision(
+                complete=False,
+                dispatch_count=1,
+                terminal_agent_run_ids=(terminal.agent_run_id,),
+            )
+
+    actor = RunActor(run_id, store, execution_scheduler=TerminalScheduler())
+    await actor.start()
+    try:
+        result_round = await actor.advance_execution_round(run_id, "execute-round-terminal")
+        snapshot = await store.snapshot(run_id)
+        assert result_round.complete is False
+        assert snapshot.state.version == 4
+        assert await store.load_agent_run(terminal.agent_run_id) == terminal
+        assert [event.event_type for event in snapshot.events[-3:]] == [
+            "agent_run.started",
+            "agent_run.terminal",
+            "run.execute.round",
+        ]
+    finally:
+        await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_and_awaits_execution_scheduler_before_return(run_id):
+    class BlockingScheduler:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+
+        async def advance_one_round(
+            self,
+            owner_run_id,
+            logical_key,
+            *,
+            on_agent_run_started,
+            on_agent_run_terminal,
+        ):
+            del on_agent_run_terminal
+            del owner_run_id, logical_key, on_agent_run_started
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled.set()
+
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(
+            run_id=run_id,
+            status=RunStatus.Executing,
+            version=1,
+            frozen_plan_sha256="c" * 64,
+        ),
+        (EventSpec("run.created", {"receipt_key": f"run.created:{run_id}"}),),
+    )
+    scheduler = BlockingScheduler()
+    actor = RunActor(run_id, store, execution_scheduler=scheduler)
+    await actor.start()
+    round_task = asyncio.create_task(actor.advance_execution_round(run_id, "execute:blocked"))
+    await asyncio.wait_for(scheduler.started.wait(), timeout=1)
+    commits_before_stop = store.commit_count
+
+    await actor.stop()
+
+    assert scheduler.cancelled.is_set()
+    with pytest.raises(StoreCommitError, match="stopped"):
+        await asyncio.wait_for(round_task, timeout=1)
+    assert store.commit_count == commits_before_stop
+    await asyncio.sleep(0)
+    assert store.commit_count == commits_before_stop
+
+
+@pytest.mark.asyncio
+async def test_close_admission_cancels_inflight_cancel_before_actor_close(run_id):
+    class PausingCommitStore(InMemoryRuntimeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_commit_started = asyncio.Event()
+            self.resume_cancel_commit = asyncio.Event()
+
+        async def commit(self, state, events, *, evolution=None):
+            if any(event.event_type == "run.cancelled" for event in events):
+                self.cancel_commit_started.set()
+                await self.resume_cancel_commit.wait()
+            return await super().commit(state, events, evolution=evolution)
+
+    store = PausingCommitStore()
+    actor = RunActor(run_id, store)
+    await actor.start()
+    assert await actor.create(create_run()) is not None
+    cancel_task = asyncio.create_task(actor.cancel(expected_version=1))
+    await asyncio.wait_for(store.cancel_commit_started.wait(), timeout=1)
+    commits_before_cancel = store.commit_count
+
+    try:
+        actor.close_admission()
+        with pytest.raises(StoreCommitError, match="stopping"):
+            await asyncio.wait_for(cancel_task, timeout=1)
+        await actor.stop()
+        snapshot = await store.snapshot(run_id)
+        assert snapshot.state.status is RunStatus.Planning
+        assert store.commit_count == commits_before_cancel
+    finally:
+        store.resume_cancel_commit.set()
+        if not cancel_task.done():
+            cancel_task.cancel()
+            await asyncio.gather(cancel_task, return_exceptions=True)
+        await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_plan_acceptance_atomically_commits_frozen_plan_agent_and_owner_receipts(run_id):
+    store = InMemoryRuntimeStore()
+    actor = RunActor(run_id, store)
+    await actor.start()
+    assert await actor.create(create_run()) is not None
+    created = AgentRun(
+        agent_run_id=AgentRunId(uuid4()),
+        owner_kind="run",
+        owner_id=run_id,
+        logical_task_key=f"plan:{run_id}",
+        phase=Phase.Plan,
+        session_kind=SessionKind.PlanAuxiliary,
+        thread_id=str(uuid4()),
+        model_binding_sha256="a" * 64,
+        context_sha256="b" * 64,
+        toolset_sha256="c" * 64,
+        template_sha256="d" * 64,
+    )
+    await store.create_or_get_agent_run(created)
+    start_receipt = await actor.record_agent_run_started(run_id, created.agent_run_id)
+    result_object = CasObject("e" * 64, 12)
+    frozen_plan_payload = b"canonical frozen plan object"
+    plan_object = CasObject(
+        hashlib.sha256(frozen_plan_payload).hexdigest(), len(frozen_plan_payload)
+    )
+    frozen_plan_hash = "f" * 64
+    completed = replace(
+        created,
+        state=SessionState.Closed,
+        exit=SessionExit.Completed,
+        result_sha256=result_object.digest,
+    )
+    completion = PlanAgentCompletion(
+        record=completed,
+        receipt=AgentRunReceipt(uuid4(), completed.agent_run_id, "plan.accepted"),
+        result_object=result_object,
+        plan_object=plan_object,
+    )
+    frozen_plan = SimpleNamespace(
+        plan_hash=frozen_plan_hash,
+        validation=SimpleNamespace(accepted=True),
+        canonical_payload=lambda: frozen_plan_payload,
+    )
+
+    receipt = await actor.accept_plan(run_id, completion, frozen_plan)
+
+    snapshot = await store.snapshot(run_id)
+    assert receipt.receipt_key == f"run.plan.accepted:{run_id}"
+    assert snapshot.state.status is RunStatus.Executing
+    assert snapshot.state.frozen_plan_sha256 == frozen_plan_hash
+    assert {event.event_type for event in snapshot.events} >= {
+        "agent_run.started",
+        "agent_run.terminal",
+        "run.plan.accepted",
+        "run.status_changed",
+    }
+    assert any(
+        event.event_type == "run.status_changed"
+        and event.data.get("run_status") == RunStatus.Executing.value
+        for event in snapshot.events
+    )
+    event_types = [event.event_type for event in snapshot.events]
+    assert event_types.index("agent_run.started") < event_types.index("agent_run.terminal")
+    assert start_receipt.receipt_key == f"agent_run.started:{created.agent_run_id}"
+    assert await store.load_agent_run_receipt(completed.agent_run_id) == completion.receipt
+    assert (
+        await store.get_cas_reference("run", run_id, f"agent-result:{completed.agent_run_id}")
+        == result_object
+    )
+    assert await store.get_cas_reference("run", run_id, "frozen-plan") == plan_object
+    commits = store.commit_count
+    assert await actor.accept_plan(run_id, completion, frozen_plan) == receipt
+    assert store.commit_count == commits
+    await actor.stop()
+
+
+@pytest.mark.asyncio
+async def test_execute_round_receipts_are_actor_idempotent_and_verify_report_are_deterministic(
+    run_id,
+):
+    store = InMemoryRuntimeStore()
+    await store.create(
+        RunState(
+            run_id=run_id,
+            status=RunStatus.Executing,
+            version=1,
+            frozen_plan_sha256="c" * 64,
+        ),
+        (
+            EventSpec(
+                "run.created",
+                {"receipt_key": f"run.created:{run_id}", "status": RunStatus.Executing.value},
+            ),
+        ),
+    )
+    scheduler = RecordingScheduler()
+    actor = RunActor(run_id, store, execution_scheduler=scheduler)
+    await actor.start()
+
+    first = await actor.advance_execution_round(run_id, f"execute:{run_id}:0")
+    replay = await actor.advance_execution_round(run_id, f"execute:{run_id}:0")
+    second = await actor.advance_execution_round(run_id, f"execute:{run_id}:1")
+    verification = await actor.commit_verification(
+        run_id,
+        VerificationSummary(passed=True, result_sha256="a" * 64),
+        f"verify:{run_id}",
+    )
+    report = await actor.commit_report(
+        run_id,
+        ReportSummary(result_sha256="b" * 64, status=RunStatus.Completed),
+        f"report:{run_id}",
+    )
+
+    assert first == replay
+    assert first.complete is False and second.complete is True
+    assert len(scheduler.calls) == 2
+    assert verification.receipt_key == f"verify:{run_id}"
+    assert report.receipt_key == f"report:{run_id}"
+    snapshot = await store.snapshot(run_id)
+    assert snapshot.state.status is RunStatus.Completed
+    assert [event.event_type for event in snapshot.events].count("run.execute.round") == 2
+    assert [event.event_type for event in snapshot.events].count("run.verify.completed") == 1
+    assert [event.event_type for event in snapshot.events].count("run.report.completed") == 1
+    assert [
+        event.data["run_status"]
+        for event in snapshot.events
+        if event.event_type == "run.status_changed"
+    ] == [RunStatus.Verifying.value, RunStatus.Reporting.value, RunStatus.Completed.value]
     await actor.stop()
 
 
@@ -148,12 +762,18 @@ def test_failure_reason_contract_is_used_without_runtime_duplication():
 
 @pytest.mark.asyncio
 async def test_actor_registry_race_returns_one_actor(run_id):
-    registry = ActorRegistry(InMemoryRuntimeStore())
+    store = InMemoryRuntimeStore()
+    seed = RunActor(run_id, store)
+    await seed.start()
+    await seed.create(create_run())
+    await seed.stop()
+    registry = ActorRegistry(store)
     actors = await asyncio.gather(
         registry.get_or_create(run_id),
         registry.get_or_create(run_id),
     )
     assert actors[0] is actors[1]
+    assert actors[0] is not None
     await registry.close()
 
 

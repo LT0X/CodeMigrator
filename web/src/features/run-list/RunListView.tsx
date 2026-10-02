@@ -3,7 +3,21 @@ import { useEffect, useState, type ReactNode } from "react";
 import type { ApiClient } from "../../shared/api/client";
 
 export function RunListView({ runs }: { runs: readonly MigrationProjection[] }) {
-  return <section className="page-panel"><div className="panel-heading"><div><span className="eyebrow">Run 首页</span><h1>迁移现场</h1></div><span className="read-only">观察模式</span></div><div className="run-list">{runs.length === 0 ? <p className="empty-state">暂无可信 Run 事实。请使用 CLI 发起迁移。</p> : runs.map((run) => <a className="run-row" href={`/runs/${encodeURIComponent(run.run_id)}`} key={run.run_id}><code>{run.run_id}</code><strong>{run.status}</strong><span>版本 {run.version}</span><span>{run.report_delivery_status ?? "报告待定"}</span></a>)}</div><p className="cli-hint"><code>codemigrator migrate start &lt;spec&gt; --follow</code></p></section>;
+  return (
+    <section className="page-panel">
+      <div className="panel-heading">
+        <div><span className="eyebrow">Run 首页</span><h1>迁移现场</h1></div>
+        <a className="session-start-link" href="/sessions/new">新建 Draft 会话</a>
+        <span className="read-only">观察模式</span>
+      </div>
+      <div className="run-list">
+        {runs.length === 0
+          ? <p className="empty-state">暂无可信 Run 事实。可先在 Web 起草并确认任务，再由 CLI 发起 Run。</p>
+          : runs.map((run) => <a className="run-row" href={`/runs/${encodeURIComponent(run.run_id)}`} key={run.run_id}><code>{run.run_id}</code><strong>{run.status}</strong><span>版本 {run.version}</span><span>{run.report_delivery_status ?? "报告待定"}</span></a>)}
+      </div>
+      <p className="cli-hint"><code>codemigrator migrate start &lt;spec&gt; --follow</code></p>
+    </section>
+  );
 }
 
 export function LiveRunListView({ client, fallback }: { client: ApiClient; fallback: ReactNode }) {

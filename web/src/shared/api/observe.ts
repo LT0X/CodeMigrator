@@ -1,5 +1,5 @@
 import type { WorkspaceProjection } from "../../entities/projections";
-import type { ApiClient } from "./client";
+import type { ApiClient, SessionEvent } from "./client";
 import type { RunEvent } from "../stage/types";
 
 const delay = (milliseconds: number, signal?: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
@@ -53,6 +53,46 @@ export async function* observeRun(client: ApiClient, runId: string, signal?: Abo
       if (retries >= 3) throw error;
       await beginCatchUp(cursor);
       await delay(250 * retries, signal);
+    }
+  }
+}
+
+export async function* observeSession(client: ApiClient, sessionId: string, signal?: AbortSignal, initialSequence = 0): AsyncIterable<SessionEvent> {
+  let cursor = initialSequence;
+  let retries = 0;
+
+  while (!signal?.aborted && retries < 3) {
+    let needsReconnect = false;
+    let failed = false;
+    let failure: unknown;
+    try {
+      for await (const event of client.streamSessionEvents(sessionId, cursor, signal)) {
+        if (event.sequence <= cursor) continue;
+        if (event.sequence !== cursor + 1) {
+          needsReconnect = true;
+          break;
+        }
+        cursor = event.sequence;
+        retries = 0;
+        yield event;
+        if (event.type === "session.closed" || event.type === "session.attached_to_run") return;
+      }
+    } catch (error) {
+      if (signal?.aborted) return;
+      failed = true;
+      failure = error;
+    }
+    if (!needsReconnect && !failed) return;
+    retries += 1;
+    if (retries >= 3) {
+      if (failed) throw failure;
+      throw new Error("session event replay could not fill a sequence gap");
+    }
+    try {
+      await delay(250 * retries, signal);
+    } catch (error) {
+      if (signal?.aborted) return;
+      throw error;
     }
   }
 }

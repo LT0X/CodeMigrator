@@ -8,7 +8,6 @@ target writes and verification to the existing project migration runner.
 from __future__ import annotations
 
 import ast
-import asyncio
 import base64
 import hashlib
 import json
@@ -18,8 +17,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
-
-import httpx
 
 from codemigrator.analysis import AnalysisResult, ModuleRole, SourcePosition, SourceRange
 from codemigrator.core import (
@@ -32,7 +29,6 @@ from codemigrator.core import (
     InMemoryDescriptorRegistry,
     MigrationRulebook,
     MigrationSpec,
-    ModelProfile,
     RepoRelativePath,
     RequiredCheckSelection,
     RulebookEntry,
@@ -57,8 +53,6 @@ from codemigrator.planning import (
 )
 from codemigrator.workspace import SecureRoot
 
-from .binding import LockedModelBinding
-from .context import PromptMessage
 from .draft import DraftFlow
 from .draft_models import (
     AskUserAnswer,
@@ -87,7 +81,6 @@ from .project_migration import (
 from .project_migration import (
     _write_json as _atomic_write_json,
 )
-from .provider import OpenAICompatibleProvider, ProviderRequest, ProviderResponse
 
 _STAGES = (
     "PREFLIGHT",
@@ -110,7 +103,7 @@ _STAGE_DIRS = {
 
 
 class PlannerAdvisor(Protocol):
-    """A bounded advisory port; machine validation remains authoritative."""
+    """Explicit V6 compatibility hint; it never supplies a V7 PlanProposal."""
 
     def advise(
         self, analysis: AnalysisResult, artifacts: DraftArtifacts
@@ -124,6 +117,7 @@ class ProjectMigrationPipelineRequest:
     state_dir: Path | None = None
     resume: bool = False
     translator: ProjectTranslator | None = None
+    # Compatibility-only opt-in. Never inferred from translator provider settings.
     planner: PlannerAdvisor | None = None
     verification_runner: _VerificationRunner | None = None
     max_parallelism: int = 1
@@ -275,7 +269,12 @@ def _validate_stage_progression(stages: Mapping[str, str]) -> None:
 
 
 class ProjectMigrationPipeline:
-    """Run the complete pre-Run drafting and post-freeze migration workflow."""
+    """Run the V6 file-level compatibility workflow, not the production Run graph.
+
+    The V7 RunWorkflowGraph uses PlanProposalWorkflow and the Actor receipt gate.
+    This prototype keeps its deterministic local derivation and records optional
+    planner advice as advisory rationale only.
+    """
 
     def run(self, request: ProjectMigrationPipelineRequest) -> ProjectMigrationPipelineReport:
         source = request.source.expanduser().resolve()
@@ -581,7 +580,7 @@ class ProjectMigrationPipeline:
                 raise ValueError("frozen plan is not accepted")
             return frozen
 
-        planner_payload = _planner_advice(request.planner, request.translator, analysis, artifacts)
+        planner_payload = _legacy_planner_advice(request.planner, analysis, artifacts)
         _write_stage_json(
             state_dir,
             "PLANNING",
@@ -634,6 +633,8 @@ class ProjectMigrationPipeline:
             snapshot_oid=analysis.snapshot_oid,
             limits=limits,
         )
+        # This compatibility pipeline's local derivation remains separate from
+        # the V7 structured PlanAgentRun proposal path.
         proposal = _align_proposal_to_executor(derive_plan_proposal(inputs), analysis, snapshot)
         rationale = list(proposal.planner_rationale)
         advice = planner_payload.get("advice")
@@ -2171,35 +2172,29 @@ def _validate_integration_manifest(
         raise ValueError("integration manifest scaffold evidence is incomplete")
 
 
-def _planner_advice(
+def _legacy_planner_advice(
     planner: PlannerAdvisor | None,
-    translator: ProjectTranslator | None,
     analysis: AnalysisResult,
     artifacts: DraftArtifacts,
 ) -> dict[str, object]:
-    if planner is not None:
-        try:
-            advice = dict(planner.advise(analysis, artifacts))
-            return {
-                "status": "AVAILABLE",
-                "advice_sha256": _sha256_text(
-                    json.dumps(advice, sort_keys=True, ensure_ascii=False)
-                ),
-                "advice": _sanitize_advice(advice),
-            }
-        except (OSError, RuntimeError, ValueError):
-            return {"status": "UNAVAILABLE", "reason": "planner advisory failed"}
-    if all(hasattr(translator, name) for name in ("_endpoint", "_api_key", "_binding")):
-        try:
-            advisor = _OpenAIPlannerAdvisor(
-                endpoint=str(getattr(translator, "_endpoint")),
-                api_key=str(getattr(translator, "_api_key")),
-                model=str(getattr(getattr(translator, "_binding"), "model_id")),
-            )
-            return advisor.advise_with_meta(analysis, artifacts)
-        except (OSError, RuntimeError, ValueError):
-            return {"status": "UNAVAILABLE", "reason": "planner advisory failed"}
-    return {"status": "UNAVAILABLE", "reason": "no planner advisory port"}
+    """Return advisory-only metadata for the explicit V6 compatibility path."""
+
+    if planner is None:
+        return {"status": "UNAVAILABLE", "reason": "no planner advisory port"}
+    try:
+        result = planner.advise(analysis, artifacts)
+        if not isinstance(result, Mapping):
+            return {"status": "UNAVAILABLE", "reason": "invalid planner advisory"}
+        advice = dict(result)
+        return {
+            "status": "AVAILABLE",
+            "advice_sha256": _sha256_text(
+                json.dumps(advice, sort_keys=True, ensure_ascii=False)
+            ),
+            "advice": _sanitize_advice(advice),
+        }
+    except (OSError, RuntimeError, ValueError):
+        return {"status": "UNAVAILABLE", "reason": "planner advisory failed"}
 
 
 def _sanitize_advice(advice: Mapping[str, object]) -> dict[str, object]:
@@ -2211,89 +2206,6 @@ def _sanitize_advice(advice: Mapping[str, object]) -> dict[str, object]:
         elif isinstance(value, list):
             result[key] = [str(item)[:256] for item in value[:32]]
     return result
-
-
-class _OpenAIPlannerAdvisor:
-    def __init__(self, *, endpoint: str, api_key: str, model: str) -> None:
-        self._endpoint = endpoint
-        self._api_key = api_key
-        self._binding = LockedModelBinding(
-            provider_id="openai-compatible",
-            model_id=model,
-            profile=ModelProfile.Reasoning,
-            config_revision=_sha256_text(f"{endpoint}\0{model}"),
-            context_window=128_000,
-            output_cap=4096,
-        )
-
-    def advise(self, analysis: AnalysisResult, artifacts: DraftArtifacts) -> Mapping[str, object]:
-        return self.advise_with_meta(analysis, artifacts).get("advice", {})  # type: ignore[return-value]
-
-    def advise_with_meta(
-        self, analysis: AnalysisResult, artifacts: DraftArtifacts
-    ) -> dict[str, object]:
-        del artifacts
-        context = {
-            "modules": len(analysis.modules),
-            "imports": len(analysis.imports),
-            "coverage": len(analysis.coverage),
-            "source_paths": sorted(
-                str(path) for module in analysis.modules for path in module.file_paths
-            )[:256],
-        }
-        prompt = (
-            "Return JSON only with keys summary, priority_paths, risk_notes. "
-            "Give bounded migration planning advice from these mechanical facts. "
-            "Do not include source code, credentials, prompts, or invented verification results.\n"
-            + json.dumps(context, ensure_ascii=False, sort_keys=True)
-        )
-        response = asyncio.run(self._complete(prompt))
-        parsed = _parse_json_object(response.content)
-        advice = _sanitize_advice(parsed)
-        return {
-            "status": "AVAILABLE",
-            "advice_sha256": _sha256_text(response.content),
-            "provider_receipt_id": response.provider_receipt_id,
-            "finish_reason": response.finish_reason,
-            "usage": {
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-            },
-            "advice": advice,
-        }
-
-    async def _complete(self, prompt: str) -> ProviderResponse:
-        provider = OpenAICompatibleProvider(
-            endpoint=self._endpoint,
-            api_key=self._api_key,
-            client=httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)),
-        )
-        try:
-            return await provider.complete(
-                ProviderRequest(
-                    binding=self._binding,
-                    tools=(),
-                    messages=(
-                        PromptMessage(
-                            role="system", content="You are a migration planner. Output JSON only."
-                        ),
-                        PromptMessage(role="user", content=prompt),
-                    ),
-                )
-            )
-        finally:
-            await provider.aclose()
-
-
-def _parse_json_object(content: str) -> dict[str, object]:
-    text = content.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text).strip()
-    value = json.loads(text)
-    if not isinstance(value, dict):
-        raise ValueError("planner response must be a JSON object")
-    return value
 
 
 def _write_stage_json(

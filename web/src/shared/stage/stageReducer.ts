@@ -1,6 +1,7 @@
 import { SequenceCursor } from "../api/sequence";
 import { eventMapping } from "./mapping";
 import type {
+  AgentRunProjection,
   EventData,
   RunEvent,
   SliceProjection,
@@ -105,6 +106,30 @@ const reduceAcceptedEvent = (state: StageState, event: RunEvent): StageState => 
   let next = { ...state, cursor: event.sequence };
   if (event.type === "run.status_changed") {
     next = { ...next, runStatus: text(event.data.run_status ?? event.data.status, state.runStatus) };
+  } else if (event.type === "agent_run.started" || event.type === "agent_run.terminal") {
+    const agentRunId = dataText(event.data, "agent_run_id");
+    if (agentRunId && agentRunId.length <= 64) {
+      const current = state.agentRuns[agentRunId];
+      if (!current || event.sequence > current.lastSequence) {
+        const terminal = event.type === "agent_run.terminal";
+        const generation = event.data.generation;
+        const projected: AgentRunProjection = {
+          id: agentRunId,
+          phase: dataText(event.data, "phase") || current?.phase || "UNKNOWN",
+          sessionKind: dataText(event.data, "session_kind") || current?.sessionKind || "UNKNOWN",
+          sliceId: dataText(event.data, "slice_id") || current?.sliceId || null,
+          generation:
+            typeof generation === "number" && Number.isInteger(generation) && generation >= 0
+              ? generation
+              : current?.generation ?? null,
+          state: terminal ? "TERMINAL" : "RUNNING",
+          exit: terminal ? dataText(event.data, "exit") || null : null,
+          receiptCategory: terminal ? dataText(event.data, "receipt_category") || null : null,
+          lastSequence: event.sequence,
+        };
+        next = { ...next, agentRuns: { ...state.agentRuns, [agentRunId]: projected } };
+      }
+    }
   } else if (event.type === "slice.status_changed") {
     next = withSlice(next, event, text(event.data.status, "UNKNOWN"));
   } else if (event.type === "dispatch.started") {
@@ -183,6 +208,7 @@ export const createInitialStageState = (latestSequence = 0): StageState => ({
   connection: "disconnected",
   runStatus: "UNKNOWN",
   slices: {},
+  agentRuns: {},
   timeline: [],
   celebrations: [],
   completedIntegrations: [],

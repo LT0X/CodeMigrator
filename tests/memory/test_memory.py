@@ -26,6 +26,7 @@ from codemigrator.runtime.memory import (
     ContextManager,
     ContextPackCache,
     DataBlockKind,
+    DraftContextIdentity,
     EvictionEngine,
     InMemoryEvolutionSegmentStore,
     NetInputCap,
@@ -89,6 +90,24 @@ def test_budget_catalog_matches_v1_and_is_immutable() -> None:
     with pytest.raises(TypeError):
         catalog.profiles["IMPLEMENTATION"] = object()
     assert catalog.to_mapping() == load_session_budget()
+
+
+def test_draft_context_uses_draft_identity_and_exact_budget_without_run_pack() -> None:
+    manager = ContextManager(token_counter=ExactCounter(), net_input_cap=FormulaCap())
+    draft = DraftContextIdentity(draft_id=uuid4(), revision_id=uuid4(), agent_run_id=uuid4())
+    assembly = manager.fit_draft(
+        identity=draft,
+        template="draft role",
+        envelope=ContextEnvelope(stable=(ContextSegment("stable", "facts"),)),
+        context_window=1000,
+        reserved_output=10,
+        tool_schema_tokens=5,
+        envelope_margin=2,
+    )
+    assert assembly.identity is draft
+    assert assembly.budget.session == "DRAFTING"
+    assert assembly.assembled_tokens == sum(len(message.content) for message in assembly.messages)
+    assert not hasattr(assembly, "pack")
 
 
 def test_context_manager_fails_closed_without_provider_capability() -> None:
@@ -270,9 +289,7 @@ def test_eviction_only_replaces_old_targeted_results() -> None:
         current_tokens=180,
         net_input_cap=200,
         watermark_pct=80,
-        measure=lambda candidate: sum(
-            len(segment.content) for segment in candidate.targeted
-        ),
+        measure=lambda candidate: sum(len(segment.content) for segment in candidate.targeted),
         audit_sink=audit_records.append,
     )
     assert result.envelope.stable == envelope.stable

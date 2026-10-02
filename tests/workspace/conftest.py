@@ -44,6 +44,7 @@ def roots(tmp_path: Path) -> Iterator[GatewayRoots]:
 def execute_context(run_id: uuid.UUID) -> GatewayContext:
     return GatewayContext(
         run_id=run_id,
+        agent_run_id=uuid.uuid4(),
         phase_policy_sha256=load_resource("core://phase-tool-policy/v2").sha256,
         phase=Phase.Execute,
         session_kind=SessionKind.Implementation,

@@ -16,6 +16,7 @@ from .checkpoint import (
     WorkspaceDiff,
     WorkspaceDiffPort,
     WorkspaceFileFact,
+    checkpoint_receipt_digest,
 )
 from .gateway import GatewayRoots, ToolGateway
 from .generated import (
@@ -145,6 +146,7 @@ __all__ = [
     "WorkspaceDiff",
     "WorkspaceDiffPort",
     "WorkspaceFileFact",
+    "checkpoint_receipt_digest",
     "WorkspaceManager",
     "WorkspaceStateError",
     "WorkspaceStateRecord",

@@ -94,6 +94,51 @@ def test_safe_jsonl_projection_is_whitelist_and_secret_resistant() -> None:
     assert "hidden" not in rendered
 
 
+def test_agent_run_lifecycle_is_projected_without_changing_run_or_slice_state() -> None:
+    projection = project_events(
+        [
+            event(
+                1,
+                "agent_run.started",
+                {
+                    "agent_run_id": "agent-1",
+                    "phase": "EXECUTE",
+                    "session_kind": "IMPLEMENTATION",
+                    "slice_id": "slice-a",
+                    "generation": 1,
+                    "thread_id": "private-thread",
+                    "prompt": "private prompt",
+                },
+            ),
+            event(
+                2,
+                "agent_run.terminal",
+                {
+                    "agent_run_id": "agent-1",
+                    "phase": "EXECUTE",
+                    "session_kind": "IMPLEMENTATION",
+                    "slice_id": "slice-a",
+                    "generation": 1,
+                    "exit": "COMPLETED",
+                    "receipt_category": "session.terminal",
+                    "checkpoint_uri": "cas://private",
+                },
+            ),
+        ]
+    )
+
+    assert projection.run_status == "UNKNOWN"
+    assert projection.slices == {}
+    assert projection.agent_runs["agent-1"].state == "TERMINAL"
+    assert projection.agent_runs["agent-1"].exit == "COMPLETED"
+    assert projection.agent_runs["agent-1"].slice_id == "slice-a"
+    assert projection.agent_runs["agent-1"].generation == 1
+    rendered = render_json(projection)
+    assert "private-thread" not in rendered
+    assert "private prompt" not in rendered
+    assert "cas://private" not in rendered
+
+
 def test_exit_codes_are_stable() -> None:
     assert ExitCode.COMPLETED == 0
     assert ExitCode.PARTIALLY_COMPLETED == 2
@@ -112,6 +157,23 @@ def test_no_follow_returns_only_creation_projection() -> None:
         "status": "CREATED",
         "web_url": "/runs/mock-run-001",
     }
+
+
+def test_run_create_without_api_configuration_never_returns_a_mock_run(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_file = tmp_path / "create-run.json"
+    request_file.write_text("{}", encoding="utf-8")
+    monkeypatch.delenv("CODEMIGRATOR_API_URL", raising=False)
+    monkeypatch.delenv("CODEMIGRATOR_API_TOKEN", raising=False)
+
+    code, output = run_command(
+        ["run", "create", str(request_file), "--idempotency-key", "create-1", "--output", "json"]
+    )
+
+    assert code == int(ExitCode.UNKNOWN)
+    assert json.loads(output) == {"status": "UNKNOWN"}
+    assert "mock-run-001" not in output
 
 
 def test_run_watch_no_follow_projects_current_events() -> None:
@@ -308,3 +370,40 @@ def test_http_run_control_sends_quoted_if_match(monkeypatch: pytest.MonkeyPatch)
     )
     assert payload["status"] == "CANCELLED"
     assert requests[0].get_header("If-match") == '"8"'
+
+
+def test_http_run_control_posts_create_request_with_idempotency_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[object] = []
+
+    class Response:
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"run_id":"run-1","status":"CREATED","version":1}'
+
+    def open_url(request: object, *, timeout: int) -> Response:
+        del timeout
+        requests.append(request)
+        return Response()
+
+    monkeypatch.setattr("codemigrator_cli.client.urlopen", open_url)
+    request_payload = {"source": {"project_id": "project-1", "snapshot_id": "snapshot-1"}}
+    result = HttpRunControl("https://api.example.test/api/v1", token="secret").create(
+        request_payload,
+        idempotency_key="create-1",
+    )
+
+    request = requests[0]
+    assert result["run_id"] == "run-1"
+    assert request.full_url == "https://api.example.test/api/v1/migrations"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == "Bearer secret"
+    assert request.get_header("Idempotency-key") == "create-1"
+    assert request.get_header("Content-type") == "application/json"
+    assert json.loads(request.data) == request_payload

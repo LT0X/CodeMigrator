@@ -299,6 +299,9 @@ export function WorkspaceShell({
     .sort((left, right) => (left.integrationRank ?? 0) - (right.integrationRank ?? 0));
   const waitingSlice = slices.find((slice) => slice.zone === "waiting" && slice.persona);
   const regenerationSlice = slices.find((slice) => slice.zone === "regeneration");
+  const agentRuns = Object.values(state.agentRuns).sort(
+    (left, right) => right.lastSequence - left.lastSequence || left.id.localeCompare(right.id),
+  );
   const celebration = state.celebrations.find((item) => item.key === presentationCelebrationKey) ?? null;
 
   return (
@@ -323,6 +326,15 @@ export function WorkspaceShell({
           <div><span className="eyebrow">Migration Confluence</span><h1>中央迁移汇流场</h1></div>
           <span>{active.length} 个活动 persona · 最大 4 个</span>
         </div>
+        <section className="agent-run-activity" aria-label="AgentRun 执行摘要">
+          <b>AgentRun</b>
+          {agentRuns.length ? agentRuns.slice(0, 4).map((item) => (
+            <span key={item.id} data-agent-run-state={item.state}>
+              {item.phase} · {item.sessionKind} · {item.state === "RUNNING" ? "运行中" : item.exit ?? "结束"}
+              {item.sliceId && item.generation !== null ? ` · ${item.sliceId} · generation ${item.generation}` : ""}
+            </span>
+          )) : <span>等待 AgentRun</span>}
+        </section>
 
         <div className="stage-surround" data-stage-layout="1fr-auto-1fr">
           <div className="capsule-flank">

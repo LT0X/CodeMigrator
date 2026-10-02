@@ -5,12 +5,23 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from sse_starlette.sse import AppStatus
 
 from codemigrator.api import ApiConfig, create_app, route_surface
 from codemigrator.api.deps import EventRecord
 from codemigrator.core import SecretRegistry
 
 from .conftest import FakeBackend, create_run_payload
+
+
+@pytest.fixture(autouse=True)
+def reset_sse_starlette_app_status():  # type: ignore[no-untyped-def]
+    """Keep sse-starlette's process-global shutdown event scoped to each test loop."""
+    AppStatus.should_exit = False
+    AppStatus.should_exit_event = None
+    yield
+    AppStatus.should_exit = False
+    AppStatus.should_exit_event = None
 
 
 def test_m02_route_surface_is_declared() -> None:
@@ -130,6 +141,73 @@ async def test_sse_route_uses_the_injected_secret_registry(backend) -> None:  # 
 
     assert response.status_code == 200
     assert "runtime-secret" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_agent_run_sse_reconnect_projects_receipt_events_without_internal_state(
+    backend,
+) -> None:  # type: ignore[no-untyped-def]
+    run_id = uuid4()
+    agent_run_id = uuid4()
+    backend.events = [
+        EventRecord(
+            run_id=run_id,
+            sequence=1,
+            event_type="agent_run.started",
+            data={
+                "receipt_key": f"agent_run.started:{agent_run_id}",
+                "agent_run_id": str(agent_run_id),
+                "phase": "EXECUTE",
+                "session_kind": "IMPLEMENTATION",
+                "thread_id": str(uuid4()),
+                "checkpoint_uri": "cas://private/checkpoint",
+                "prompt": "source code must not be projected",
+            },
+            timestamp_utc=datetime.now(UTC),
+        ),
+        EventRecord(
+            run_id=run_id,
+            sequence=2,
+            event_type="agent_run.terminal",
+            data={
+                "receipt_key": f"agent_run.terminal:{agent_run_id}",
+                "agent_run_id": str(agent_run_id),
+                "phase": "EXECUTE",
+                "session_kind": "IMPLEMENTATION",
+                "exit": "COMPLETED",
+                "receipt_category": "session.terminal",
+                "provider_error": "private provider response",
+            },
+            timestamp_utc=datetime.now(UTC),
+        ),
+        EventRecord(
+            run_id=run_id,
+            sequence=3,
+            event_type="run.status_changed",
+            data={"run_status": "COMPLETED"},
+            timestamp_utc=datetime.now(UTC),
+        ),
+    ]
+    app = create_app(backend, config=ApiConfig(token="secret"))
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    )
+
+    async with client:
+        response = await client.get(
+            f"/api/v1/migrations/{run_id}/events",
+            headers={"Authorization": "Bearer secret", "Last-Event-ID": "1"},
+        )
+
+    assert response.status_code == 200
+    assert "id: 1" not in response.text
+    assert "id: 2" in response.text
+    assert '"type":"agent_run.terminal"' in response.text
+    assert "id: 3" in response.text
+    assert "thread_id" not in response.text
+    assert "cas://private" not in response.text
+    assert "source code must not be projected" not in response.text
+    assert "private provider response" not in response.text
 
 
 @pytest.mark.asyncio

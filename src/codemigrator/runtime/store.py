@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any, Protocol, cast
 from uuid import UUID
 
@@ -12,21 +18,74 @@ from pydantic import BaseModel
 
 from codemigrator.core import (
     ActiveDispatch,
+    CreateRun,
     FailureReason,
+    GitOid,
+    IntegrationIntent,
+    Phase,
     RunId,
     RunStatus,
     SecretRegistry,
+    SessionKind,
+    SliceGenerationRef,
+    SliceId,
+    canonical_json_bytes,
 )
+from codemigrator.core.draft_event_projection import project_draft_public_event
 
+from .agent_runs import AgentRun, AgentRunId, AgentRunReceipt
 from .budget import BudgetUsage
-from .contracts import EventSpec, RunState, RuntimeEvent, RuntimeSnapshot
+from .cas import CasObject, CheckpointIndex, PendingWriteIndex
+from .contracts import (
+    CandidateCheckpointFact,
+    DraftOwnerReceipt,
+    DraftSessionEvent,
+    DraftSessionEventSpec,
+    EventSpec,
+    IntegrationReceipt,
+    RunState,
+    RunStatePage,
+    RuntimeEvent,
+    RuntimeSnapshot,
+    RuntimeStoreTransaction,
+)
+from .loop_contracts import SessionExit, SessionState
 from .memory import EvolutionSegment, EvolutionSegmentDraft
 from .schema import RUNTIME_SCHEMA_SQL
+
+_RUN_TERMINAL_STATUSES = frozenset(
+    {
+        RunStatus.Completed.value,
+        RunStatus.PartiallyCompleted.value,
+        RunStatus.Failed.value,
+        RunStatus.Cancelled.value,
+    }
+)
+_DRAFT_TERMINAL_EVENTS = frozenset({"session.closed", "session.attached_to_run"})
+_DRAFT_MUTABLE_LEDGER_CATEGORIES = frozenset(
+    {
+        "draft.turn.requested",
+        "draft.confirm.requested",
+        "draft.task_revision",
+        "draft.ask_user.question",
+        "draft.ask_user.answer",
+    }
+)
+
+
+def _validate_run_page_limit(limit: int) -> None:
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("Run page limit must be between 1 and 100")
 
 
 class RuntimeStore(Protocol):
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         """Load one Run and its append-only events."""
+
+    async def list_run_states(
+        self, *, limit: int, after_run_id: RunId | None = None
+    ) -> RunStatePage:
+        """Read a bounded Run page in stable UUID order."""
 
     async def create(
         self,
@@ -34,8 +93,32 @@ class RuntimeStore(Protocol):
         events: Sequence[EventSpec],
         *,
         evolution: EvolutionSegmentDraft | None = None,
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> RuntimeSnapshot:
         """Insert a new Run atomically with its first events."""
+
+    async def execute_api_command(
+        self,
+        *,
+        principal_id: str,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+        command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
+        project_response: Callable[[object], object],
+        owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+        create_draft_graph_handoff: bool = False,
+    ) -> Mapping[str, object]:
+        """Commit an API receipt with its owner command in one transaction."""
+
+    async def list_pending_graph_starts(self) -> tuple[tuple[RunId, str], ...]: ...
+
+    async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None: ...
+
+    async def list_pending_draft_graph_starts(self) -> tuple[tuple[UUID, str], ...]: ...
+
+    async def mark_draft_graph_start_started(self, draft_id: UUID, receipt_key: str) -> None: ...
 
     async def commit(
         self,
@@ -46,14 +129,257 @@ class RuntimeStore(Protocol):
     ) -> RuntimeSnapshot:
         """Commit state and events in one transaction."""
 
+    async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
+        """Read committed Run events strictly after a sequence cursor."""
+
+    async def wait_for_run_events(self, run_id: RunId, after_sequence: int) -> None:
+        """Wait for a wake-up and recheck the durable Run event ledger."""
+
+    async def is_run_stream_terminal(self, run_id: RunId, after_sequence: int) -> bool:
+        """Report whether a terminal Run event at or before the cursor is committed."""
+
+    async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
+        """Create one session per owner logical task, or return its frozen identity."""
+
+    async def load_agent_run(self, agent_run_id: AgentRunId) -> AgentRun | None:
+        """Load private session metadata."""
+
+    async def list_agent_runs_by_owner(
+        self, owner_kind: str, owner_id: UUID
+    ) -> tuple[AgentRun, ...]:
+        """Load private session metadata for one owner during retention cleanup."""
+
+    async def commit_draft_owner_fact(
+        self,
+        draft_id: UUID,
+        receipt_key: str,
+        category: str,
+        fact: Mapping[str, object],
+        *,
+        events: Sequence[DraftSessionEventSpec] = (),
+        transaction: RuntimeStoreTransaction | None = None,
+        expected_existing_facts: Sequence[DraftOwnerReceipt] | None = None,
+    ) -> DraftOwnerReceipt:
+        """Persist an immutable Draft fact and its idempotency receipt."""
+
+    async def load_draft_owner_fact(
+        self, draft_id: UUID, receipt_key: str
+    ) -> tuple[DraftOwnerReceipt, dict[str, object]] | None: ...
+
+    async def list_draft_owner_facts(
+        self, draft_id: UUID
+    ) -> tuple[tuple[DraftOwnerReceipt, dict[str, object]], ...]: ...
+
+    async def read_draft_session_events(
+        self, draft_id: UUID, after_sequence: int
+    ) -> tuple[DraftSessionEvent, ...]: ...
+
+    async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None: ...
+
+    async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool: ...
+
+    async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
+        """Load the committed owner receipt, if any."""
+
+    async def get_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        """Load a durable owner reference to an opaque CAS object."""
+
+    async def list_checkpoint_indexes(
+        self, thread_id: str | None = None, namespace: str | None = None
+    ) -> tuple[CheckpointIndex, ...]:
+        """Load checkpoint references without retrieving CAS checkpoint bodies."""
+        ...
+
+    async def commit_agent_run_receipt(
+        self,
+        record: AgentRun,
+        receipt: AgentRunReceipt,
+        *,
+        state: RunState | None = None,
+        events: Sequence[EventSpec] = (),
+        cas_references: Sequence[tuple[str, CasObject]] = (),
+    ) -> AgentRunReceipt:
+        """Commit terminal metadata and owner facts/events in one transaction."""
+
+    async def persist_integration_intent(self, intent: IntegrationIntent) -> IntegrationIntent:
+        """Persist one immutable M-11 intent before any verified-ref update."""
+        ...
+
+    async def load_integration_intent(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationIntent | None: ...
+
+    async def load_integration_receipt(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationReceipt | None: ...
+
+    async def load_latest_integration_receipt(self, run_id: RunId) -> IntegrationReceipt | None: ...
+
+    async def list_pending_integration_intents(
+        self, run_id: RunId
+    ) -> tuple[IntegrationIntent, ...]: ...
+
+    async def list_integration_receipts(
+        self, run_id: RunId
+    ) -> tuple[IntegrationReceipt, ...]: ...
+
+    async def commit_integration_receipt(
+        self,
+        state: RunState,
+        intent: IntegrationIntent,
+        verified_commit_oid: GitOid,
+        events: Sequence[EventSpec],
+    ) -> IntegrationReceipt:
+        """Atomically adopt an advanced verified head with its Run events/state."""
+        ...
+
 
 class StoreCommitError(RuntimeError):
     """Raised when the persistence transaction cannot be committed."""
 
 
-def _validate_evolution_draft(
-    draft: EvolutionSegmentDraft, expected_run_id: object
+class DraftOwnerFrozenError(StoreCommitError):
+    """Raised when a new ledger fact is written after its Draft was frozen."""
+
+
+class DraftLedgerChangedError(StoreCommitError):
+    """Raised when a freeze's ledger snapshot changes before its atomic commit."""
+
+
+def _validate_new_agent_run(record: AgentRun) -> None:
+    if record.state is not SessionState.Created or record.exit is not None:
+        raise StoreCommitError("new AgentRun must be created without an exit")
+    if any(
+        getattr(record, name) is not None
+        for name in (
+            "checkpoint_sha256",
+            "candidate_checkpoint_sha256",
+            "result_sha256",
+            "usage_sha256",
+        )
+    ):
+        raise StoreCommitError("new AgentRun cannot have terminal references")
+
+
+def _make_integration_receipt(
+    intent: IntegrationIntent, verified_commit_oid: GitOid, event_sequence: int
+) -> IntegrationReceipt:
+    payload = {
+        "idempotency_key": str(intent.idempotency_key),
+        "verified_commit_oid": str(verified_commit_oid),
+    }
+    return IntegrationReceipt(
+        intent=intent,
+        verified_commit_oid=verified_commit_oid,
+        receipt_sha256=sha256(canonical_json_bytes(payload)).hexdigest(),
+        event_sequence=event_sequence,
+    )
+
+
+def _integration_intent_digest(intent: IntegrationIntent) -> str:
+    payload = intent.model_dump(mode="json", by_alias=True)
+    return sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def _stored_integration_intent(value: Any, digest: Any) -> IntegrationIntent:
+    intent = _decode_integration_intent(value)
+    if str(digest).strip() != _integration_intent_digest(intent):
+        raise StoreCommitError("stored integration intent digest mismatch")
+    return intent
+
+
+def _stored_integration_receipt(
+    intent: IntegrationIntent,
+    verified_commit_oid: Any,
+    digest: Any,
+    event_sequence: Any,
+) -> IntegrationReceipt:
+    receipt = _make_integration_receipt(
+        intent,
+        GitOid(str(verified_commit_oid)),
+        int(event_sequence),
+    )
+    if str(digest).strip() != receipt.receipt_sha256:
+        raise StoreCommitError("stored integration receipt digest mismatch")
+    return receipt
+
+
+def _validate_integration_intent(intent: IntegrationIntent) -> None:
+    hashes = (
+        str(intent.guard_sha256),
+        str(intent.verification_fingerprint),
+        str(intent.idempotency_key),
+    )
+    oids = (str(intent.expected_verified_oid), str(intent.prospective_commit_oid))
+    if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in hashes):
+        raise StoreCommitError("IntegrationIntent digests are invalid")
+    if any(re.fullmatch(r"[0-9a-f]{40}", value) is None for value in oids):
+        raise StoreCommitError("IntegrationIntent Git OIDs are invalid")
+    if oids[0] == oids[1] or oids[1] == "0" * 40:
+        raise StoreCommitError("IntegrationIntent must advance to a non-zero commit")
+
+
+def _validate_integration_events(
+    intent: IntegrationIntent,
+    verified_commit_oid: GitOid,
+    events: Sequence[EventSpec],
 ) -> None:
+    if len(events) != 2:
+        raise StoreCommitError("integration receipt requires its ordered Run events")
+    completed, advanced = events
+    receipt_key = f"integration.completed:{intent.idempotency_key}"
+    if (
+        completed.event_type != "integration.completed"
+        or completed.data.get("receipt_key") != receipt_key
+        or completed.data.get("slice_id") != str(intent.slice_id)
+        or completed.data.get("generation") != int(intent.generation)
+        or completed.data.get("verified_commit_oid") != str(verified_commit_oid)
+        or advanced.event_type != "verified.advanced"
+        or advanced.data.get("slice_id") != str(intent.slice_id)
+        or advanced.data.get("generation") != int(intent.generation)
+        or advanced.data.get("commit_oid") != str(verified_commit_oid)
+    ):
+        raise StoreCommitError("integration receipt Run events do not match its intent")
+
+
+def _validate_agent_receipt(
+    current: AgentRun | None,
+    record: AgentRun,
+    receipt: AgentRunReceipt,
+    state: RunState | None,
+    events: Sequence[EventSpec],
+    cas_references: Sequence[tuple[str, CasObject]] = (),
+) -> None:
+    if current is None:
+        raise StoreCommitError("AgentRun does not exist")
+    if not current.same_frozen_identity(record):
+        raise StoreCommitError("AgentRun frozen identity mismatch")
+    if current.is_terminal or not record.is_terminal:
+        raise StoreCommitError("AgentRun receipt requires a new terminal state")
+    if receipt.agent_run_id != record.agent_run_id:
+        raise StoreCommitError("AgentRun receipt identity mismatch")
+    if record.owner_kind == "run":
+        if state is None or state.run_id != record.owner_id:
+            raise StoreCommitError("Run owner receipt requires matching Run state")
+    elif state is not None or events:
+        raise StoreCommitError("Draft owner cannot write Run facts or events")
+    if record.owner_kind != "run" and cas_references:
+        raise StoreCommitError("Run receipt CAS refs require a Run owner")
+    if any(
+        not reference_key
+        or len(reference_key) > 256
+        or any(
+            character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+            for character in reference_key
+        )
+        for reference_key, _ in cas_references
+    ):
+        raise StoreCommitError("CAS reference key is invalid")
+
+
+def _validate_evolution_draft(draft: EvolutionSegmentDraft, expected_run_id: object) -> None:
     if draft.run_id != expected_run_id:
         raise StoreCommitError("context evolution run identity does not match state")
     if not isinstance(draft.summary_text, str) or not draft.summary_text.strip():
@@ -95,9 +421,730 @@ class InMemoryRuntimeStore:
         self.commit_count = 0
         self._fail_next = False
         self.secret_registry = secret_registry or SecretRegistry()
+        self._run_conditions: dict[RunId, asyncio.Condition] = {}
+        self._agent_runs: dict[AgentRunId, AgentRun] = {}
+        self._agent_run_keys: dict[tuple[str, UUID, str], AgentRunId] = {}
+        self._agent_threads: dict[UUID, AgentRunId] = {}
+        self._agent_receipts: dict[AgentRunId, AgentRunReceipt] = {}
+        self._agent_lock = asyncio.Lock()
+        self._draft_facts: dict[tuple[UUID, str], tuple[DraftOwnerReceipt, dict[str, object]]] = {}
+        self._draft_events: dict[UUID, list[DraftSessionEvent]] = {}
+        self._draft_event_specs: dict[
+            tuple[UUID, str], tuple[tuple[str, dict[str, object]], ...]
+        ] = {}
+        self._draft_conditions: dict[UUID, asyncio.Condition] = {}
+        self._draft_terminals: dict[UUID, int] = {}
+        self._integration_intents: dict[tuple[RunId, str], IntegrationIntent] = {}
+        self._integration_receipts: dict[tuple[RunId, str], IntegrationReceipt] = {}
+        self._cas_refs: dict[tuple[str, UUID, str], CasObject] = {}
+        self._checkpoints: dict[tuple[str, str, str], CheckpointIndex] = {}
+        self._pending_writes: dict[tuple[str, str, str, str, int], PendingWriteIndex] = {}
+        self._api_command_lock = asyncio.Lock()
+        self._api_commands: dict[
+            tuple[str, str, str], tuple[str, Mapping[str, object], datetime]
+        ] = {}
+        self._graph_start_handoffs: dict[RunId, str] = {}
+        self._draft_graph_start_handoffs: dict[tuple[UUID, str], str] = {}
+
+    async def add_cas_reference(
+        self, object_ref: CasObject, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> None:
+        async with self._agent_lock:
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            key = (owner_kind, owner_id, reference_key)
+            previous = self._cas_refs.get(key)
+            if previous is not None and previous != object_ref:
+                raise StoreCommitError("CAS reference key already points to another object")
+            if any(
+                value.digest == object_ref.digest and value.size != object_ref.size
+                for value in self._cas_refs.values()
+            ):
+                raise StoreCommitError("CAS object size mismatch")
+            self._cas_refs[key] = object_ref
+
+    async def get_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        return self._cas_refs.get((owner_kind, owner_id, reference_key))
+
+    async def commit_draft_owner_fact(
+        self,
+        draft_id: UUID,
+        receipt_key: str,
+        category: str,
+        fact: Mapping[str, object],
+        *,
+        events: Sequence[DraftSessionEventSpec] = (),
+        transaction: RuntimeStoreTransaction | None = None,
+        expected_existing_facts: Sequence[DraftOwnerReceipt] | None = None,
+    ) -> DraftOwnerReceipt:
+        receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
+        event_data = _prepare_draft_events(events, self.secret_registry)
+        if transaction is None:
+            async with self._agent_lock:
+                committed, _appended, created = await self._commit_draft_fact_locked(
+                    draft_id,
+                    receipt_key,
+                    receipt,
+                    payload,
+                    event_data,
+                    expected_existing_facts,
+                )
+            if created and event_data:
+                self._schedule_draft_event_notification(draft_id)
+            return committed
+        if transaction.store is not self or not transaction.active:
+            raise StoreCommitError("runtime transaction does not belong to this store")
+
+        await self._agent_lock.acquire()
+        lock_transferred = False
+        try:
+            committed, appended, created = await self._commit_draft_fact_locked(
+                draft_id,
+                receipt_key,
+                receipt,
+                payload,
+                event_data,
+                expected_existing_facts,
+            )
+            if created:
+                transaction.after_rollback(
+                    lambda: self._rollback_draft_fact(draft_id, receipt_key, appended)
+                )
+                transaction.after_rollback(self._agent_lock.release)
+                transaction.after_commit(self._agent_lock.release)
+                if event_data:
+                    transaction.after_commit(
+                        lambda: self._schedule_draft_event_notification(draft_id)
+                    )
+                lock_transferred = True
+            return committed
+        finally:
+            if not lock_transferred:
+                self._agent_lock.release()
+
+    async def _commit_draft_fact_locked(
+        self,
+        draft_id: UUID,
+        receipt_key: str,
+        receipt: DraftOwnerReceipt,
+        payload: dict[str, object],
+        event_data: tuple[tuple[str, dict[str, object]], ...],
+        expected_existing_facts: Sequence[DraftOwnerReceipt] | None,
+    ) -> tuple[DraftOwnerReceipt, tuple[DraftSessionEvent, ...], bool]:
+        key = (draft_id, receipt_key)
+        previous = self._draft_facts.get(key)
+        if previous is not None:
+            if (
+                previous[0] != receipt
+                or previous[1] != payload
+                or self._draft_event_specs[key] != event_data
+            ):
+                raise StoreCommitError("Draft owner fact replay mismatch")
+            return previous[0], (), False
+        if receipt.category == "draft.freeze" and expected_existing_facts is not None:
+            actual = tuple(
+                current_receipt
+                for (owner_id, _), (current_receipt, _) in sorted(
+                    self._draft_facts.items(), key=lambda item: item[0][1]
+                )
+                if owner_id == draft_id
+            )
+            expected = tuple(sorted(expected_existing_facts, key=lambda item: item.receipt_key))
+            if actual != expected:
+                raise DraftLedgerChangedError("Draft owner facts changed before freeze commit")
+        if (
+            receipt.category in _DRAFT_MUTABLE_LEDGER_CATEGORIES
+            and (
+                draft_id,
+                "draft.freeze",
+            )
+            in self._draft_facts
+        ):
+            raise DraftOwnerFrozenError("Draft is already frozen")
+        if self._fail_next:
+            self._fail_next = False
+            raise StoreCommitError("injected commit failure")
+        self._draft_facts[key] = (receipt, payload)
+        self._draft_event_specs[key] = event_data
+        ledger = self._draft_events.setdefault(draft_id, [])
+        first_sequence = len(ledger) + 1
+        appended = tuple(
+            DraftSessionEvent(draft_id, first_sequence + index, event_type, data, datetime.now(UTC))
+            for index, (event_type, data) in enumerate(event_data)
+        )
+        ledger.extend(appended)
+        for event in appended:
+            if event.event_type in _DRAFT_TERMINAL_EVENTS:
+                terminal = self._draft_terminals.get(draft_id)
+                if terminal is None or event.sequence < terminal:
+                    self._draft_terminals[draft_id] = event.sequence
+        return receipt, appended, True
+
+    def _schedule_draft_event_notification(self, draft_id: UUID) -> None:
+        loop = asyncio.get_running_loop()
+        loop.call_soon(lambda: loop.create_task(self._notify_draft_event_waiters(draft_id)))
+
+    async def _notify_draft_event_waiters(self, draft_id: UUID) -> None:
+        condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
+        async with condition:
+            condition.notify_all()
+
+    def _rollback_draft_fact(
+        self,
+        draft_id: UUID,
+        receipt_key: str,
+        appended: tuple[DraftSessionEvent, ...],
+    ) -> None:
+        self._draft_facts.pop((draft_id, receipt_key), None)
+        self._draft_event_specs.pop((draft_id, receipt_key), None)
+        removed_sequences = {event.sequence for event in appended}
+        ledger = self._draft_events.get(draft_id)
+        if ledger is not None and removed_sequences:
+            ledger[:] = [event for event in ledger if event.sequence not in removed_sequences]
+            if not ledger:
+                self._draft_events.pop(draft_id, None)
+        terminal = min(
+            (
+                event.sequence
+                for event in self._draft_events.get(draft_id, ())
+                if event.event_type in _DRAFT_TERMINAL_EVENTS
+            ),
+            default=None,
+        )
+        if terminal is None:
+            self._draft_terminals.pop(draft_id, None)
+        else:
+            self._draft_terminals[draft_id] = terminal
+
+    async def read_draft_session_events(
+        self, draft_id: UUID, after_sequence: int
+    ) -> tuple[DraftSessionEvent, ...]:
+        async with self._agent_lock:
+            return tuple(
+                DraftSessionEvent(
+                    event.draft_id,
+                    event.sequence,
+                    event.event_type,
+                    dict(event.data),
+                    event.timestamp_utc,
+                )
+                for event in self._draft_events.get(draft_id, ())
+                if event.sequence > after_sequence
+            )
+
+    async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None:
+        condition = self._draft_conditions.setdefault(draft_id, asyncio.Condition())
+        async with condition:
+            while True:
+                async with self._agent_lock:
+                    if len(self._draft_events.get(draft_id, ())) > after_sequence or (
+                        self._draft_terminals.get(draft_id) is not None
+                        and self._draft_terminals[draft_id] <= after_sequence
+                    ):
+                        return
+                await condition.wait()
+
+    async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool:
+        async with self._agent_lock:
+            terminal_sequence = self._draft_terminals.get(draft_id)
+            return terminal_sequence is not None and terminal_sequence <= after_sequence
+
+    async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
+        snapshot = self._snapshots.get(run_id)
+        if snapshot is None:
+            return ()
+        return tuple(
+            RuntimeEvent(
+                sequence=event.sequence,
+                event_type=event.event_type,
+                data=dict(event.data),
+                timestamp_utc=event.timestamp_utc,
+            )
+            for event in snapshot.events
+            if event.sequence > after_sequence
+        )
+
+    async def wait_for_run_events(self, run_id: RunId, after_sequence: int) -> None:
+        condition = self._run_conditions.setdefault(run_id, asyncio.Condition())
+        async with condition:
+            await condition.wait_for(
+                lambda: (
+                    self._has_run_events_after(run_id, after_sequence)
+                    or self._run_terminal_reached(run_id, after_sequence)
+                )
+            )
+
+    async def is_run_stream_terminal(self, run_id: RunId, after_sequence: int) -> bool:
+        return self._run_terminal_reached(run_id, after_sequence)
+
+    def _has_run_events_after(self, run_id: RunId, after_sequence: int) -> bool:
+        snapshot = self._snapshots.get(run_id)
+        return snapshot is not None and any(
+            event.sequence > after_sequence for event in snapshot.events
+        )
+
+    def _run_terminal_reached(self, run_id: RunId, after_sequence: int) -> bool:
+        snapshot = self._snapshots.get(run_id)
+        return snapshot is not None and any(
+            event.sequence <= after_sequence
+            and event.event_type == "run.status_changed"
+            and _event_status(event.data) in _RUN_TERMINAL_STATUSES
+            for event in snapshot.events
+        )
+
+    async def load_draft_owner_fact(
+        self, draft_id: UUID, receipt_key: str
+    ) -> tuple[DraftOwnerReceipt, dict[str, object]] | None:
+        async with self._agent_lock:
+            value = self._draft_facts.get((draft_id, receipt_key))
+            if value is None:
+                return None
+            receipt, fact = value
+            _verify_draft_fact_digest(receipt, fact)
+            return receipt, _decode_draft_fact(canonical_json_bytes(fact))
+
+    async def list_draft_owner_facts(
+        self, draft_id: UUID
+    ) -> tuple[tuple[DraftOwnerReceipt, dict[str, object]], ...]:
+        async with self._agent_lock:
+            values = tuple(
+                value
+                for (owner_id, _), value in sorted(
+                    self._draft_facts.items(), key=lambda item: item[0][1]
+                )
+                if owner_id == draft_id
+            )
+            for receipt, fact in values:
+                _verify_draft_fact_digest(receipt, fact)
+            return tuple(
+                (receipt, _decode_draft_fact(canonical_json_bytes(fact)))
+                for receipt, fact in values
+            )
+
+    async def release_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        async with self._agent_lock:
+            object_ref = self._cas_refs.pop((owner_kind, owner_id, reference_key), None)
+            if object_ref is None or any(
+                value.digest == object_ref.digest for value in self._cas_refs.values()
+            ):
+                return None
+            return object_ref
+
+    async def referenced_digests(self) -> frozenset[str]:
+        return frozenset(value.digest for value in self._cas_refs.values())
+
+    async def publish_checkpoint_index(self, index: CheckpointIndex) -> None:
+        key = (index.thread_id, index.namespace, index.checkpoint_id)
+        async with self._agent_lock:
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            existing = self._checkpoints.get(key)
+            if existing is not None:
+                if existing != index:
+                    raise StoreCommitError("checkpoint identity collision")
+                return
+            if any(
+                item.thread_id == index.thread_id
+                and (item.owner_kind, item.owner_id, item.graph_family)
+                != (index.owner_kind, index.owner_id, index.graph_family)
+                for item in self._checkpoints.values()
+            ) or any(
+                item.thread_id == index.thread_id
+                and (item.owner_kind, item.owner_id, item.graph_family)
+                != (index.owner_kind, index.owner_id, index.graph_family)
+                for item in self._pending_writes.values()
+            ):
+                raise StoreCommitError("checkpoint thread belongs to another owner")
+            self._checkpoints[key] = index
+            self._cas_refs[(index.owner_kind, index.owner_id, index.reference_key)] = index.object
+
+    async def list_checkpoint_indexes(
+        self, thread_id: str | None = None, namespace: str | None = None
+    ) -> tuple[CheckpointIndex, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in self._checkpoints.values()
+                    if (thread_id is None or item.thread_id == thread_id)
+                    and (namespace is None or item.namespace == namespace)
+                ),
+                key=lambda item: item.checkpoint_id,
+                reverse=True,
+            )
+        )
+
+    async def publish_pending_write_index(self, index: PendingWriteIndex) -> None:
+        write_key = (
+            index.thread_id,
+            index.namespace,
+            index.checkpoint_id,
+            index.task_id,
+            index.write_index,
+        )
+        async with self._agent_lock:
+            owner_mismatch = any(
+                item.thread_id == index.thread_id
+                and (item.owner_kind, item.owner_id) != (index.owner_kind, index.owner_id)
+                for item in self._checkpoints.values()
+            ) or any(
+                item.thread_id == index.thread_id
+                and (item.owner_kind, item.owner_id) != (index.owner_kind, index.owner_id)
+                for item in self._pending_writes.values()
+            )
+            if owner_mismatch:
+                raise StoreCommitError("pending write thread belongs to another owner")
+            existing = self._pending_writes.get(write_key)
+            if existing is not None and index.write_index >= 0:
+                return
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            if existing is not None:
+                self._cas_refs.pop((existing.owner_kind, existing.owner_id, existing.reference_key))
+            self._pending_writes[write_key] = index
+            self._cas_refs[(index.owner_kind, index.owner_id, index.reference_key)] = index.object
+
+    async def list_pending_write_indexes(
+        self, thread_id: str, namespace: str, checkpoint_id: str
+    ) -> tuple[PendingWriteIndex, ...]:
+        return tuple(
+            item
+            for key, item in self._pending_writes.items()
+            if key[:3] == (thread_id, namespace, checkpoint_id)
+        )
+
+    async def delete_checkpoint_thread(
+        self,
+        thread_id: str,
+        *,
+        graph_family: str,
+        owner_kind: str,
+        owner_id: UUID,
+    ) -> tuple[CasObject, ...]:
+        async with self._agent_lock:
+            indexes: list[CheckpointIndex | PendingWriteIndex] = []
+            indexes.extend(
+                item for item in self._checkpoints.values() if item.thread_id == thread_id
+            )
+            indexes.extend(
+                item for item in self._pending_writes.values() if item.thread_id == thread_id
+            )
+            if any(
+                (item.graph_family, item.owner_kind, item.owner_id)
+                != (graph_family, owner_kind, owner_id)
+                for item in indexes
+            ):
+                raise ValueError("checkpoint owner identity mismatch")
+            for item in indexes:
+                self._cas_refs.pop((item.owner_kind, item.owner_id, item.reference_key), None)
+            self._checkpoints = {
+                key: item for key, item in self._checkpoints.items() if item.thread_id != thread_id
+            }
+            self._pending_writes = {
+                key: item
+                for key, item in self._pending_writes.items()
+                if item.thread_id != thread_id
+            }
+            live = {value.digest for value in self._cas_refs.values()}
+            return tuple(
+                {
+                    item.object.digest: item.object
+                    for item in indexes
+                    if item.object.digest not in live
+                }.values()
+            )
+
+    async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
+        _validate_new_agent_run(record)
+        async with self._agent_lock:
+            if record.owner_kind == "run" and RunId(record.owner_id) not in self._snapshots:
+                raise StoreCommitError("AgentRun owner Run does not exist")
+            existing_id = self._agent_run_keys.get(record.owner_key)
+            if existing_id is not None:
+                existing = self._agent_runs[existing_id]
+                if not existing.same_creation_identity(record):
+                    raise StoreCommitError("AgentRun logical task identity mismatch")
+                return existing
+            if record.agent_run_id in self._agent_runs:
+                raise StoreCommitError("AgentRun ID already exists")
+            if UUID(record.thread_id) in self._agent_threads:
+                raise StoreCommitError("AgentRun thread already exists")
+            self._agent_runs[record.agent_run_id] = record
+            self._agent_run_keys[record.owner_key] = record.agent_run_id
+            self._agent_threads[UUID(record.thread_id)] = record.agent_run_id
+            return record
+
+    async def load_agent_run(self, agent_run_id: AgentRunId) -> AgentRun | None:
+        return self._agent_runs.get(agent_run_id)
+
+    async def list_agent_runs_by_owner(
+        self, owner_kind: str, owner_id: UUID
+    ) -> tuple[AgentRun, ...]:
+        return tuple(
+            sorted(
+                (
+                    record
+                    for record in self._agent_runs.values()
+                    if record.owner_kind == owner_kind and record.owner_id == owner_id
+                ),
+                key=lambda record: record.logical_task_key,
+            )
+        )
+
+    async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
+        return self._agent_receipts.get(agent_run_id)
+
+    async def commit_agent_run_receipt(
+        self,
+        record: AgentRun,
+        receipt: AgentRunReceipt,
+        *,
+        state: RunState | None = None,
+        events: Sequence[EventSpec] = (),
+        cas_references: Sequence[tuple[str, CasObject]] = (),
+    ) -> AgentRunReceipt:
+        async with self._agent_lock:
+            existing_receipt = self._agent_receipts.get(record.agent_run_id)
+            if existing_receipt is not None:
+                if (
+                    existing_receipt.category != receipt.category
+                    or existing_receipt.agent_run_id != receipt.agent_run_id
+                    or self._agent_runs[record.agent_run_id] != record
+                    or any(
+                        self._cas_refs.get((record.owner_kind, record.owner_id, key)) != obj
+                        for key, obj in cas_references
+                    )
+                ):
+                    raise StoreCommitError("AgentRun receipt replay mismatch")
+                return existing_receipt
+            current = self._agent_runs.get(record.agent_run_id)
+            _validate_agent_receipt(current, record, receipt, state, events, cas_references)
+            for reference_key, object_ref in cas_references:
+                existing_ref = self._cas_refs.get(
+                    (record.owner_kind, record.owner_id, reference_key)
+                )
+                if existing_ref is not None and existing_ref != object_ref:
+                    raise StoreCommitError("CAS reference key already points to another object")
+                if any(
+                    value.digest == object_ref.digest and value.size != object_ref.size
+                    for value in self._cas_refs.values()
+                ):
+                    raise StoreCommitError("CAS object size mismatch")
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            if state is not None:
+                previous = self._snapshots.get(state.run_id)
+                if previous is None:
+                    raise StoreCommitError("runtime run does not exist")
+                if state.version != previous.state.version + 1:
+                    raise StoreCommitError("Run owner state version is stale")
+                try:
+                    materialized = tuple(
+                        RuntimeEvent(
+                            sequence=len(previous.events) + index + 1,
+                            event_type=event.event_type,
+                            data=_redact_event_data(event.data, self.secret_registry),
+                        )
+                        for index, event in enumerate(events)
+                    )
+                except ValueError as exc:
+                    raise StoreCommitError("observation rejected") from exc
+                snapshot = RuntimeSnapshot(state=state, events=(*previous.events, *materialized))
+            else:
+                snapshot = None
+            if snapshot is not None:
+                run_id = RunId(record.owner_id)
+                condition = self._run_conditions.setdefault(run_id, asyncio.Condition())
+                async with condition:
+                    self._snapshots[run_id] = snapshot
+                    if events:
+                        condition.notify_all()
+            self._agent_runs[record.agent_run_id] = record
+            self._agent_receipts[record.agent_run_id] = receipt
+            for reference_key, object_ref in cas_references:
+                self._cas_refs[(record.owner_kind, record.owner_id, reference_key)] = object_ref
+            self.commit_count += 1
+            return receipt
+
+    async def persist_integration_intent(self, intent: IntegrationIntent) -> IntegrationIntent:
+        _validate_integration_intent(intent)
+        run_id = RunId(intent.run_id)
+        key = (run_id, str(intent.idempotency_key))
+        async with self._agent_lock:
+            if run_id not in self._snapshots:
+                raise StoreCommitError("integration intent owner Run does not exist")
+            existing = self._integration_intents.get(key)
+            if existing is not None:
+                if existing != intent:
+                    raise StoreCommitError("integration intent replay mismatch")
+                return existing
+            if any(
+                pending_run == run_id
+                and pending_key != key[1]
+                and pending_key not in {
+                    receipt_key
+                    for receipt_run, receipt_key in self._integration_receipts
+                    if receipt_run == run_id
+                }
+                for pending_run, pending_key in self._integration_intents
+            ):
+                raise StoreCommitError("another integration intent is awaiting verified receipt")
+            latest = await self.load_latest_integration_receipt(run_id)
+            if latest is not None and latest.verified_commit_oid != intent.expected_verified_oid:
+                raise StoreCommitError(
+                    "integration intent expected head differs from latest receipt"
+                )
+            self._integration_intents[key] = intent
+            return intent
+
+    async def load_integration_intent(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationIntent | None:
+        return self._integration_intents.get((RunId(run_id), idempotency_key))
+
+    async def load_integration_receipt(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationReceipt | None:
+        return self._integration_receipts.get((RunId(run_id), idempotency_key))
+
+    async def load_latest_integration_receipt(self, run_id: RunId) -> IntegrationReceipt | None:
+        receipts = [
+            receipt
+            for (receipt_run, _), receipt in self._integration_receipts.items()
+            if receipt_run == run_id
+        ]
+        return max(receipts, key=lambda receipt: receipt.event_sequence, default=None)
+
+    async def list_pending_integration_intents(
+        self, run_id: RunId
+    ) -> tuple[IntegrationIntent, ...]:
+        return tuple(
+            intent
+            for (intent_run, key), intent in self._integration_intents.items()
+            if intent_run == run_id and (intent_run, key) not in self._integration_receipts
+        )
+
+    async def list_integration_receipts(
+        self, run_id: RunId
+    ) -> tuple[IntegrationReceipt, ...]:
+        return tuple(
+            sorted(
+                (
+                    receipt
+                    for (receipt_run, _), receipt in self._integration_receipts.items()
+                    if receipt_run == run_id
+                ),
+                key=lambda receipt: receipt.event_sequence,
+            )
+        )
+
+    async def commit_integration_receipt(
+        self,
+        state: RunState,
+        intent: IntegrationIntent,
+        verified_commit_oid: GitOid,
+        events: Sequence[EventSpec],
+    ) -> IntegrationReceipt:
+        run_id = RunId(intent.run_id)
+        idempotency_key = str(intent.idempotency_key)
+        key = (run_id, idempotency_key)
+        async with self._agent_lock:
+            existing = self._integration_receipts.get(key)
+            if existing is not None:
+                if (
+                    self._integration_intents.get(key) != intent
+                    or existing.verified_commit_oid != verified_commit_oid
+                ):
+                    raise StoreCommitError("integration receipt replay mismatch")
+                stored_events = self._snapshots[run_id].events
+                matching = next(
+                    (
+                        event
+                        for event in stored_events
+                        if event.sequence == existing.event_sequence
+                        and event.event_type == "integration.completed"
+                    ),
+                    None,
+                )
+                if matching is None or matching.data.get("receipt_key") != (
+                    f"integration.completed:{idempotency_key}"
+                ):
+                    raise StoreCommitError("integration receipt event replay mismatch")
+                return existing
+            _validate_integration_intent(intent)
+            if self._integration_intents.get(key) != intent:
+                raise StoreCommitError("integration intent is not durably committed")
+            if verified_commit_oid != intent.prospective_commit_oid:
+                raise StoreCommitError("verified head does not match the intent")
+            previous_receipt = await self.load_latest_integration_receipt(run_id)
+            if (
+                previous_receipt is not None
+                and previous_receipt.verified_commit_oid != intent.expected_verified_oid
+            ):
+                raise StoreCommitError(
+                    "integration intent expected head differs from latest receipt"
+                )
+            previous = self._snapshots.get(run_id)
+            if previous is None:
+                raise StoreCommitError("integration receipt owner Run does not exist")
+            if state.run_id != run_id or state.version != previous.state.version + 1:
+                raise StoreCommitError("Run owner state version is stale")
+            _validate_integration_events(intent, verified_commit_oid, events)
+            if self._fail_next:
+                self._fail_next = False
+                raise StoreCommitError("injected commit failure")
+            first_sequence = len(previous.events) + 1
+            try:
+                materialized = tuple(
+                    RuntimeEvent(
+                        sequence=first_sequence + index,
+                        event_type=event.event_type,
+                        data=_redact_event_data(event.data, self.secret_registry),
+                    )
+                    for index, event in enumerate(events)
+                )
+            except ValueError as exc:
+                raise StoreCommitError("observation rejected") from exc
+            receipt = _make_integration_receipt(
+                intent, verified_commit_oid, first_sequence
+            )
+            condition = self._run_conditions.setdefault(run_id, asyncio.Condition())
+            async with condition:
+                self._snapshots[run_id] = RuntimeSnapshot(
+                    state=state,
+                    events=(*previous.events, *materialized),
+                )
+                self._integration_receipts[key] = receipt
+                self.commit_count += 1
+                condition.notify_all()
+            return receipt
 
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         return self._snapshots.get(run_id)
+
+    async def list_run_states(
+        self, *, limit: int, after_run_id: RunId | None = None
+    ) -> RunStatePage:
+        _validate_run_page_limit(limit)
+        cursor = after_run_id.bytes if after_run_id is not None else None
+        states = sorted(
+            (snapshot.state for snapshot in self._snapshots.values()),
+            key=lambda state: state.run_id.bytes,
+        )
+        if cursor is not None:
+            states = [state for state in states if state.run_id.bytes > cursor]
+        has_more = len(states) > limit
+        selected = tuple(states[:limit])
+        next_cursor = RunId(selected[-1].run_id) if has_more and selected else None
+        return RunStatePage(selected, next_cursor)
 
     async def create(
         self,
@@ -105,10 +1152,127 @@ class InMemoryRuntimeStore:
         events: Sequence[EventSpec],
         *,
         evolution: EvolutionSegmentDraft | None = None,
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> RuntimeSnapshot:
+        if transaction is not None:
+            if transaction.store is not self or not transaction.active:
+                raise StoreCommitError("runtime transaction does not belong to this store")
+            snapshot = await self._write(state, events, evolution=evolution)
+            transaction.after_rollback(lambda: self._snapshots.pop(state.run_id, None))
+            return snapshot
         if state.run_id in self._snapshots:
             raise StoreCommitError("run already exists")
         return await self._write(state, events, evolution=evolution)
+
+    async def execute_api_command(
+        self,
+        *,
+        principal_id: str,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+        command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
+        project_response: Callable[[object], object],
+        owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+        create_draft_graph_handoff: bool = False,
+    ) -> Mapping[str, object]:
+        scope = (principal_id, route, key)
+        body_digest = sha256(canonical_body).hexdigest()
+        now = datetime.now(UTC)
+        async with self._api_command_lock:
+            previous = self._api_commands.get(scope)
+            expired = previous is not None and previous[2] <= now
+            if previous is not None:
+                if not expired and previous[0] != body_digest:
+                    return {"conflict": True, "replayed": False}
+                if not expired:
+                    return {**previous[1], "replayed": True}
+            transaction = RuntimeStoreTransaction(self, None)
+            try:
+                value = await command(transaction)
+                response = project_response(value)
+                owner = owner_receipt(value)
+                self._record_in_memory_graph_handoff(owner)
+                outcome: dict[str, object] = {
+                    "response": response,
+                    "status_code": status_code,
+                    "owner_kind": owner[0] if owner else None,
+                    "owner_id": str(owner[1]) if owner else None,
+                    "owner_receipt_key": owner[2] if owner else None,
+                    "replayed": False,
+                }
+                if expired:
+                    del self._api_commands[scope]
+                self._api_commands[scope] = (
+                    body_digest,
+                    outcome,
+                    now + timedelta(hours=24),
+                )
+                if owner is not None and owner[0] == "run":
+                    self._graph_start_handoffs[RunId(owner[1])] = owner[2]
+                if owner is not None and owner[0] == "draft" and create_draft_graph_handoff:
+                    draft_handoff_key = (owner[1], owner[2])
+                    previous_handoff_status = self._draft_graph_start_handoffs.get(
+                        draft_handoff_key
+                    )
+                    self._draft_graph_start_handoffs.setdefault(draft_handoff_key, "PENDING")
+                    if previous_handoff_status is None:
+                        transaction.after_rollback(
+                            lambda: self._draft_graph_start_handoffs.pop(
+                                draft_handoff_key, None
+                            )
+                        )
+                transaction.after_rollback(lambda: self._api_commands.pop(scope, None))
+                if owner is not None and owner[0] == "run":
+                    transaction.after_rollback(
+                        lambda: self._graph_start_handoffs.pop(RunId(owner[1]), None)
+                    )
+            except BaseException:
+                transaction.finish(committed=False)
+                raise
+            transaction.finish(committed=True)
+            return outcome
+
+    def _record_in_memory_graph_handoff(self, owner: tuple[str, UUID, str] | None) -> None:
+        if owner is None:
+            return
+        owner_kind, owner_id, receipt_key = owner
+        if owner_kind == "draft":
+            if (owner_id, receipt_key) not in self._draft_facts:
+                raise StoreCommitError("API command has no committed Draft owner receipt")
+            return
+        if owner_kind != "run":
+            raise StoreCommitError("unsupported API command owner receipt")
+        run_id = RunId(owner_id)
+        snapshot = self._snapshots.get(run_id)
+        if snapshot is None or not any(
+            event.event_type == "run.created" and event.data.get("receipt_key") == receipt_key
+            for event in snapshot.events
+        ):
+            raise StoreCommitError("API command has no committed RunCreated receipt")
+
+    async def list_pending_graph_starts(self) -> tuple[tuple[RunId, str], ...]:
+        return tuple(self._graph_start_handoffs.items())
+
+    async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None:
+        if self._graph_start_handoffs.get(run_id) != receipt_key:
+            raise StoreCommitError("Run graph-start handoff is not pending")
+        del self._graph_start_handoffs[run_id]
+
+    async def list_pending_draft_graph_starts(self) -> tuple[tuple[UUID, str], ...]:
+        return tuple(
+            key
+            for key, status in sorted(self._draft_graph_start_handoffs.items())
+            if status == "PENDING"
+        )
+
+    async def mark_draft_graph_start_started(self, draft_id: UUID, receipt_key: str) -> None:
+        key = (draft_id, receipt_key)
+        status = self._draft_graph_start_handoffs.get(key)
+        if status is None:
+            raise StoreCommitError("Draft graph-start handoff does not exist")
+        self._draft_graph_start_handoffs[key] = "STARTED"
 
     async def commit(
         self,
@@ -140,29 +1304,33 @@ class InMemoryRuntimeStore:
         if self._fail_next:
             self._fail_next = False
             raise StoreCommitError("injected commit failure")
-        previous = self._snapshots.get(state.run_id)
-        first_sequence = len(previous.events) + 1 if previous is not None else 1
-        try:
-            materialized = tuple(
-                RuntimeEvent(
-                    sequence=first_sequence + index,
-                    event_type=event.event_type,
-                    data=_redact_event_data(event.data, self.secret_registry),
+        condition = self._run_conditions.setdefault(state.run_id, asyncio.Condition())
+        async with condition:
+            previous = self._snapshots.get(state.run_id)
+            first_sequence = len(previous.events) + 1 if previous is not None else 1
+            try:
+                materialized = tuple(
+                    RuntimeEvent(
+                        sequence=first_sequence + index,
+                        event_type=event.event_type,
+                        data=_redact_event_data(event.data, self.secret_registry),
+                    )
+                    for index, event in enumerate(events)
                 )
-                for index, event in enumerate(events)
+            except ValueError as exc:
+                raise StoreCommitError("observation rejected") from exc
+            evolution_entry = _next_in_memory_evolution(evolution, state.run_id, self._evolution)
+            snapshot = RuntimeSnapshot(
+                state=state,
+                events=(*previous.events, *materialized) if previous else materialized,
             )
-        except ValueError as exc:
-            raise StoreCommitError("observation rejected") from exc
-        evolution_entry = _next_in_memory_evolution(evolution, state.run_id, self._evolution)
-        snapshot = RuntimeSnapshot(
-            state=state,
-            events=(*previous.events, *materialized) if previous else materialized,
-        )
-        self._snapshots[state.run_id] = snapshot
-        if evolution_entry is not None:
-            self._evolution.setdefault(state.run_id, []).append(evolution_entry)
-        self.commit_count += 1
-        return snapshot
+            self._snapshots[state.run_id] = snapshot
+            if evolution_entry is not None:
+                self._evolution.setdefault(state.run_id, []).append(evolution_entry)
+            self.commit_count += 1
+            if materialized:
+                condition.notify_all()
+            return snapshot
 
     async def evolution_segments(self, *, run_id: object) -> tuple[EvolutionSegment, ...]:
         return tuple(self._evolution.get(run_id, ()))
@@ -173,44 +1341,1341 @@ class PostgreSQLRuntimeStore:
 
     The pool/connection object is deliberately accepted at the adapter boundary;
     runtime logic never imports or manages a database connection directly.
+    Production composition supplies the advisory-lock connection for every write;
+    standalone stores may omit it and use the pool for isolated tests and tools.
     """
 
-    def __init__(self, pool: Any, *, secret_registry: SecretRegistry | None = None) -> None:
+    def __init__(
+        self,
+        pool: Any,
+        *,
+        secret_registry: SecretRegistry | None = None,
+        write_connection: Any | None = None,
+    ) -> None:
         self.pool = pool
         self.secret_registry = secret_registry or SecretRegistry()
+        self._write_connection = write_connection
+        self._write_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def _acquire_write_connection(self) -> AsyncIterator[Any]:
+        """Serialize writes on the lock session so lock loss aborts active writes."""
+        if self._write_connection is None:
+            async with self.pool.acquire() as connection:
+                yield connection
+            return
+
+        async with self._write_lock:
+            if self._write_connection.is_closed():
+                raise StoreCommitError("application write connection is closed")
+            yield self._write_connection
+
+    async def commit_draft_owner_fact(
+        self,
+        draft_id: UUID,
+        receipt_key: str,
+        category: str,
+        fact: Mapping[str, object],
+        *,
+        events: Sequence[DraftSessionEventSpec] = (),
+        transaction: RuntimeStoreTransaction | None = None,
+        expected_existing_facts: Sequence[DraftOwnerReceipt] | None = None,
+    ) -> DraftOwnerReceipt:
+        receipt, payload = _make_draft_receipt(draft_id, receipt_key, category, fact)
+        event_data = _prepare_draft_events(events, self.secret_registry)
+        if transaction is not None and (
+            transaction.store is not self
+            or not transaction.active
+            or transaction.connection is None
+        ):
+            raise StoreCommitError("runtime transaction does not belong to this store")
+
+        async def commit_on(connection: Any) -> DraftOwnerReceipt:
+            await connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))", str(draft_id)
+            )
+            existing = await connection.fetchval(
+                """SELECT 1 FROM draft_owner_facts
+                    WHERE draft_id=$1 AND receipt_key=$2""",
+                draft_id,
+                receipt_key,
+            )
+            if existing is None and category in _DRAFT_MUTABLE_LEDGER_CATEGORIES:
+                frozen = await connection.fetchval(
+                    """SELECT 1 FROM draft_owner_facts
+                        WHERE draft_id=$1 AND receipt_key='draft.freeze'""",
+                    draft_id,
+                )
+                if frozen is not None:
+                    raise DraftOwnerFrozenError("Draft is already frozen")
+            if (
+                existing is None
+                and category == "draft.freeze"
+                and expected_existing_facts is not None
+            ):
+                snapshot_rows = await connection.fetch(
+                    """SELECT receipt_key, category, fact_sha256 FROM draft_owner_facts
+                        WHERE draft_id=$1 ORDER BY receipt_key""",
+                    draft_id,
+                )
+                actual = tuple(
+                    DraftOwnerReceipt(
+                        draft_id,
+                        str(_row_value(row, "receipt_key")),
+                        str(_row_value(row, "category")),
+                        str(_row_value(row, "fact_sha256")).strip(),
+                    )
+                    for row in snapshot_rows
+                )
+                expected = tuple(sorted(expected_existing_facts, key=lambda item: item.receipt_key))
+                if actual != expected:
+                    raise DraftLedgerChangedError("Draft owner facts changed before freeze commit")
+            inserted = await connection.fetchval(
+                """INSERT INTO draft_owner_facts(
+                        draft_id, receipt_key, category, fact_sha256, fact
+                    ) VALUES ($1,$2,$3,$4,$5::jsonb)
+                    ON CONFLICT (draft_id, receipt_key) DO NOTHING
+                    RETURNING receipt_key""",
+                draft_id,
+                receipt_key,
+                category,
+                receipt.fact_sha256,
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            )
+            row = await connection.fetchrow(
+                """SELECT category, fact_sha256, fact FROM draft_owner_facts
+                    WHERE draft_id=$1 AND receipt_key=$2""",
+                draft_id,
+                receipt_key,
+            )
+            if row is None:
+                raise StoreCommitError("Draft owner fact commit disappeared")
+            stored = _decode_draft_fact(_row_value(row, "fact"))
+            stored_receipt = DraftOwnerReceipt(
+                draft_id,
+                receipt_key,
+                str(_row_value(row, "category")),
+                str(_row_value(row, "fact_sha256")).strip(),
+            )
+            if stored_receipt != receipt or stored != payload:
+                raise StoreCommitError("Draft owner fact replay mismatch")
+            if inserted is not None:
+                first_sequence = await connection.fetchval(
+                    """SELECT COALESCE(MAX(sequence), 0) + 1
+                        FROM draft_session_events WHERE draft_id=$1""",
+                    draft_id,
+                )
+                for index, (event_type, data) in enumerate(event_data):
+                    await connection.execute(
+                        """INSERT INTO draft_session_events
+                            (draft_id, receipt_key, sequence, event_type, data)
+                            VALUES ($1,$2,$3,$4,$5::jsonb)""",
+                        draft_id,
+                        receipt_key,
+                        first_sequence + index,
+                        event_type,
+                        json.dumps(data, sort_keys=True, separators=(",", ":")),
+                    )
+                if event_data:
+                    await connection.execute(
+                        "SELECT pg_notify('draft_session_events', $1)", str(draft_id)
+                    )
+            else:
+                replay_rows = await connection.fetch(
+                    """SELECT event_type, data FROM draft_session_events
+                        WHERE draft_id=$1 AND receipt_key=$2 ORDER BY sequence""",
+                    draft_id,
+                    receipt_key,
+                )
+                replay_events = tuple(
+                    (
+                        str(_row_value(row, "event_type")),
+                        _decode_draft_fact(_row_value(row, "data")),
+                    )
+                    for row in replay_rows
+                )
+                if replay_events != event_data:
+                    raise StoreCommitError("Draft owner fact replay mismatch")
+            return stored_receipt
+
+        if transaction is not None:
+            return await commit_on(transaction.connection)
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                return await commit_on(connection)
+
+    async def read_draft_session_events(
+        self, draft_id: UUID, after_sequence: int
+    ) -> tuple[DraftSessionEvent, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT sequence, event_type, data, timestamp_utc FROM draft_session_events
+                WHERE draft_id=$1 AND sequence>$2 ORDER BY sequence""",
+                draft_id,
+                after_sequence,
+            )
+        return tuple(
+            DraftSessionEvent(
+                draft_id,
+                int(_row_value(row, "sequence")),
+                str(_row_value(row, "event_type")),
+                _decode_draft_fact(_row_value(row, "data")),
+                _row_value(row, "timestamp_utc").astimezone(UTC),
+            )
+            for row in rows
+        )
+
+    async def wait_for_draft_session_events(self, draft_id: UUID, after_sequence: int) -> None:
+        loop = asyncio.get_running_loop()
+        wake = loop.create_future()
+
+        def listener(_connection: Any, _pid: int, _channel: str, payload: str) -> None:
+            if payload == str(draft_id) and not wake.done():
+                wake.set_result(None)
+
+        async with self.pool.acquire() as connection:
+            await connection.add_listener("draft_session_events", listener)
+            try:
+                row = await connection.fetchrow(
+                    """SELECT COALESCE(MAX(sequence), 0) AS latest_sequence,
+                    COALESCE(MIN(sequence) FILTER (WHERE event_type = ANY($2::text[])), 0)
+                        AS terminal_sequence
+                    FROM draft_session_events WHERE draft_id=$1""",
+                    draft_id,
+                    list(_DRAFT_TERMINAL_EVENTS),
+                )
+                latest = int(_row_value(row, "latest_sequence"))
+                terminal = int(_row_value(row, "terminal_sequence"))
+                if latest > after_sequence or (terminal > 0 and terminal <= after_sequence):
+                    return
+                await wake
+            finally:
+                await connection.remove_listener("draft_session_events", listener)
+
+    async def is_draft_session_terminal(self, draft_id: UUID, after_sequence: int) -> bool:
+        async with self.pool.acquire() as connection:
+            terminal = await connection.fetchval(
+                """SELECT COALESCE(MIN(sequence), 0)
+                FROM draft_session_events
+                WHERE draft_id=$1 AND sequence <= $2 AND event_type = ANY($3::text[])""",
+                draft_id,
+                after_sequence,
+                list(_DRAFT_TERMINAL_EVENTS),
+            )
+            return int(terminal) > 0
+
+    async def load_draft_owner_fact(
+        self, draft_id: UUID, receipt_key: str
+    ) -> tuple[DraftOwnerReceipt, dict[str, object]] | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT category, fact_sha256, fact FROM draft_owner_facts
+                WHERE draft_id=$1 AND receipt_key=$2""",
+                draft_id,
+                receipt_key,
+            )
+        if row is None:
+            return None
+        receipt = DraftOwnerReceipt(
+            draft_id,
+            receipt_key,
+            str(_row_value(row, "category")),
+            str(_row_value(row, "fact_sha256")).strip(),
+        )
+        fact = _decode_draft_fact(_row_value(row, "fact"))
+        _verify_draft_fact_digest(receipt, fact)
+        return receipt, fact
+
+    async def list_draft_owner_facts(
+        self, draft_id: UUID
+    ) -> tuple[tuple[DraftOwnerReceipt, dict[str, object]], ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT receipt_key, category, fact_sha256, fact
+                FROM draft_owner_facts WHERE draft_id=$1 ORDER BY receipt_key""",
+                draft_id,
+            )
+        values = tuple(
+            (
+                DraftOwnerReceipt(
+                    draft_id,
+                    str(_row_value(row, "receipt_key")),
+                    str(_row_value(row, "category")),
+                    str(_row_value(row, "fact_sha256")).strip(),
+                ),
+                _decode_draft_fact(_row_value(row, "fact")),
+            )
+            for row in rows
+        )
+        for receipt, fact in values:
+            _verify_draft_fact_digest(receipt, fact)
+        return values
+
+    async def create_or_get_agent_run(self, record: AgentRun) -> AgentRun:
+        _validate_new_agent_run(record)
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                if record.owner_kind == "run":
+                    owner_row = await connection.fetchrow(
+                        "SELECT run_id FROM runtime_runs WHERE run_id = $1",
+                        record.owner_id,
+                    )
+                    if owner_row is None:
+                        raise StoreCommitError("AgentRun owner Run does not exist")
+                try:
+                    await connection.execute(
+                        """INSERT INTO agent_runs(
+                            agent_run_id, owner_kind, owner_id, logical_task_key,
+                            thread_id, phase, session_kind, model_binding_sha256,
+                            context_sha256, toolset_sha256, template_sha256,
+                            state, exit, metadata
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
+                        ON CONFLICT (owner_kind, owner_id, logical_task_key) DO NOTHING""",
+                        record.agent_run_id,
+                        record.owner_kind,
+                        record.owner_id,
+                        record.logical_task_key,
+                        UUID(record.thread_id),
+                        record.phase.value,
+                        record.session_kind.value,
+                        record.model_binding_sha256,
+                        record.context_sha256,
+                        record.toolset_sha256,
+                        record.template_sha256,
+                        record.state.value,
+                        None,
+                        _dump_agent_run(record),
+                    )
+                except Exception as exc:
+                    if getattr(exc, "constraint_name", None) == "agent_runs_thread_id_unique":
+                        raise StoreCommitError("AgentRun thread already exists") from exc
+                    raise
+                row = await connection.fetchrow(
+                    """SELECT metadata FROM agent_runs
+                    WHERE owner_kind = $1 AND owner_id = $2 AND logical_task_key = $3""",
+                    *record.owner_key,
+                )
+                if row is None:
+                    raise StoreCommitError("AgentRun creation disappeared")
+                existing = _decode_agent_run(_row_value(row, "metadata"))
+                if not existing.same_creation_identity(record):
+                    raise StoreCommitError("AgentRun logical task identity mismatch")
+                return existing
+
+    async def load_agent_run(self, agent_run_id: AgentRunId) -> AgentRun | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT metadata FROM agent_runs WHERE agent_run_id = $1",
+                agent_run_id,
+            )
+        return _decode_agent_run(_row_value(row, "metadata")) if row is not None else None
+
+    async def list_agent_runs_by_owner(
+        self, owner_kind: str, owner_id: UUID
+    ) -> tuple[AgentRun, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT metadata FROM agent_runs
+                WHERE owner_kind=$1 AND owner_id=$2 ORDER BY logical_task_key""",
+                owner_kind,
+                owner_id,
+            )
+        return tuple(_decode_agent_run(_row_value(row, "metadata")) for row in rows)
+
+    async def load_agent_run_receipt(self, agent_run_id: AgentRunId) -> AgentRunReceipt | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT receipt_id, category FROM agent_run_receipts WHERE agent_run_id = $1",
+                agent_run_id,
+            )
+        if row is None:
+            return None
+        return AgentRunReceipt(
+            _row_value(row, "receipt_id"), agent_run_id, str(_row_value(row, "category"))
+        )
+
+    async def commit_agent_run_receipt(
+        self,
+        record: AgentRun,
+        receipt: AgentRunReceipt,
+        *,
+        state: RunState | None = None,
+        events: Sequence[EventSpec] = (),
+        cas_references: Sequence[tuple[str, CasObject]] = (),
+    ) -> AgentRunReceipt:
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    "SELECT metadata FROM agent_runs WHERE agent_run_id = $1 FOR UPDATE",
+                    record.agent_run_id,
+                )
+                current = (
+                    _decode_agent_run(_row_value(row, "metadata")) if row is not None else None
+                )
+                receipt_row = await connection.fetchrow(
+                    "SELECT receipt_id, category FROM agent_run_receipts WHERE agent_run_id = $1",
+                    record.agent_run_id,
+                )
+                if receipt_row is not None:
+                    existing_receipt = AgentRunReceipt(
+                        _row_value(receipt_row, "receipt_id"),
+                        record.agent_run_id,
+                        str(_row_value(receipt_row, "category")),
+                    )
+                    if (
+                        existing_receipt.category != receipt.category
+                        or existing_receipt.agent_run_id != receipt.agent_run_id
+                        or current != record
+                    ):
+                        raise StoreCommitError("AgentRun receipt replay mismatch")
+                    for reference_key, object_ref in cas_references:
+                        ref = await connection.fetchrow(
+                            """SELECT r.digest, o.size_bytes FROM cas_object_refs r
+                            JOIN cas_objects o ON o.digest=r.digest
+                            WHERE r.owner_kind=$1 AND r.owner_id=$2 AND r.reference_key=$3""",
+                            record.owner_kind,
+                            record.owner_id,
+                            reference_key,
+                        )
+                        if (
+                            ref is None
+                            or str(_row_value(ref, "digest")) != object_ref.digest
+                            or int(_row_value(ref, "size_bytes")) != object_ref.size
+                        ):
+                            raise StoreCommitError("AgentRun receipt CAS ref replay mismatch")
+                    return existing_receipt
+                _validate_agent_receipt(current, record, receipt, state, events, cas_references)
+                if state is not None:
+                    locked = await connection.fetchrow(
+                        "SELECT state FROM runtime_runs WHERE run_id = $1 FOR UPDATE",
+                        state.run_id,
+                    )
+                    if locked is None:
+                        raise StoreCommitError("runtime run does not exist")
+                    previous_state = _decode_state(_row_value(locked, "state"))
+                    if state.version != previous_state.version + 1:
+                        raise StoreCommitError("Run owner state version is stale")
+                    sequence_row = await connection.fetchrow(
+                        """SELECT COALESCE(MAX(sequence), 0) AS last_sequence
+                        FROM runtime_events WHERE run_id = $1""",
+                        state.run_id,
+                    )
+                    await connection.execute(
+                        "UPDATE runtime_runs SET state = $2::jsonb WHERE run_id = $1",
+                        state.run_id,
+                        _dump_json(state),
+                    )
+                    await _insert_events(
+                        connection,
+                        state.run_id,
+                        events,
+                        first_sequence=int(_row_value(sequence_row, "last_sequence")) + 1,
+                        secret_registry=self.secret_registry,
+                    )
+                await connection.execute(
+                    """UPDATE agent_runs SET state = $2, exit = $3, metadata = $4::jsonb,
+                    updated_at = CURRENT_TIMESTAMP WHERE agent_run_id = $1""",
+                    record.agent_run_id,
+                    record.state.value,
+                    record.exit.value if record.exit is not None else None,
+                    _dump_agent_run(record),
+                )
+                for reference_key, object_ref in cas_references:
+                    await connection.execute(
+                        """INSERT INTO cas_objects(digest,size_bytes) VALUES($1,$2)
+                        ON CONFLICT (digest) DO NOTHING""",
+                        object_ref.digest,
+                        object_ref.size,
+                    )
+                    object_row = await connection.fetchrow(
+                        "SELECT size_bytes FROM cas_objects WHERE digest=$1 FOR UPDATE",
+                        object_ref.digest,
+                    )
+                    if int(_row_value(object_row, "size_bytes")) != object_ref.size:
+                        raise StoreCommitError("CAS object size mismatch")
+                    await connection.execute(
+                        """INSERT INTO cas_object_refs(owner_kind,owner_id,reference_key,digest)
+                        VALUES($1,$2,$3,$4) ON CONFLICT(owner_kind,owner_id,reference_key)
+                        DO NOTHING""",
+                        record.owner_kind,
+                        record.owner_id,
+                        reference_key,
+                        object_ref.digest,
+                    )
+                    ref_row = await connection.fetchrow(
+                        """SELECT digest FROM cas_object_refs WHERE owner_kind=$1
+                        AND owner_id=$2 AND reference_key=$3""",
+                        record.owner_kind,
+                        record.owner_id,
+                        reference_key,
+                    )
+                    if str(_row_value(ref_row, "digest")) != object_ref.digest:
+                        raise StoreCommitError("CAS reference key already has another digest")
+                await connection.execute(
+                    """INSERT INTO agent_run_receipts(receipt_id, agent_run_id, category)
+                    VALUES ($1,$2,$3)""",
+                    receipt.receipt_id,
+                    receipt.agent_run_id,
+                    receipt.category,
+                )
+                return receipt
+
+    async def persist_integration_intent(self, intent: IntegrationIntent) -> IntegrationIntent:
+        _validate_integration_intent(intent)
+        run_id = RunId(intent.run_id)
+        idempotency_key = str(intent.idempotency_key)
+        payload = intent.model_dump(mode="json", by_alias=True)
+        encoded = canonical_json_bytes(payload).decode("utf-8")
+        digest = _integration_intent_digest(intent)
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                owner = await connection.fetchrow(
+                    "SELECT run_id FROM runtime_runs WHERE run_id=$1 FOR UPDATE", run_id
+                )
+                if owner is None:
+                    raise StoreCommitError("integration intent owner Run does not exist")
+                existing = await connection.fetchrow(
+                    """SELECT intent, intent_sha256 FROM run_integration_intents
+                    WHERE run_id=$1 AND idempotency_key=$2 FOR UPDATE""",
+                    run_id,
+                    idempotency_key,
+                )
+                if existing is not None:
+                    stored = _stored_integration_intent(
+                        _row_value(existing, "intent"),
+                        _row_value(existing, "intent_sha256"),
+                    )
+                    if stored != intent or _integration_intent_digest(stored) != digest:
+                        raise StoreCommitError("integration intent replay mismatch")
+                    return stored
+                pending = await connection.fetchrow(
+                    """SELECT i.idempotency_key FROM run_integration_intents i
+                    LEFT JOIN run_integration_receipts r
+                      ON r.run_id=i.run_id AND r.idempotency_key=i.idempotency_key
+                    WHERE i.run_id=$1 AND r.idempotency_key IS NULL LIMIT 1""",
+                    run_id,
+                )
+                if pending is not None:
+                    raise StoreCommitError(
+                        "another integration intent is awaiting verified receipt"
+                    )
+                latest = await connection.fetchrow(
+                    """SELECT verified_commit_oid FROM run_integration_receipts
+                    WHERE run_id=$1 ORDER BY event_sequence DESC LIMIT 1""",
+                    run_id,
+                )
+                if (
+                    latest is not None
+                    and str(_row_value(latest, "verified_commit_oid"))
+                    != str(intent.expected_verified_oid)
+                ):
+                    raise StoreCommitError(
+                        "integration intent expected head differs from latest receipt"
+                    )
+                await connection.execute(
+                    """INSERT INTO run_integration_intents(
+                        run_id,idempotency_key,intent_sha256,intent
+                    ) VALUES($1,$2,$3,$4::jsonb)""",
+                    run_id,
+                    idempotency_key,
+                    digest,
+                    encoded,
+                )
+        return intent
+
+    async def load_integration_intent(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationIntent | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT intent,intent_sha256 FROM run_integration_intents
+                WHERE run_id=$1 AND idempotency_key=$2""",
+                run_id,
+                idempotency_key,
+            )
+        return (
+            _stored_integration_intent(
+                _row_value(row, "intent"), _row_value(row, "intent_sha256")
+            )
+            if row is not None
+            else None
+        )
+
+    async def load_integration_receipt(
+        self, run_id: RunId, idempotency_key: str
+    ) -> IntegrationReceipt | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT i.intent,i.intent_sha256,r.verified_commit_oid,
+                          r.receipt_sha256,r.event_sequence
+                FROM run_integration_receipts r
+                JOIN run_integration_intents i USING(run_id,idempotency_key)
+                WHERE r.run_id=$1 AND r.idempotency_key=$2""",
+                run_id,
+                idempotency_key,
+            )
+        if row is None:
+            return None
+        intent = _stored_integration_intent(
+            _row_value(row, "intent"), _row_value(row, "intent_sha256")
+        )
+        return _stored_integration_receipt(
+            intent,
+            _row_value(row, "verified_commit_oid"),
+            _row_value(row, "receipt_sha256"),
+            _row_value(row, "event_sequence"),
+        )
+
+    async def load_latest_integration_receipt(self, run_id: RunId) -> IntegrationReceipt | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT i.intent,i.intent_sha256,r.verified_commit_oid,
+                          r.receipt_sha256,r.event_sequence
+                FROM run_integration_receipts r
+                JOIN run_integration_intents i USING(run_id,idempotency_key)
+                WHERE r.run_id=$1 ORDER BY r.event_sequence DESC LIMIT 1""",
+                run_id,
+            )
+        if row is None:
+            return None
+        intent = _stored_integration_intent(
+            _row_value(row, "intent"), _row_value(row, "intent_sha256")
+        )
+        return _stored_integration_receipt(
+            intent,
+            _row_value(row, "verified_commit_oid"),
+            _row_value(row, "receipt_sha256"),
+            _row_value(row, "event_sequence"),
+        )
+
+    async def list_pending_integration_intents(
+        self, run_id: RunId
+    ) -> tuple[IntegrationIntent, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT i.intent,i.intent_sha256 FROM run_integration_intents i
+                LEFT JOIN run_integration_receipts r USING(run_id,idempotency_key)
+                WHERE i.run_id=$1 AND r.idempotency_key IS NULL ORDER BY i.created_at""",
+                run_id,
+            )
+        return tuple(
+            _stored_integration_intent(
+                _row_value(row, "intent"), _row_value(row, "intent_sha256")
+            )
+            for row in rows
+        )
+
+    async def list_integration_receipts(
+        self, run_id: RunId
+    ) -> tuple[IntegrationReceipt, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT i.intent,i.intent_sha256,r.verified_commit_oid,
+                          r.receipt_sha256,r.event_sequence
+                FROM run_integration_receipts r
+                JOIN run_integration_intents i USING(run_id,idempotency_key)
+                WHERE r.run_id=$1 ORDER BY r.event_sequence""",
+                run_id,
+            )
+        return tuple(
+            _stored_integration_receipt(
+                _stored_integration_intent(
+                    _row_value(row, "intent"), _row_value(row, "intent_sha256")
+                ),
+                _row_value(row, "verified_commit_oid"),
+                _row_value(row, "receipt_sha256"),
+                _row_value(row, "event_sequence"),
+            )
+            for row in rows
+        )
+
+    async def commit_integration_receipt(
+        self,
+        state: RunState,
+        intent: IntegrationIntent,
+        verified_commit_oid: GitOid,
+        events: Sequence[EventSpec],
+    ) -> IntegrationReceipt:
+        run_id = RunId(intent.run_id)
+        idempotency_key = str(intent.idempotency_key)
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                owner = await connection.fetchrow(
+                    "SELECT state FROM runtime_runs WHERE run_id=$1 FOR UPDATE", run_id
+                )
+                if owner is None:
+                    raise StoreCommitError("integration receipt owner Run does not exist")
+                intent_row = await connection.fetchrow(
+                    """SELECT intent,intent_sha256 FROM run_integration_intents
+                    WHERE run_id=$1 AND idempotency_key=$2 FOR UPDATE""",
+                    run_id,
+                    idempotency_key,
+                )
+                stored_intent = (
+                    _stored_integration_intent(
+                        _row_value(intent_row, "intent"),
+                        _row_value(intent_row, "intent_sha256"),
+                    )
+                    if intent_row is not None
+                    else None
+                )
+                if stored_intent != intent:
+                    raise StoreCommitError("integration intent is not durably committed")
+                existing = await connection.fetchrow(
+                    """SELECT verified_commit_oid,receipt_sha256,event_sequence
+                    FROM run_integration_receipts
+                    WHERE run_id=$1 AND idempotency_key=$2""",
+                    run_id,
+                    idempotency_key,
+                )
+                if existing is not None:
+                    receipt = _stored_integration_receipt(
+                        stored_intent,
+                        _row_value(existing, "verified_commit_oid"),
+                        _row_value(existing, "receipt_sha256"),
+                        _row_value(existing, "event_sequence"),
+                    )
+                    if receipt.verified_commit_oid != verified_commit_oid:
+                        raise StoreCommitError("integration receipt replay mismatch")
+                    return receipt
+                if verified_commit_oid != intent.prospective_commit_oid:
+                    raise StoreCommitError("verified head does not match the intent")
+                previous_state = _decode_state(_row_value(owner, "state"))
+                if state.run_id != run_id or state.version != previous_state.version + 1:
+                    raise StoreCommitError("Run owner state version is stale")
+                latest = await connection.fetchrow(
+                    """SELECT verified_commit_oid FROM run_integration_receipts
+                    WHERE run_id=$1 ORDER BY event_sequence DESC LIMIT 1""",
+                    run_id,
+                )
+                if (
+                    latest is not None
+                    and str(_row_value(latest, "verified_commit_oid"))
+                    != str(intent.expected_verified_oid)
+                ):
+                    raise StoreCommitError(
+                        "integration intent expected head differs from latest receipt"
+                    )
+                _validate_integration_events(intent, verified_commit_oid, events)
+                sequence_row = await connection.fetchrow(
+                    """SELECT COALESCE(MAX(sequence),0) AS last_sequence
+                    FROM runtime_events WHERE run_id=$1""",
+                    run_id,
+                )
+                event_sequence = int(_row_value(sequence_row, "last_sequence")) + 1
+                receipt = _make_integration_receipt(
+                    intent, verified_commit_oid, event_sequence
+                )
+                await connection.execute(
+                    "UPDATE runtime_runs SET state=$2::jsonb WHERE run_id=$1",
+                    run_id,
+                    _dump_json(state),
+                )
+                await _insert_events(
+                    connection,
+                    run_id,
+                    events,
+                    first_sequence=event_sequence,
+                    secret_registry=self.secret_registry,
+                )
+                await connection.execute(
+                    """INSERT INTO run_integration_receipts(
+                        run_id,idempotency_key,verified_commit_oid,receipt_sha256,event_sequence
+                    ) VALUES($1,$2,$3,$4,$5)""",
+                    run_id,
+                    idempotency_key,
+                    str(verified_commit_oid),
+                    receipt.receipt_sha256,
+                    event_sequence,
+                )
+                return receipt
+
+    async def add_cas_reference(
+        self, object_ref: CasObject, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> None:
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                await _add_cas_reference_with_connection(
+                    connection, object_ref, owner_kind, owner_id, reference_key
+                )
+
+    async def get_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        async with self.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT r.digest, o.size_bytes FROM cas_object_refs r
+                JOIN cas_objects o ON o.digest = r.digest
+                WHERE r.owner_kind = $1 AND r.owner_id = $2 AND r.reference_key = $3""",
+                owner_kind,
+                owner_id,
+                reference_key,
+            )
+        return _cas_object_from_row(row) if row is not None else None
+
+    async def release_cas_reference(
+        self, owner_kind: str, owner_id: UUID, reference_key: str
+    ) -> CasObject | None:
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                return await _release_cas_reference_with_connection(
+                    connection, owner_kind, owner_id, reference_key
+                )
+
+    async def referenced_digests(self) -> frozenset[str]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch("SELECT DISTINCT digest FROM cas_object_refs")
+        return frozenset(str(_row_value(row, "digest")).strip() for row in rows)
+
+    async def publish_checkpoint_index(self, index: CheckpointIndex) -> None:
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """INSERT INTO graph_threads(thread_id, graph_family, owner_kind, owner_id)
+                    VALUES ($1,$2,$3,$4) ON CONFLICT (thread_id) DO NOTHING""",
+                    UUID(index.thread_id),
+                    index.graph_family,
+                    index.owner_kind,
+                    index.owner_id,
+                )
+                thread = await connection.fetchrow(
+                    """SELECT graph_family, owner_kind, owner_id FROM graph_threads
+                    WHERE thread_id = $1""",
+                    UUID(index.thread_id),
+                )
+                if (
+                    str(_row_value(thread, "graph_family")),
+                    str(_row_value(thread, "owner_kind")),
+                    _row_value(thread, "owner_id"),
+                ) != (index.graph_family, index.owner_kind, index.owner_id):
+                    raise StoreCommitError("checkpoint thread belongs to another owner")
+                await _add_cas_reference_with_connection(
+                    connection,
+                    index.object,
+                    index.owner_kind,
+                    index.owner_id,
+                    index.reference_key,
+                )
+                await connection.execute(
+                    """INSERT INTO graph_checkpoints(
+                        thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id,
+                        digest, size_bytes
+                    ) VALUES ($1,$2,$3,$4,$5,$6)
+                    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id) DO NOTHING""",
+                    UUID(index.thread_id),
+                    index.namespace,
+                    index.checkpoint_id,
+                    index.parent_checkpoint_id,
+                    index.object.digest,
+                    index.object.size,
+                )
+                row = await connection.fetchrow(
+                    """SELECT parent_checkpoint_id, digest, size_bytes
+                    FROM graph_checkpoints WHERE thread_id=$1 AND checkpoint_ns=$2
+                    AND checkpoint_id=$3""",
+                    UUID(index.thread_id),
+                    index.namespace,
+                    index.checkpoint_id,
+                )
+                if (
+                    _row_value(row, "parent_checkpoint_id"),
+                    str(_row_value(row, "digest")).strip(),
+                    int(_row_value(row, "size_bytes")),
+                ) != (index.parent_checkpoint_id, index.object.digest, index.object.size):
+                    raise StoreCommitError("checkpoint identity collision")
+
+    async def list_checkpoint_indexes(
+        self, thread_id: str | None = None, namespace: str | None = None
+    ) -> tuple[CheckpointIndex, ...]:
+        async with self.pool.acquire() as connection:
+            return await _list_checkpoint_indexes_with_connection(connection, thread_id, namespace)
+
+    async def publish_pending_write_index(self, index: PendingWriteIndex) -> None:
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    """INSERT INTO graph_threads(thread_id, graph_family, owner_kind, owner_id)
+                    VALUES ($1,$2,$3,$4) ON CONFLICT (thread_id) DO NOTHING""",
+                    UUID(index.thread_id),
+                    index.graph_family,
+                    index.owner_kind,
+                    index.owner_id,
+                )
+                thread = await connection.fetchrow(
+                    """SELECT graph_family, owner_kind, owner_id FROM graph_threads
+                    WHERE thread_id=$1""",
+                    UUID(index.thread_id),
+                )
+                if (
+                    _row_value(thread, "graph_family"),
+                    _row_value(thread, "owner_kind"),
+                    _row_value(thread, "owner_id"),
+                ) != (index.graph_family, index.owner_kind, index.owner_id):
+                    raise StoreCommitError("pending write owner mismatch")
+                existing = await connection.fetchrow(
+                    """SELECT digest FROM graph_pending_writes WHERE thread_id=$1
+                    AND checkpoint_ns=$2 AND checkpoint_id=$3 AND task_id=$4
+                    AND write_index=$5 FOR UPDATE""",
+                    UUID(index.thread_id),
+                    index.namespace,
+                    index.checkpoint_id,
+                    index.task_id,
+                    index.write_index,
+                )
+                if existing is not None and index.write_index >= 0:
+                    return
+                if existing is not None:
+                    await connection.execute(
+                        """DELETE FROM cas_object_refs WHERE owner_kind=$1 AND owner_id=$2
+                        AND reference_key=$3""",
+                        index.owner_kind,
+                        index.owner_id,
+                        index.reference_key,
+                    )
+                await _add_cas_reference_with_connection(
+                    connection,
+                    index.object,
+                    index.owner_kind,
+                    index.owner_id,
+                    index.reference_key,
+                )
+                await connection.execute(
+                    """INSERT INTO graph_pending_writes(
+                        thread_id, checkpoint_ns, checkpoint_id, task_id, write_index,
+                        digest, size_bytes
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                    ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id, task_id, write_index)
+                    DO UPDATE SET digest=EXCLUDED.digest, size_bytes=EXCLUDED.size_bytes""",
+                    UUID(index.thread_id),
+                    index.namespace,
+                    index.checkpoint_id,
+                    index.task_id,
+                    index.write_index,
+                    index.object.digest,
+                    index.object.size,
+                )
+
+    async def list_pending_write_indexes(
+        self, thread_id: str, namespace: str, checkpoint_id: str
+    ) -> tuple[PendingWriteIndex, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT t.graph_family, t.owner_kind, t.owner_id, w.thread_id, w.checkpoint_ns,
+                       w.checkpoint_id, w.task_id, w.write_index, w.digest, w.size_bytes
+                FROM graph_pending_writes w JOIN graph_threads t ON t.thread_id=w.thread_id
+                WHERE w.thread_id=$1 AND w.checkpoint_ns=$2 AND w.checkpoint_id=$3
+                ORDER BY w.created_at, w.task_id, w.write_index""",
+                UUID(thread_id),
+                namespace,
+                checkpoint_id,
+            )
+        return tuple(
+            PendingWriteIndex(
+                str(_row_value(row, "graph_family")),
+                str(_row_value(row, "owner_kind")),
+                _row_value(row, "owner_id"),
+                str(_row_value(row, "thread_id")),
+                str(_row_value(row, "checkpoint_ns")),
+                str(_row_value(row, "checkpoint_id")),
+                str(_row_value(row, "task_id")),
+                int(_row_value(row, "write_index")),
+                _cas_object_from_row(row),
+            )
+            for row in rows
+        )
+
+    async def delete_checkpoint_thread(
+        self,
+        thread_id: str,
+        *,
+        graph_family: str,
+        owner_kind: str,
+        owner_id: UUID,
+    ) -> tuple[CasObject, ...]:
+        async with self._acquire_write_connection() as connection:
+            async with connection.transaction():
+                thread = await connection.fetchrow(
+                    """SELECT graph_family, owner_kind, owner_id FROM graph_threads
+                    WHERE thread_id=$1 FOR UPDATE""",
+                    UUID(thread_id),
+                )
+                if thread is None:
+                    return ()
+                if (
+                    str(_row_value(thread, "graph_family")),
+                    str(_row_value(thread, "owner_kind")),
+                    _row_value(thread, "owner_id"),
+                ) != (graph_family, owner_kind, owner_id):
+                    raise ValueError("checkpoint owner identity mismatch")
+                indexes = await _list_checkpoint_indexes_with_connection(
+                    connection, thread_id, None
+                )
+                writes = await self.list_pending_write_indexes_for_thread(connection, thread_id)
+                items: tuple[CheckpointIndex | PendingWriteIndex, ...] = (*indexes, *writes)
+                await connection.execute(
+                    "DELETE FROM graph_pending_writes WHERE thread_id=$1", UUID(thread_id)
+                )
+                await connection.execute(
+                    "DELETE FROM graph_checkpoints WHERE thread_id=$1", UUID(thread_id)
+                )
+                await connection.execute(
+                    "DELETE FROM graph_threads WHERE thread_id=$1", UUID(thread_id)
+                )
+                candidates = {item.object.digest: item.object for item in items}
+                for item in items:
+                    await connection.execute(
+                        """DELETE FROM cas_object_refs WHERE owner_kind=$1 AND owner_id=$2
+                        AND reference_key=$3""",
+                        item.owner_kind,
+                        item.owner_id,
+                        item.reference_key,
+                    )
+                unreferenced = []
+                for candidate in candidates.values():
+                    remaining = await connection.fetchrow(
+                        "SELECT 1 FROM cas_object_refs WHERE digest=$1 LIMIT 1", candidate.digest
+                    )
+                    if remaining is None:
+                        await connection.execute(
+                            "DELETE FROM cas_objects WHERE digest=$1", candidate.digest
+                        )
+                        unreferenced.append(candidate)
+                return tuple(unreferenced)
+
+    async def list_pending_write_indexes_for_thread(
+        self, connection: Any, thread_id: str
+    ) -> tuple[PendingWriteIndex, ...]:
+        rows = await connection.fetch(
+            """SELECT t.graph_family, t.owner_kind, t.owner_id, w.thread_id, w.checkpoint_ns,
+                   w.checkpoint_id, w.task_id, w.write_index, w.digest, w.size_bytes
+            FROM graph_pending_writes w JOIN graph_threads t ON t.thread_id=w.thread_id
+            WHERE w.thread_id=$1""",
+            UUID(thread_id),
+        )
+        return tuple(
+            PendingWriteIndex(
+                str(_row_value(row, "graph_family")),
+                str(_row_value(row, "owner_kind")),
+                _row_value(row, "owner_id"),
+                str(_row_value(row, "thread_id")),
+                str(_row_value(row, "checkpoint_ns")),
+                str(_row_value(row, "checkpoint_id")),
+                str(_row_value(row, "task_id")),
+                int(_row_value(row, "write_index")),
+                _cas_object_from_row(row),
+            )
+            for row in rows
+        )
 
     async def initialize(self) -> None:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             await connection.execute(RUNTIME_SCHEMA_SQL)
+
+    async def execute_api_command(
+        self,
+        *,
+        principal_id: str,
+        route: str,
+        key: str,
+        canonical_body: bytes,
+        status_code: int,
+        command: Callable[[RuntimeStoreTransaction], Awaitable[object]],
+        project_response: Callable[[object], object],
+        owner_receipt: Callable[[object], tuple[str, UUID, str] | None],
+        create_draft_graph_handoff: bool = False,
+    ) -> Mapping[str, object]:
+        """Run one owner command and persist its replay result on the same connection."""
+
+        if not principal_id.strip() or not route.startswith("/") or not key.strip():
+            raise ValueError("API idempotency scope is invalid")
+        if len(key) > 256:
+            raise ValueError("API idempotency key is too long")
+        body_digest = sha256(canonical_body).hexdigest()
+        scope_key = json.dumps([principal_id, route, key], ensure_ascii=True, separators=(",", ":"))
+        transaction_context: RuntimeStoreTransaction | None = None
+        outcome: dict[str, object]
+        try:
+            async with self._acquire_write_connection() as connection:
+                async with connection.transaction():
+                    await connection.fetchval(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+                        scope_key,
+                    )
+                    existing = await connection.fetchrow(
+                        """SELECT body_sha256, status_code, response_body, owner_kind,
+                        owner_id, owner_receipt_key,
+                        expires_at > clock_timestamp() AS active
+                        FROM api_command_receipts
+                        WHERE principal_id=$1 AND route=$2 AND idempotency_key=$3""",
+                        principal_id,
+                        route,
+                        key,
+                    )
+                    expired = existing is not None and not bool(_row_value(existing, "active"))
+                    if expired:
+                        existing = None
+                    if existing is not None:
+                        if str(_row_value(existing, "body_sha256")).strip() != body_digest:
+                            outcome = {"conflict": True, "replayed": False}
+                        else:
+                            outcome = {
+                                "response": _decode_json_value(
+                                    _row_value(existing, "response_body")
+                                ),
+                                "status_code": int(_row_value(existing, "status_code")),
+                                "owner_kind": _row_value(existing, "owner_kind"),
+                                "owner_id": _row_value(existing, "owner_id"),
+                                "owner_receipt_key": _row_value(existing, "owner_receipt_key"),
+                                "replayed": True,
+                            }
+                    else:
+                        transaction_context = RuntimeStoreTransaction(self, connection)
+                        value = await command(transaction_context)
+                        response = project_response(value)
+                        response_json = json.dumps(response, sort_keys=True, separators=(",", ":"))
+                        owner = owner_receipt(value)
+                        owner_kind: str | None = None
+                        owner_id: UUID | None = None
+                        receipt_key: str | None = None
+                        if owner is not None:
+                            owner_kind, owner_id, receipt_key = owner
+                            if owner_kind not in {"run", "draft"} or not receipt_key:
+                                raise StoreCommitError("API command owner receipt is unsupported")
+                            if owner_kind == "run":
+                                committed_receipt = await connection.fetchval(
+                                    """SELECT 1 FROM runtime_events WHERE run_id=$1
+                                    AND sequence=1 AND event_type='run.created'
+                                    AND data->>'receipt_key'=$2""",
+                                    owner_id,
+                                    receipt_key,
+                                )
+                            else:
+                                committed_receipt = await connection.fetchval(
+                                    """SELECT 1 FROM draft_owner_facts
+                                    WHERE draft_id=$1 AND receipt_key=$2""",
+                                    owner_id,
+                                    receipt_key,
+                                )
+                            if committed_receipt is None:
+                                owner_fact = "RunCreated" if owner_kind == "run" else "Draft owner"
+                                raise StoreCommitError(
+                                    f"API command has no committed {owner_fact} receipt"
+                                )
+                            if owner_kind == "run":
+                                await connection.execute(
+                                    """INSERT INTO run_graph_start_handoffs
+                                    (run_id, receipt_key, status) VALUES ($1,$2,'PENDING')""",
+                                    owner_id,
+                                    receipt_key,
+                                )
+                            elif create_draft_graph_handoff:
+                                await connection.execute(
+                                    """INSERT INTO draft_graph_start_handoffs
+                                    (draft_id, receipt_key, status) VALUES ($1,$2,'PENDING')
+                                    ON CONFLICT (draft_id, receipt_key) DO NOTHING""",
+                                    owner_id,
+                                    receipt_key,
+                                )
+                        if expired:
+                            await connection.execute(
+                                """DELETE FROM api_command_receipts
+                                WHERE principal_id=$1 AND route=$2 AND idempotency_key=$3
+                                AND expires_at <= clock_timestamp()""",
+                                principal_id,
+                                route,
+                                key,
+                            )
+                        await connection.execute(
+                            """INSERT INTO api_command_receipts(
+                            principal_id, route, idempotency_key, body_sha256, status_code,
+                            response_body, owner_kind, owner_id, owner_receipt_key,
+                            expires_at
+                            ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,
+                                clock_timestamp() + INTERVAL '24 hours')""",
+                            principal_id,
+                            route,
+                            key,
+                            body_digest,
+                            status_code,
+                            response_json,
+                            owner_kind,
+                            owner_id,
+                            receipt_key,
+                        )
+                        outcome = {
+                            "response": response,
+                            "status_code": status_code,
+                            "owner_kind": owner_kind,
+                            "owner_id": owner_id,
+                            "owner_receipt_key": receipt_key,
+                            "replayed": False,
+                        }
+        except BaseException:
+            if transaction_context is not None:
+                transaction_context.finish(committed=False)
+            raise
+        if transaction_context is not None:
+            transaction_context.finish(committed=True)
+        return outcome
+
+    async def list_pending_graph_starts(self) -> tuple[tuple[RunId, str], ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT run_id, receipt_key FROM run_graph_start_handoffs
+                WHERE status='PENDING' ORDER BY created_at, run_id"""
+            )
+        return tuple(
+            (RunId(_row_value(row, "run_id")), str(_row_value(row, "receipt_key"))) for row in rows
+        )
+
+    async def mark_graph_start_started(self, run_id: RunId, receipt_key: str) -> None:
+        async with self._acquire_write_connection() as connection:
+            updated = await connection.execute(
+                """UPDATE run_graph_start_handoffs SET status='STARTED',
+                started_at=COALESCE(started_at, clock_timestamp())
+                WHERE run_id=$1 AND receipt_key=$2""",
+                run_id,
+                receipt_key,
+            )
+        if updated.split()[-1] != "1":
+            raise StoreCommitError("Run graph-start handoff does not exist")
+
+    async def list_pending_draft_graph_starts(self) -> tuple[tuple[UUID, str], ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT draft_id, receipt_key FROM draft_graph_start_handoffs
+                WHERE status='PENDING' ORDER BY created_at, draft_id, receipt_key"""
+            )
+        return tuple(
+            (UUID(str(_row_value(row, "draft_id"))), str(_row_value(row, "receipt_key")))
+            for row in rows
+        )
+
+    async def mark_draft_graph_start_started(self, draft_id: UUID, receipt_key: str) -> None:
+        async with self._acquire_write_connection() as connection:
+            updated = await connection.execute(
+                """UPDATE draft_graph_start_handoffs SET status='STARTED',
+                started_at=COALESCE(started_at, clock_timestamp())
+                WHERE draft_id=$1 AND receipt_key=$2""",
+                draft_id,
+                receipt_key,
+            )
+        if updated.split()[-1] != "1":
+            raise StoreCommitError("Draft graph-start handoff does not exist")
+
+    async def read_run_events(self, run_id: RunId, after_sequence: int) -> tuple[RuntimeEvent, ...]:
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT sequence, event_type, data, timestamp_utc FROM runtime_events
+                WHERE run_id=$1 AND sequence>$2 ORDER BY sequence""",
+                run_id,
+                after_sequence,
+            )
+        return tuple(
+            RuntimeEvent(
+                sequence=int(_row_value(row, "sequence")),
+                event_type=str(_row_value(row, "event_type")),
+                data=_decode_event_data(_row_value(row, "data")),
+                timestamp_utc=_row_value(row, "timestamp_utc"),
+            )
+            for row in rows
+        )
+
+    async def wait_for_run_events(self, run_id: RunId, after_sequence: int) -> None:
+        loop = asyncio.get_running_loop()
+        wake = loop.create_future()
+
+        def listener(_connection: Any, _pid: int, _channel: str, payload: str) -> None:
+            if payload == str(run_id) and not wake.done():
+                wake.set_result(None)
+
+        async with self.pool.acquire() as connection:
+            await connection.add_listener("runtime_events", listener)
+            try:
+                row = await connection.fetchrow(
+                    """SELECT COALESCE(MAX(sequence), 0) AS latest_sequence,
+                    COALESCE(MIN(sequence) FILTER (
+                        WHERE event_type='run.status_changed'
+                        AND COALESCE(data->>'run_status', data->>'status') = ANY($2::text[])
+                    ), 0) AS terminal_sequence
+                    FROM runtime_events WHERE run_id=$1""",
+                    run_id,
+                    list(_RUN_TERMINAL_STATUSES),
+                )
+                latest = int(_row_value(row, "latest_sequence"))
+                terminal = int(_row_value(row, "terminal_sequence"))
+                if latest > after_sequence or (terminal > 0 and terminal <= after_sequence):
+                    return
+                await wake
+            finally:
+                await connection.remove_listener("runtime_events", listener)
+
+    async def is_run_stream_terminal(self, run_id: RunId, after_sequence: int) -> bool:
+        async with self.pool.acquire() as connection:
+            terminal = await connection.fetchval(
+                """SELECT COALESCE(MIN(sequence), 0) FROM runtime_events
+                WHERE run_id=$1 AND sequence<=$2 AND event_type='run.status_changed'
+                AND COALESCE(data->>'run_status', data->>'status') = ANY($3::text[])""",
+                run_id,
+                after_sequence,
+                list(_RUN_TERMINAL_STATUSES),
+            )
+        return int(terminal) > 0
 
     async def load(self, run_id: RunId) -> RuntimeSnapshot | None:
         async with self.pool.acquire() as connection:
-            row = await connection.fetchrow(
-                "SELECT state FROM runtime_runs WHERE run_id = $1",
-                run_id,
-            )
-            if row is None:
-                return None
-            event_rows = await connection.fetch(
+            rows = await connection.fetch(
                 """
-                SELECT sequence, event_type, data
-                FROM runtime_events
-                WHERE run_id = $1
-                ORDER BY sequence
+                SELECT r.state, e.sequence, e.event_type, e.data, e.timestamp_utc
+                FROM runtime_runs AS r
+                LEFT JOIN runtime_events AS e ON e.run_id = r.run_id
+                WHERE r.run_id = $1
+                ORDER BY e.sequence
                 """,
                 run_id,
             )
-        return RuntimeSnapshot(
-            state=_decode_state(_row_value(row, "state")),
-            events=tuple(
-                RuntimeEvent(
-                    sequence=int(_row_value(event, "sequence")),
-                    event_type=str(_row_value(event, "event_type")),
-                    data=dict(_row_value(event, "data")),
-                )
-                for event in event_rows
-            ),
+            if not rows:
+                return None
+        first_row = rows[0]
+        state = _decode_state(_row_value(first_row, "state"))
+        events = tuple(
+            RuntimeEvent(
+                sequence=int(_row_value(row, "sequence")),
+                event_type=str(_row_value(row, "event_type")),
+                data=_decode_event_data(_row_value(row, "data")),
+                timestamp_utc=_row_value(row, "timestamp_utc"),
+            )
+            for row in rows
+            if _row_value(row, "sequence") is not None
         )
+        return RuntimeSnapshot(state=state, events=events)
+
+    async def list_run_states(
+        self, *, limit: int, after_run_id: RunId | None = None
+    ) -> RunStatePage:
+        _validate_run_page_limit(limit)
+        async with self.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT run_id, state
+                FROM runtime_runs
+                WHERE ($1::uuid IS NULL OR run_id > $1::uuid)
+                ORDER BY run_id
+                LIMIT $2
+                """,
+                after_run_id,
+                limit + 1,
+            )
+        has_more = len(rows) > limit
+        selected_rows = rows[:limit]
+        states: list[RunState] = []
+        for row in selected_rows:
+            state = _decode_state(_row_value(row, "state"))
+            if state.run_id != RunId(_row_value(row, "run_id")):
+                raise StoreCommitError("stored Run identity does not match its index")
+            states.append(state)
+        next_cursor = RunId(states[-1].run_id) if has_more and states else None
+        return RunStatePage(tuple(states), next_cursor)
 
     async def create(
         self,
@@ -218,30 +2683,69 @@ class PostgreSQLRuntimeStore:
         events: Sequence[EventSpec],
         *,
         evolution: EvolutionSegmentDraft | None = None,
+        transaction: RuntimeStoreTransaction | None = None,
     ) -> RuntimeSnapshot:
-        async with self.pool.acquire() as connection:
+        if transaction is not None:
+            if transaction.store is not self or not transaction.active:
+                raise StoreCommitError("runtime transaction does not belong to this store")
+            return await self._create_with_connection(
+                transaction.connection, state, events, evolution=evolution
+            )
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
-                try:
-                    await connection.execute(
-                        "INSERT INTO runtime_runs(run_id, state) VALUES ($1, $2::jsonb)",
-                        state.run_id,
-                        _dump_json(state),
-                    )
-                except Exception as exc:
-                    raise StoreCommitError("unable to create runtime run") from exc
-                await _insert_events(
-                    connection,
-                    state.run_id,
-                    events,
-                    first_sequence=1,
-                    secret_registry=self.secret_registry,
-                )
-                if evolution is not None:
-                    await _append_evolution_with_connection(connection, evolution, state.run_id)
-        snapshot = await self.load(state.run_id)
-        if snapshot is None:
+                await self._create_with_connection(connection, state, events, evolution=evolution)
+            snapshot = await self.load(state.run_id)
+            if snapshot is None:
+                raise StoreCommitError("created runtime run disappeared")
+            return snapshot
+
+    async def _create_with_connection(
+        self,
+        connection: Any,
+        state: RunState,
+        events: Sequence[EventSpec],
+        *,
+        evolution: EvolutionSegmentDraft | None,
+    ) -> RuntimeSnapshot:
+        try:
+            await connection.execute(
+                "INSERT INTO runtime_runs(run_id, state) VALUES ($1, $2::jsonb)",
+                state.run_id,
+                _dump_json(state),
+            )
+        except Exception as exc:
+            raise StoreCommitError("unable to create runtime run") from exc
+        await _insert_events(
+            connection,
+            state.run_id,
+            events,
+            first_sequence=1,
+            secret_registry=self.secret_registry,
+        )
+        if evolution is not None:
+            await _append_evolution_with_connection(connection, evolution, state.run_id)
+        row = await connection.fetchrow(
+            "SELECT state FROM runtime_runs WHERE run_id=$1", state.run_id
+        )
+        event_rows = await connection.fetch(
+            """SELECT sequence, event_type, data, timestamp_utc FROM runtime_events
+            WHERE run_id=$1 ORDER BY sequence""",
+            state.run_id,
+        )
+        if row is None:
             raise StoreCommitError("created runtime run disappeared")
-        return snapshot
+        return RuntimeSnapshot(
+            state=_decode_state(_row_value(row, "state")),
+            events=tuple(
+                RuntimeEvent(
+                    sequence=int(_row_value(event, "sequence")),
+                    event_type=str(_row_value(event, "event_type")),
+                    data=_decode_event_data(_row_value(event, "data")),
+                    timestamp_utc=_row_value(event, "timestamp_utc"),
+                )
+                for event in event_rows
+            ),
+        )
 
     async def commit(
         self,
@@ -250,7 +2754,7 @@ class PostgreSQLRuntimeStore:
         *,
         evolution: EvolutionSegmentDraft | None = None,
     ) -> RuntimeSnapshot:
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 locked = await connection.fetchrow(
                     "SELECT run_id FROM runtime_runs WHERE run_id = $1 FOR UPDATE",
@@ -306,7 +2810,7 @@ class PostgreSQLRuntimeStore:
             character not in "0123456789abcdef" for character in template_sha256
         ):
             raise ValueError("template digest must be SHA-256")
-        async with self.pool.acquire() as connection:
+        async with self._acquire_write_connection() as connection:
             async with connection.transaction():
                 locked = await connection.fetchrow(
                     "SELECT run_id FROM runtime_runs WHERE run_id = $1 FOR UPDATE",
@@ -399,6 +2903,114 @@ async def _append_evolution_with_connection(
     )
 
 
+def _cas_object_from_row(row: Any) -> CasObject:
+    return CasObject(
+        str(_row_value(row, "digest")).strip(),
+        int(_row_value(row, "size_bytes")),
+    )
+
+
+async def _list_checkpoint_indexes_with_connection(
+    connection: Any, thread_id: str | None, namespace: str | None
+) -> tuple[CheckpointIndex, ...]:
+    rows = await connection.fetch(
+        """SELECT t.graph_family, t.owner_kind, t.owner_id,
+               c.thread_id, c.checkpoint_ns, c.checkpoint_id,
+               c.parent_checkpoint_id, c.digest, c.size_bytes
+        FROM graph_checkpoints c JOIN graph_threads t ON t.thread_id=c.thread_id
+        WHERE ($1::uuid IS NULL OR c.thread_id=$1)
+          AND ($2::text IS NULL OR c.checkpoint_ns=$2)
+        ORDER BY c.checkpoint_id DESC""",
+        UUID(thread_id) if thread_id is not None else None,
+        namespace,
+    )
+    return tuple(
+        CheckpointIndex(
+            str(_row_value(row, "graph_family")),
+            str(_row_value(row, "owner_kind")),
+            _row_value(row, "owner_id"),
+            str(_row_value(row, "thread_id")),
+            str(_row_value(row, "checkpoint_ns")),
+            str(_row_value(row, "checkpoint_id")),
+            _row_value(row, "parent_checkpoint_id"),
+            _cas_object_from_row(row),
+        )
+        for row in rows
+    )
+
+
+async def _add_cas_reference_with_connection(
+    connection: Any,
+    object_ref: CasObject,
+    owner_kind: str,
+    owner_id: UUID,
+    reference_key: str,
+) -> None:
+    await connection.execute(
+        """INSERT INTO cas_objects(digest, size_bytes) VALUES ($1,$2)
+        ON CONFLICT (digest) DO NOTHING""",
+        object_ref.digest,
+        object_ref.size,
+    )
+    object_row = await connection.fetchrow(
+        "SELECT size_bytes FROM cas_objects WHERE digest=$1 FOR UPDATE", object_ref.digest
+    )
+    if object_row is None or int(_row_value(object_row, "size_bytes")) != object_ref.size:
+        raise StoreCommitError("CAS object size mismatch")
+    await connection.execute(
+        """INSERT INTO cas_object_refs(owner_kind, owner_id, reference_key, digest)
+        VALUES ($1,$2,$3,$4)
+        ON CONFLICT (owner_kind, owner_id, reference_key) DO NOTHING""",
+        owner_kind,
+        owner_id,
+        reference_key,
+        object_ref.digest,
+    )
+    ref_row = await connection.fetchrow(
+        """SELECT digest FROM cas_object_refs WHERE owner_kind=$1 AND owner_id=$2
+        AND reference_key=$3""",
+        owner_kind,
+        owner_id,
+        reference_key,
+    )
+    if ref_row is None or str(_row_value(ref_row, "digest")).strip() != object_ref.digest:
+        raise StoreCommitError("CAS reference key already points to another object")
+
+
+async def _release_cas_reference_with_connection(
+    connection: Any,
+    owner_kind: str,
+    owner_id: UUID,
+    reference_key: str,
+) -> CasObject | None:
+    row = await connection.fetchrow(
+        """SELECT r.digest, o.size_bytes FROM cas_object_refs r
+        JOIN cas_objects o ON o.digest=r.digest
+        WHERE r.owner_kind=$1 AND r.owner_id=$2 AND r.reference_key=$3
+        FOR UPDATE OF r""",
+        owner_kind,
+        owner_id,
+        reference_key,
+    )
+    if row is None:
+        return None
+    object_ref = _cas_object_from_row(row)
+    await connection.execute(
+        """DELETE FROM cas_object_refs WHERE owner_kind=$1 AND owner_id=$2
+        AND reference_key=$3""",
+        owner_kind,
+        owner_id,
+        reference_key,
+    )
+    remaining = await connection.fetchrow(
+        "SELECT 1 FROM cas_object_refs WHERE digest=$1 LIMIT 1", object_ref.digest
+    )
+    if remaining is not None:
+        return None
+    await connection.execute("DELETE FROM cas_objects WHERE digest=$1", object_ref.digest)
+    return object_ref
+
+
 async def _insert_events(
     connection: Any,
     run_id: RunId,
@@ -414,14 +3026,38 @@ async def _insert_events(
             raise StoreCommitError("observation rejected") from exc
         await connection.execute(
             """
-            INSERT INTO runtime_events(run_id, sequence, event_type, data)
-            VALUES ($1, $2, $3, $4::jsonb)
+            INSERT INTO runtime_events(run_id, sequence, event_type, data, timestamp_utc)
+            VALUES ($1, $2, $3, $4::jsonb, clock_timestamp())
             """,
             run_id,
             index,
             event.event_type,
             json.dumps(data, sort_keys=True, separators=(",", ":")),
         )
+    if events:
+        await connection.execute("SELECT pg_notify('runtime_events', $1)", str(run_id))
+
+
+def _decode_event_data(value: Any) -> dict[str, object]:
+    try:
+        payload = json.loads(value) if isinstance(value, (str, bytes, bytearray)) else dict(value)
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored Run event data is invalid") from exc
+    if not isinstance(payload, dict):
+        raise StoreCommitError("stored Run event data is not an object")
+    return cast(dict[str, object], payload)
+
+
+def _decode_json_value(value: Any) -> object:
+    try:
+        return json.loads(value) if isinstance(value, (str, bytes, bytearray)) else value
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored API response is invalid JSON") from exc
+
+
+def _event_status(data: Mapping[str, object]) -> object:
+    status = data.get("run_status", data.get("status"))
+    return getattr(status, "value", status)
 
 
 def _redact_event_data(value: dict[str, object], registry: SecretRegistry) -> dict[str, object]:
@@ -429,6 +3065,164 @@ def _redact_event_data(value: dict[str, object], registry: SecretRegistry) -> di
     if not result.accepted or not isinstance(result.value, dict):
         raise ValueError("observation rejected")
     return cast(dict[str, object], result.value)
+
+
+_DRAFT_EVENT_FIELDS: dict[str, frozenset[str]] = {
+    "session.question.asked": frozenset({"question_id"}),
+    "session.question.answered": frozenset({"question_id"}),
+    "session.attached_to_run": frozenset({"run_id"}),
+    "session.closed": frozenset({"status"}),
+    "agent_run.started": frozenset(
+        {"agent_run_id", "phase", "session_kind", "slice_id", "generation"}
+    ),
+    "agent_run.terminal": frozenset(
+        {
+            "agent_run_id",
+            "phase",
+            "session_kind",
+            "slice_id",
+            "generation",
+            "exit",
+            "receipt_category",
+        }
+    ),
+}
+
+
+def _prepare_draft_events(
+    events: Sequence[DraftSessionEventSpec], registry: SecretRegistry
+) -> tuple[tuple[str, dict[str, object]], ...]:
+    prepared = []
+    for event in events:
+        if event.event_type in {
+            "session.question.asked",
+            "session.draft_revision.created",
+            "session.draft_revision.confirmation_requested",
+            "session.draft_revision.confirmed",
+        }:
+            try:
+                projected = project_draft_public_event(event.event_type, event.data)
+                if projected is None:
+                    raise ValueError("Draft event projection is unavailable")
+            except ValueError as exc:
+                raise StoreCommitError("Draft session event summary is invalid") from exc
+            try:
+                prepared.append(
+                    (
+                        event.event_type,
+                        _redact_draft_public_event(event.event_type, projected, registry),
+                    )
+                )
+            except ValueError as exc:
+                raise StoreCommitError("observation rejected") from exc
+            continue
+        fields = _DRAFT_EVENT_FIELDS.get(event.event_type)
+        if fields is None:
+            raise StoreCommitError("Draft session event type is not durable")
+        if event.event_type in {"session.question.asked", "session.question.answered"}:
+            required = {"question_id"}
+        elif event.event_type == "session.attached_to_run":
+            required = {"run_id"}
+        elif event.event_type == "session.closed":
+            required = {"status"}
+        else:
+            required = {"agent_run_id", "phase", "session_kind"}
+            if event.event_type == "agent_run.terminal":
+                required |= {"exit", "receipt_category"}
+        if not required <= event.data.keys():
+            raise StoreCommitError("Draft session event fields are incomplete")
+        projected = {key: value for key, value in event.data.items() if key in fields}
+        if event.event_type == "session.closed" and projected != {"status": "CLOSED"}:
+            raise StoreCommitError("Draft close event status is invalid")
+        try:
+            if event.event_type.startswith("agent_run."):
+                if projected["phase"] not in {item.value for item in Phase} or projected[
+                    "session_kind"
+                ] not in {item.value for item in SessionKind}:
+                    raise ValueError("AgentRun public enum is invalid")
+                if event.event_type == "agent_run.terminal" and (
+                    projected["exit"] not in {item.value for item in SessionExit}
+                    or not isinstance(projected["receipt_category"], str)
+                    or re.fullmatch(r"[a-z][a-z0-9._-]{0,63}", projected["receipt_category"])
+                    is None
+                ):
+                    raise ValueError("AgentRun terminal summary is invalid")
+            for key in ("question_id", "run_id", "agent_run_id", "slice_id"):
+                if key in projected:
+                    UUID(str(projected[key]))
+            if ("slice_id" in projected) != ("generation" in projected):
+                raise ValueError("slice fields must be paired")
+            if "generation" in projected and (
+                type(projected["generation"]) is not int or projected["generation"] < 0
+            ):
+                raise ValueError("slice generation is invalid")
+            projected = _redact_event_data(projected, registry)
+            projected = _decode_draft_fact(canonical_json_bytes(projected))
+        except (TypeError, ValueError) as exc:
+            raise StoreCommitError("Draft session event data is invalid") from exc
+        prepared.append((event.event_type, projected))
+    return tuple(prepared)
+
+
+def _redact_draft_public_event(
+    event_type: str, value: dict[str, object], registry: SecretRegistry
+) -> dict[str, object]:
+    """Scan allowlisted user-facing text without treating AskUser as a model prompt."""
+
+    if event_type != "session.question.asked":
+        return _redact_event_data(value, registry)
+    prompt = value.get("prompt")
+    if not isinstance(prompt, str):
+        raise ValueError("Draft question event summary is invalid")
+    scan_value = {key: nested for key, nested in value.items() if key != "prompt"}
+    scan_value["ask_user_text"] = prompt
+    redacted = _redact_event_data(scan_value, registry)
+    redacted["prompt"] = redacted.pop("ask_user_text")
+    return redacted
+
+
+def _make_draft_receipt(
+    draft_id: UUID,
+    receipt_key: str,
+    category: str,
+    fact: Mapping[str, object],
+) -> tuple[DraftOwnerReceipt, dict[str, object]]:
+    if not isinstance(draft_id, UUID) or not isinstance(fact, Mapping):
+        raise StoreCommitError("Draft owner fact identity or body is invalid")
+    if not isinstance(receipt_key, str) or not receipt_key or len(receipt_key) > 256:
+        raise StoreCommitError("Draft owner fact receipt key is invalid")
+    if not isinstance(category, str) or not category or len(category) > 64:
+        raise StoreCommitError("Draft owner fact category is invalid")
+    try:
+        encoded = canonical_json_bytes(dict(fact))
+        payload = json.loads(encoded)
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("Draft owner fact is not canonical JSON") from exc
+    if not isinstance(payload, dict):
+        raise StoreCommitError("Draft owner fact must be a JSON object")
+    receipt = DraftOwnerReceipt(
+        draft_id=draft_id,
+        receipt_key=receipt_key,
+        category=category,
+        fact_sha256=hashlib.sha256(encoded).hexdigest(),
+    )
+    return receipt, cast(dict[str, object], payload)
+
+
+def _decode_draft_fact(value: Any) -> dict[str, object]:
+    try:
+        payload = json.loads(value) if isinstance(value, (str, bytes, bytearray)) else dict(value)
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored Draft owner fact is invalid") from exc
+    if not isinstance(payload, dict):
+        raise StoreCommitError("stored Draft owner fact is not an object")
+    return cast(dict[str, object], payload)
+
+
+def _verify_draft_fact_digest(receipt: DraftOwnerReceipt, fact: Mapping[str, object]) -> None:
+    digest = hashlib.sha256(canonical_json_bytes(dict(fact))).hexdigest()
+    if digest != receipt.fact_sha256:
+        raise StoreCommitError("stored Draft owner fact digest mismatch")
 
 
 def _row_value(row: Any, key: str) -> Any:
@@ -455,6 +3249,46 @@ def _dump_json(state: RunState) -> str:
     return json.dumps(_json_value(state), sort_keys=True, separators=(",", ":"))
 
 
+def _dump_agent_run(record: AgentRun) -> str:
+    return json.dumps(_json_value(record), sort_keys=True, separators=(",", ":"))
+
+
+def _decode_agent_run(value: Any) -> AgentRun:
+    payload = json.loads(value) if isinstance(value, str) else dict(value)
+    return AgentRun(
+        agent_run_id=AgentRunId(UUID(payload["agent_run_id"])),
+        owner_kind=str(payload["owner_kind"]),
+        owner_id=UUID(payload["owner_id"]),
+        logical_task_key=str(payload["logical_task_key"]),
+        phase=Phase(payload["phase"]),
+        session_kind=SessionKind(payload["session_kind"]),
+        thread_id=str(payload["thread_id"]),
+        model_binding_sha256=str(payload["model_binding_sha256"]),
+        context_sha256=str(payload["context_sha256"]),
+        toolset_sha256=str(payload["toolset_sha256"]),
+        template_sha256=str(payload["template_sha256"]),
+        slice_ref=(
+            SliceGenerationRef.model_validate(payload["slice_ref"])
+            if payload.get("slice_ref") is not None
+            else None
+        ),
+        write_scope_sha256=payload.get("write_scope_sha256"),
+        checkpoint_sha256=payload.get("checkpoint_sha256"),
+        candidate_checkpoint_sha256=payload.get("candidate_checkpoint_sha256"),
+        result_sha256=payload.get("result_sha256"),
+        usage_sha256=payload.get("usage_sha256"),
+        retry_of=(AgentRunId(UUID(payload["retry_of"])) if payload.get("retry_of") else None),
+        continuation_of=(
+            AgentRunId(UUID(payload["continuation_of"])) if payload.get("continuation_of") else None
+        ),
+        restarted_from=(
+            AgentRunId(UUID(payload["restarted_from"])) if payload.get("restarted_from") else None
+        ),
+        state=SessionState(payload["state"]),
+        exit=SessionExit(payload["exit"]) if payload.get("exit") else None,
+    )
+
+
 def _decode_state(value: Any) -> RunState:
     payload = json.loads(value) if isinstance(value, str) else dict(value)
     return RunState(
@@ -479,7 +3313,35 @@ def _decode_state(value: Any) -> RunState:
         terminal_slice_failures=tuple(payload["terminal_slice_failures"]),
         adopted_advice_ids=tuple(payload.get("adopted_advice_ids", ())),
         pending_advice_ids=tuple(payload.get("pending_advice_ids", ())),
+        create_request=(
+            CreateRun.model_validate(payload["create_request"])
+            if payload.get("create_request") is not None
+            else None
+        ),
+        frozen_plan_sha256=payload.get("frozen_plan_sha256"),
+        candidate_checkpoints=tuple(
+            CandidateCheckpointFact(
+                agent_run_id=AgentRunId(UUID(item["agent_run_id"])),
+                slice_id=SliceId(UUID(item["slice_id"])),
+                generation=int(item["generation"]),
+                expected_candidate_oid=str(item["expected_candidate_oid"]),
+                candidate_oid=str(item["candidate_oid"]),
+                receipt_sha256=str(item["receipt_sha256"]),
+            )
+            for item in payload.get("candidate_checkpoints", ())
+        ),
     )
+
+
+def _decode_integration_intent(value: Any) -> IntegrationIntent:
+    payload = _decode_json_value(value)
+    if not isinstance(payload, Mapping):
+        raise StoreCommitError("stored IntegrationIntent is invalid")
+    try:
+        return IntegrationIntent.model_validate(payload)
+    except (TypeError, ValueError) as exc:
+        raise StoreCommitError("stored IntegrationIntent is invalid") from exc
+
 
 __all__ = [
     "InMemoryRuntimeStore",

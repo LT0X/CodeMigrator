@@ -2,6 +2,7 @@ import type {
   EvidenceProjection,
   HealthProjection,
   MigrationProjection,
+  RegisteredProjectProjection,
   ReportProjection,
   SessionProjection,
   WorkspaceProjection,
@@ -14,8 +15,21 @@ export interface ApiClientOptions {
   readonly token?: string;
 }
 
+export interface SessionEvent {
+  readonly schema: "migration.session.event";
+  readonly version: 1;
+  readonly type: string;
+  readonly data: Record<string, unknown>;
+  readonly sequence: number;
+  readonly timestamp_utc: string;
+  readonly sse_id: string;
+}
+
 export interface ApiClient {
   listMigrations(): Promise<MigrationProjection[]>;
+  listProjects(): Promise<RegisteredProjectProjection[]>;
+  createDraftSession(input: CreateDraftSessionInput): Promise<SessionProjection>;
+  getMigration(runId: string): Promise<MigrationProjection>;
   getWorkspace(runId: string): Promise<WorkspaceProjection>;
   getReport(runId: string): Promise<ReportProjection>;
   getEvidence(runId: string, receiptId: string): Promise<EvidenceProjection>;
@@ -25,6 +39,15 @@ export interface ApiClient {
   confirmSession(sessionId: string, revision: number): Promise<SessionProjection>;
   confirmCorrection(sessionId: string, correctionId: string, previewHash: string): Promise<SessionProjection>;
   streamEvents(runId: string, afterSequence: number, signal?: AbortSignal): AsyncIterable<RunEvent>;
+  streamSessionEvents(sessionId: string, afterSequence: number, signal?: AbortSignal): AsyncIterable<SessionEvent>;
+}
+
+export interface CreateDraftSessionInput {
+  readonly source: {
+    readonly project_id: string;
+    readonly snapshot_id: string;
+  };
+  readonly goal: string;
 }
 
 const requireResponse = async (response: Response): Promise<Response> => {
@@ -42,7 +65,9 @@ const idempotencyKey = (): string => {
   return `cm-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 };
 
-const parseSse = (chunk: string): RunEvent | null => {
+type ParsedEvent = RunEvent | SessionEvent;
+
+const parseEnvelopeSse = (chunk: string, schema: ParsedEvent["schema"]): ParsedEvent | null => {
   const lines = chunk.split("\n");
   const id = lines.find((line) => line.startsWith("id:"))?.slice(3).trim();
   const data = lines
@@ -59,7 +84,7 @@ const parseSse = (chunk: string): RunEvent | null => {
   if (typeof candidate !== "object" || candidate === null) return null;
   const record = candidate as Record<string, unknown>;
   if (
-    record.schema !== "migration.event" ||
+    record.schema !== schema ||
     record.version !== 1 ||
     typeof record.type !== "string" ||
     typeof record.sequence !== "number" ||
@@ -75,13 +100,16 @@ const parseSse = (chunk: string): RunEvent | null => {
     sequence: record.sequence,
     data: record.data as Record<string, unknown>,
     timestamp_utc: typeof record.timestamp_utc === "string" ? record.timestamp_utc : "",
-    schema: "migration.event",
+    schema,
     version: 1,
     sse_id: id ?? String(record.sequence),
-  };
+  } as ParsedEvent;
 };
 
-async function* readEvents(response: Response): AsyncIterable<RunEvent> {
+const parseSse = (chunk: string): RunEvent | null => parseEnvelopeSse(chunk, "migration.event") as RunEvent | null;
+const parseSessionSse = (chunk: string): SessionEvent | null => parseEnvelopeSse(chunk, "migration.session.event") as SessionEvent | null;
+
+async function* readEvents<T extends ParsedEvent>(response: Response, parse: (chunk: string) => T | null): AsyncIterable<T> {
   if (!response.body) return;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -93,11 +121,11 @@ async function* readEvents(response: Response): AsyncIterable<RunEvent> {
     const chunks = buffer.split("\n\n");
     buffer = chunks.pop() ?? "";
     for (const chunk of chunks) {
-      const event = parseSse(chunk);
+      const event = parse(chunk);
       if (event) yield event;
     }
   }
-  const finalEvent = parseSse(buffer);
+  const finalEvent = parse(buffer);
   if (finalEvent) yield finalEvent;
 }
 
@@ -121,6 +149,9 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
   });
   return {
     listMigrations: async () => (await readJson<{ items?: MigrationProjection[] }>(request("/migrations"))).items ?? [],
+    listProjects: async () => (await readJson<{ items?: RegisteredProjectProjection[] }>(request("/projects"))).items ?? [],
+    createDraftSession: async (input) => readJson<SessionProjection>(writeRequest("/sessions", { kind: "DRAFT", payload: input })),
+    getMigration: async (runId) => readJson<MigrationProjection>(request(`/migrations/${encode(runId)}`)),
     getWorkspace: async (runId) => readJson<WorkspaceProjection>(request(`/migrations/${encode(runId)}/workspace`)),
     getReport: async (runId) => readJson<ReportProjection>(request(`/migrations/${encode(runId)}/report`)),
     getEvidence: async (runId, receiptId) => readJson<EvidenceProjection>(request(`/migrations/${encode(runId)}/evidence/${encode(receiptId)}`)),
@@ -131,9 +162,13 @@ export function createApiClient(options: ApiClientOptions = {}): ApiClient {
     confirmCorrection: async (sessionId, correctionId, previewHash) => readJson<SessionProjection>(writeRequest(`/sessions/${encode(sessionId)}/corrections/${encode(correctionId)}/confirm`, { preview_hash: previewHash })),
     streamEvents: async function* (runId, afterSequence, signal) {
       const response = await requireResponse(await request(`/migrations/${encode(runId)}/events`, { headers: { Accept: "text/event-stream", "Last-Event-ID": String(afterSequence) }, signal }));
-      yield* readEvents(response);
+      yield* readEvents(response, parseSse);
+    },
+    streamSessionEvents: async function* (sessionId, afterSequence, signal) {
+      const response = await requireResponse(await request(`/sessions/${encode(sessionId)}/events`, { headers: { Accept: "text/event-stream", "Last-Event-ID": String(afterSequence) }, signal }));
+      yield* readEvents(response, parseSessionSse);
     },
   };
 }
 
-export { parseSse };
+export { parseSse, parseSessionSse };

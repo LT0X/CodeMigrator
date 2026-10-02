@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, StrictInt, field_validator, model_validator
+from pydantic import Field, RootModel, StrictInt, field_validator, model_validator
 
 from codemigrator.analysis import SourceRange
 from codemigrator.core import (
@@ -239,13 +239,36 @@ class AskUserAnswer(_FrozenDraftModel):
         return self
 
 
+class DraftQuestionTurn(_FrozenDraftModel):
+    """One AgentRun turn that pauses the Draft for a structured user answer."""
+
+    kind: Literal["question"]
+    question: AskUserQuestion
+
+
+class DraftArtifactsTurn(_FrozenDraftModel):
+    """One AgentRun turn that proposes the four typed Draft artifacts."""
+
+    kind: Literal["artifacts"]
+    artifacts: DraftArtifacts
+
+
+class DraftTurn(
+    RootModel[
+        Annotated[DraftQuestionTurn | DraftArtifactsTurn, Field(discriminator="kind")]
+    ]
+):
+    """Closed structured result: ask one question or propose a Draft revision."""
+
+    model_config = {"frozen": True}
+
+
 class DraftExecRequest(_FrozenDraftModel):
     """Closed input accepted by the draft Exec orchestration boundary."""
 
-    operation: Literal["ReadFile", "QuerySourceAst", "AskUser"]
+    operation: Literal["ReadFile", "QuerySourceAst"]
     path: RepoRelativePath | None = None
     query: str | None = Field(default=None, min_length=1, max_length=4096)
-    question_id: QuestionId | None = None
 
     @field_validator("path", mode="before")
     @classmethod
@@ -255,13 +278,10 @@ class DraftExecRequest(_FrozenDraftModel):
     @model_validator(mode="after")
     def operation_has_exactly_read_only_arguments(self) -> DraftExecRequest:
         if self.operation == "ReadFile":
-            if self.path is None or self.query is not None or self.question_id is not None:
+            if self.path is None or self.query is not None:
                 raise ValueError("ReadFile Exec requires only one repository path")
-        elif self.operation == "QuerySourceAst":
-            if self.path is None or self.query is None or self.question_id is not None:
-                raise ValueError("QuerySourceAst Exec requires a path and query")
-        elif self.question_id is None or self.path is not None or self.query is not None:
-            raise ValueError("AskUser Exec requires only a question id")
+        elif self.path is None or self.query is None:
+            raise ValueError("QuerySourceAst Exec requires a path and query")
         return self
 
 
@@ -293,9 +313,12 @@ __all__ = [
     "CoverageResult",
     "DomainSkeleton",
     "DraftArtifacts",
+    "DraftArtifactsTurn",
     "DraftExecRequest",
     "DraftFreezeReceipt",
     "DraftStage",
+    "DraftQuestionTurn",
+    "DraftTurn",
     "DossierConsistencyResult",
     "ExploreReassignment",
     "ExplorationMerge",

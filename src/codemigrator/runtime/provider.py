@@ -15,6 +15,63 @@ import httpx
 from .binding import LockedModelBinding
 from .context import PromptMessage
 
+_DEFAULT_PROVIDER_TIMEOUT = httpx.Timeout(
+    timeout=120.0,
+    connect=10.0,
+    write=10.0,
+    pool=10.0,
+)
+
+_PROVIDER_FAILURE_CODES = frozenset(
+    {
+        "provider_error",
+        "invalid_response",
+        "cancelled",
+        "invalid_json",
+        "invalid_envelope",
+        "invalid_usage",
+        "invalid_content",
+        "provider_binding_mismatch",
+        "invalid_choices",
+        "invalid_choice",
+        "invalid_message",
+        "missing_finish_reason",
+        "invalid_content_blocks",
+        "invalid_tool_calls",
+        "invalid_tool_call",
+        "model_identity_mismatch",
+        "missing_response_id",
+        "missing_tool_call_id",
+        "connect_timeout",
+        "read_timeout",
+        "write_timeout",
+        "pool_timeout",
+        "proxy_error",
+        "remote_protocol_error",
+        "connect_error",
+        "transport_error",
+        "provider_response_truncated",
+        "invalid_tool_arguments_json",
+        "invalid_tool_arguments_shape",
+        "http_status_out_of_range",
+    }
+)
+
+
+def _is_provider_failure_code(value: str) -> bool:
+    if value in _PROVIDER_FAILURE_CODES:
+        return True
+    prefix = "http_status_"
+    if not value.startswith(prefix):
+        return False
+    status = value[len(prefix) :]
+    return (
+        len(status) == 3
+        and status.isascii()
+        and status.isdigit()
+        and 100 <= int(status) <= 599
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class TokenUsage:
@@ -43,6 +100,7 @@ class ToolDefinition:
     name: str
     description: str
     parameters: Mapping[str, object]
+    strict: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "parameters", MappingProxyType(dict(self.parameters)))
@@ -70,6 +128,7 @@ class ProviderRequest:
     binding: LockedModelBinding
     messages: tuple[PromptMessage, ...]
     tools: tuple[ToolDefinition, ...] = DEFAULT_TOOL_DEFINITIONS
+    tool_choice: str | None = None
     cancellation: CancellationSignal | None = None
 
 
@@ -107,7 +166,7 @@ class UsageReceipt:
 
 
 class ProviderError(RuntimeError):
-    """A provider call failed without exposing credentials or response bodies."""
+    """A provider call failed with a safe category and no response-body detail."""
 
     def __init__(
         self,
@@ -116,11 +175,17 @@ class ProviderError(RuntimeError):
         retryable: bool,
         retry_delay_secs: int | None = None,
         cancelled: bool = False,
+        failure_code: str = "provider_error",
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.retry_delay_secs = retry_delay_secs
         self.cancelled = cancelled
+        if not isinstance(failure_code, str) or not _is_provider_failure_code(
+            failure_code
+        ):
+            raise ValueError("provider failure code must be a fixed safe category")
+        self.failure_code = failure_code
 
 
 class AsyncProvider(Protocol):
@@ -140,6 +205,69 @@ class ProviderRegistry:
             raise ProviderError("provider binding is unavailable", retryable=False) from exc
 
 
+def provider_adapter_id_for_label(label: str) -> str:
+    """Map a local OpenCode config label onto an existing locked adapter ID."""
+
+    normalized = label.strip().casefold()
+    if normalized == "opencode":
+        return "openai-compatible"
+    if normalized in {"openai", "openai-compatible", "anthropic"}:
+        return normalized
+    raise ValueError("unsupported provider label")
+
+
+def decode_concatenated_json_objects(payload: str) -> tuple[dict[str, object], ...]:
+    """Decode adjacent config objects without including invalid input in errors."""
+
+    if not isinstance(payload, str) or not payload.strip():
+        raise ValueError("concatenated JSON objects are required")
+    if len(payload.encode("utf-8")) > 1_048_576:
+        raise ValueError("concatenated JSON objects exceed the size limit")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
+    decoder = json.JSONDecoder(object_pairs_hook=reject_duplicate_keys)
+    values: list[dict[str, object]] = []
+    position = 0
+    try:
+        while position < len(payload):
+            while position < len(payload) and payload[position].isspace():
+                position += 1
+            if position == len(payload):
+                break
+            decoded, position = decoder.raw_decode(payload, position)
+            if not isinstance(decoded, dict):
+                raise ValueError("JSON config document must be an object")
+            values.append(decoded)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid concatenated JSON objects") from exc
+    if not values:
+        raise ValueError("concatenated JSON objects are required")
+    return tuple(values)
+
+
+def select_unique_provider_config(payload: str, label: str) -> dict[str, object]:
+    """Select one provider record or fail closed on missing/ambiguous labels."""
+
+    normalized = label.strip().casefold()
+    if not normalized:
+        raise ValueError("provider label is required")
+    matches = tuple(
+        item
+        for item in decode_concatenated_json_objects(payload)
+        if str(item.get("Provider", "")).strip().casefold() == normalized
+    )
+    if len(matches) != 1:
+        raise ValueError("configuration must contain exactly one matching provider")
+    return matches[0]
+
+
 def retry_delay_for_attempt(attempt: int) -> int:
     """Return the actor-facing retry hint for the 1st, 2nd, or later retry."""
 
@@ -148,12 +276,41 @@ def retry_delay_for_attempt(attempt: int) -> int:
     return (30, 60, 120)[min(attempt - 1, 2)]
 
 
-def _provider_error(*, retryable: bool) -> ProviderError:
+def _provider_error(
+    *, retryable: bool, failure_code: str = "invalid_response"
+) -> ProviderError:
     return ProviderError(
         "provider request failed",
         retryable=retryable,
         retry_delay_secs=retry_delay_for_attempt(1) if retryable else None,
+        failure_code=failure_code,
     )
+
+
+def _transport_failure_code(error: httpx.HTTPError) -> str:
+    """Map transport failures to fixed labels without copying exception details."""
+
+    if isinstance(error, httpx.ConnectTimeout):
+        return "connect_timeout"
+    if isinstance(error, httpx.ReadTimeout):
+        return "read_timeout"
+    if isinstance(error, httpx.WriteTimeout):
+        return "write_timeout"
+    if isinstance(error, httpx.PoolTimeout):
+        return "pool_timeout"
+    if isinstance(error, httpx.ProxyError):
+        return "proxy_error"
+    if isinstance(error, httpx.RemoteProtocolError):
+        return "remote_protocol_error"
+    if isinstance(error, httpx.ConnectError):
+        return "connect_error"
+    return "transport_error"
+
+
+def _http_status_failure_code(status_code: int) -> str:
+    if 100 <= status_code <= 599:
+        return f"http_status_{status_code:03d}"
+    return "http_status_out_of_range"
 
 
 async def _post_json(
@@ -177,24 +334,37 @@ async def _post_json(
             if cancellation_task in done and request_task not in done:
                 request_task.cancel()
                 await asyncio.gather(request_task, return_exceptions=True)
-                raise ProviderError("provider request cancelled", retryable=False, cancelled=True)
+                raise ProviderError(
+                    "provider request cancelled",
+                    retryable=False,
+                    cancelled=True,
+                    failure_code="cancelled",
+                )
             response = await request_task
     except httpx.HTTPError as exc:
-        raise _provider_error(retryable=True) from exc
+        raise _provider_error(
+            retryable=True, failure_code=_transport_failure_code(exc)
+        ) from exc
     finally:
         if cancellation_task is not None and not cancellation_task.done():
             cancellation_task.cancel()
             await asyncio.gather(cancellation_task, return_exceptions=True)
     if response.status_code >= 500 or response.status_code == 429:
-        raise _provider_error(retryable=True)
+        raise _provider_error(
+            retryable=True,
+            failure_code=_http_status_failure_code(response.status_code),
+        )
     if response.status_code >= 400:
-        raise _provider_error(retryable=False)
+        raise _provider_error(
+            retryable=False,
+            failure_code=_http_status_failure_code(response.status_code),
+        )
     try:
         decoded = response.json()
     except (ValueError, json.JSONDecodeError) as exc:
-        raise _provider_error(retryable=False) from exc
+        raise _provider_error(retryable=False, failure_code="invalid_json") from exc
     if not isinstance(decoded, dict):
-        raise _provider_error(retryable=False)
+        raise _provider_error(retryable=False, failure_code="invalid_envelope")
     return cast(dict[str, Any], decoded)
 
 
@@ -207,11 +377,11 @@ def _usage(
 ) -> TokenUsage:
     raw = payload.get("usage")
     if not isinstance(raw, Mapping):
-        raise _provider_error(retryable=False)
+        raise _provider_error(retryable=False, failure_code="invalid_usage")
     input_tokens = raw.get(input_key)
     output_tokens = raw.get(output_key)
     if type(input_tokens) is not int or type(output_tokens) is not int:
-        raise _provider_error(retryable=False)
+        raise _provider_error(retryable=False, failure_code="invalid_usage")
     raw_cost = raw.get("cost_micros")
     if raw_cost is None:
         cost_micros = math.ceil(input_tokens / 1000) * binding.input_cost_micros_per_1k
@@ -219,7 +389,7 @@ def _usage(
     elif type(raw_cost) is int and raw_cost >= 0:
         cost_micros = raw_cost
     else:
-        raise _provider_error(retryable=False)
+        raise _provider_error(retryable=False, failure_code="invalid_usage")
     return TokenUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -240,7 +410,7 @@ def _content_text(value: object) -> str:
                 if isinstance(text, str):
                     parts.append(text)
         return "".join(parts)
-    raise _provider_error(retryable=False)
+    raise _provider_error(retryable=False, failure_code="invalid_content")
 
 
 class OpenAICompatibleProvider:
@@ -252,22 +422,27 @@ class OpenAICompatibleProvider:
         endpoint: str,
         api_key: str,
         client: httpx.AsyncClient | None = None,
+        timeout: httpx.Timeout | float = _DEFAULT_PROVIDER_TIMEOUT,
     ) -> None:
         if not endpoint or not api_key:
             raise ValueError("provider endpoint and api key are required")
         self.endpoint = endpoint.rstrip("/")
         self._api_key = api_key
-        self._client = client or httpx.AsyncClient()
+        self._client = client or httpx.AsyncClient(timeout=timeout)
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         if request.binding.provider_id not in {"openai", "openai-compatible"}:
-            raise _provider_error(retryable=False)
+            raise _provider_error(retryable=False, failure_code="provider_binding_mismatch")
         payload = {
             "model": request.binding.model_id,
             "messages": _openai_messages(request.messages),
             "tools": _openai_tools(request.tools),
             "max_tokens": request.binding.output_cap,
         }
+        if request.tool_choice is not None:
+            payload["tool_choice"] = (
+                "required" if request.tool_choice == "any" else request.tool_choice
+            )
         decoded = await _post_json(
             self._client,
             f"{self.endpoint}/chat/completions",
@@ -278,17 +453,17 @@ class OpenAICompatibleProvider:
         model = _response_model(decoded, request.binding.model_id)
         choices = decoded.get("choices")
         if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)) or not choices:
-            raise _provider_error(retryable=False)
+            raise _provider_error(retryable=False, failure_code="invalid_choices")
         first = choices[0]
         if not isinstance(first, Mapping):
-            raise _provider_error(retryable=False)
+            raise _provider_error(retryable=False, failure_code="invalid_choice")
         message = first.get("message")
         if not isinstance(message, Mapping):
-            raise _provider_error(retryable=False)
+            raise _provider_error(retryable=False, failure_code="invalid_message")
         tool_calls = _tool_calls(message.get("tool_calls"))
         finish_reason = first.get("finish_reason")
         if not isinstance(finish_reason, str):
-            raise _provider_error(retryable=False)
+            raise _provider_error(retryable=False, failure_code="missing_finish_reason")
         return ProviderResponse(
             content=_content_text(message.get("content")),
             tool_calls=tool_calls,
@@ -317,13 +492,14 @@ class AnthropicProvider:
         api_key: str,
         anthropic_version: str,
         client: httpx.AsyncClient | None = None,
+        timeout: httpx.Timeout | float = _DEFAULT_PROVIDER_TIMEOUT,
     ) -> None:
         if not endpoint or not api_key or not anthropic_version:
             raise ValueError("provider endpoint, api key, and version are required")
         self.endpoint = endpoint.rstrip("/")
         self._api_key = api_key
         self._version = anthropic_version
-        self._client = client or httpx.AsyncClient()
+        self._client = client or httpx.AsyncClient(timeout=timeout)
 
     async def complete(self, request: ProviderRequest) -> ProviderResponse:
         if request.binding.provider_id != "anthropic":
@@ -342,6 +518,7 @@ class AnthropicProvider:
                 "system": system_parts,
                 "messages": messages,
                 "tools": _anthropic_tools(request.tools),
+                **({"tool_choice": {"type": "any"}} if request.tool_choice == "any" else {}),
                 "max_tokens": request.binding.output_cap,
             },
             cancellation=request.cancellation,
@@ -349,7 +526,7 @@ class AnthropicProvider:
         model = _response_model(decoded, request.binding.model_id)
         content = decoded.get("content")
         if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
-            raise _provider_error(retryable=False)
+            raise _provider_error(retryable=False, failure_code="invalid_content_blocks")
         tool_calls = _tool_calls(
             tuple(
                 {
@@ -363,7 +540,7 @@ class AnthropicProvider:
         )
         finish_reason = decoded.get("stop_reason")
         if not isinstance(finish_reason, str):
-            raise _provider_error(retryable=False)
+            raise _provider_error(retryable=False, failure_code="missing_finish_reason")
         return ProviderResponse(
             content=_content_text(content),
             tool_calls=tool_calls,
@@ -386,11 +563,11 @@ def _tool_calls(value: object) -> tuple[ProviderToolCall, ...]:
     if value is None:
         return ()
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        raise _provider_error(retryable=False)
+        raise _provider_error(retryable=False, failure_code="invalid_tool_calls")
     calls: list[ProviderToolCall] = []
     for index, item in enumerate(value):
         if not isinstance(item, Mapping):
-            raise _provider_error(retryable=False)
+            raise _provider_error(retryable=False, failure_code="invalid_tool_call")
         function = item.get("function")
         if isinstance(function, Mapping):
             name = function.get("name")
@@ -399,11 +576,14 @@ def _tool_calls(value: object) -> tuple[ProviderToolCall, ...]:
             name = item.get("name")
             arguments = item.get("input")
         if not isinstance(name, str) or not name:
-            raise _provider_error(retryable=False)
-        if isinstance(arguments, Mapping):
-            arguments = json.dumps(arguments, separators=(",", ":"))
+            raise _provider_error(retryable=False, failure_code="invalid_tool_call")
         if not isinstance(arguments, str):
-            raise _provider_error(retryable=False)
+            try:
+                arguments = json.dumps(arguments, separators=(",", ":"))
+            except (TypeError, ValueError):
+                raise _provider_error(
+                    retryable=False, failure_code="invalid_tool_call"
+                ) from None
         call_id = item.get("id")
         if not isinstance(call_id, str) or not call_id:
             call_id = f"call-{index + 1}"
@@ -414,14 +594,22 @@ def _tool_calls(value: object) -> tuple[ProviderToolCall, ...]:
 def _response_model(payload: Mapping[str, object], expected: str) -> str:
     model = payload.get("model")
     if not isinstance(model, str) or model != expected:
-        raise ProviderError("provider model identity mismatch", retryable=False)
+        raise ProviderError(
+            "provider model identity mismatch",
+            retryable=False,
+            failure_code="model_identity_mismatch",
+        )
     return model
 
 
 def _response_id(payload: Mapping[str, object]) -> str:
     value = payload.get("id")
     if not isinstance(value, str) or not value:
-        raise ProviderError("provider response receipt is missing", retryable=False)
+        raise ProviderError(
+            "provider response receipt is missing",
+            retryable=False,
+            failure_code="missing_response_id",
+        )
     return value
 
 
@@ -433,6 +621,7 @@ def _openai_tools(tools: Sequence[ToolDefinition]) -> list[dict[str, object]]:
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": dict(tool.parameters),
+                **({"strict": True} if tool.strict else {}),
             },
         }
         for tool in tools
@@ -454,7 +643,11 @@ def _openai_messages(messages: Sequence[PromptMessage]) -> list[dict[str, object
             ]
         if message.role == "tool":
             if message.tool_call_id is None:
-                raise ProviderError("tool message is missing call identity", retryable=False)
+                raise ProviderError(
+                    "tool message is missing call identity",
+                    retryable=False,
+                    failure_code="missing_tool_call_id",
+                )
             item["tool_call_id"] = message.tool_call_id
         rendered.append(item)
     return rendered
@@ -511,7 +704,11 @@ def _anthropic_messages(messages: Sequence[PromptMessage]) -> list[dict[str, obj
             continue
         if message.role == "tool":
             if message.tool_call_id is None:
-                raise ProviderError("tool message is missing call identity", retryable=False)
+                raise ProviderError(
+                    "tool message is missing call identity",
+                    retryable=False,
+                    failure_code="missing_tool_call_id",
+                )
             rendered.append(
                 {
                     "role": "user",
@@ -549,5 +746,8 @@ __all__ = [
     "ToolDefinition",
     "DEFAULT_TOOL_DEFINITIONS",
     "UsageReceipt",
+    "decode_concatenated_json_objects",
+    "provider_adapter_id_for_label",
+    "select_unique_provider_config",
     "retry_delay_for_attempt",
 ]
