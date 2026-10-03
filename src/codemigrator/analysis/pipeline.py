@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import posixpath
 import re
@@ -17,6 +18,7 @@ from codemigrator.core import (
     StableErrorCode,
 )
 
+from .errors import AnalysisFailure
 from .grammar import GrammarCache, GrammarCircuitBreaker, GrammarFailure, SyntaxNode
 from .models import (
     AnalysisError,
@@ -49,7 +51,13 @@ from .models import (
     UnknownReason,
 )
 from .ports import SnapshotSource
-from .rules import ImportRule, SourceAnalysisDescriptor, TextRule, descriptor_pattern_matches
+from .rules import (
+    ImportRule,
+    SourceAnalysisDescriptor,
+    SyntaxImportRule,
+    TextRule,
+    descriptor_pattern_matches,
+)
 
 
 def _module_key(
@@ -169,7 +177,7 @@ def _syntax_nodes(tree: object, content: bytes) -> tuple[SyntaxNode, ...]:
                 kind=kind,
                 start_byte=start,
                 end_byte=end,
-                name=_tree_sitter_name(node, content),
+                name=_syntax_node_name(node, kind, start, end, content),
             )
         )
         children = getattr(node, "children", ())
@@ -178,6 +186,133 @@ def _syntax_nodes(tree: object, content: bytes) -> tuple[SyntaxNode, ...]:
 
     visit_external(root)
     return tuple(nodes)
+
+
+def _syntax_node_name(node: object, kind: str, start: int, end: int, content: bytes) -> str | None:
+    field_name = _tree_sitter_name(node, content)
+    if field_name is not None:
+        return field_name
+    if kind.lower() in {
+        "identifier",
+        "field_identifier",
+        "property_identifier",
+        "type_identifier",
+        "package_identifier",
+    }:
+        return content[start:end].decode("utf-8", errors="ignore") or None
+    return None
+
+
+def _walk_tree(tree: object) -> tuple[object, ...]:
+    root = getattr(tree, "root_node", tree)
+    nodes: list[object] = []
+
+    def visit(node: object) -> None:
+        nodes.append(node)
+        for child in getattr(node, "children", ()):
+            visit(child)
+
+    visit(root)
+    return tuple(nodes)
+
+
+def _node_field_text(
+    node: object,
+    field_name: str,
+    content: bytes,
+) -> tuple[object | None, str | None]:
+    child_by_field_name = getattr(node, "child_by_field_name", None)
+    if not callable(child_by_field_name):
+        return None, None
+    field_node = child_by_field_name(field_name)
+    if field_node is None:
+        return None, None
+    start = getattr(field_node, "start_byte", None)
+    end = getattr(field_node, "end_byte", None)
+    if not isinstance(start, int) or not isinstance(end, int):
+        return field_node, None
+    return field_node, content[start:end].decode("utf-8", errors="replace")
+
+
+def _decode_import_literal(value: str) -> str | None:
+    try:
+        decoded = ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        if len(value) >= 2 and value[0] == value[-1] == "`":
+            return value[1:-1]
+        return None
+    return decoded if isinstance(decoded, str) else None
+
+
+def _syntax_imports(
+    path: str,
+    text: str,
+    tree: object | None,
+    rule: SyntaxImportRule,
+) -> list[tuple[str, str, SourceRange, tuple[tuple[str, SourceRange], ...]]]:
+    if tree is None:
+        return []
+    content = text.encode("utf-8")
+    imports: list[tuple[str, str, SourceRange, tuple[tuple[str, SourceRange], ...]]] = []
+    for node in _walk_tree(tree):
+        if getattr(node, "type", None) != rule.node_kind:
+            continue
+        target_node, target_literal = _node_field_text(node, rule.target_field, content)
+        if target_node is None or target_literal is None:
+            continue
+        target = _decode_import_literal(target_literal)
+        if not target:
+            continue
+        alias = None
+        if rule.alias_field is not None:
+            _alias_node, alias_text = _node_field_text(node, rule.alias_field, content)
+            if alias_text:
+                alias = alias_text
+        if alias is None:
+            alias = target.rstrip("/").rsplit("/", 1)[-1]
+        start = getattr(node, "start_byte", None)
+        end = getattr(node, "end_byte", None)
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+        selector_sites: list[tuple[str, SourceRange]] = []
+        if (
+            rule.selector_node_kind is not None
+            and alias not in {".", "_"}
+            and rule.selector_object_field is not None
+            and rule.selector_member_field is not None
+        ):
+            for selector in _walk_tree(tree):
+                if getattr(selector, "type", None) != rule.selector_node_kind:
+                    continue
+                _object_node, object_text = _node_field_text(
+                    selector, rule.selector_object_field, content
+                )
+                member_node, member = _node_field_text(
+                    selector, rule.selector_member_field, content
+                )
+                if object_text != alias or member_node is None or not member:
+                    continue
+                member_start = getattr(member_node, "start_byte", None)
+                member_end = getattr(member_node, "end_byte", None)
+                if not isinstance(member_start, int) or not isinstance(member_end, int):
+                    continue
+                selector_sites.append(
+                    (member, _range_from_bytes(path, text, member_start, member_end))
+                )
+        imports.append(
+            (
+                target,
+                alias,
+                _range_from_bytes(path, text, start, end),
+                tuple(
+                    sorted(
+                        selector_sites,
+                        key=lambda item: (item[1].start.line, item[1].start.column),
+                    )
+                ),
+            )
+        )
+    return imports
 
 
 def _default_syntax_tree(content: bytes, descriptor: SourceAnalysisDescriptor) -> SyntaxNode:
@@ -332,9 +467,17 @@ def _resolve_module(
     source_paths: set[str],
     source_modules: Mapping[str, ProjectModuleId],
     descriptor: SourceAnalysisDescriptor,
+    module_path: str | None = None,
 ) -> ProjectModuleId | None:
+    module_root_import = bool(module_path and target == module_path)
+    if module_root_import:
+        target = "."
+    elif module_path and target.startswith(f"{module_path}/"):
+        target = target[len(module_path) + 1 :]
     target = descriptor.aliases.get(target, target)
-    if target.startswith("."):
+    if module_root_import:
+        pass
+    elif target.startswith("."):
         target = posixpath.normpath(posixpath.join(posixpath.dirname(source_path), target))
     else:
         target = target.replace(".", "/") if "." in target else target
@@ -342,7 +485,9 @@ def _resolve_module(
         return None
     for path in sorted(source_paths):
         stem = path.rsplit(".", 1)[0] if "." in posixpath.basename(path) else path
-        if target in {path, stem, f"{stem}/__init__"} or posixpath.dirname(path) == target:
+        target_directory = "." if module_root_import else target
+        path_directory = posixpath.dirname(path) or "."
+        if target in {path, stem, f"{stem}/__init__"} or path_directory == target_directory:
             return source_modules.get(path)
     return None
 
@@ -370,6 +515,16 @@ def _directory_coverage(
 
 
 def _parse_manifest(path: str, kind: str, content: bytes) -> ManifestSummary:
+    if kind.lower() == "go.mod":
+        module_path, dependencies = _parse_go_mod(content)
+        return ManifestSummary(
+            manifest_path=RepoRelativePath(path),
+            manifest_kind=kind,
+            dependencies=dependencies,
+            scripts=[],
+            entry_points=[],
+            module_path=module_path,
+        )
     if path.endswith(".json") or kind.lower().endswith("json"):
         document = json.loads(content.decode("utf-8"))
     elif path.endswith(".toml") or kind.lower().endswith("toml"):
@@ -414,6 +569,39 @@ def _parse_manifest(path: str, kind: str, content: bytes) -> ManifestSummary:
     )
 
 
+def _parse_go_mod(content: bytes) -> tuple[str | None, list[DependencyEntry]]:
+    text = content.decode("utf-8")
+    module_path: str | None = None
+    dependencies: dict[str, str] = {}
+    in_require_block = False
+    for raw_line in text.splitlines():
+        line = raw_line.split("//", 1)[0].strip()
+        if not line:
+            continue
+        if in_require_block:
+            if line == ")":
+                in_require_block = False
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                dependencies[parts[0]] = parts[1]
+            continue
+        if line.startswith("module "):
+            parts = line.split()
+            if len(parts) == 2:
+                module_path = parts[1]
+        elif line == "require (" or line.startswith("require ("):
+            in_require_block = True
+        elif line.startswith("require "):
+            parts = line.split()
+            if len(parts) >= 3:
+                dependencies[parts[1]] = parts[2]
+    return module_path, [
+        DependencyEntry(name=name, version=version)
+        for name, version in sorted(dependencies.items())
+    ]
+
+
 def _error(code: StableErrorCode, message: str, path: str | None = None) -> AnalysisError:
     return AnalysisError(
         code=code,
@@ -434,6 +622,16 @@ def analyze_snapshot(
     tree-sitter adapter can supply syntax trees without moving resource I/O
     into this package. Extraction rules remain descriptor-owned and deterministic.
     """
+
+    if (
+        not descriptor.text_fallback
+        and (descriptor.grammar_id or "").startswith("tree-sitter-")
+        and parser is None
+    ):
+        raise AnalysisFailure(
+            StableErrorCode.ANALYSIS_INFRA_ERROR,
+            f"required tree-sitter parser is unavailable: {descriptor.grammar_id}",
+        )
 
     files: dict[str, bytes] = {}
     texts: dict[str, str] = {}
@@ -465,7 +663,10 @@ def analyze_snapshot(
             texts[path] = content.decode("utf-8")
         except UnicodeDecodeError:
             texts[path] = content.decode("utf-8", errors="replace")
-            errors.append(_error(StableErrorCode.ANALYSIS_INFRA_ERROR, "source is not UTF-8", path))
+            if descriptor.is_source_file(path) or descriptor.manifest_kind(path) is not None:
+                errors.append(
+                    _error(StableErrorCode.ANALYSIS_INFRA_ERROR, "source is not UTF-8", path)
+                )
         if not descriptor.text_fallback and descriptor.is_source_file(path):
             try:
                 parser_fn: Callable[[bytes], object] = parser or (
@@ -509,9 +710,15 @@ def analyze_snapshot(
     external_packages = set(descriptor.external_packages)
     for manifest in manifests:
         for dependency in manifest.dependencies:
-            package_match = re.match(r"[A-Za-z0-9_.-]+", dependency.name)
-            if package_match is not None:
-                external_packages.add(package_match.group(0))
+            if manifest.manifest_kind.lower() == "go.mod":
+                external_packages.add(dependency.name)
+            else:
+                package_match = re.match(r"[A-Za-z0-9_.-]+", dependency.name)
+                if package_match is not None:
+                    external_packages.add(package_match.group(0))
+    module_path = next(
+        (manifest.module_path for manifest in manifests if manifest.module_path), None
+    )
     for path in sorted(source_paths | test_paths):
         role = ModuleRole.Test if path in test_paths else ModuleRole.Source
         key = _module_key(
@@ -544,6 +751,7 @@ def analyze_snapshot(
                 export_ranges[(module_id, symbol)].append(definition)
 
     imports: list[ImportEdge] = []
+    syntax_selector_references: list[tuple[ProjectModuleId, str, SourceRange]] = []
     for path in sorted(source_paths | test_paths):
         module_id = path_to_module[path]
         for import_rule in descriptor.import_rules:
@@ -558,7 +766,12 @@ def analyze_snapshot(
                     None
                     if _enum_value(import_rule.confidence) == EdgeConfidence.Unknown.value
                     else _resolve_module(
-                        path, target_name, source_paths, source_modules, descriptor
+                        path,
+                        target_name,
+                        source_paths,
+                        source_modules,
+                        descriptor,
+                        module_path,
                     )
                 )
                 target: ModuleTarget | ExternalTarget | None
@@ -615,6 +828,55 @@ def analyze_snapshot(
                         local_symbols=local_symbols,
                     )
                 )
+        for syntax_rule in descriptor.syntax_import_rules:
+            for target_name, _alias, evidence, selectors in _syntax_imports(
+                path, texts[path], syntax_trees.get(path), syntax_rule
+            ):
+                target_module = _resolve_module(
+                    path,
+                    target_name,
+                    source_paths,
+                    source_modules,
+                    descriptor,
+                    module_path,
+                )
+                if target_module is not None:
+                    syntax_target: ModuleTarget | ExternalTarget | None = ModuleTarget(
+                        module_id=target_module
+                    )
+                    confidence = EdgeConfidence.Static
+                    reason = None
+                else:
+                    external_package = max(
+                        (
+                            package
+                            for package in external_packages
+                            if target_name == package or target_name.startswith(f"{package}/")
+                        ),
+                        key=len,
+                        default=None,
+                    )
+                    if external_package is not None:
+                        syntax_target = ExternalTarget(package=external_package)
+                        confidence = EdgeConfidence.Static
+                        reason = None
+                    else:
+                        syntax_target = None
+                        confidence = EdgeConfidence.Unknown
+                        reason = UnknownReason.UnresolvedPath
+                imports.append(
+                    ImportEdge(
+                        from_module=module_id,
+                        to=syntax_target,
+                        confidence=confidence,
+                        reason=reason,
+                        evidence=evidence,
+                    )
+                )
+                if isinstance(syntax_target, ModuleTarget):
+                    syntax_selector_references.extend(
+                        (syntax_target.module_id, symbol, site) for symbol, site in selectors
+                    )
 
     modules: list[ModuleFact] = []
     boundary = _module_boundary(descriptor.module_boundary_strategy)
@@ -772,10 +1034,6 @@ def analyze_snapshot(
             for definition in ranges
         )
 
-    definitions_by_symbol: dict[str, list[SourceRange]] = defaultdict(list)
-    for (_export_module_id, symbol), ranges in export_ranges.items():
-        definitions_by_symbol[symbol].extend(ranges)
-
     reference_sites: list[ReferenceSite] = []
     for edge in imports:
         if not isinstance(edge.to, ModuleTarget):
@@ -789,7 +1047,7 @@ def analyze_snapshot(
         for symbol, local_symbol in symbols:
             if symbol not in target_exports:
                 continue
-            definitions = definitions_by_symbol[symbol]
+            definitions = export_ranges[(edge.to.module_id, symbol)]
             for start, site in _identifier_ranges(
                 source_path, source_text, syntax_trees.get(source_path), local_symbol
             ):
@@ -804,6 +1062,19 @@ def analyze_snapshot(
                         ambiguous=len(definitions) != 1,
                     )
                 )
+
+    for target_module, symbol, site in syntax_selector_references:
+        definitions = export_ranges.get((target_module, symbol), [])
+        if not definitions:
+            continue
+        reference_sites.append(
+            ReferenceSite(
+                symbol=symbol,
+                site=site,
+                binding=definitions[0] if len(definitions) == 1 else None,
+                ambiguous=len(definitions) != 1,
+            )
+        )
 
     call_edges = [
         CallEdge(symbol=reference.symbol, caller=reference.site, callee=reference.binding)

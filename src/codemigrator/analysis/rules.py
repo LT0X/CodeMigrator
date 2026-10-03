@@ -50,6 +50,31 @@ class ImportRule:
 
 
 @dataclass(frozen=True)
+class SyntaxImportRule:
+    """Descriptor-owned tree-sitter fields for literal import declarations."""
+
+    node_kind: str
+    target_field: str
+    alias_field: str | None = None
+    selector_node_kind: str | None = None
+    selector_object_field: str | None = None
+    selector_member_field: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.node_kind or not self.target_field:
+            raise ValueError("syntax import rules require a node kind and target field")
+        selector_fields = (
+            self.selector_node_kind,
+            self.selector_object_field,
+            self.selector_member_field,
+        )
+        if any(value is not None for value in selector_fields) and not all(
+            value is not None for value in selector_fields
+        ):
+            raise ValueError("syntax selector rules require node, object, and member fields")
+
+
+@dataclass(frozen=True)
 class ManifestRule:
     pattern: str
     manifest_kind: str
@@ -76,6 +101,7 @@ class SourceAnalysisDescriptor:
     module_boundary_strategy: ModuleBoundaryStrategy
     test_patterns: tuple[str, ...] = ()
     import_rules: tuple[ImportRule, ...] = ()
+    syntax_import_rules: tuple[SyntaxImportRule, ...] = ()
     export_rules: tuple[TextRule, ...] = ()
     test_function_rules: tuple[TextRule, ...] = ()
     assertion_rules: tuple[TextRule, ...] = ()
@@ -127,6 +153,17 @@ class SourceAnalysisDescriptor:
                 }
                 for rule in self.import_rules
             ],
+            "syntax_import_rules": [
+                {
+                    "node_kind": rule.node_kind,
+                    "target_field": rule.target_field,
+                    "alias_field": rule.alias_field,
+                    "selector_node_kind": rule.selector_node_kind,
+                    "selector_object_field": rule.selector_object_field,
+                    "selector_member_field": rule.selector_member_field,
+                }
+                for rule in self.syntax_import_rules
+            ],
             "export_rules": [
                 {"pattern": rule.pattern, "kind": rule.kind} for rule in self.export_rules
             ],
@@ -176,6 +213,7 @@ __all__ = [
     "ImportRule",
     "ManifestRule",
     "SourceAnalysisDescriptor",
+    "SyntaxImportRule",
     "TextRule",
     "descriptor_pattern_matches",
 ]

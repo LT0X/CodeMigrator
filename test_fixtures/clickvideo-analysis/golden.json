@@ -8,6 +8,18 @@
     ["cmd/server", "internal/clickvideo"],
     ["internal/clickvideo#test", "internal/clickvideo"]
   ],
+  "expected_symbol_bindings": [
+    ["cmd/server/main.go", "Main", 5],
+    ["internal/clickvideo/service.go", "Handle", 3]
+  ],
+  "expected_reference_sites": [
+    ["cmd/server/main.go", "Handle", 5],
+    ["internal/clickvideo/service_test.go", "Handle", 5]
+  ],
+  "expected_call_edges": [
+    ["cmd/server/main.go", "Handle", 5, "internal/clickvideo/service.go"],
+    ["internal/clickvideo/service_test.go", "Handle", 5, "internal/clickvideo/service.go"]
+  ],
   "expected_source_files": [
     "cmd/server/main.go",
     "internal/clickvideo/service.go"
