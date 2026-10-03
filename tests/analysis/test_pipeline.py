@@ -134,6 +134,20 @@ def test_unsupported_snapshot_paths_and_large_files_are_not_analyzed() -> None:
     assert result.errors[0].code.value == "SOURCE_FILE_TOO_LARGE"
 
 
+def test_binary_non_source_assets_do_not_report_source_analysis_errors() -> None:
+    source = InMemorySnapshotSource(
+        snapshot_oid="3" * 40,
+        files={
+            "src/main.py": b"def main():\n    return 1\n",
+            "assets/favicon.ico": b"\x00\xff\x81",
+        },
+    )
+
+    result = analyze_snapshot(source, descriptor())
+
+    assert result.errors == []
+
+
 def test_manifest_parse_errors_are_recorded_without_blocking_other_facts() -> None:
     source = InMemorySnapshotSource(
         snapshot_oid="4" * 40,

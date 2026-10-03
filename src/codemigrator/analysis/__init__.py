@@ -72,6 +72,7 @@ from .rules import (
     ImportRule,
     ManifestRule,
     SourceAnalysisDescriptor,
+    SyntaxImportRule,
     TextRule,
     descriptor_pattern_matches,
 )
@@ -114,6 +115,7 @@ __all__ = [
     "SearchContext",
     "SnapshotSource",
     "SourceAnalysisDescriptor",
+    "SyntaxImportRule",
     "SourceAstQuery",
     "TextRule",
     "analyze_snapshot",

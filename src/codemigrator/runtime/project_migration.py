@@ -25,11 +25,14 @@ from typing import Protocol
 import httpx
 
 from codemigrator.analysis import (
+    EdgeConfidence,
     ImportRule,
     InMemorySnapshotSource,
     ManifestRule,
     SourceAnalysisDescriptor,
+    SyntaxImportRule,
     TextRule,
+    UnknownReason,
     analyze_snapshot,
 )
 from codemigrator.core import ModelProfile, ModuleBoundaryStrategy
@@ -1008,7 +1011,19 @@ def _go_analysis_descriptor() -> SourceAnalysisDescriptor:
         test_patterns=("*_test.go",),
         import_rules=(
             ImportRule(
-                pattern=r'^\s*(?:import\s+)?(?:[A-Za-z_][\w]*\s+)?"(?P<target>[A-Za-z0-9_.\-/]+)"',
+                pattern=r"\bplugin\.Open\s*\(\s*(?P<target>[^)]*)\)",
+                confidence=EdgeConfidence.Unknown,
+                reason=UnknownReason.DynamicImport,
+            ),
+        ),
+        syntax_import_rules=(
+            SyntaxImportRule(
+                node_kind="import_spec",
+                target_field="path",
+                alias_field="name",
+                selector_node_kind="selector_expression",
+                selector_object_field="operand",
+                selector_member_field="field",
             ),
         ),
         export_rules=(

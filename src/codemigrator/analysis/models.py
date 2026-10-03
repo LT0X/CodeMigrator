@@ -169,6 +169,7 @@ class ManifestSummary(_FrozenModel):
     dependencies: list[DependencyEntry]
     scripts: list[ScriptEntry]
     entry_points: list[str]
+    module_path: str | None = None
 
     @field_validator("manifest_path", mode="before")
     @classmethod

@@ -18,6 +18,7 @@ from .checkpoint import (
     WorkspaceFileFact,
     checkpoint_receipt_digest,
 )
+from .exec_engine import QuickJSExecEngine
 from .gateway import GatewayRoots, ToolGateway
 from .generated import (
     GeneratedActionError,
@@ -136,6 +137,7 @@ __all__ = [
     "PathNotFound",
     "PathSecurityError",
     "QuerySourceAstPort",
+    "QuickJSExecEngine",
     "SecureRoot",
     "ShellExecution",
     "ShellRunner",
