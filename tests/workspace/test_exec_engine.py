@@ -260,6 +260,17 @@ def test_syntax_error_is_reported_with_source_line() -> None:
     assert result.timed_out is False
 
 
+def test_script_failure_preserves_exception_message() -> None:
+    result = _run(
+        QuickJSExecEngine(),
+        "throw new Error('expected failure');",
+        RecordingBridge(),
+    )
+
+    assert result.error_message is not None
+    assert "Error: expected failure" in result.error_message
+
+
 def test_cpu_timeout_is_reported_and_does_not_poison_next_context() -> None:
     engine = QuickJSExecEngine(max_timeout_secs=1)
     timed = engine.execute("while (true) {}", RecordingBridge(), timeout_secs=3)

@@ -71,6 +71,12 @@ globalThis.__cm_exec_state = {status: "pending", result: "null", error: null};
 _TOOL_SCRIPT_PREFIX = "globalThis.__cm_exec_task = (async function () {\n"
 _TOOL_SCRIPT_SUFFIX = "\n})();"
 _RESULT_HANDLER = r"""
+function describeError(error) {
+  const message = String(error);
+  const stack = String(error && error.stack ? error.stack : "");
+  return stack && stack !== message ? `${message}\n${stack}` : message;
+}
+
 globalThis.__cm_exec_task.then(
   (value) => {
     try {
@@ -79,12 +85,12 @@ globalThis.__cm_exec_task.then(
       globalThis.__cm_exec_state.result = encoded;
       globalThis.__cm_exec_state.status = "done";
     } catch (error) {
-      globalThis.__cm_exec_state.error = String(error && error.stack ? error.stack : error);
+      globalThis.__cm_exec_state.error = describeError(error);
       globalThis.__cm_exec_state.status = "error";
     }
   },
   (error) => {
-    globalThis.__cm_exec_state.error = String(error && error.stack ? error.stack : error);
+    globalThis.__cm_exec_state.error = describeError(error);
     globalThis.__cm_exec_state.status = "error";
   }
 );
