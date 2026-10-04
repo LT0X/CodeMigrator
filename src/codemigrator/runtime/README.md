@@ -16,6 +16,10 @@ Run actor、事务编排、调度、集成、恢复、观测装配和唯一 app 
 
 唯一 console script `codemigrator-app = codemigrator.runtime:main`。
 
+生产入口从 `CODEMIGRATOR_DATABASE_URL` 或分开的 `CODEMIGRATOR_DATABASE_HOST/PORT/NAME/USER/PASSWORD` 读取 PostgreSQL 配置，并要求 `CODEMIGRATOR_API_TOKEN`。它启动根级 `codemigrator.asgi.create_production_app` 和单进程 Uvicorn server；`api.production` 是唯一 PostgreSQL pool、advisory lock、schema、恢复与 readiness owner。不要同时启动 `RuntimeApplication.run()`，否则会争用应用级 advisory lock。默认 Compose 仍为 app + PostgreSQL，app 只在宿主 loopback 发布 HTTP，并用带 Bearer token 的现有 `/api/v1/system/health` 检查真实 readiness。
+
+ASGI 启动只证明 HTTP、应用 lifecycle 与 PostgreSQL readiness 可用。未配置真实 Run/Draft host factory 时，相关写命令继续 fail closed；health 通过不表示 Run workflow 或迁移已装配。
+
 ## V7 图与 AgentRun
 
 `RuntimeGraphAssembly` 在 runtime 组合根注入 ProviderRegistry、ContextManager、ToolGateway、RuntimeStore、CAS、usage sink 与图 checkpointer，并编译独立的 `MigrationSessionGraph` 和 `RunWorkflowGraph`。Run、Draft、AgentRun 使用彼此隔离的 checkpointer；缺少依赖、阶段工厂或 saver 隔离时 fail closed。该 assembly 不改变八子包边界，也不提供绕过现有 API/owner port 的写入口。

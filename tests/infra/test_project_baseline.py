@@ -60,11 +60,23 @@ def test_python_baseline_and_required_dependencies_are_declared() -> None:
         "asyncpg",
         "tree-sitter",
         "structlog",
+        "uvicorn",
         "opentelemetry-api",
         "opentelemetry-sdk",
         "httpx",
     ):
         assert package in dependencies
+
+
+def test_compose_app_uses_runtime_configuration_and_live_api_healthcheck() -> None:
+    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+
+    assert "CODEMIGRATOR_API_TOKEN: ${CODEMIGRATOR_API_TOKEN:?" in compose
+    assert "CODEMIGRATOR_DATABASE_HOST: postgres" in compose
+    assert "CODEMIGRATOR_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?" in compose
+    assert '127.0.0.1:${CODEMIGRATOR_HTTP_PUBLISHED_PORT:-8080}:8080' in compose
+    assert "/api/v1/system/health" in compose
+    assert "import codemigrator" not in compose
 
 
 def test_go_grammar_digest_matches_descriptor() -> None:
@@ -245,10 +257,8 @@ def test_deploy_files_contain_no_credentials_or_host_sockets() -> None:
     assert "COPY pyproject.toml uv.lock README.md ./" in dockerfile
     assert "COPY descriptors ./descriptors" in dockerfile
     assert "COPY migrations ./migrations" in dockerfile
-    assert (
-        'test: ["CMD", "uv", "run", "--no-dev", "python", "-c", "import codemigrator"]'
-        in compose
-    )
+    assert "/api/v1/system/health" in compose
+    assert "os.environ['CODEMIGRATOR_API_TOKEN']" in compose
     target_dockerfile = (ROOT / "deploy/images/target-python/Dockerfile").read_text(
         encoding="utf-8"
     )
