@@ -6,9 +6,9 @@ import os
 import tempfile
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
-from pydantic import ValidationError
 
 from codemigrator.core import ModelProfile, Phase, SessionKind, canonical_json_bytes, load_resource
 from codemigrator.core.ids import new_uuid7
@@ -43,7 +43,7 @@ from codemigrator.workspace import GatewayContext
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("CODEMIGRATOR_REAL_OPENCODE", "").casefold() not in {"1", "true"},
-    reason="set CODEMIGRATOR_REAL_OPENCODE=1 to make one billed provider call",
+    reason="set CODEMIGRATOR_REAL_OPENCODE=1 to make one OpenCode free-model request",
 )
 
 
@@ -61,15 +61,16 @@ class _ConservativeCounter:
 
 
 class _UsageSink:
-    def __init__(self) -> None:
+    def __init__(self, *, request_cap: int = 1) -> None:
         self._rounds: dict[AgentRunId, dict[str, int]] = {}
+        self._request_cap = request_cap
         self.receipts: list[object] = []
 
     async def reserve_round(self, agent_run_id, call_id: str, *, max_rounds: int):
         calls = self._rounds.setdefault(agent_run_id, {})
         if call_id in calls:
             return calls[call_id]
-        if len(calls) >= max_rounds:
+        if len(calls) >= min(max_rounds, self._request_cap):
             return None
         calls[call_id] = len(calls) + 1
         return calls[call_id]
@@ -107,6 +108,11 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
     config = _opencode_config()
     provider_id = provider_adapter_id_for_label(str(config["Provider"]))
     model_id = str(config["模型"])
+    if model_id != "space-bunny-free":
+        pytest.fail("the live integration smoke is pinned to OpenCode space-bunny-free")
+    endpoint = urlsplit(str(config["Base URL"]))
+    if endpoint.scheme != "https" or endpoint.netloc.casefold() != "opencode.ai":
+        pytest.fail("the live integration smoke is pinned to the OpenCode HTTPS endpoint")
     binding = LockedModelBinding(
         provider_id=provider_id,
         model_id=model_id,
@@ -135,13 +141,12 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
     )
     template = (
         "You are a read-only CodeMigrator exploration assistant. "
-        "Return only one JSON object matching this shape: "
-        '{"domain_path":".","anchors":[{"file_path":"src/example.py",'
-        '"start":{"line":1,"column":0},"end":{"line":1,"column":1}}],'
-        '"coverage":["src/example.py"],"confidence_reason":"brief reason"}. '
-        "Do not wrap it in Markdown fences and do not call tools."
+        "No source snapshot is attached. Return one typed ExplorationReport through the "
+        "required structured output channel. Set domain_path exactly to '.'; use one "
+        "synthetic anchor and the only coverage path 'src/example.py'. Do not invoke "
+        "repository tools or include prose."
     )
-    usage_sink = _UsageSink()
+    usage_sink = _UsageSink(request_cap=1)
 
     with tempfile.TemporaryDirectory(prefix="codemigrator-opencode-agent-") as temp_dir:
         cas = FileHostCAS(Path(temp_dir) / "cas")
@@ -180,6 +185,7 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                         phase=Phase.Plan,
                         session_kind=SessionKind.ExploreCoordinator,
                         owner_kind="draft",
+                        response_format=ExplorationReport,
                     ),
                     template_sha256=template_sha,
                 )
@@ -204,21 +210,15 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
                     usage_sink=usage_sink,
                     context_identity=context_identity,
                     checkpointer=agent_checkpointer,
+                    response_format=ExplorationReport,
                 )
                 result = await bound.ainvoke(task=task)
-                if result.exit is not SessionExit.Completed or not result.assistant_texts:
+                report = result.structured_response
+                if (
+                    result.exit is not SessionExit.Completed
+                    or not isinstance(report, ExplorationReport)
+                ):
                     raise AssertionError("live OpenCode AgentRun did not complete")
-                report_text = result.assistant_texts[0].strip()
-                if report_text.startswith("```"):
-                    lines = report_text.splitlines()
-                    if len(lines) >= 3 and lines[-1].strip() == "```":
-                        report_text = "\n".join(lines[1:-1])
-                try:
-                    report = ExplorationReport.model_validate_json(report_text)
-                except ValidationError:
-                    raise AssertionError(
-                        "live OpenCode response was not a valid typed Draft report"
-                    ) from None
                 result_body = canonical_json_bytes(report.model_dump(mode="json", by_alias=True))
                 result_reference = await CasLedger(cas, store).put(
                     result_body,
@@ -255,9 +255,13 @@ async def test_real_opencode_agent_run_reaches_durable_draft_graph_receipt() -> 
         )
         try:
             completion = await graph.explore_domain(
-                ".", "Return a minimal typed report for the synthetic source example."
+                ".",
+                "Return one minimal typed ExplorationReport for a synthetic source example. "
+                "Set domain_path exactly to '.' and use src/example.py as the only anchor "
+                "and coverage path.",
             )
-            assert usage_sink.receipts
+            assert isinstance(completion.materialized, ExplorationReport)
+            assert len(usage_sink.receipts) == 1
             assert await store.load_agent_run(completion.record.agent_run_id) == completion.record
             assert (
                 await store.load_agent_run_receipt(completion.record.agent_run_id)
