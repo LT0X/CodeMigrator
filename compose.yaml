@@ -3,6 +3,17 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile
+    environment:
+      CODEMIGRATOR_API_TOKEN: ${CODEMIGRATOR_API_TOKEN:?CODEMIGRATOR_API_TOKEN must be supplied}
+      CODEMIGRATOR_DATABASE_HOST: postgres
+      CODEMIGRATOR_DATABASE_NAME: codemigrator
+      CODEMIGRATOR_DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be supplied}
+      CODEMIGRATOR_DATABASE_PORT: "5432"
+      CODEMIGRATOR_DATABASE_USER: codemigrator
+      CODEMIGRATOR_HTTP_HOST: 0.0.0.0
+      CODEMIGRATOR_HTTP_PORT: "8080"
+    ports:
+      - "127.0.0.1:${CODEMIGRATOR_HTTP_PUBLISHED_PORT:-8080}:8080"
     security_opt:
       - seccomp=unconfined
     cap_add:
@@ -16,7 +27,17 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "uv", "run", "--no-dev", "python", "-c", "import codemigrator"]
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, urllib.request;
+          url = 'http://127.0.0.1:' + os.environ['CODEMIGRATOR_HTTP_PORT'] + '/api/v1/system/health';
+          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['CODEMIGRATOR_API_TOKEN']});
+          response = urllib.request.urlopen(request, timeout=2);
+          response.read();
+          response.close()
       interval: 5s
       timeout: 3s
       retries: 10

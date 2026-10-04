@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol
+from urllib.parse import quote, urlunsplit
 
 import asyncpg  # type: ignore[import-untyped]
 
@@ -287,12 +290,113 @@ class RuntimeApplication:
 
 
 def run_from_environment() -> int:
-    """Start the application using a DSN supplied by the deployment environment."""
+    """Run the production ASGI application from deployment-provided configuration."""
 
-    dsn = os.environ.get("CODEMIGRATOR_DATABASE_URL")
-    if not dsn:
+    dsn = _database_dsn_from_environment(os.environ)
+    token = os.environ.get("CODEMIGRATOR_API_TOKEN")
+    if not dsn or not token:
         return 1
-    return asyncio.run(RuntimeApplication.from_dsn(dsn).run())
+
+    import uvicorn
+
+    from codemigrator.api.deps import ApiConfig
+    from codemigrator.asgi import create_production_app
+
+    server_ref: list[Any] = []
+
+    async def stop_server() -> None:
+        if server_ref:
+            server_ref[0].should_exit = True
+
+    app = create_production_app(
+        dsn,
+        config=ApiConfig(token=token),
+        stop_server=stop_server,
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=os.environ.get("CODEMIGRATOR_HTTP_HOST", "0.0.0.0"),
+            port=_http_port_from_environment(os.environ),
+            log_level=os.environ.get("CODEMIGRATOR_LOG_LEVEL", "info"),
+        )
+    )
+    server_ref.append(server)
+
+    async def serve() -> int:
+        await server.serve()
+        return 0 if server.started else 1
+
+    return asyncio.run(serve())
+
+
+def _database_dsn_from_environment(environ: Mapping[str, str]) -> str | None:
+    configured_dsn = environ.get("CODEMIGRATOR_DATABASE_URL")
+    if configured_dsn:
+        return configured_dsn
+
+    host = environ.get("CODEMIGRATOR_DATABASE_HOST")
+    database = environ.get("CODEMIGRATOR_DATABASE_NAME")
+    username = environ.get("CODEMIGRATOR_DATABASE_USER")
+    password = environ.get("CODEMIGRATOR_DATABASE_PASSWORD")
+    if not host or not database or not username or not password:
+        return None
+
+    try:
+        port = int(environ.get("CODEMIGRATOR_DATABASE_PORT", "5432"))
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    authority_host = _database_authority_host(host)
+    if authority_host is None:
+        return None
+
+    authority = (
+        f"{quote(username, safe='')}:{quote(password, safe='')}"
+        f"@{authority_host}:{port}"
+    )
+    return urlunsplit(("postgresql", authority, f"/{quote(database, safe='')}", "", ""))
+
+
+def _database_authority_host(host: str) -> str | None:
+    bracketed = host.startswith("[") or host.endswith("]")
+    if bracketed and not (host.startswith("[") and host.endswith("]")):
+        return None
+    candidate = host[1:-1] if bracketed else host
+
+    if ":" in candidate:
+        if "%" in candidate:
+            return None
+        try:
+            ipaddress.IPv6Address(candidate)
+        except ValueError:
+            return None
+        return f"[{candidate}]"
+    if bracketed:
+        return None
+
+    hostname = candidate[:-1] if candidate.endswith(".") else candidate
+    if not hostname or len(hostname) > 253:
+        return None
+    labels = hostname.split(".")
+    if any(
+        len(label) > 63
+        or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label) is None
+        for label in labels
+    ):
+        return None
+    return host
+
+
+def _http_port_from_environment(environ: Mapping[str, str]) -> int:
+    try:
+        port = int(environ.get("CODEMIGRATOR_HTTP_PORT", "8080"))
+    except ValueError as error:
+        raise ValueError("CODEMIGRATOR_HTTP_PORT must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise ValueError("CODEMIGRATOR_HTTP_PORT must be between 1 and 65535")
+    return port
 
 
 __all__ = [
